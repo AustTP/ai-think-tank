@@ -1,4 +1,6 @@
 {
-  "world/serve.py": 32429,
-  "world/sim.py": 14285
+  "world/content.py": 40,
+  "world/selfedit.py": 40,
+  "world/serve.py": 180,
+  "world/sim.py": 40
 }

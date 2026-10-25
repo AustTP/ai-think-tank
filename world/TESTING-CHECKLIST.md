@@ -144,10 +144,15 @@ Prereq: provision the credential once —
 ---
 
 ## Known baseline
-The full pytest suite has **23 pre-existing failures** (DB-ordering pollution) that
-**pass in isolation** — unrelated to the blocked-field / mail / email / issue work.
-They live in products/wiki, sprints, teams, seed. If you want a clean green bar,
-run those specific test files alone; none of the flows above depend on them.
+The suite is green:
+
+```bash
+python3 -m pytest world/tests -q
+node world/tests/js_coverage.mjs
+```
+
+That is 7,814 passing Python tests and a 90% JavaScript coverage floor. Any
+failure is a new regression; diagnose it instead of treating a file as flaky.
 
 ## If a check FAILS
 Capture: the exact step, the observed vs expected state, and the relevant serve

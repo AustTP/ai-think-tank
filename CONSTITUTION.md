@@ -4,10 +4,10 @@ Status: immutable. Only the owner/player may amend these rules.
 
 The think tank may govern its own process, edit `BUSINESS-PROCESSES.md`, and
 change its own code, including `serve.py` through the signed kernel path and
-`sim.py` outside the movement-physics block, inside these limits. These rules
-are not ordinary policy and cannot be waived by an agent, a director, a scrum
-master, the chief of staff, or a majority. Only this document and
-`world/constitution.py` are immutable.
+the simulation parts outside the movement-physics block, inside these
+limits. These rules are not ordinary policy and cannot be waived by an agent, a
+director, a scrum master, the chief of staff, or a majority. Only this document
+and `world/core/constitution.py` are immutable.
 
 1. **No self-funding.** Do not acquire credits, top up an account, purchase a
    service, start a paid trial, create a billing account, move money, or run a
@@ -37,8 +37,9 @@ master, the chief of staff, or a majority. Only this document and
    that keep it there. HTML, CSS, and other non-code assets are exempt from
    Python coverage and flake8 checks, but still pass their own validation.
 8. **Movement physics is owner-protected.** Do not change pathfinding,
-   collision, or step/slide movement geometry in `sim.py` unless the player
-   explicitly asks for that change. Other parts of `sim.py` remain editable.
+   collision, or step/slide movement geometry in the movement-physics block of
+   `world/village/sim_parts/00_header.py` unless the player explicitly asks for
+   that change. Other simulation parts remain editable.
 9. **Change control and veto.** Code changes go through the self-edit and
    change-request path. The implementing worker proposes the edit, a different
    validator reviews the applied bytes, and the owner receives the change

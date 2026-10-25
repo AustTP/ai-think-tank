@@ -109,6 +109,7 @@ PROTECTED_BASENAMES = ('CONSTITUTION.md', 'constitution.py')
 # The markers make the guarded span explicit; a missing marker pair fails
 # closed so an edit cannot remove the fence and then walk through it.
 PHYSICS_BASENAMES = ('sim.py',)
+PHYSICS_PARTS = ('village/sim_parts/00_header.py',)
 PHYSICS_BEGIN = '# BEGIN MOVEMENT PHYSICS'
 PHYSICS_END = '# END MOVEMENT PHYSICS'
 
@@ -264,23 +265,27 @@ def is_protected(resolved_path):
 
 
 def _physics_refusal(resolved_path, original, find):
-    """Refuse a splice that overlaps sim.py's owner-protected movement
-    physics. Markers are required; their absence fails closed."""
-    if os.path.basename(resolved_path) not in PHYSICS_BASENAMES:
+    """Refuse a splice that overlaps owner-protected movement physics.
+
+    Markers are required; their absence fails closed."""
+    rel = os.path.relpath(os.path.realpath(resolved_path),
+                          os.path.realpath(_world())).replace(os.sep, '/')
+    if (os.path.basename(resolved_path) not in PHYSICS_BASENAMES
+            and rel not in PHYSICS_PARTS):
         return None
     begin = original.find(PHYSICS_BEGIN)
     end = original.find(PHYSICS_END)
     if begin < 0 or end < begin:
-        return ('sim.py movement physics guard markers are missing or '
-                'damaged; the file is refused until the owner restores them')
+        return ('movement physics guard markers are missing or damaged; '
+                'the file is refused until the owner restores them')
     region_end = end + len(PHYSICS_END)
     start = original.find(find)
     if start < 0:
         return None
     if start < region_end and start + len(find) > begin:
-        return ('sim.py movement physics is owner-protected: pathfinding, '
+        return ('movement physics is owner-protected: pathfinding, '
                 'collision, and step/slide geometry may not be changed '
-                'without the owner. Edit other parts of sim.py instead')
+                'without the owner. Edit other sim code instead')
     return None
 
 

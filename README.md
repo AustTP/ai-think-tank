@@ -36,19 +36,20 @@ Only `OPENROUTER_API_KEY` is required. Every other key in `.env.template` is opt
 Run the tests:
 
 ```bash
-cd world && python3 -m pytest tests/
+python3 -m pytest world/tests -q
+node world/tests/js_coverage.mjs
 ```
 
-The suite has 6,473 passing tests.
+`bash world/tests/run_all.sh` runs both. The suite has 7,814 passing Python tests and a 90% JavaScript coverage floor.
 
 ## Theo's control room
 
 Theo keeps the building honest. He cares about state, gates, and where the money goes.
 
 - **The database.** `think_tank.db` is SQLite. Every action gets logged. Agent history can be replayed. Nothing is lost on restart.
-- **The server.** `world/serve.py` is a FastAPI app. It owns the simulation, model calls through OpenRouter, the shared Library, spend accounting, and session auth.
-- **The simulation.** `world/sim.py` moves agents, assigns tasks, runs ceremonies, enforces peer-review gates, and drives sprint lifecycles. It does all of this in one read-modify-write pass every 6 seconds.
-- **The executors.** `world/content.py` runs when an agent reaches a task. It handles research crawls, code writing and review, weather, distillation, media digests, bank reviews, and time-boxed investigations called spikes.
+- **The server.** `world/serve.py` loads the parts in `world/server/serve_parts/`. The FastAPI app owns the simulation, model calls through OpenRouter, the shared Library, spend accounting, and session auth.
+- **The simulation.** `world/sim.py` loads the parts in `world/village/sim_parts/`. It moves agents, assigns tasks, runs ceremonies, enforces peer-review gates, and drives sprint lifecycles in one read-modify-write pass every 6 seconds.
+- **The executors.** `world/content.py` loads the parts in `world/agents/content_parts/`. It handles research crawls, code writing and review, weather, distillation, media digests, bank reviews, and time-boxed investigations called spikes.
 - **The client.** `world/index.html` draws the tank as a pixel-art canvas and lets you interact. It is a viewport. The server owns every position, task, and decision.
 - **The model tiers.** Work starts on the cheap `low` tier. JEV decides which calls earn `mid` or `high`. Coding tasks use the coding tier automatically. The refresh re-picks each band's best-value model from the live OpenRouter catalog.
 - **The budgets.** Page requests are capped at 1,000 per month. The hard spend cap defaults to $50 per month and is set with `SPEND_CAP_USD`. The high tier has its own monthly budget, which defaults to $5. JEV respects both.
@@ -68,20 +69,20 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 
 | Component | What it owns |
 |-----------|-------------|
-| `world/serve.py` | FastAPI app: state DB, model calls, tools, auth, spend ledger, simulation driver, team and director hierarchy, model-tier refresh |
-| `world/bank.py` | The Bank: spend ledger, per-service budget gates, spend cap, forecasts (re-exported from serve.py) |
-| `world/auth.py` | Player auth: credential creation, password hashing, login sessions, rate limiting (re-exported from serve.py) |
-| `world/notify.py` | Escalation and player-notification email and Telegram senders (re-exported from serve.py) |
-| `world/sim.py` | Simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
-| `world/confirmations.py` | Durable two-phase confirmation proposals: target and argument binding, exact phrase, expiry, completion |
-| `world/confirmations_api.py` | Player and agent HTTP surface for proposing, confirming, listing, and cancelling actions |
-| `world/migrations.py` + `world/migrations/` | Versioned SQLite migrations with checksums |
-| `world/model_config.py` | Model-band validation and operator table |
-| `world/content.py` | Per-room content executors: research, code writing and review, weather, media, distill, spikes, bank teller |
-| `world/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
-| `world/sim_helpers.py` | Pure priority normalization, room and team derivation, sprint and product ID generation, village and memory-clock helpers |
-| `world/index.html` + `world/*.js` | Browser renderer. The client is a viewport and never the state machine. |
-| `world/tests/` | Python test suite (6,473 passing tests) |
+| `world/serve.py` + `world/server/serve_parts/` | FastAPI app: state DB, model calls, tools, auth, spend ledger, simulation driver, team and director hierarchy, model-tier refresh |
+| `world/integrations/bank.py` | The Bank: spend ledger, per-service budget gates, spend cap, forecasts |
+| `world/core/auth.py` | Player auth: credential creation, password hashing, login sessions, rate limiting |
+| `world/integrations/notify.py` | Escalation and player-notification email and Telegram senders |
+| `world/sim.py` + `world/village/sim_parts/` | Simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
+| `world/core/confirmations.py` | Durable two-phase confirmation proposals: target and argument binding, exact phrase, expiry, completion |
+| `world/server/confirmations_api.py` | Player and agent HTTP surface for proposing, confirming, listing, and cancelling actions |
+| `world/server/migrations.py` + `world/migrations/` | Versioned SQLite migrations with checksums |
+| `world/core/model_config.py` | Model-band validation and operator table |
+| `world/content.py` + `world/agents/content_parts/` | Per-room content executors: research, code writing and review, weather, media, distill, spikes, bank teller |
+| `world/integrations/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
+| `world/village/sim_helpers.py` | Pure priority normalization, room and team derivation, sprint and product ID generation, village and memory-clock helpers |
+| `world/index.html` + `world/js/*.js` | Browser renderer. The client is a viewport and never the state machine. |
+| `world/tests/` | Python and JavaScript test suites (7,814 Python tests plus the JS coverage harness) |
 
 ## Repo layout
 

@@ -23,6 +23,12 @@ def test_cov_physics_refusal_edges(tmp_path):
                f'{selfedit.PHYSICS_END}\n')
     assert selfedit._physics_refusal(path, outside, 'X = 1') is None
 
+    part = os.path.join(selfedit._world(), 'village', 'sim_parts',
+                        '00_header.py')
+    assert selfedit._physics_refusal(part, 'no markers', 'a') is not None
+    assert selfedit._physics_refusal(part, guarded, 'PHYS = 1') is not None
+    assert selfedit._physics_refusal(part, outside, 'X = 1') is None
+
 
 def test_cov_facade_parts_and_source_stitching(fake_repo):
     _, world = fake_repo

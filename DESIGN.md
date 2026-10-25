@@ -10,54 +10,50 @@ consequences. The server owns all state (`think_tank.db`); the browser is a
 read-view into it.
 
 **Codebase:**
-- `world/serve.py` (~32k lines) — FastAPI server, simulation driver,
-  model-tier management, JEV gates, team/director
-  hierarchy, all HTTP endpoints. The Bank ledger/budget gates, player
-  auth/sessions, and escalation/email/telegram notifications were extracted
-  (2026-10-05) into `bank.py`, `auth.py`, and `notify.py` below; serve.py
-  re-exports them at the top so `serve.*` call sites are unchanged.
-- `world/sim.py` (~14k lines) — Server-owned state machine: movement,
-  task assignment, ceremonies (refinement, social, governance, escalation),
-  peer review gates, sprint lifecycle, agent off-duty/position management.
-- `world/content.py` (~3.7k lines) — Content executors that run when an
-  agent arrives at a task room: research, coding, review, distill, weather,
-  media, spikes, and the Bank teller.
-- `world/confirmations.py` + `world/confirmations_api.py` — Durable
+- `world/serve.py` + `world/server/serve_parts/` — FastAPI server, simulation
+  driver, model-tier management, JEV gates, team/director hierarchy, and all
+  HTTP endpoints. `serve.py` is the loader that assembles the parts.
+- `world/sim.py` + `world/village/sim_parts/` — Server-owned state machine:
+  movement, task assignment, ceremonies (refinement, social, governance,
+  escalation), peer review gates, sprint lifecycle, and agent off-duty and
+  position management.
+- `world/content.py` + `world/agents/content_parts/` — Content executors that
+  run when an agent arrives at a task room: research, coding, review, distill,
+  weather, media, spikes, and the Bank teller.
+- `world/core/confirmations.py` + `world/server/confirmations_api.py` — Durable
   two-phase confirmation proposals for write actions. Proposals bind action,
   target, arguments, actor, channel, and expiry. Only the player can confirm
   the exact phrase; execution rechecks the payload hash and actor.
-- `world/migrations.py` + `world/migrations/` — Versioned SQLite migrations
+- `world/server/migrations.py` + `world/migrations/` — Versioned SQLite migrations
   with SHA-256 checksums. New schema changes go here instead of another
   idempotent block in `init_db`.
-- `world/model_config.py` — Validates model bands, price ranges, quality gaps,
+- `world/core/model_config.py` — Validates model bands, price ranges, quality gaps,
   selected tiers, and fallback ranks without importing `serve.py`.
-- `world/bank.py` — The Bank: spend ledger + per-service budget gates,
-  spend-cap enforcement, forecasts (extracted from serve.py; re-exported).
-- `world/auth.py` — Player auth: credential creation, PBKDF2 hashing, login
-  sessions, rate limiting (extracted from serve.py; re-exported).
-- `world/notify.py` — Escalation + player-notification email/telegram senders
-  (extracted from serve.py; re-exported).
-- `world/web_helpers.py` — Pure HTML stripping, link extraction, HTTP-date
-  parsing, SSRF host check, filename sanitization (extracted from serve.py).
-- `world/config.py` — Operator-edited policy JSON loaded from `world/*.json`:
+- `world/integrations/bank.py` — The Bank: spend ledger + per-service budget gates,
+  spend-cap enforcement, and forecasts.
+- `world/core/auth.py` — Player auth: credential creation, PBKDF2 hashing, login
+  sessions, and rate limiting.
+- `world/integrations/notify.py` — Escalation and player-notification email
+  and Telegram senders.
+- `world/integrations/web_helpers.py` — Pure HTML stripping, link extraction, HTTP-date
+  parsing, SSRF host check, and filename sanitization.
+- `world/core/config.py` — Operator-edited policy JSON loaded from `world/*.json`:
   `plain_writing.json` (ban list), `browse_policy.json` (block categories),
   `research_desk.json` (desk passes), `watchlist.json` (standing research
   topics). Fail-closed loaders with in-code defaults; the watchlist seeds
   researchTopics on boot and reflects villager additions back to the file.
-- `world/evidence.py` — The Research Desk: a claim-level evidence ledger
+- `world/core/evidence.py` — The Research Desk: a claim-level evidence ledger
   (`evidence_records`) and a review-gated coverage ledger
   (`coverage_ledger`), each in its own single-row SQLite table. Short-link
   source identity resolution, repost dedup, covered-only-after-review, and
-  the 24h search-window overlap (extracted into its own module like bank.py;
-  re-exported by serve.py).
-- `world/sim_helpers.py` — Pure priority normalization, room derivation,
+  the 24h search-window overlap.
+- `world/village/sim_helpers.py` — Pure priority normalization, room derivation,
   team lookup, sprint/product id generation (extracted from sim.py).
-- `world/memory.py` — Conversation memory (STM + LTM) for the Telegram bridge.
+- `world/agents/memory.py` — Conversation memory (STM + LTM) for the Telegram bridge.
   STM stores each ask turn per
   chat session and injects the recent turns + a rolling summary into the next
   ask; LTM distills durable facts/preferences from the conversation and recalls
-  the relevant ones on each ask (extracted into its own module like bank.py;
-  re-exported by serve.py).
+  the relevant ones on each ask.
 
 ---
 
@@ -131,7 +127,7 @@ direct report becomes a director for free.
   team). Get their own team records automatically.
 - **Workers** — non-chief-of-staff, non-director agents who do the actual room work.
 
-`world/governance.py` is the shared policy seam: directors and the chief of staff may
+`world/core/governance.py` is the shared policy seam: directors and the chief of staff may
 not pick up `code`, `bug`, or `qa` work; they file stories, spikes, and bugs
 instead. Directors and the chief of staff also cannot arm code self-edits. A scrum
 master (or a director/chief of staff) may grant file and app entitlements when a
@@ -296,7 +292,7 @@ band's definition, so a sublow pick can never drift up-market.
 ### Sublow experiment grants
 
 Scale experiments (hundreds of reenactment agents in a Colab notebook) need
-model calls without ever holding the OpenRouter key. `world/sublow.py` solves
+model calls without ever holding the OpenRouter key. `world/core/sublow.py` solves
 it with rotating server-side grants:
 
 - **Mint** `POST /api/experiments/sublow/grant` (operator gate: player
@@ -331,7 +327,7 @@ notebook, and no model choice for the caller to argue with.
 
 ### JEV experiment grants
 
-`world/jev_grants.py` is the sublow grant system pointed at the JEV
+`world/core/jev_grants.py` is the sublow grant system pointed at the JEV
 decisions model -- same restrictions, different model. An experiment that
 needs bounded calls against the JEV model (a calibration sweep, a
 side-by-side probe) mints a rotating server-side token and never holds the
@@ -639,13 +635,13 @@ the mapping recorded here so the review is auditable, not re-done.
 The "Build Your Own AI Research Desk" article (Ichigo, 2026-10-08) was
 reviewed against the codebase. Most of its lessons are already operationalized
 (approval gating, peer review, dedup, fail-closed). Four gaps were closed; the
-implementation lives in `world/evidence.py` plus the research executor's
+implementation lives in `world/core/evidence.py` plus the research executor's
 desk hooks:
 
 | Article lesson | Where it lives |
 |----------------|----------------|
-| Claim-level evidence records with a status lifecycle (`needs_review` -> `cleared` / `blocked`), a source, date, and scope | `evidence_records` ledger (`world/evidence.py`), written by the research crawl and read through `/api/evidence` |
-| Claim-type taxonomy (official_announcement / user_report / opinion / benchmark_claim), honest default `unclassified` until a Verifier classifies | `CLAIM_TYPES` + `record_source_claim` (`world/evidence.py`); the Verifier sets it via `/api/evidence/review` |
+| Claim-level evidence records with a status lifecycle (`needs_review` -> `cleared` / `blocked`), a source, date, and scope | `evidence_records` ledger (`world/core/evidence.py`), written by the research crawl and read through `/api/evidence` |
+| Claim-type taxonomy (official_announcement / user_report / opinion / benchmark_claim), honest default `unclassified` until a Verifier classifies | `CLAIM_TYPES` + `record_source_claim` (`world/core/evidence.py`); the Verifier sets it via `/api/evidence/review` |
 | A repost is NOT a second independent source | `record_source_claim` marks a second record on the same resolved identity `independent=False` + `repost_of=<first id>`; the coverage gate skips reposts of a covered item too |
 | Covered-only-after-review; a failed run never suppresses the next attempt; 24h overlap on recurring runs | `coverage_ledger`: `mark_covered(reviewed=False)` -> `pending_review` (not covered); `reviewed=True` (a Verifier clearing a claim) -> `covered`; `record_run_failure` never covers; `search_since_ms` / `RESEARCH_OVERLAP_MS` |
 | Search for a question, not a keyword (announcements / practical examples / limitations passes) | `RESEARCH_DESK_PASSES` folded into the research synthesis prompt + `passLog` in each run's result; scheduled research instructions carry the three passes |
@@ -656,7 +652,7 @@ short link's raw string is NEVER a source identity. `t.co/abc` and
 can be repointed to a malicious destination at any time. So:
 
 1. Identity is derived from the RESOLVED landing URL (`source_identity` in
-   `world/evidence.py`), which `/api/browse` already returns after it re-gates
+   `world/core/evidence.py`), which `/api/browse` already returns after it re-gates
    the redirect chain's FINAL host. Two short links that land on different
    sites get different identities; a repost to the same landing site is
    deduped to it.
@@ -664,7 +660,7 @@ can be repointed to a malicious destination at any time. So:
    `resolved_ok=False`, recorded with an open question ("short link not
    resolved; destination unknown"). It is never claimed to be "the same
    source" as anything and never serves as a verified source on its own.
-3. `_is_short_link` (registry-based in `world/web_helpers.py`) flags short
+3. `_is_short_link` (registry-based in `world/integrations/web_helpers.py`) flags short
    links for the risk/identity handling; `_resolve_final_url` follows the
    redirect chain SSRF-safe (every hop pinned to a public IP) and is exposed
    via `/api/evidence/resolve` so an operator can verify a short link's
@@ -705,7 +701,7 @@ Verifier within the cap, and over-covering is reversible and visible (the
 audit + coverage ledger), not airtight. The always-block browse categories and
 the egress grants cap what a compromised agent can reach elsewhere.
 
-### Operator-edited policy JSON (`world/config.py`)
+### Operator-edited policy JSON (`world/core/config.py`)
 
 Settings the operator tunes live in JSON files, not Python. Each loader is
 fail-closed (missing/malformed file falls back to the in-code default) and
@@ -735,7 +731,7 @@ force-removed from state (same policy as the long-horizon topic).
 The Telegram bridge answered every message with a stateless prompt ("a fresh
 question"), so a follow-up like "and the second one?" had no referent and the
 chief of staff failed to answer. The fix adds conversation memory on the think tank's
-own SQLite DB, in `world/memory.py`:
+own SQLite DB, in `world/agents/memory.py`:
 
 | Tier | What it does | Storage |
 |------|--------------|---------|
@@ -856,7 +852,7 @@ hash-chained:
 ## 18. Scoped File and Notes Access
 
 Agents get read/write/organize access to the player's own folders (Desktop,
-Downloads) and iCloud Notes, gated by player-issued grants in `world/fs.py`.
+Downloads) and iCloud Notes, gated by player-issued grants in `world/core/fs.py`.
 The trust root is the grant, not the agent: agents never hold macOS paths or
 Notes credentials directly -- they get a `local_file` tool whose every call is
 checked against a grant (scope root + capability set) stored in state under

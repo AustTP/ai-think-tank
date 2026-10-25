@@ -46,9 +46,11 @@ Three source documents were used:
 
 - `README.md` for purpose and operator setup.
 - `DESIGN.md` for architecture and design intent.
-- The implementation: `world/serve.py`, `world/sim.py`, `world/content.py`,
-  and the extracted modules (`bank.py`, `evidence.py`, `memory.py`,
-  `theo_policy.py`, `config.py`, `fs.py`, `auth.py`, `notify.py`).
+- The implementation: `world/serve.py` with `world/server/`, `world/sim.py`
+  with `world/village/`, `world/content.py` with `world/agents/content_parts/`,
+  and the package modules (`world/integrations/bank.py`, `world/core/evidence.py`,
+  `world/agents/memory.py`, `world/core/theo_policy.py`, `world/core/config.py`,
+  `world/core/fs.py`, `world/core/auth.py`, `world/integrations/notify.py`).
 
 ## 0.1 Change log
 
@@ -2454,9 +2456,10 @@ the shared GitHub repository (`origin main`) under a two-agent contract:
 
 **Surface audit (operator decision, 2026-10-18).** Three tiers now bound
 what agents may edit and read. Only the owner constitution is immutable
-(`CONSTITUTION.md`, `world/constitution.py`). `BUSINESS-PROCESSES.md`,
+(`CONSTITUTION.md`, `world/core/constitution.py`). `BUSINESS-PROCESSES.md`,
 `serve.py`, and `sim.py` are editable. `serve.py` uses the signed kernel
-path; `sim.py` keeps its movement-physics block owner-protected.
+path; the movement-physics block of `world/village/sim_parts/00_header.py`
+stays owner-protected.
 
 1. Tier A -- the test gate (`world/tests/`, `conftest.py`, the run
    scripts): refused outright for edits AND fixes, with no approval path.
@@ -3117,8 +3120,8 @@ rather than gate-integrity questions.
 | `RULE_MINE_CADENCE_MS` | `world/operator_policy.json` | 7 days |
 | `MIN_RESEARCH_CADENCE_MS` | `world/operator_policy.json` | 5 minutes |
 | `MIN_PIPELINE_CADENCE_MS` | `world/sim.py` | 1 hour |
-| `VERIFIER_COVERED_MAX` | `world/evidence.py` | 12 |
-| `VERIFIER_COVERED_WINDOW_S` | `world/evidence.py` | 6 hours |
+| `VERIFIER_COVERED_MAX` | `world/core/evidence.py` | 12 |
+| `VERIFIER_COVERED_WINDOW_S` | `world/core/evidence.py` | 6 hours |
 | `DIRECTOR_ESCALATION_REASK_COOLDOWN_S` | `world/operator_policy.json` | 15 minutes |
 | `DIRECTOR_ESCALATION_MAX_ASKS` | `world/operator_policy.json` | 6 |
 | `MEMORY_ENABLED` | `.env` | Conversation memory |
@@ -3153,7 +3156,7 @@ rather than gate-integrity questions.
 | `--max-idle-minutes` | launch flag | Dormancy arm; 0 or unset disables |
 | Pipeline step cap | `world/serve.py` | 64 steps per run |
 | Pipeline job cap | `world/serve.py` | 256 concurrent jobs |
-| Transport ceiling | `world/runtime_limits.py` | 3,600 seconds |
+| Transport ceiling | `world/core/runtime_limits.py` | 3,600 seconds |
 
 ## 19. Appendix C: process to code map
 
