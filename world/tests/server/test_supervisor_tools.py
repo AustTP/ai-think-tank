@@ -329,6 +329,76 @@ def test_supervise_card_pins_its_director_and_keeps_the_team(monkeypatch):
     assert all(t.get('assignedTo') != 'ruth' for t in state['tasks'].values())
 
 
+def test_assign_task_ignores_an_idle_agent_blocking_the_door():
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    tx = door['x'] + door['w'] / 2
+    ty = door['y'] + door['h'] + 4
+    state['agents']['nora'].update({
+        'x': tx, 'y': ty, 'offDuty': False, 'busy': False, 'task': None,
+        'visible': True})
+    state['agents']['ruth'].update({
+        'x': 300.0, 'y': 340.0, 'offDuty': False, 'busy': False, 'task': None,
+        'visible': True})
+    task = sim.assign_task(
+        state, 'ruth', 'Build the outlet', 'pressoffice', 'Build it.', 'x',
+        {'taskType': 'code'}, grid, doors, 1000, {0: 0})
+    assert task is not None
+    assert task['assignedTo'] == 'ruth'
+
+
+def test_supervisor_card_waits_instead_of_abandoning_on_path_failure(monkeypatch):
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    state['agents']['nora'].update({
+        'x': door['x'] + door['w'] / 2,
+        'y': door['y'] + door['h'] + 4,
+        'offDuty': False, 'busy': False, 'task': None})
+    item = {'title': '[SUPERVISE] check', 'room': 'pressoffice',
+            'taskType': 'supervise', 'assignedTo': 'nora', 'teamId': 'nora',
+            'instructions': 'check the team'}
+    monkeypatch.setattr(sim, 'assign_task', lambda *a, **k: None)
+    now_ms = 10_000
+    assert sim._assign_due_item(state, item, True, grid, doors, now_ms,
+                                task_id_holder={0: 0}) is sim._ASSIGN_WAIT
+    assert item['notBefore'] == now_ms + 60_000
+
+
+def test_normal_card_waits_instead_of_abandoning_on_path_failure(monkeypatch):
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    state['agents']['ruth'].update({
+        'x': door['x'] + door['w'] / 2,
+        'y': door['y'] + door['h'] + 4,
+        'offDuty': False, 'busy': False, 'task': None, 'visible': True})
+    item = {'title': 'Build the south outlet', 'room': 'pressoffice',
+            'taskType': 'code', 'teamId': 'nora', 'assignedTo': 'ruth',
+            'directRoute': True, 'instructions': 'Build the outlet.'}
+    monkeypatch.setattr(sim, 'assign_task', lambda *a, **k: None)
+    now_ms = 10_000
+    assert sim._assign_due_item(state, item, True, grid, doors, now_ms,
+                                task_id_holder={0: 0}) is sim._ASSIGN_WAIT
+    assert item['notBefore'] == now_ms + 60_000
+
+
+def test_abandoned_card_is_recorded_and_raises_supervisor_attention():
+    state = _state()
+    now_ms = 10_000
+    sim._on_work_item_abandoned(state, {
+        'title': '[AVATAR] Generate images for Ruth',
+        'room': 'pressoffice', 'taskType': 'avatar',
+        'teamId': 'nora', 'attempts': 3,
+    }, now_ms)
+    assert state['_abandonedCards'][-1]['title'] == '[AVATAR] Generate images for Ruth'
+    assert sim._supervisor_attention_reason(state, 'nora', now_ms) == '1 abandoned card(s)'
+    # Old abandonment is not a live attention reason.
+    assert 'abandoned' not in sim._supervisor_attention_reason(
+        state, 'nora', now_ms + 25 * 60 * 60 * 1000)
+
+
 def test_directed_card_waits_for_its_named_worker():
     state = _state()
     state['agents']['nora']['busy'] = True
@@ -388,6 +458,7 @@ def test_supervisor_tool_loop_has_a_heartbeat(monkeypatch):
     called = {}
 
     def fake_loop(model, messages, tools, execute_tool, **kwargs):
+        called['messages'] = messages
         called['report'] = execute_tool('supervisor_report', {})
         return 'done', []
 
@@ -398,3 +469,5 @@ def test_supervisor_tool_loop_has_a_heartbeat(monkeypatch):
     monkeypatch.setattr(sim, '_store_content_result', lambda *a, **k: None)
     content._run_supervisor_content(state, 'nora', task)
     assert 'report' in called
+    assert 'Specific card instruction' in called['messages'][0]['content']
+    assert 'Check the team.' in called['messages'][0]['content']

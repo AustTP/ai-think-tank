@@ -1827,18 +1827,23 @@ actual-cost cutoff, token hash storage, revocation.
 2. Every call checks the task budget.
 3. When the ceiling is crossed, the card closes as failed and is marked
    `budgetExhausted`.
-4. The owning director gets a non-disruptive mailbox note with budget, actual
-   spend, attempts, cause, work landed, and the future budget factor.
-5. The director may grant more budget and reopen the card. The new ceiling must
-   exceed what was already spent.
-6. The failed record is kept and stamped with the raised budget. The reopened
-   card is a fresh task pinned to the original author.
+4. The owning director gets a high-priority `[BUDGET]` supervisor card with
+   budget, actual spend, attempts, cause, work landed, and the future budget
+   factor. The decision is a card, not just a mailbox note.
+5. The director investigates the cause and decides. The default is to grant
+   more budget and reopen the card when the spend bought usable progress and
+   no blocking issue exists. If an issue prevents completion, the director
+   says what blocks it and closes or replaces the work instead.
+6. A new ceiling must exceed what was already spent. The failed record is kept
+   and stamped with the raised budget. The reopened card is a fresh task pinned
+   to the original author.
 7. Overrun history raises future budgets for similar work.
 
-**Controls.** Per-task ceiling, one-time notice, reopen validation, overrun
-factor.
+**Controls.** Per-task ceiling, one-time notice, director decision card,
+reopen validation, overrun factor.
 
-**Records.** Task budget fields, spend rows, mailbox note, governance log.
+**Records.** Task budget fields, spend rows, `[BUDGET]` card, mailbox note,
+governance log.
 
 ### BP-46 Page request budget
 

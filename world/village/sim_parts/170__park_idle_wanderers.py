@@ -771,6 +771,13 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)
+    if not task:
+        # A chosen agent with no path is a temporary map/crowd failure, not a
+        # reason to destroy the card. The old 3-attempt cap burned in seconds
+        # and silently abandoned real work (including the first expansion
+        # stories). Wait a minute and retry; never shed the work here.
+        pick['notBefore'] = now_ms + 60_000
+        return _ASSIGN_WAIT
     # W1: a `pair` card recruits a navigator server-side (deterministic
     # round-robin, zero JEV). The driver keeps the solo walk when no second
     # eligible hand exists -- graceful degradation, never a stuck card.

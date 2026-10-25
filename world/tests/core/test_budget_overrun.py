@@ -293,6 +293,34 @@ class DirectorNotification(unittest.TestCase):
         self.assertIn('No work landed before the stop', text)
         self.assertNotIn('Similar future cards', text)
 
+    def test_budget_exhaustion_queues_a_director_decision_card(self):
+        state = _state()
+        task = _task(status='failed', budgetExhausted=True,
+                     failNote='task model-spend budget exhausted')
+        analysis = budget.analyze_overrun(task, 0.75, 12)
+        completed = budget.evaluate_completed_work(task)
+        self._notify(state, task, analysis, completed)
+        queued = [w for w in state.get('workQueue', [])
+                  if str(w.get('title', '')).startswith('[BUDGET]')]
+        self.assertEqual(len(queued), 1)
+        card = queued[0]
+        self.assertEqual(card['taskType'], 'supervise')
+        self.assertEqual(card['assignedTo'], 'nora')
+        self.assertEqual(card['teamId'], 'dev')
+        self.assertEqual(card['priority'], 2)
+        self.assertIn('supervisor_grant_budget', card['instructions'])
+        self.assertIn('Default to granting more budget', card['instructions'])
+        self.assertIn('$1.00', card['instructions'])
+
+    def test_budget_decision_card_is_not_duplicated(self):
+        state = _state()
+        task = _task(status='failed', budgetExhausted=True)
+        self._notify(state, task)
+        self._notify(state, task)
+        self.assertEqual(
+            len([w for w in state.get('workQueue', [])
+                 if str(w.get('title', '')).startswith('[BUDGET]')]), 1)
+
     def test_fires_once_per_task(self):
         state = _state()
         task = _task()

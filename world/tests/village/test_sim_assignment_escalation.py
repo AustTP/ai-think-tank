@@ -441,4 +441,5 @@ class ReclaimAndEscalation(SimIsolation):
         sim._on_work_item_abandoned(state2, {'taskType': 'code', 'productId': 'p1'}, 1)
         sim._on_work_item_abandoned(state2, {'taskType': 'bug'}, 1)
         sim._on_work_item_abandoned(state2, {'taskType': 'bug', 'productId': 'nope'}, 1)
-        self.assertEqual(state2, {})
+        self.assertNotIn('_escalatedProducts', state2)
+        self.assertEqual(len(state2['_abandonedCards']), 3)

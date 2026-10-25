@@ -806,6 +806,39 @@ def _notify_task_budget_exhausted(state, task, spent=None, attempts=None,
                      'perCallUsd': (analysis or {}).get('perCallUsd'),
                      'workLanded': (completed or {}).get('landed'),
                      'futureFactor': factor})
+    # A mailbox note alone is not a decision. Put a high-priority supervisor
+    # card in front of the owning director so the overrun is investigated and
+    # either funded or closed. Default is to grant when the spend bought
+    # progress and no blocking issue exists; the grant tool enforces the
+    # ceiling and reopens the failed card.
+    if not task.get('_budgetReviewQueued') and director_id:
+        task['_budgetReviewQueued'] = True
+        spent_num = float(spent or 0.0)
+        ceiling_num = float(budget or 0.0)
+        suggested = max(spent_num * 2.0, ceiling_num * 1.5, 0.05)
+        suggested = round(suggested, 2)
+        queue_work(state, [{
+            'title': f"[BUDGET] {task.get('id') or 'card'}: decide more budget or close",
+            'room': 'pressoffice',
+            'taskType': 'supervise',
+            'assignedTo': director_id,
+            'teamId': task.get('teamId'),
+            'priority': 'high',
+            'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
+            'sizeEstimate': 'S',
+            'instructions': (
+                f"Budget review for card {task.get('id')} ({task.get('title')}). "
+                f"It hit its cap of ${float(task.get('budgetUsd') or 0):.2f} "
+                f"after ${spent_num:.4f} across {int(attempts or 0)} attempt(s). "
+                f"Cause: {(analysis or {}).get('detail') or (analysis or {}).get('reason') or 'unknown'}. "
+                f"Work landed before the stop: {(completed or {}).get('verdict') if completed and completed.get('landed') else 'none'}. "
+                "Investigate why it went over. Default to granting more budget when the spend bought "
+                "progress and no blocking issue exists: call supervisor_grant_budget with this task id "
+                f"and a ceiling above ${spent_num:.4f} (a reasonable start is ${suggested:.2f}). "
+                "If a real issue prevents completion, do not grant more; say what blocks it and direct "
+                "a new card or close the work with that reason. Do not do the work yourself."
+            ),
+        }])
 
 
 def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=None, now_ms=None):
@@ -881,9 +914,29 @@ def _revoke_agent_credentials(agent_id):
 
 def _on_work_item_abandoned(state, pick, now_ms):
     """Trigger 1 for the Cut-3 escalation: a work item was permanently abandoned
-    (assignment-attempt cap reached). If it's an incident/bug, hand the failed
-    restore to the product's owning team scrum master so it becomes a backlog
-    story/spike instead of dying silently."""
+    (assignment-attempt cap reached). Remember every abandoned card so the next
+    supervisor pass can see what fell out of the queue. If it's an incident/bug,
+    hand the failed restore to the product's owning team scrum master so it
+    becomes a backlog story/spike instead of dying silently."""
+    try:
+        team_id = pick.get('teamId')
+        if not team_id:
+            try:
+                director_id = _task_owner_director(state, pick)
+                team_id = director_id
+            except Exception:
+                team_id = None
+        state.setdefault('_abandonedCards', []).append({
+            'title': (pick.get('title') or 'untitled')[:160],
+            'room': pick.get('room'),
+            'taskType': pick.get('taskType'),
+            'teamId': team_id,
+            'attempts': int(pick.get('attempts') or 0),
+            'at': int(now_ms or time.time() * 1000),
+        })
+        state['_abandonedCards'] = state['_abandonedCards'][-100:]
+    except Exception:
+        pass
     if not (pick.get('taskType') == 'bug' or pick.get('incident')):
         return
     product_id = pick.get('productId')

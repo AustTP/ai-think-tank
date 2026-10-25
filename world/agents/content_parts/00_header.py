@@ -741,6 +741,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'ok': False, 'note': 'The scoped supervisor brief could not be built.'})
         return
+    avatar_paused = bool(snapshot.get('_avatarPaused'))
     key = _serve.get_or_create_agent_key(agent_id)
     model = _serve._mid_tier_slug() or _serve._low_tier_slug()
     task['workUntil'] = time.time() + 180
@@ -803,6 +804,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     if is_admin:
         tools += [_SUPERVISOR_BACKLOG_TOOL, _SUPERVISOR_DB_TOOL,
                   _SUPERVISOR_STATE_TOOL]
+        card_note = (task.get('instructions') or '').strip()
         system = (
             f'You are {name}, chief of staff for the whole think tank. '
             'Your job is cross-team oversight and coordination, not the work itself.\n'
@@ -831,9 +833,12 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'Finish with a short report: what you checked, anything unusual, directives filed, '
             'records changed, and next actions.\n\n'
             'Current cross-team brief (supervisor_report returns a fresh copy):\n' + brief['text']
+            + ('\n\nAvatar generation is paused during the expansion track. Do not call generate_agent_avatar.' if avatar_paused else '')
+            + (f'\n\nSpecific card instruction:\n{card_note}' if card_note else '')
         )
         user_prompt = 'Sweep the whole think tank now.'
     else:
+        card_note = (task.get('instructions') or '').strip()
         system = (
             f'You are {name}, team "{team.get("name") or team_id}". '
             'Your job is facilitation, not the work. Your scope is this team only.\n'
@@ -858,6 +863,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'Never inspect or comment on another team, never touch the database, never write code. '
             'Finish with a short report: cards reviewed, budget decisions, process issues, delegations, next actions.\n\n'
             'Current scoped brief (supervisor_report returns a fresh copy):\n' + brief['text']
+            + ('\n\nAvatar generation is paused during the expansion track. Do not call generate_agent_avatar.' if avatar_paused else '')
+            + (f'\n\nSpecific card instruction:\n{card_note}' if card_note else '')
         )
         user_prompt = 'Check your team now.'
     messages = [{'role': 'system', 'content': system},

@@ -347,6 +347,11 @@ TIER_RECHECK_DRAIN_INTERVAL_S = 60
 
 _AVAILABILITY_ERROR_MARKERS = (
     'no endpoints found', 'model_not_found', 'model not found', 'model does not exist',
+    # DeepInfra returns this 400 when the model emits malformed tool-call
+    # arguments. It is a provider/model failure, not a caller bug, so the
+    # band must fall over to its next ranked model instead of surfacing an
+    # empty completion that looks like the agent refused to work.
+    'arguments must be valid json',
 )
 
 

@@ -484,6 +484,11 @@ class OpenRouterPostTest(unittest.TestCase):
         err, _ = self._run([_http_error(500, 'model not found')])
         self.assertTrue(getattr(err, 'availability_failure', False))
 
+    def test_provider_invalid_tool_json_sets_flag(self):
+        err, _ = self._run([_http_error(
+            400, 'upstream error: assistant tool call function.arguments must be valid json')])
+        self.assertTrue(getattr(err, 'availability_failure', False))
+
     def test_retry_payment_required_marks_pause(self):
         err, pause = self._run([
             _http_error(400, 'reasoning is mandatory for this endpoint'),

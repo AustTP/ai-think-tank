@@ -384,6 +384,8 @@ def _queue_avatar_tasks():
             return 0
         if _sim.automation_paused(state):
             return 0
+        if state.get('_avatarPaused'):
+            return 0
         agents = state.get('agents') or {}
         roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
         admin = next((d.get('id') for d in (state.get('agentRoster') or [])

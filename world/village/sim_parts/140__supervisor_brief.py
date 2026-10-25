@@ -56,6 +56,15 @@ def _supervisor_brief(state, team_id, now_ms=None):
     for t in failures[:10]:
         note = (t.get('failNote') or t.get('note') or '')[:200]
         lines.append(f"  - {t.get('id')} {t.get('status')}: {t.get('title') or ''} -- {note}")
+    abandoned = _recent_abandoned(state, team_id, now_ms)
+    lines.append('')
+    lines.append('Recently abandoned:')
+    if not abandoned:
+        lines.append('  (none)')
+    for item in abandoned[:10]:
+        lines.append(f"  - {item.get('title') or 'untitled'} "
+                     f"[{item.get('taskType') or 'task'}] "
+                     f"attempts {item.get('attempts') or 0}")
     stuck = [t for t in tasks if t.get('status') == 'needs_review'
              and now_ms - int(t.get('updatedAt') or now_ms) > 30 * 60 * 1000]
     if stuck:
@@ -203,6 +212,10 @@ def _supervisor_brief_step(state, now, now_ms):
         reason = _supervisor_attention_reason(state, tid, now_ms)
         if reason:
             reasons.append(f"{team.get('name') or tid}: {reason}")
+    unowned = [a for a in _recent_abandoned(state, None, now_ms)
+               if not a.get('teamId')]
+    if unowned:
+        reasons.append(f"unowned: {len(unowned)} abandoned card(s)")
     # No failure, no stuck review, no budget pressure: that is the normal idle
     # state, not a reason to spend a supervision turn. Routine cross-team
     # sweeps used to refill an otherwise-empty board every cadence.
@@ -261,10 +274,28 @@ def _supervisor_admin_card_open(state):
     return False
 
 
+def _recent_abandoned(state, team_id=None, now_ms=None, window_ms=24 * 60 * 60 * 1000):
+    """Recent assignment-abandoned cards, scoped to one team or all teams."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    out = []
+    for item in (state.get('_abandonedCards') or []):
+        if not isinstance(item, dict):
+            continue
+        if now_ms - int(item.get('at') or 0) > window_ms:
+            continue
+        if team_id is not None and item.get('teamId') != team_id:
+            continue
+        out.append(item)
+    return out
+
+
 def _supervisor_attention_reason(state, team_id, now_ms):
     """Why this team needs a supervisor turn now, or '' when it does not:
-    a failure, a review stuck over 30 minutes, or a live card at 80%+ of its
-    budget. Cheap and state-only."""
+    a failure, a review stuck over 30 minutes, a live card at 80%+ of its
+    budget, or a recently abandoned card. Cheap and state-only."""
+    abandoned = _recent_abandoned(state, team_id, now_ms)
+    if abandoned:
+        return f"{len(abandoned)} abandoned card(s)"
     for t in _supervisor_team_tasks(state, team_id):
         status = t.get('status')
         if status in ('failed', 'blocked'):

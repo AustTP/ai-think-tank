@@ -193,6 +193,14 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     target_y = door['y'] + door['h'] + 4
     path = find_path(a['x'], a['y'], target_x, target_y, agent_id, agents, grid)
     if not path:
+        # An idle agent standing in a corridor must not permanently block the
+        # room. Retry against the STATIC map only. This still honors walls and
+        # furniture, but lets a worker walk through a crowd (the same overlap
+        # already allowed at a contested door). Without this, a few visible
+        # idlers wedged the whole pressoffice queue and every card retried or
+        # was abandoned.
+        path = find_path(a['x'], a['y'], target_x, target_y, agent_id, {}, grid)
+    if not path:
         # A pinned agent woken AT the target door is already standing on the
         # destination. find_path returns no steps, but that is a valid arrival,
         # not an assignment failure. A one-node path lets movement emit the

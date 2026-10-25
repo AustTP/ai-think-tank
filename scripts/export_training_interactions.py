@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'world'))
-import agents.training_capture as capture
+import agents.training_capture as capture  # noqa: E402
 
 
 def sha(value):
@@ -83,7 +83,7 @@ def export(conn, out, fraction=0.1, max_chars=40000):
                 parent[max(a, b)] = min(a, b)
             seen[key] = group
     groups = sorted({find(row['group_id']) for row, _ in accepted}, key=sha)
-    n_eval = min(len(groups)-1, max(1, round(len(groups)*fraction))) if len(groups)>1 else 0
+    n_eval = min(len(groups) - 1, max(1, round(len(groups) * fraction))) if len(groups) > 1 else 0
     eval_groups = set(groups[:n_eval])
     splits, manifest, fingerprints = {'train': [], 'eval': []}, [], set()
     for row, conversation in accepted:
