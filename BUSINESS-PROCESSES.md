@@ -1,7 +1,7 @@
 # Think Tank Business Processes
 
-Status: review draft
-Date: 2026-10-20
+Status: review draft, code-checked 2026-10-25
+Date: 2026-10-25
 Owner: operator (the player)
 Scope: the operating processes of the AI think tank as implemented in this repository
 
@@ -19,7 +19,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
 - 9. Security, risk, and human oversight (BP-47 to BP-56)
-- 10. Communication and lifecycle (BP-57 to BP-63)
+- 10. Communication and lifecycle (BP-57 to BP-69)
 - 11. Player and operator processes
 - 12. Control framework
 - 13. State and record model
@@ -56,6 +56,28 @@ Three source documents were used:
 
 This is a dated change record. Git history carries commit detail; this section
 states only what changed in the operating model.
+
+**2026-10-25**
+
+- Large requests now pass a durable plan approval gate before any filing or
+  staffing. Approval binds the exact plan revision hash; apply is one-shot.
+  See BP-66.
+- The ops page now has a per-agent trace feed that joins actions, tool calls,
+  model replies, JEV decisions, and task plan checkpoints. See BP-67.
+- All prose-producing agent calls now carry the no-slop writing directive and
+  strip em and en dashes on the way out. See BP-68.
+- The public `/api/intent/ask` lane now keeps conversation memory. The
+  Telegram-only memory claim in BP-40 and section 16 item 7 is closed.
+- The director review chain now continues after a low-confidence deny. A
+  confident deny is final; a hesitant deny goes to the next reviewer. See
+  BP-47.
+- Sim-watchdog alerts now queue a research card, not a code card. A senior
+  director who cannot work code can still take the investigation. See BP-56.
+- The change-request approver rule is two-person and fails closed when the
+  only director is the chief of staff. See BP-60 and the roles matrix.
+- This review was run as a six-agent panel: chief of staff plus five directors.
+  Every corrected claim below was checked against the current code. Sections
+  still marked unverified are listed in section 16.
 
 **2026-10-20**
 
@@ -188,7 +210,7 @@ list a process reader needs in hand.
 | Task cycle | 6s | `_task_cycle` cadence |
 | Idle gate | No due work and no active agent -> no spend | `think_tank_has_work` |
 | Peer review gate | 2 distinct approvals | `sim._peer_gate_should_close` |
-| Review cycle cap | 8 cycles, then freeze and escalate | `sim.MAX_REVIEW_CYCLES` |
+| Review cycle cap | Team policy, default 8 cycles, then freeze and escalate | `team_policy(..., 'maxReviewCycles')`, `sim.MAX_REVIEW_CYCLES` |
 | Citation gate | Cited URL must be in the task's discovered-URL ledger | `url_evidence.citation_errors` |
 | Pipeline cap | 64 steps per run, 256 concurrent jobs | `serve._pipeline_execute_locked`, `_PIPELINE_JOBS` |
 | Transport ceiling | 3,600 seconds | `runtime_limits.transport` |
@@ -206,6 +228,7 @@ list a process reader needs in hand.
 | Page request budget | 1,000 per month by default | `serve.PAGE_REQUEST_MONTHLY_BUDGET` |
 | Spend cap | $50 by default, 0 disables | `serve.SPEND_CAP_USD` |
 | High-tier monthly budget | $5 by default; 0 disables | `serve.HIGH_TIER_MONTHLY_BUDGET_USD` |
+| Plan approval TTL | 24 hours by default, 5 minutes to 7 days | `plan_approvals.DEFAULT_TTL_S`, `MIN_TTL_S`, `MAX_TTL_S` |
 
 ## 2. Operating model
 
@@ -218,7 +241,7 @@ list a process reader needs in hand.
 | Supervisor | A non-director operator proxy with Mac terminal access | Watches active work, stops spirals, files blocker bugs, and fixes infrastructure. Does not author product code. |
 | Senior-most director | A director with no director above them, excluding the chief of staff | Stands in for the owner on routine escalation approvals. |
 | Director | Any agent with direct reports | Owns a team, a product area, or both. Can write team and agent state. Files stories, spikes, and bugs from sprint findings. Does not pick up code, bug, or QA work and cannot self-edit code. |
-| Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. May grant file and app entitlements when a director is tied up. |
+| Scrum master | A designated team facilitator | Runs refinement, breakdown, retrospective, and escalation ceremonies. Required at team size 4 or more. Directors and the scrum master may grant file and app entitlements. |
 | Worker | A non-chief-of-staff, non-director agent | Does room work, reviews peers, files requests and reports. |
 | Critic reviewer | The first reviewer on a peer gate | Instructed to prove the work wrong, not to rubber-stamp it. |
 | Verifier | The player, or a director/chief of staff agent | Clears or blocks evidence claims and flips coverage. A worker or ordinary key holder cannot verify. Agent verifiers are capped at 12 flips per 6 hours; the player is not capped. |
@@ -238,7 +261,7 @@ intensity, not the safety gates:
 | 2 | Watch failures with 3 or more dependent cards. |
 | 3 | Default. Watch any failure that gates at least one dependent card. |
 | 4 | Watch any recent failed or blocked card, even with no dependents. |
-| 5 | Most extensive. Same as 4, with the shortest monitoring patience. |
+| 5 | Same as 4. The code has no separate patience parameter; 5 is the top of the scale. |
 
 Directors set their own levels through `GET/PUT /api/supervision`; the player
 and chief of staff may set any director's level. The stored map is
@@ -386,6 +409,11 @@ Owner request
 | BP-62 | Cross-team card responses | Owning team changes a filed card | Per transition | Owning team | Mail to the reporter |
 | BP-63 | Speed tie-break in tier picks | Tier re-pick or price watch | 2h refresh, 30m watch | Serve | Updated tier pick, latency samples |
 | BP-64 | Photo review | Owner upload or album watch | On demand or 30s watch | Owner, vision tier | Photo note in Library, reviewed manifest |
+| BP-65 | Durable confirmations | Write action that opts in | On demand | Serve | Confirmed or refused proposal |
+| BP-66 | Plan approval gate | Large request | On demand | Owner | Approved plan revision |
+| BP-67 | Agent trace visibility | Ops page request | On demand | Ops page | Per-agent timeline |
+| BP-68 | Agent writing style | Every prose model call | Per call | Serve | Plain text without slop or dash marks |
+| BP-69 | Read-only live project inspection | Director or chief ask | On demand | Serve | Bounded code, git, and task evidence |
 
 ## 4. Core delivery processes
 
@@ -434,10 +462,10 @@ fallbacks, action log, passport decision.
 **Records.** `action_log` rows (`route_classified`, `schedule_created`,
 `issue_created`, `incident_filed`), research topic record, work item, issue.
 
-**Review note.** Two intake surfaces exist. The Telegram bridge has conversation
-memory. The public `/api/intent/ask` endpoint is stateless by design. The
-operator should know which surface the owner is expected to use for follow-up
-questions.
+**Review note.** Two intake surfaces exist. The Telegram bridge and the public
+`/api/intent/ask` endpoint both keep conversation memory now. The public lane
+uses `player-ask:<agent>` or `player-ask:any` as its session id, so a web
+follow-up keeps context. A caller that passes no session id is still stateless.
 
 ### BP-02 Agent work requests
 
@@ -498,15 +526,24 @@ or the request arrives through the big-task path.
 
 **Steps.**
 
-1. `file_large_request` records the goal, constraints, and requesting authority.
-2. The team's scrum master and workers convene a breakdown ceremony.
-3. The ceremony produces stories and spikes with room, title, and estimate.
-4. Items are queued. A team in an active sprint defers the breakdown until free.
-5. Up to 3 requests are handled per pass (`BREAKDOWN_MAX_REQUESTS`).
+1. A plan revision is stored as `pending` in `plan_revisions`. It carries the
+   goal, constraints, route, payload, and an exact `plan_hash`. Nothing is
+   filed or staffed yet.
+2. The player approves, rejects with a reason, or asks for a revision. Approval
+   binds that hash. A later edit to the plan cannot inherit the approval.
+3. Only an approved revision can be claimed for apply, once. The apply path
+   calls `file_large_request`, `_breakdown_into_shared_backlog`, or
+   `spawn_new_team_for_request` depending on the stored route.
+4. An expired revision cannot be approved. A superseded or applied revision
+   cannot be applied again.
+5. The approved route files the work. A team in an active sprint still defers
+   the breakdown until free.
+6. Up to 3 requests are handled per pass (`BREAKDOWN_MAX_REQUESTS`).
 
-**Controls.** Scrum master gate, active-sprint guard, request cap, JEV decider.
+**Controls.** Owner approval, exact revision hash, one-shot apply, TTL,
+status transitions, active-sprint guard, request cap, JEV decider.
 
-**Records.** `_pendingBreakdown`, work items, decision tape.
+**Records.** `plan_revisions`, work items, decision tape, action log.
 
 ### BP-05 New-team spawn
 
@@ -691,8 +728,8 @@ tape, `stagedWorkspace`, `previousWorkspace`, `sourceDigest`, `writtenPy`,
    requests a fresh second reviewer instead of lowering the bar.
 6. A rejection sends the work back to the author as a fix task. The prior
    reviewer pair is preferred for the re-review.
-7. The cycle count carries across re-entries. At 8 cycles the gate freezes and
-   escalates.
+7. The cycle count carries across re-entries. The cap is team policy
+   (`maxReviewCycles`, default 8). At the cap the gate freezes and escalates.
 8. A stuck gate sweep runs every 20 seconds. It re-picks a reachable reviewer
    pair. Re-picks are spaced by a 30-minute rescue cooldown.
 9. The review reads the filed Library document from its `libraryPath`. It does
@@ -1469,7 +1506,9 @@ ownership, player-only grant API.
 
 ### BP-40 Conversation memory
 
-**Scope.** The Telegram bridge only. The public ask endpoint stays stateless.
+**Scope.** The Telegram bridge and the public `/api/intent/ask` lane. The public
+lane keys memory by agent (`player-ask:<agent>`) or by `player-ask:any` when no
+agent is named. A direct caller that passes no session id is stateless.
 
 **STM.**
 
@@ -1598,9 +1637,16 @@ cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 
 - Coding task type -> coding tier, no JEV.
 - Vision work -> vision tier.
+- Latency-sensitive work -> low tier, no JEV call.
+- `best_effort=True` -> high tier when the monthly high-tier budget is not
+  spent, no JEV call. This is an explicit caller lane, not the default.
 - Everything else -> JEV chooses low, mid, or high, with confidence floors.
 - High requires both confidence and budget headroom.
 - An outage or low confidence fails closed to low.
+
+The JEV gate is therefore not universal. Code, vision, latency, and explicit
+best-effort calls bypass it by design. The doc and the control table must say
+which lanes are gated rather than claiming every call is.
 
 **Refresh.** A full re-pick of every band every 2 hours, as a governance task.
 A cheaper price watch runs every 30 minutes and checks only the selected
@@ -1705,8 +1751,16 @@ oversight loops that catch what slips past.
 
 **Used by.** Browse allow/block, command allow/block, peer review clean or
 actionable, escalation approve/deny, refinement accept/reject, firing
-keep/fire, social carryaway, governance picks, model tier gate, Colab shard
-gate, request routing, failure classification, player-ask gate.
+keep/fire, social carryaway, governance picks, Colab shard gate, request
+routing, failure classification, player-ask gate, and the model tier gate on
+the non-latency, non-best-effort path. Code, vision, latency, and explicit
+best-effort tier picks do not call JEV.
+
+**Low-confidence allow chain.** A low-confidence JEV allow is uncertainty,
+not a verdict. `180_director_second_opinion.py` asks the immediate director,
+then the senior-most director, then the chief of staff. Inside that chain, a
+low-confidence deny continues to the next reviewer. A confident deny is final.
+If no reviewer in the chain gives a confident answer, the action fails closed.
 
 **Controls.** Quorum, typed choice, confidence floor, fail-closed, decision tape,
 cache.
@@ -2123,10 +2177,14 @@ kept. The retention value remains operator-settable in `operator_policy.json`.
    A severity escalation still pushes.
 4. Push warning and critical alerts to email and Telegram. Info stays on the
    dashboard.
-5. Write a periodic digest.
+5. A sim-loop watchdog alert is mailed to the senior director and queued as a
+   pinned research card (`taskType: research`), not a code card. A director who
+   cannot work code can still take the investigation. If the streak reaches two
+   restarts, the chief of staff is also mailed.
+6. Write a periodic digest.
 
 **Controls.** Dedup window, severity filter, no network in the snapshot, best
-effort delivery.
+effort delivery, research-lane watchdog card.
 
 **Records.** `health_alerts`, digest, action log.
 
@@ -2724,6 +2782,124 @@ binding, expiry, status transitions, no automatic replay, action log.
 action log `confirmation_proposed` / `confirmation_confirmed` /
 `confirmation_cancelled` / `confirmation_required`.
 
+### BP-66 Plan approval gate
+
+**Purpose.** Make a large request cheap to revise and hard to apply by accident.
+
+**Trigger.** A large request arrives through `/api/intent/plan-big-task` or the
+plan endpoints. The request is planned before any work is filed or staffed.
+
+**Steps.**
+
+1. The planner stores an immutable revision in `plan_revisions` with goal,
+   constraints, route, payload, creator, and an exact `plan_hash`. Status is
+   `pending`.
+2. The owner reviews the plan in the board UI. The owner can approve, reject
+   with a reason, or submit a revised revision. A revision supersedes the prior
+   pending revision.
+3. Approval binds the exact hash. A changed goal, route, constraint, or payload
+   needs a new revision and a new approval.
+4. The approved revision is claimed for apply exactly once. Claim moves it to
+   `applying`; success moves it to `applied`; failure moves it to `failed` with
+   a reason. A second claim is refused. A failed apply is final until a new
+   revision is approved.
+5. Expiry is 24 hours by default. An expired plan cannot be approved. A
+   rejected, superseded, or applied plan cannot be applied again.
+6. The apply path runs the stored route: staffed plan, backlog plan, or new
+   team. The plan gate itself does not execute work.
+
+**Controls.** Owner decision, revision hash, immutable revisions, one-shot
+apply, status machine, TTL, supersede on revision, audit actor and reason.
+
+**Records.** `plan_revisions`, action log, board pending-plan panel,
+`/api/plans` and `/api/plans/{id}` responses.
+
+### BP-67 Agent trace visibility
+
+**Purpose.** Let an operator or director reconstruct what one agent actually
+did, without reading the whole database.
+
+**Trigger.** A request to `/api/ops/agents` or
+`/api/ops/agents/{agent_id}/trace`.
+
+**Steps.**
+
+1. List live agents with role, task, and status. Operator auth is required.
+2. For one agent, read a bounded timeline (`limit` 1 to 300, default 150) from
+   action log entries, tool calls, model replies, JEV decisions, and task plan
+   checkpoints.
+3. Join the sources by agent id and timestamp. Keep the source label on every
+   row so a reader knows whether a row is an action, a decision, or a plan
+   step.
+4. Return the timeline. The endpoint is read-only and does not change agent
+   state.
+
+**Controls.** Operator auth, bounded limit, read-only queries, source labels,
+no secret fields.
+
+**Records.** Existing action log, decision tape, task checkpoints. The endpoint
+writes no new table.
+
+### BP-68 Agent writing style
+
+**Purpose.** Keep agent prose plain and free of AI tells in thinking, peer
+messages, player replies, and outside communication.
+
+**Trigger.** Every prose-producing model call.
+
+**Steps.**
+
+1. The no-slop rules reject binary contrasts, throat-clearing openers,
+   faux-insight setups, colon reveals, dramatic fragments, importance puffery,
+   weasel attribution, negative listings, robotic rhythm, and banned filler
+   words. `core/style.py` holds the final punctuation sanitizer.
+2. `PLAIN_WRITING_DIRECTIVE` in `serve_parts/130_run_browser_act_sync.py` folds
+   those rules and the operator-edited banned-word list from
+   `world/plain_writing.json` into the first system message. It sits in the
+   system prompt, so it applies to the model's reasoning and to the visible
+   reply.
+3. `_apply_plain_writing` is idempotent. A message that already carries the
+   directive is left alone.
+4. A final sanitizer replaces em dashes with a spaced hyphen and en dashes with
+   a hyphen before the text leaves the tool loop. Player asks, supervisor
+   checks, agent tool loops, mail sends, and stored task notes pass through the
+   guard.
+5. The guard does not rewrite facts, code, paths, numbers, or quoted text. It
+   changes punctuation and blocks known filler, not technical substance.
+
+**Controls.** Single directive source, operator-edited ban list, idempotent
+insertion, final dash sanitizer, no change to facts or code.
+
+**Records.** `world/plain_writing.json` and `core/style.py` are the policy and
+code records. Style checks do not write a new table.
+
+### BP-69 Read-only live project inspection
+
+**Purpose.** Give directors and the chief of staff bounded evidence from the
+live repository without giving them write access or a shell.
+
+**Trigger.** A director, chief of staff, or delegated supervisor asks to inspect
+the live project.
+
+**Steps.**
+
+1. The ask lane and supervisor lane expose `live_read` to director and chief of
+   staff roles. Workers do not get it.
+2. Supported operations: `ls`, `read`, `grep`, `team_log`, `git_status`,
+   `git_diff`, `git_log`, `task_trace`, and `find_artifact`.
+3. Reads are bounded by a path allowlist, line caps, and byte caps. `.git`,
+   secrets, `.env`, key files, and database files are refused.
+4. Git operations are read-only. There is no checkout, commit, reset, or push.
+5. `task_trace` returns the scoped task, review, and decision trail for a task
+   id. `find_artifact` is chief of staff only and searches Library paths.
+6. Every call is read-only. The endpoint writes an action-log row, not a file.
+
+**Controls.** Role gate, path allowlist, size cap, read-only git, team scope,
+chief-only artifact search, no secret access, audit row.
+
+**Records.** Action log `live_read` entries. No new table.
+
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -2767,7 +2943,7 @@ action log `confirmation_proposed` / `confirmation_confirmed` /
 | Tier fallback | A delisted model stops work | Availability error -> next ranked model | `model_tier_fallbacks` |
 | High-tier monthly cap | Expensive model use | Cap hit -> mid tier | Spend ledger |
 | Peer gate | Deliverable quality | Reject -> fix task and re-review | Peer gate record |
-| Review cycle cap | Infinite review loops | 8 cycles -> freeze and escalate | Gate record |
+| Review cycle cap | Infinite review loops | Team policy, default 8 cycles -> freeze and escalate | Gate record |
 | Artifact inspection | Cited files that do not exist or do not meet shape | Error -> unclean vote | `reviewDiagnostics.artifactChecks` |
 | Citation gate | Invented report URLs | URL not in discovered ledger -> unclean vote | `reviewDiagnostics.citationErrors` |
 | Frozen review contract | Moving the acceptance bar after work starts | Contract travels with the review | `reviewContract` |
@@ -2834,6 +3010,7 @@ action log `confirmation_proposed` / `confirmation_confirmed` /
 | `health_alerts` | Persisted health alerts | Dedup window |
 | `stm_sessions`, `stm_messages` | Conversation short-term memory | TTL |
 | `ltm_memories` | Long-term memories | Forever |
+| `plan_revisions` | Immutable plan revisions and approval state | Forever |
 
 ### 13.2 Task states
 
@@ -2865,6 +3042,7 @@ status.
 | Record | States |
 |---|---|
 | Sprint | `active` -> `closed` |
+| Plan revision | `pending` -> `approved` -> `applying` -> `applied`; `rejected`, `superseded`, `expired`, or `failed` are terminal |
 | Product | `draft` -> `in_progress` -> `review` -> `released` |
 | Backlog request | `pending` -> `accepted` -> `resolved` |
 | Player inbox ask | `awaiting_input` -> answered or `superseded` |
@@ -2950,6 +3128,8 @@ Task records also carry `completionRecovery`, `transportRecovery`,
 | Change policy | Yes | No | No | No |
 | Grant or revoke Theo key | Yes | No | No | No |
 | Spend, external comm, repo change, add agent, provision container | Yes | Approval required | Approval required | Per key |
+| Self-edit code | Yes | No | No | No |
+| Approve a change request | Yes | Director validator plus chief of staff | No | Per key |
 | Write wiki | Yes | Yes | Proposal only | Per key |
 | Review evidence | Yes | Director/chief of staff | No | No |
 | Mark coverage reviewed | Yes | No | No | No |
@@ -2997,9 +3177,9 @@ rather than gate-integrity questions.
 6. **Human-only escalation backlog.** Floor-1.0 kinds wait for the owner with no
    time-based SLA. The queue is visible in the escalation file, but not in a
    dedicated aging report. Add an aging view if these can sit.
-7. **Telegram-only memory.** Follow-up context exists only on the Telegram
-   bridge. The public ask endpoint is stateless. If the owner uses the web chat,
-   a follow-up loses context. Decide which surface is canonical.
+7. **Telegram-only memory (closed 2026-10-25).** The public ask lane now keeps
+   STM and LTM under `player-ask:<agent>` or `player-ask:any`. A web follow-up
+   keeps context. The session-less internal callers remain stateless by choice.
 8. **Verifier cap.** Agent verifiers can flip 12 claims per 6 hours. A large,
    legitimate review batch needs the owner. That is a deliberate abuse control,
    but it can become an operational bottleneck.
@@ -3043,7 +3223,11 @@ rather than gate-integrity questions.
     `0700` browser profile. That is the same sensitivity as the browser's own
     session store. If profiles are ever backed up or copied between hosts,
     treat the seed as a credential.
-18. **Citation ledger completeness.** The citation gate trusts `sourceUrls`.
+18. **Doc drift gate.** No check fails when a BP section points at a file or
+    symbol that no longer exists. The panel recommends a per-section "verified
+    against code on" date and a review check that walks Appendix C. Until that
+    lands, this document is a snapshot, not a live contract.
+19. **Citation ledger completeness.** The citation gate trusts `sourceUrls`.
     If a legitimately allowed URL never entered the ledger because a tool
     returned it indirectly, the report is rejected. The safe failure is a
     rejection, but the review should check that the tool ledger captures every
@@ -3143,7 +3327,9 @@ rather than gate-integrity questions.
 | `PHOTO_WATCH_BATCH` | `world/serve.py` | 3 assets per tick |
 | `PHOTO_REVIEW_MAX_ATTEMPTS` | `world/serve.py` | 3 vision attempts |
 | `BROWSE_BLOCK_CATEGORIES` | `world/browse_policy.json` | Always-block policy |
-| `PLAIN_WRITING_BAN_LIST` | `world/plain_writing.json` | Anti-slop words |
+| `PLAIN_WRITING_BAN_LIST` | `world/plain_writing.json` | Anti-slop words; the directive also bans em and en dashes |
+| Plan approval TTL | `world/core/plan_approvals.py` | `DEFAULT_TTL_S` 24 hours; `MIN_TTL_S` 5 minutes; `MAX_TTL_S` 7 days |
+| Ops trace limit | `/api/ops/agents/{id}/trace` | `limit` 1 to 300, default 150 |
 | `RESEARCH_DESK_PASSES` | `world/research_desk.json` | Three-pass questions |
 | `RESEARCH_WATCHLIST` | `world/watchlist.json` | Standing topics |
 | Operator policy knobs | `world/operator_policy.json` | 108 knobs: cadences, cooldowns, team rules, memory and device knobs, and every former serve.py static (Phase 3, 2026-10-18) |
@@ -3226,6 +3412,11 @@ rather than gate-integrity questions.
 | BP-62 | `sim._mail_card_update`, `sim.set_issue_status`, groom-loop mail hooks |
 | BP-63 | `serve._record_model_latency`, `serve._model_median_latency_ms`, `serve._speed_tie_order`, `serve._best_value_pick` |
 | BP-64 | `apple_photos.py`, `serve._photo_review_from_image`, `_review_album_batch_sync`, `_photo_album_watch_loop`, photo review endpoints |
+| BP-65 | `serve` confirmation endpoints, `confirmation_proposals`, `REQUIRE_CONFIRMATION_FOR_EXECUTION` |
+| BP-66 | `plan_approvals.py`, `serve_parts/215_big_task_plans.py`, `serve._apply_staffed_plan`, `_apply_backlog_plan` |
+| BP-67 | `serve_parts/425_ops_traces.py`, `serve_parts/430_jev_model_get.py` pulse route, `agents/pulse_ui.py` |
+| BP-68 | `serve_parts/130_run_browser_act_sync.py`, `core/style.py`, `plain_writing.json` |
+| BP-69 | `serve.supervisor_live_read`, `content._make_supervisor_live_read_executor`, `serve._ask_core` |
 
 ## 20. Appendix D: review checklist
 
@@ -3238,6 +3429,8 @@ Use this list when reviewing the document and the process.
 - [ ] Every process leaves a record that can be audited.
 - [ ] Every cadence is documented with its actual code value.
 - [ ] Every owner-facing approval has a visible queue.
+- [ ] Every changed BP section states the date it was verified against code.
+- [ ] Every Appendix C path still exists and still contains the named symbol.
 - [ ] Every single-slot queue is intentional.
 - [ ] Every lane without peer review has another quality control.
 - [ ] Every budget stop has a recovery path.
