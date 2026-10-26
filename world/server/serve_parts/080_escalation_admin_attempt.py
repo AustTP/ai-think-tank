@@ -80,6 +80,13 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
 
 
 DORMANCY_WINDOW_STALE_GRACE_S = 300
+# A pending decision that nobody acted on for this long is stale: deny it
+# safely (the action does not run) instead of paging the owner again. The
+# agent can re-request if the need is still real. Applies to the routine
+# kinds below; explicit security blocks keep waiting for a human.
+ESCALATION_STALE_TTL_S = 6 * 60 * 60
+_STALE_DENY_KINDS = ('owner safety decision', 'allowlist candidate',
+                     'allowlist request', 'dormancy window request')
 
 
 def _dormancy_window_start(esc_id):
@@ -91,6 +98,22 @@ def _dormancy_window_start(esc_id):
     except Exception:
         return None
     return float(row[0]) if row else None
+
+
+def _expire_stale_escalation(esc_id, esc, now):
+    if (esc or {}).get('kind') not in _STALE_DENY_KINDS:
+        return False
+    created = float((esc or {}).get('ts') or 0)
+    if not created or now - created <= ESCALATION_STALE_TTL_S:
+        return False
+    esc['status'] = 'denied'
+    esc['resolvedBy'] = 'expired: no decision within 6 hours'
+    esc['resolvedAt'] = now
+    log_action(None, 'escalation_expired', {
+        'escalationId': esc_id, 'kind': esc.get('kind'),
+        'ageS': round(now - created, 1),
+        'reason': 'no decision within 6 hours'}, authorized=False)
+    return True
 
 
 def _expire_stale_dormancy_window(esc_id, esc):
@@ -196,6 +219,9 @@ def _resolve_pending_escalations_sync():
         director_def = roster.get(director_id, {}) if director_id else {}
         director_name = director_def.get('name', director_id or 'the director')
         if _expire_stale_dormancy_window(esc_id, esc):
+            dirty = True
+            continue
+        if _expire_stale_escalation(esc_id, esc, now):
             dirty = True
             continue
         # Escalations with a 1.0 risk floor are "never auto-approve" by design

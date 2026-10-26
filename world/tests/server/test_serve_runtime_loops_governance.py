@@ -188,6 +188,21 @@ class ResolvePendingEscalations(unittest.TestCase):
         resolve.assert_called_once_with('e1', False)
         notify.assert_not_called()
 
+    def test_stale_escalation_is_denied_after_six_hours(self):
+        esc = {'e1': {'status': 'pending', 'kind': 'allowlist candidate',
+                      'question': 'host?', 'ts': time.time() - 7 * 3600}}
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'notify_human_of_escalation') as notify, \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync') as quorum, \
+             unittest.mock.patch.object(serve, '_save_escalations'):
+            self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
+        self.assertEqual(esc['e1']['status'], 'denied')
+        self.assertIn('6 hours', esc['e1']['resolvedBy'])
+        notify.assert_not_called()
+        quorum.assert_not_called()
+
     def test_an_unsure_rung_is_not_reasked(self):
         esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'q?',
                       'lastAskedAt': 0, 'askCount': 0}}
