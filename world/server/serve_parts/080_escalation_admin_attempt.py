@@ -100,18 +100,31 @@ def _expire_stale_dormancy_window(esc_id, esc):
     if (esc or {}).get('kind') != 'dormancy window request':
         return False
     start_ts = _dormancy_window_start(esc_id)
-    if start_ts is None or start_ts >= time.time() - DORMANCY_WINDOW_STALE_GRACE_S:
+    now = time.time()
+    if start_ts is None:
+        # The window row is gone (or was never persisted). Approving this
+        # escalation would have nothing to schedule. Give a fresh record a
+        # short grace while create_escalation -> _window_record completes,
+        # then treat an orphan as expired.
+        created = float((esc or {}).get('ts') or 0)
+        if not created or now - created <= 600:
+            return False
+    elif start_ts >= now - DORMANCY_WINDOW_STALE_GRACE_S:
         return False
     esc['status'] = 'denied'
-    esc['resolvedBy'] = 'expired: the requested window has passed'
-    esc['resolvedAt'] = time.time()
+    esc['resolvedBy'] = ('expired: the requested window has passed'
+                         if start_ts is not None else
+                         'expired: the window record no longer exists')
+    esc['resolvedAt'] = now
     try:
         _selfedit.resolve_window_escalation(esc_id, False)
     except Exception:
         pass
     log_action(None, 'escalation_expired', {
         'escalationId': esc_id, 'kind': esc.get('kind'),
-        'startTs': start_ts, 'reason': 'dormancy window time passed'}, authorized=False)
+        'startTs': start_ts,
+        'reason': ('dormancy window time passed' if start_ts is not None
+                   else 'dormancy window record missing')}, authorized=False)
     return True
 
 

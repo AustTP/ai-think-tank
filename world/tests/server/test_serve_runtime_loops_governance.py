@@ -171,6 +171,23 @@ class ResolvePendingEscalations(unittest.TestCase):
         resolve.assert_called_once_with('e1', False)
         notify.assert_not_called()
 
+    def test_orphaned_dormancy_window_expires(self):
+        esc = {'e1': {'status': 'pending', 'kind': 'dormancy window request',
+                      'question': 'Agent worker requests a dormancy window',
+                      'ts': time.time() - 3600, 'note': 'win-gone'}}
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
+             unittest.mock.patch.object(serve, '_dormancy_window_start', return_value=None), \
+             unittest.mock.patch.object(serve._selfedit, 'resolve_window_escalation') as resolve, \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'notify_human_of_escalation') as notify, \
+             unittest.mock.patch.object(serve, '_save_escalations'):
+            self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
+        self.assertEqual(esc['e1']['status'], 'denied')
+        self.assertIn('window record', esc['e1']['resolvedBy'])
+        resolve.assert_called_once_with('e1', False)
+        notify.assert_not_called()
+
     def test_an_unsure_rung_is_not_reasked(self):
         esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'q?',
                       'lastAskedAt': 0, 'askCount': 0}}
