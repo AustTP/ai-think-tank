@@ -326,6 +326,8 @@ class BreakdownCeremony(SimIsolation):
         card = state['workQueue'][0]
         self.assertEqual(card['taskType'], 'report')
         self.assertEqual(card['sequence'], 0)
+        self.assertEqual(card['reportPath'], 'admin/repair-loop-brief.md')
+        self.assertIn('admin/repair-loop-brief.md', card['instructions'])
         self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
 
     def test_multi_card_breakdown_sets_sequence(self):

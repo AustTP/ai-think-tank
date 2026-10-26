@@ -336,7 +336,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # files -- a long report is written in full via the tool, then the closer's
     # own short synthesis still lands on this path (see the report_path
     # reference in the close block).
-    report_path = f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md"
+    report_path = str(task.get('reportPath') or
+                      f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md")
     spike_report_writer = _make_spike_report_writer(agent_id, key, report_path)
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor(agent_id, key)

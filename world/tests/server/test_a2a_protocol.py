@@ -129,6 +129,21 @@ class A2A(unittest.TestCase):
         self.assertEqual(task['status']['state'], 'completed')
         self.assertEqual(task['artifacts'][0]['parts'][0]['text'], 'archive/report.md')
 
+    def test_tasks_get_reads_archived_artifacts(self):
+        task_id = self._send('Ship the archived report', metadata={'team': 'nora'}).json()['result']['id']
+        archived = {'task-9': {
+            'id': 'task-9', 'title': 'Ship the archived report',
+            'requestId': task_id, 'status': 'done',
+            'libraryPath': 'admin/repair-loop-brief.md'}}
+        with unittest.mock.patch.object(serve, '_archived_tasks', return_value=archived):
+            r = self.client.post('/a2a', headers={'Authorization': f'Bearer {self.theo_key}'},
+                                 json={'jsonrpc': '2.0', 'id': 9, 'method': 'tasks/get',
+                                       'params': {'id': task_id}})
+        task = r.json()['result']
+        self.assertEqual(task['status']['state'], 'completed')
+        self.assertEqual(task['artifacts'][0]['parts'][0]['text'],
+                         'admin/repair-loop-brief.md')
+
     def test_tasks_cancel_removes_only_queued_cards(self):
         task_id = self._send('Cancel me', metadata={'team': 'nora'}).json()['result']['id']
         state = serve.get_state_from_db()

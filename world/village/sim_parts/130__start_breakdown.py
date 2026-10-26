@@ -1,3 +1,4 @@
+import re
 
 
 def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=0):
@@ -92,6 +93,23 @@ _SINGLE_DELIVERABLE_CODE = (
 )
 
 
+_REQUESTED_PATH_RE = re.compile(
+    r'(?:under|at|to|as|in)\s+[`"\']?([A-Za-z0-9_./-]+\.'
+    r'(?:md|txt|json|csv|py|js|html))', re.I)
+
+
+def _requested_library_path(goal):
+    """The explicit Library path a goal names, if any. A goal that says
+    "save it under admin/x.md" must keep that path through the breakdown."""
+    match = _REQUESTED_PATH_RE.search(str(goal or ''))
+    if not match:
+        return None
+    path = match.group(1).lstrip('/')
+    if '..' in path.split('/'):
+        return None
+    return path
+
+
 def _single_deliverable_goal(goal):
     """True when the goal names ONE written artifact. Such a goal must be one
     report card, not a gather/write/save/verify chain that can run in parallel.
@@ -126,6 +144,7 @@ def _single_deliverable_item(goal, constraints):
                                'with the requested sources and recommendation.'),
         'sizeEstimate': 'M',
         'budgetUsd': budget,
+        'reportPath': _requested_library_path(goal),
         'singleDeliverable': True,
     }
 
@@ -237,7 +256,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             ac = (s.get('acceptanceCriteria') or '').strip()
             never = normalize_never_block(s.get('never'))
             instructions_text = (f"Filed by {req.get('filedBy')} during a large-request breakdown by "
-                                 f"{sm_name}. Requested goal: {goal[:200]}")
+                                 f"{sm_name}. Requested goal: {goal[:2000]}")
             if ac:
                 instructions_text += f"\n\nAcceptance criteria:\n{ac}"
             if never:
@@ -264,6 +283,10 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 'sizeEstimate': s.get('sizeEstimate'),
                 'never': never,
                 'budgetUsd': card_budget,
+                # An explicit path in the goal survives onto the card so the
+                # report/spike closer writes the requested file, not a generic
+                # archive name.
+                'reportPath': s.get('reportPath'),
                 # Serial group: cards of one request run in the model's order.
                 # The assignment guard waits while an earlier card is queued or
                 # active, so gather -> write -> save cannot run in parallel.

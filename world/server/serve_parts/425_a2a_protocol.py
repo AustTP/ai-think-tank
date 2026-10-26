@@ -64,6 +64,17 @@ def _a2a_find_request(state, task_id):
 def _a2a_linked(state, request_id):
     tasks = [t for t in (state.get('tasks') or {}).values()
              if t.get('requestId') == request_id]
+    seen = {t.get('id') for t in tasks}
+    # Completed cards are pruned from the live map; read the archive too so a
+    # tasks/get after completion still returns its Library artifact.
+    try:
+        archived = _archived_tasks()
+    except Exception:
+        archived = {}
+    for task in archived.values():
+        if task.get('requestId') == request_id and task.get('id') not in seen:
+            tasks.append(task)
+            seen.add(task.get('id'))
     queued = [q for q in (state.get('workQueue') or [])
               if q.get('requestId') == request_id]
     return tasks, queued
