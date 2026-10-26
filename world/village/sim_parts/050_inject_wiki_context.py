@@ -164,13 +164,41 @@ def _spawn_at_room_door(state, agent_id, room, agents, grid, doors):
     a['inRoom'] = None
     a['busy'] = False
     a['task'] = None
-    # Nudge each spawned reviewer a few px off the exact door center (deterministic
-    # on her id) so the TWO reviewers of a gate don't land on the identical cell,
-    # where neither can complete a walk-to due to self-collision.
-    _off = AGENT_W + 8
-    _nudge = sum(ord(ch) for ch in str(agent_id)) % 3
-    a['x'] = door['x'] + door['w'] / 2 + _nudge * _off
-    a['y'] = door['y'] + door['h'] + 4
+    # Pick a free approach cell, not a fixed nudge. The old nudge pushed the
+    # second reviewer into the building wall, so assign_task could not find a
+    # path and the review card retried forever (the 2026-10-26 task-649 gate).
+    base_x = door['x'] + door['w'] / 2
+    base_y = door['y'] + door['h'] + 4
+    if not grid:
+        a['x'], a['y'] = base_x, base_y
+        return
+    occupied = {
+        (round(other.get('x')), round(other.get('y')))
+        for oid, other in (agents or {}).items()
+        if oid != agent_id and isinstance(other, dict) and other.get('visible')
+        and other.get('x') is not None and other.get('y') is not None
+    }
+    step = AGENT_W + 8
+    candidates = [(base_x, base_y)]
+    for ring in (1, -1, 2, -2):
+        candidates.append((base_x + ring * step, base_y))
+        candidates.append((base_x + ring * step, base_y + AGENT_H + 8))
+    chosen = None
+    for x, y in candidates:
+        if (round(x), round(y)) in occupied:
+            continue
+        if _blocked_at({'x': x, 'y': y, 'w': AGENT_W, 'h': AGENT_H}, grid):
+            continue
+        if (x, y) == (base_x, base_y):
+            chosen = (x, y)
+            break
+        if find_path(x, y, base_x, base_y, agent_id, agents, grid):
+            chosen = (x, y)
+            break
+        if find_path(x, y, base_x, base_y, agent_id, {}, grid):
+            chosen = (x, y)
+            break
+    a['x'], a['y'] = chosen or (base_x, base_y)
 
 
 def assign_task(state, agent_id, title, room, instructions, project_label,

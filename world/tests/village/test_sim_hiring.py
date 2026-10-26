@@ -63,6 +63,30 @@ class SpawnWakeCluster(SimIsolation):
     def test_spawn_at_room_door_missing_agent(self):
         sim._spawn_at_room_door({'agents': {}}, 'ghost', 'observatory', {}, None, {})
 
+    def test_spawn_at_room_door_picks_a_free_approach_cell(self):
+        # task-649: the fixed nudge put the second reviewer inside the wall,
+        # so assign_task returned None and the review retried every 60s.
+        grid, doors = sim._load_outdoor_geometry()
+        if not grid or not doors or 'pressoffice' not in doors:
+            self.skipTest('pressoffice geometry unavailable')
+        state = {'agents': {
+            'miles': {'id': 'miles', 'x': 900, 'y': 400, 'visible': False,
+                      'busy': False, 'task': None, 'offDuty': True},
+            'clara': {'id': 'clara', 'x': 100, 'y': 600, 'visible': False,
+                      'busy': False, 'task': None, 'offDuty': True},
+        }}
+        sim._spawn_at_room_door(state, 'miles', 'pressoffice',
+                                state['agents'], grid, doors)
+        sim._spawn_at_room_door(state, 'clara', 'pressoffice',
+                                state['agents'], grid, doors)
+        spots = set()
+        for aid in ('miles', 'clara'):
+            a = state['agents'][aid]
+            self.assertFalse(sim._blocked_at(
+                {'x': a['x'], 'y': a['y'], 'w': sim.AGENT_W, 'h': sim.AGENT_H}, grid))
+            spots.add((a['x'], a['y']))
+        self.assertEqual(len(spots), 2, 'the two reviewers must not share a cell')
+
     def test_spawn_at_room_door_no_door_falls_back(self):
         state = {'agents': {'ada': {'id': 'ada'}}}
         with unittest.mock.patch.object(sim, 'appear_from_outskirts') as fallback:
