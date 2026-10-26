@@ -845,6 +845,16 @@ def finish_task(state, agent_id, grid=None):
         log_action(agent_id, 'task_completion_refused',
                    {'taskId': task['id'] if task else None,
                     'title': task['title'] if task else None,
+                    'taskType': task.get('taskType') if task else None,
+                    'evidence': {
+                        'libraryPath': bool(task and task.get('libraryPath')),
+                        'reportPath': bool(task and task.get('reportPath')),
+                        'writtenPy': bool(task and task.get('writtenPy')),
+                        'restoreCheck': bool(task and task.get('restoreCheck')),
+                        'codePublished': bool(task and task.get('codePublished')),
+                        'wikiPage': bool(task and task.get('wikiPage')),
+                        'note': bool(task and str(task.get('note') or '').strip()),
+                    },
                     'reason': 'missing_saved_deliverable'}, authorized=True)
         _notify_card_failure(
             state, task or {}, 'no saved deliverable in the Library',
