@@ -18,7 +18,7 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     escalation then falls through to the player exactly as before.
     """
     admin_id = _admin_agent_id(state)
-    if not admin_id or admin_id == director_id:
+    if not admin_id:
         return False
     if esc.get('adminAskedAt'):
         return False
@@ -123,6 +123,13 @@ def _resolve_pending_escalations_sync():
         # Chain: the requester's own director, then the senior director, then
         # the chief of staff. `_immediateTried` is set when the first rung
         # gives up or cannot decide.
+        # Migration for records written before the admin-as-reviewer fix:
+        # the rung was marked tried even though the admin was never asked.
+        # Give it its one turn. adminAskedAt is set when it is actually asked,
+        # so this cannot loop.
+        if esc.get('_adminTried') and not esc.get('adminAskedAt'):
+            esc['_adminTried'] = False
+            dirty = True
         immediate_id = _escalation_requester_director(state, esc)
         admin_id = _admin_agent_id(state)
         # One attempt per rung: the requester's own director, then the senior
