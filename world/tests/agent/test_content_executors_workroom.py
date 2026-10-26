@@ -199,6 +199,20 @@ class ResearchDeskWiring(_ExecutorTestCase):
         self.assertTrue(calls['coverage'][0]['failure'])
         self.assertIn('no model tier', seen['d3']['note'])
 
+class CodeLibraryReport(_ExecutorTestCase):
+    def test_publish_writes_a_library_record(self):
+        result = {'stagedWorkspace': 'ws-1', 'sourceDigest': 'abc',
+                  'note': 'validated staged changes published'}
+        with mock.patch.object(serve, '_http_json', return_value={'ok': True}) as post, \
+             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'):
+            content._save_code_library_report('cora', {'id': 't1', 'title': 'Fix it'}, result)
+        self.assertTrue(result['libraryPath'].startswith('archive/'))
+        self.assertIn('-code-t1.md', result['libraryPath'])
+        args, kwargs = post.call_args
+        self.assertEqual(args[2], '/api/library/file')
+        self.assertEqual(args[3]['source'], 'firsthand')
+
+
 class ObservatoriesAndDispatcher(_ExecutorTestCase):
     def test_observatory_dispatches_on_task_flags(self):
         seen = _store()

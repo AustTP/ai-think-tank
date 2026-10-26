@@ -388,6 +388,35 @@ def _deliverable_problem(before, candidate):
     return 'the candidate change is empty: no file was added or modified'
 
 
+def _save_code_library_report(agent_id, task, result, key=None):
+    """A validated code publish leaves a real Library record of what changed.
+
+    The completion gate requires a saved deliverable for code/story cards, but
+    the coding executor publishes a staged workspace and does not itself write
+    a Library file. Without this record a successful code card was refused as
+    "missing_saved_deliverable" and a repair card repeated the same mismatch.
+    Best-effort: a Library write failure must not discard the published code.
+    """
+    try:
+        path = (f"archive/{int(time.time() * 1000)}-code-"
+                f"{task.get('id') or 'adhoc'}.md")
+        body = (
+            f"# Code change: {task.get('title') or 'untitled task'}\n\n"
+            f"Task: {task.get('id') or 'adhoc'}\n"
+            f"Agent: {agent_id}\n"
+            f"Staged workspace: {result.get('stagedWorkspace') or 'n/a'}\n"
+            f"Source digest: {result.get('sourceDigest') or 'n/a'}\n"
+            f"Result: {(result.get('note') or '').strip()}\n"
+        )
+        _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                          {'agentId': agent_id, 'path': path, 'content': body,
+                           'source': 'firsthand'},
+                          key or _serve.get_or_create_agent_key(agent_id))
+        result['libraryPath'] = path
+    except Exception:
+        pass
+
+
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     """Run coding in a private staged workspace; publish only validated changes."""
     import sim
@@ -424,6 +453,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                     _commit_story_workspace(workspace, task.get('id'))
                     result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
                     result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
+                    _save_code_library_report(agent_id, task, result)
             else:
                 stage.checkpoint()
                 result['ok'] = False
