@@ -44,7 +44,10 @@ async def selfedit_schedule(request: Request):
             on_call=body.get('onCall'),
             acknowledgements=body.get('acknowledgements'),
             blackout_windows=body.get('blackoutWindows'),
-            notify_created=True)
+            # No creation-time Telegram. The director -> senior director ->
+            # chief of staff chain decides first; the player is only paged by
+            # notify_human_of_escalation when every rung fails.
+            notify_created=False)
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},

@@ -98,7 +98,7 @@ class SelfEditScheduleEndpointTests(unittest.TestCase):
         self.assertEqual('a', fake.request_window.call_args[0][0])
         self.assertEqual('2026-10-30', fake.request_window.call_args[0][1])
         self.assertEqual('03:00', fake.request_window.call_args[0][2])
-        self.assertTrue(fake.request_window.call_args[1]['notify_created'])
+        self.assertFalse(fake.request_window.call_args[1]['notify_created'])
 
         fake.request_window.return_value = (False, {'error': 'slot taken'})
         resp, _, _ = self._post(body, fake=fake)

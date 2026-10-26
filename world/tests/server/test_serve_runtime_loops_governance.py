@@ -260,6 +260,7 @@ class ResolvePendingEscalations(unittest.TestCase):
                      unittest.mock.patch.object(serve, '_effective_safety_confidence', return_value=0.6), \
                      unittest.mock.patch.object(serve, '_jev_judge_model', return_value=None), \
                      unittest.mock.patch.object(serve, 'log_action') as log, \
+                     unittest.mock.patch.object(serve, 'notify_human_of_escalation') as notify, \
                      unittest.mock.patch.object(serve, '_save_escalations',
                                                 side_effect=lambda d: saved.update(d)) as save:
                     result = serve._resolve_pending_escalations_sync()
@@ -268,6 +269,7 @@ class ResolvePendingEscalations(unittest.TestCase):
         save.assert_called_once()
         log.assert_called_once()
         self.assertEqual(log.call_args.args[1], 'escalation_approve')
+        notify.assert_not_called()
 
 
 class DirectorApprovalLoop(unittest.TestCase):
