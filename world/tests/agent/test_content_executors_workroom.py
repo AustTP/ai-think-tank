@@ -304,6 +304,53 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             else:
                 target[expected].assert_called_once()
 
+    def test_dispatcher_honors_explicit_note_and_report_deliverables(self):
+        seen = _store()
+        _base_mocks()
+        for task, target in [
+            ({'id': 'n1', 'taskType': 'code', 'deliverable': 'note',
+              'room': 'pressoffice', 'projectLabel': 'Reset cards'},
+             '_run_note_content'),
+            ({'id': 'n2', 'taskType': 'bug', 'deliverable': 'report',
+              'room': 'pressoffice', 'projectLabel': 'Write it up'},
+             '_run_report_content'),
+        ]:
+            with mock.patch.object(content, '_run_note_content') as note, \
+                 mock.patch.object(content, '_run_report_content') as report, \
+                 mock.patch.object(content, '_run_workroom_content') as workroom, \
+                 mock.patch.object(content, '_run_coding_content') as coding:
+                content._server_content_dispatcher(_snapshot(), 'cora', task)
+            target_fn = {'_run_note_content': note,
+                         '_run_report_content': report}[target]
+            target_fn.assert_called_once()
+            workroom.assert_not_called()
+            coding.assert_not_called()
+
+    def test_dispatcher_backfills_note_for_an_old_task_issue(self):
+        snapshot = _snapshot(issues={'HAROL-37': {'type': 'task'}})
+        with mock.patch.object(content, '_run_note_content') as note, \
+             mock.patch.object(content, '_run_workroom_content') as workroom, \
+             mock.patch.object(content, '_run_coding_content') as coding:
+            content._server_content_dispatcher(
+                snapshot, 'cora',
+                {'id': 'old', 'taskType': 'code', 'issueKey': 'HAROL-37',
+                 'room': 'pressoffice', 'projectLabel': 'Reset cards'})
+        note.assert_called_once()
+        workroom.assert_not_called()
+        coding.assert_not_called()
+
+    def test_note_content_records_the_note(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(content, '_plain_completion',
+                               return_value='Verified X. Next: Y.'):
+            content._run_note_content(
+                _snapshot(), 'cora',
+                {'id': 'n1', 'title': 'Reset cards',
+                 'instructions': 'Reset the stale cards.'})
+        self.assertTrue(seen['n1']['ok'])
+        self.assertEqual(seen['n1']['note'], 'Verified X. Next: Y.')
+
     def test_dispatcher_pipeline_step_overrides_everything(self):
         with mock.patch.object(content, '_run_pipeline_step_content') as ps:
             content._server_content_dispatcher(_snapshot(), 'cora',

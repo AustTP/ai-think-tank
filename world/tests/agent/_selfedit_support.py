@@ -18,6 +18,10 @@ def fake_repo(tmp_path, monkeypatch):
     world.mkdir()
     monkeypatch.setattr(serve, 'ROOT', str(world))
     monkeypatch.setattr(serve, 'DB_PATH', str(tmp_path / 'think_tank.db'))
+    # Keep escalation writes inside the fake repo. Without this the
+    # dormancy-window tests created real pending escalations in the live tank.
+    monkeypatch.setattr(serve, 'ESCALATIONS_PATH',
+                        str(tmp_path / 'escalations.json'))
     serve.init_db()
     return tmp_path, world
 

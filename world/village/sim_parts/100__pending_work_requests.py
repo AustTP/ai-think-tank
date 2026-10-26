@@ -121,7 +121,10 @@ _DELIVERABLE_BY_ISSUE_TYPE = {
     'spike': 'report',
     'bug': 'code',
     'story': 'code',
-    'task': 'code',
+    # A generic 'task' is operational/meta work: close, reset, audit, decide.
+    # It records the outcome in a note instead of running the coding lane.
+    # Code work uses story/bug, or an explicit deliverable='code'.
+    'task': 'note',
 }
 # `blocked` is a boolean FIELD on an issue (issue['blocked'], default False), NOT
 # a status. Only the owning team's scrum master commits it (via _file_block_change

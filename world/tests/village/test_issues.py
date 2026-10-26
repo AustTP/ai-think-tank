@@ -66,8 +66,11 @@ class IssueDeliverable(unittest.TestCase):
                              'player', now_ms=_NOW_MS)
         spike = sim.file_issue(state, 'dev', 'spike', 'Investigate it',
                                'checkout', 'player', now_ms=_NOW_MS)
+        task = sim.file_issue(state, 'dev', 'task', 'Reset the stale cards',
+                              'checkout', 'player', now_ms=_NOW_MS)
         self.assertEqual(bug['deliverable'], 'code')
         self.assertEqual(spike['deliverable'], 'report')
+        self.assertEqual(task['deliverable'], 'note')
         req = next(r for r in state['backlogRequests']
                    if r.get('issueKey') == spike['key'])
         self.assertEqual(req['deliverable'], 'report')

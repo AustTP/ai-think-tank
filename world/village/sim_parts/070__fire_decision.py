@@ -379,6 +379,17 @@ def _stop_card_pattern(state, task, info, author):
         _log_governance(state, author, 'card_pattern_suppressed',
                         {'taskId': task.get('id'), 'pattern': info['key'],
                          'failures': info['failures'], 'taskIds': info['taskIds']})
+        try:
+            from serve import send_player_telegram_sync
+            send_player_telegram_sync(
+                '[AI Think Tank] Card pattern suppressed',
+                (f'Stopped minting cards for {info["key"]} after '
+                 f'{info["failures"]} failures in 24h.\n'
+                 f'Task: {task.get("title") or task.get("id")}\n'
+                 f'Tasks: {", ".join(info["taskIds"])}\n'
+                 'The card contract is wrong. Fix it before another card is filed.'))
+        except Exception:
+            pass
 
 
 def _repair_loop_should_stop(state, title, now_ms):

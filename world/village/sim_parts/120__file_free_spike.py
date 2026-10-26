@@ -546,6 +546,13 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                             + '; '.join(pc['mustInclude']) + '.')
         pin_text = (' ' + ' '.join(pin_bits)) if pin_bits else ''
         card_type = (req.get('issueType') or req.get('taskType') or 'story').strip().lower()
+        # A generic task is operational/meta work. Backfill old requests that
+        # predate the deliverable field so they do not fall into the coding
+        # lane and fail for a missing executable command.
+        deliverable = (req.get('deliverable')
+                       or ('note' if card_type == 'task' else None))
+        if deliverable and not req.get('deliverable'):
+            req['deliverable'] = deliverable
         instructions = (f"{sm_name} is the scrum master running backlog refinement for {filed_by}'s "
                         f"({author.get('name') or filed_by} / {author.get('role') or 'worker'}) work request "
                         f"in the {req.get('room')} room. Requested card: '{req.get('title')}'. "
@@ -670,13 +677,13 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                 # report, even when the issue was typed as a bug/story. This is
                 # the mint-time half of the contract; the completion gate reads
                 # the same field.
-                if req.get('deliverable') == 'report' and queue_task_type not in ('spike', 'report', 'research'):
+                if deliverable == 'report' and queue_task_type not in ('spike', 'report', 'research'):
                     queue_task_type = 'spike'
                 queue_work(state, [{
                     'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                     'instructions': instructions,
                     'taskType': queue_task_type,
-                    'deliverable': req.get('deliverable') or None,
+                    'deliverable': deliverable,
                     'approvedTools': list(req.get('approvedTools') or []),
                     'teamId': req.get('teamId'),
                     'userStory': story,

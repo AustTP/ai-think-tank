@@ -1,5 +1,39 @@
 
 
+def _run_note_content(snapshot, agent_id, task, base_ctx=None):
+    """A note-only card: record the outcome, no code and no shell.
+
+    Operational task cards (close/reset/audit/decide) have no code deliverable.
+    Running them through the coding lane ended in the executable-command gate
+    rejecting them twice and closing the card as failed. This lane makes the
+    note the explicit deliverable. It cannot execute or mutate state, so the
+    prompt forbids claiming an action the lane cannot perform; the note names
+    what was verified and what action remains.
+    """
+    import sim as _sim_module
+    name = _agent_name(snapshot, agent_id)
+    model = _serve._low_tier_slug() or _serve._mid_tier_slug()
+    prompt = (
+        f'You are {name}. Write the completion note for this operational card.\n'
+        f'Card: {task.get("title") or ""}\n'
+        f'Instructions: {task.get("instructions") or ""}\n'
+        + (f'Context:\n{base_ctx}\n' if base_ctx else '')
+        + 'You cannot run shell commands or change tank state in this lane. '
+          'Do not claim you performed an action you could not perform. '
+          'Record, in at most 150 words: what the card asked, what you verified '
+          'from the context, and the exact next action for a human or a code card.'
+    )
+    text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
+                             max_tokens=1200, service='note',
+                             task_id=task.get('id'))
+    if not text:
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False, 'note': 'Note synthesis returned nothing.'})
+        return
+    _sim_module._store_content_result(task.get('id'), {
+        'ok': True, 'note': text.strip()})
+
+
 def _run_report_content(snapshot, agent_id, task, base_ctx=None):
     """Deterministic local-source report lane.
 
@@ -144,9 +178,25 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     lane_marked = bool(task.get('distill') or task.get('skillReview')
                        or task.get('research') or task_type == 'research'
                        or title_lane_marked)
+    deliverable = str(task.get('deliverable') or '').strip().lower()
+    if not deliverable and task_type in ('code', 'bug') and task.get('issueKey'):
+        # Backfill old generic-task cards that predate the deliverable field:
+        # the ISSUE type is the durable contract. A task issue is operational,
+        # so it records a note instead of entering the coding lane.
+        issue = (snapshot.get('issues') or {}).get(task.get('issueKey') or '')
+        if (issue or {}).get('type') == 'task':
+            deliverable = 'note'
     if lane_marked:
         executor = _run_observatory_content
-    elif task_type in ('code', 'bug'):
+    elif deliverable == 'report':
+        # Explicit report contract: never route a report card through the
+        # coding lane just because its room or projectLabel looks like code.
+        executor = _run_report_content
+    elif deliverable == 'note':
+        # Explicit note contract: operational task cards close on a note, not
+        # on an executable shell command.
+        executor = _run_note_content
+    elif deliverable == 'code' or task_type in ('code', 'bug'):
         # A CODE card is code wherever it was queued. The room only decides
         # which BUILDING it runs in, not what kind of work it is. Falling
         # through to the room executor made a code/bug card queued into

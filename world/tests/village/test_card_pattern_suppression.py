@@ -60,3 +60,25 @@ def test_title_fallback_strips_fix_prefixes():
         state, {'title': 'Fix: Act on mail'}, now)
     assert info is not None
     assert info['key'] == 'title:Act on mail'
+
+
+def test_stop_card_pattern_alerts_once_per_window(monkeypatch):
+    import serve
+    calls = []
+    monkeypatch.setattr(serve, 'send_player_telegram_sync',
+                        lambda subject, body: calls.append((subject, body)) or True)
+    monkeypatch.setattr(sim, '_log_governance', lambda *a, **k: None)
+    monkeypatch.setattr(sim, '_append_mailbox', lambda *a, **k: None)
+    now = int(time.time() * 1000)
+    state = {'tasks': {
+        'task-1': {'id': 'task-1', 'status': 'failed', 'failedAt': now,
+                   'assignedTo': 'ada', 'issueKey': 'IRIS-1',
+                   'title': 'Reset cards'},
+    }, 'agents': {'ada': {}}}
+    info = {'key': 'issue:IRIS-1', 'failures': 3, 'taskIds': ['task-1']}
+    sim._stop_card_pattern(state, state['tasks']['task-1'], info, 'ada')
+    sim._stop_card_pattern(
+        state, {'id': 'task-2', 'assignedTo': 'ada', 'issueKey': 'IRIS-1',
+                'title': 'Reset cards again'}, info, 'ada')
+    assert len(calls) == 1
+    assert 'Card pattern suppressed' in calls[0][0]
