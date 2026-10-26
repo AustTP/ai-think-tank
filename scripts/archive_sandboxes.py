@@ -32,9 +32,11 @@ def archive_old_sandboxes(root, archive_dir, max_age_days, stage_max_age_hours,
             if age_hours <= stage_max_age_hours:
                 continue
             if dry_run:
-                print(f"[DRY RUN] Would delete stage: {entry} ({age_hours:.1f}h old)")
+                age = round(age_hours, 1)
+                print(f"[DRY RUN] Would delete stage: {entry} ({age}h old)")
                 continue
-            print(f"Deleting stage: {entry} ({age_hours:.1f}h old)")
+            age = round(age_hours, 1)
+            print(f"Deleting stage: {entry} ({age}h old)")
             try:
                 shutil.rmtree(entry)
             except OSError as exc:
@@ -45,10 +47,12 @@ def archive_old_sandboxes(root, archive_dir, max_age_days, stage_max_age_hours,
         if age_hours <= max_age_days * 24:
             continue
         if dry_run:
-            print(f"[DRY RUN] Would archive: {entry} ({age_hours:.1f}h old)")
+            age = round(age_hours, 1)
+            print(f"[DRY RUN] Would archive: {entry} ({age}h old)")
             continue
         tar_path = archive_dir / f"{name}.tar.gz"
-        print(f"Archiving: {entry} ({age_hours:.1f}h old)")
+        age = round(age_hours, 1)
+        print(f"Archiving: {entry} ({age}h old)")
         try:
             with tarfile.open(tar_path, "w:gz") as tar:
                 tar.add(entry, arcname=name)

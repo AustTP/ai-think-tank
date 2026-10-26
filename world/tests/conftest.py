@@ -141,3 +141,92 @@ def _clear_unpriced_receipts():
 def pytest_sessionfinish(session, exitstatus):
     """Remove this run's DB copy the moment pytest finishes."""
     _remove_tmpdir(_tmpdir)
+
+
+# The DB copy above only covers sqlite. The service also writes the Library,
+# escalations.json, agent profile trees, sandboxes, and several ledgers. Tests
+# that exercise those paths without patching them must not touch the operator's
+# real files, so point every writable root at a session-local copy.
+_LIVE_ROOT = _REPO
+_TEST_ROOT = os.path.join(_tmpdir, 'root')
+
+
+def _seed_test_root(root):
+    os.makedirs(root, exist_ok=True)
+    # Keep read fixtures (reports, skills, project files) but never their live
+    # absolute paths: the copy is writable and disposable.
+    live_library = os.path.join(_LIVE_ROOT, 'library')
+    if os.path.isdir(live_library):
+        shutil.copytree(live_library, os.path.join(root, 'library'),
+                        dirs_exist_ok=True)
+    # Agent profiles are mostly small JSON/Markdown; skip the large avatar and
+    # prototype media trees. Tests that need those patch their own temp root.
+    live_agents = os.path.join(_LIVE_ROOT, 'agents')
+    if os.path.isdir(live_agents):
+        shutil.copytree(
+            live_agents, os.path.join(root, 'agents'), dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(
+                'avatars', 'prototypes', '*.png', '*.jpg', '*.jpeg', '*.webp',
+                '*.gif', '*.mp4', '*.mov', '*.mp3', '*.wav'))
+    # The live-read supervisor test intentionally reads source from the
+    # project root. Copy the source tree (not tests or git metadata) so that
+    # read still works without exposing the live tree to writes.
+    live_world = os.path.join(_LIVE_ROOT, 'world')
+    if os.path.isdir(live_world):
+        shutil.copytree(
+            live_world, os.path.join(root, 'world'), dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns(
+                '.git', 'tests', '__pycache__', '*.pyc',
+                '.selfedit_staging', '.selfedit_failed'))
+    for name in ('escalations.json', 'webhooks.jsonl', 'failures.json',
+                 'rule_proposals.json', 'successes.json',
+                 'success_proposals.json', 'browse_trail.json',
+                 'library_usage.json', 'object_stores.json'):
+        src = os.path.join(_LIVE_ROOT, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(root, name))
+    for name in ('sandboxes', 'think-tank-db-backups', '.http_cache',
+                 '.secret_keys'):
+        os.makedirs(os.path.join(root, name), exist_ok=True)
+
+
+@pytest.fixture(scope='session', autouse=True)
+def _isolate_live_tree():
+    """Point every writable service path at the session temp root."""
+    _seed_test_root(_TEST_ROOT)
+    import serve
+    import core.object_store as object_store
+
+    paths = {
+        'THINK_TANK_DIR': _TEST_ROOT,
+        'SANDBOXES_DIR': os.path.join(_TEST_ROOT, 'sandboxes'),
+        'ESCALATIONS_PATH': os.path.join(_TEST_ROOT, 'escalations.json'),
+        'WEBHOOKS_PATH': os.path.join(_TEST_ROOT, 'webhooks.jsonl'),
+        'FAILURES_PATH': os.path.join(_TEST_ROOT, 'failures.json'),
+        'RULE_PROPOSALS_PATH': os.path.join(_TEST_ROOT, 'rule_proposals.json'),
+        'SUCCESSES_PATH': os.path.join(_TEST_ROOT, 'successes.json'),
+        'SUCCESS_PROPOSALS_PATH': os.path.join(_TEST_ROOT, 'success_proposals.json'),
+        'LIBRARY_DIR': os.path.join(_TEST_ROOT, 'library'),
+        'LIBRARY_ARCHIVE_DIR': os.path.join(_TEST_ROOT, 'library', 'archive'),
+        'PASSPORT_PATH': os.path.join(_TEST_ROOT, 'library', '.passport.json'),
+        'AGENTS_DIR': os.path.join(_TEST_ROOT, 'agents'),
+        'DB_BACKUP_DIR': os.path.join(_TEST_ROOT, 'think-tank-db-backups'),
+        'BROWSE_TRAIL_PATH': os.path.join(_TEST_ROOT, 'browse_trail.json'),
+        'LIBRARY_USAGE_PATH': os.path.join(_TEST_ROOT, 'library_usage.json'),
+        'HTTP_CACHE_DIR': os.path.join(_TEST_ROOT, '.http_cache'),
+        '_FERNET_EDEK_DIR': os.path.join(_TEST_ROOT, '.secret_keys'),
+    }
+    saved = {name: getattr(serve, name, None) for name in paths}
+    for name, value in paths.items():
+        setattr(serve, name, value)
+    old_agents = object_store.AGENTS_DIR
+    old_registry = object_store.REGISTRY_PATH
+    object_store.AGENTS_DIR = os.path.join(_TEST_ROOT, 'agents')
+    object_store.REGISTRY_PATH = os.path.join(_TEST_ROOT, 'object_stores.json')
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(serve, name, value)
+        object_store.AGENTS_DIR = old_agents
+        object_store.REGISTRY_PATH = old_registry

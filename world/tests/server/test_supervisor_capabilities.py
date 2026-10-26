@@ -56,7 +56,7 @@ def test_live_read_lists_and_greps_the_live_project(monkeypatch):
     assert 'sim.py' in listed['entries']
     found = serve.supervisor_live_read(
         'nora', {'op': 'grep', 'path': 'world', 'pattern': 'def _supervisor_brief'})
-    assert found['matches'] and 'sim.py' in found['matches'][0]
+    assert any('140__supervisor_brief.py' in m for m in found['matches'])
 
 
 def test_live_read_refuses_secrets_and_traversal(monkeypatch):
