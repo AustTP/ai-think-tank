@@ -221,6 +221,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'projectLabel': project_label,
         'research': (extra or {}).get('research'),
         'taskType': (extra or {}).get('taskType', 'code'),
+        'deliverable': (extra or {}).get('deliverable') or None,
         # A scheduled item's notBefore rides onto the task (see _assign_due_item)
         # so the preemption picker can recognize TIME-CRITICAL work: a card that
         # was scheduled for a specific time must not be yanked off the agent for
@@ -730,6 +731,28 @@ def _completion_has_evidence(state, task):
         return True
     if ttype in ('meeting', 'supervise', 'avatar', 'review', 'qa'):
         return True
+    # Explicit deliverable contract (file_issue -> refinement -> queue ->
+    # task). A card says what it must produce, so the gate never has to infer
+    # from the title. A bug that is really a missing report is minted as a
+    # spike with deliverable='report'; a code bug keeps deliverable='code'.
+    deliverable = str(task.get('deliverable') or '').strip().lower()
+    if deliverable in ('meeting', 'supervision', 'review'):
+        return True
+    if deliverable in ('report', 'note', 'code'):
+        if deliverable == 'report':
+            ok = bool(task.get('libraryPath') or task.get('reportPath')) and bool(
+                str(task.get('note') or '').strip())
+        elif deliverable == 'note':
+            ok = bool(str(task.get('note') or '').strip())
+        else:
+            ok = bool(task.get('libraryPath') or task.get('writtenPy')
+                      or task.get('restoreCheck') or task.get('codePublished'))
+        if not ok:
+            return False
+        grade = task.get('grade')
+        if isinstance(grade, (int, float)) and grade <= 0:
+            return False
+        return True
     if (ttype == 'research' or task.get('research') or task.get('distill')
             or task.get('skillReview')):
         # Scheduled research, distill, and skill-review cards record their
@@ -774,6 +797,14 @@ def _completion_evidence_gap(task):
             or ttype == 'research'):
         return ('the task note is empty; record what the run produced in the note '
                 '(or the wiki page for a distill)')
+    deliverable = str(task.get('deliverable') or '').strip().lower()
+    if deliverable == 'report':
+        return 'no reportPath or task note'
+    if deliverable == 'note':
+        return 'the task note is empty'
+    if deliverable == 'code':
+        return ('no published change, written .py file, restore check, '
+                'or Library artifact')
     if ttype == 'bug':
         return ('no published change, written .py file, restore check, '
                 'or Library artifact')

@@ -437,6 +437,9 @@ _SUPERVISOR_BACKLOG_TOOL = {
                 'taskType': {'type': 'string',
                              'enum': ['task', 'story', 'spike', 'bug'],
                              'description': 'Backlog card type (default task).'},
+                'deliverable': {'type': 'string',
+                                'enum': ['code', 'report', 'note', 'meeting', 'supervision', 'review'],
+                                'description': ('What the card must produce. Use "report" when the remedy is a saved report/Library artifact, not a code change; the card is minted as a spike so it can close. Defaults from taskType.')},
                 'feature': {'type': 'string',
                             'description': 'Optional Jira project/area label.'},
             },
@@ -669,7 +672,8 @@ def _make_supervisor_backlog_executor(agent_id):
         import serve as _serve
         ok, payload = _serve.supervisor_backlog_directive(
             agent_id, args.get('team'), args.get('title'), args.get('reason'),
-            args.get('taskType') or 'task', args.get('feature'))
+            args.get('taskType') or 'task', args.get('feature'),
+            args.get('deliverable'))
         return _json.dumps(payload, sort_keys=True)
     return run
 

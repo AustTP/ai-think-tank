@@ -112,6 +112,17 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
 # ---------------------------------------------------------------------------
 
 ISSUE_TYPES = ('story', 'spike', 'bug', 'task', 'meeting')
+# What the card must actually produce. The completion gate reads this instead
+# of guessing from the type or title: a bug that is really a missing report is
+# minted as a spike with deliverable='report', and a code bug as 'code'.
+ISSUE_DELIVERABLES = ('code', 'report', 'note', 'meeting', 'supervision', 'review')
+_DELIVERABLE_BY_ISSUE_TYPE = {
+    'meeting': 'meeting',
+    'spike': 'report',
+    'bug': 'code',
+    'story': 'code',
+    'task': 'code',
+}
 # `blocked` is a boolean FIELD on an issue (issue['blocked'], default False), NOT
 # a status. Only the owning team's scrum master commits it (via _file_block_change
 # + _block_step), so it stays a single player-facing "this card can't be or needn't
@@ -315,7 +326,7 @@ def _groups_look_like_gwt(text):
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
                description='', story_points=None, title=None, now_ms=None,
                assigned_to=None, lane=None, attendees=None,
-               facilitator_id=None, approved_tools=None):
+               facilitator_id=None, approved_tools=None, deliverable=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -341,6 +352,11 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     convenes the meeting and writes the minutes. Both survive
     file_issue -> refinement -> queue -> task (queue_work whitelists
     them), so the meeting executor can name the participants.
+    `deliverable` is what the card must produce: 'code' (a landed change),
+    'report' (a saved report/Library artifact), 'note' (recorded findings), or
+    the non-gated 'meeting'/'supervision'/'review'. It defaults from the issue
+    type and travels file_issue -> refinement -> queue -> task, so the
+    completion gate reads the explicit contract instead of guessing by title.
     Duplicate stamp: an exact-title (case- and whitespace-insensitive) match
     against an OPEN issue in the same team sets `duplicateOf` on the new card;
     filing still succeeds -- rejection is the scrum master's call, not the
@@ -360,6 +376,9 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
     if not _team_row(state, team_id):
         return None
     approved_tools = [str(t) for t in (approved_tools or []) if str(t).strip()]
+    deliverable = (deliverable or '').strip().lower() or _DELIVERABLE_BY_ISSUE_TYPE.get(issue_type, 'code')
+    if deliverable not in ISSUE_DELIVERABLES:
+        return None
     now_ms = time.time() * 1000 if now_ms is None else now_ms
     key = next_issue_key(state, team_id)
     story, criteria, never = _normalize_description(description)
@@ -384,6 +403,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'teamId': team_id,
         'teamKey': team_prefix(state, team_id),
         'type': issue_type,
+        'deliverable': deliverable,
         'summary': summary,
         'title': title,  # one-line scan headline; distinct from summary/description
         'feature': feature,
@@ -434,6 +454,7 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         'issueKey': key,
         'teamId': team_id,
         'issueType': issue_type,
+        'deliverable': deliverable,
         # Human-in-the-loop: a card filed for the PLAYER stays the player's
         # through refinement (assignedTo survives onto the queued item, and
         # _assign_due_item hands it to the player -- see _resolve_refinement).

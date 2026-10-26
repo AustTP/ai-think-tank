@@ -442,7 +442,16 @@ class SpikeExecutorBranches(unittest.TestCase):
             wish = content._spike_file_issue_wish('Bug found: login fails.\nDetails here.',
                                                   {'teamId': 't1', 'projectLabel': 'P'}, 'Ada', 'b')
             self.assertEqual(wish['issueType'], 'bug')
+            self.assertEqual(wish['deliverable'], 'code')
             self.assertEqual(wish['teamId'], 't1')
+        with mock.patch.object(serve, '_call_openrouter_decision_sync',
+                               return_value={'d': 1}), \
+             mock.patch.object(serve, '_jev_choice', return_value=('file_bug', 0.9, 0.01)):
+            wish = content._spike_file_issue_wish(
+                'Missing deliverable: the saved Library file is missing. Save the report.',
+                {'teamId': 't1'}, 'Ada', 'b')
+            self.assertEqual(wish['issueType'], 'spike')
+            self.assertEqual(wish['deliverable'], 'report')
         with mock.patch.object(serve, '_call_openrouter_decision_sync',
                                return_value={'d': 1}), \
              mock.patch.object(serve, '_jev_choice', return_value=('file_story', 0.9, 0.01)):

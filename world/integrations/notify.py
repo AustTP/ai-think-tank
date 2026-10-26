@@ -76,7 +76,8 @@ def _save_escalations(data, replace_missing=False):
             current = data.get(eid)
             if current is None and not replace_missing:
                 data[eid] = esc
-            elif (esc.get('status') in ('approved', 'denied')
+            elif (current is not None
+                  and esc.get('status') in ('approved', 'denied')
                   and current.get('status') == 'pending'):
                 data[eid] = esc
         tmp = f'{path}.{os.getpid()}.{threading.get_ident()}.tmp'
@@ -359,6 +360,17 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     if agent_id:
         escalations[esc_id]['agentId'] = agent_id
     _serve._save_escalations(escalations)
+    try:
+        # Pair every creation with a durable log entry. Without it, an expiry
+        # that cannot find its record is indistinguishable from a genuine
+        # timeout (the 30 "dormancy window record missing" events).
+        _serve.log_action(None, 'escalation_created', {
+            'escalationId': esc_id, 'kind': kind,
+            'windowId': on_approve_note or None,
+            'agentId': agent_id or None,
+        }, authorized=False)
+    except Exception:
+        pass
 
     # Human-only kinds (floor >= 1.0) notify the player immediately -- the
     # director loop is barred from them, so the email link IS the only path.

@@ -496,7 +496,8 @@ def _file_spike_issue(state, wish, task, now_ms):
     issue = file_issue(state, team_id, issue_type, summary, feature, reporter,
                        description=wish.get('description') or '',
                        title=wish.get('title') or None,
-                       now_ms=now_ms)
+                       now_ms=now_ms,
+                       deliverable=wish.get('deliverable'))
     if not issue:
         return False
     _log_governance(state, reporter, 'worker_filed_issue',

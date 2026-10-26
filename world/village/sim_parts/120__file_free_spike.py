@@ -584,12 +584,20 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             {'id': 'accept_generous', 'description': f"Create '{req.get('title')}' as a real {card_type} card in {req.get('room')} -- it's a genuine, well-scoped, HIGH-VALUE gap worth a card AND a generous spend budget (a bigger investigation or deliverable than the standard card)."},
             {'id': 'reject', 'description': "Groom this request out -- it's a duplicate, low-value, trivial/filler, over-ambitious/un-scoped, out-of-scope, or the roadmap already covers it."},
         ]
-        choice = decider(instructions, criteria)
-        if choice is None:
-            # Outage fallback: accept only a request that names a real
-            # delegatable-room gap (same determinism as the governance fallback --
-            # better to ship one well-scoped card than to silently drop a filed gap).
-            choice = 'accept' if req.get('room') in VALUED_QUEUE_ROOMS else 'reject'
+        suppression = _card_pattern_suppressed(
+            state, {'issueKey': req.get('issueKey'), 'title': req.get('title')}, now_ms)
+        if suppression:
+            # The same issue/pattern already failed three times in 24h. Do not
+            # mint another card from it: the contract is wrong, and a fourth
+            # copy only repeats the failure.
+            choice = 'reject'
+        else:
+            choice = decider(instructions, criteria)
+            if choice is None:
+                # Outage fallback: accept only a request that names a real
+                # delegatable-room gap (same determinism as the governance fallback --
+                # better to ship one well-scoped card than to silently drop a filed gap).
+                choice = 'accept' if req.get('room') in VALUED_QUEUE_ROOMS else 'reject'
         # Item 4: the grooming choice also picks the spend band. 'accept_generous'
         # (a HIGH-VALUE story) doubles the type-default ceiling; 'accept' is the
         # standard band; the rejected branch never touches it. An explicit
@@ -658,10 +666,17 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                 queue_task_type = (card_type if card_type in
                                    ('spike', 'research', 'meeting', 'review', 'qa', 'bug')
                                    else 'code')
+                # An explicit report deliverable needs a lane that writes a
+                # report, even when the issue was typed as a bug/story. This is
+                # the mint-time half of the contract; the completion gate reads
+                # the same field.
+                if req.get('deliverable') == 'report' and queue_task_type not in ('spike', 'report', 'research'):
+                    queue_task_type = 'spike'
                 queue_work(state, [{
                     'title': req['title'], 'room': req['room'], 'goal': req.get('title'),
                     'instructions': instructions,
                     'taskType': queue_task_type,
+                    'deliverable': req.get('deliverable') or None,
                     'approvedTools': list(req.get('approvedTools') or []),
                     'teamId': req.get('teamId'),
                     'userStory': story,
@@ -715,11 +730,16 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     state, filed_by, 'request_declined', req.get('issueKey'),
                     req.get('title'),
                     (_team_row(state, pending.get('teamId')) or {}).get('name'),
-                    extra='judged duplicate, trivial, out of scope, or '
-                          'already covered by the roadmap')
+                    extra=('suppressed: this issue/pattern already failed '
+                           'three times in 24h; fix the contract before re-filing'
+                           if suppression else
+                           'judged duplicate, trivial, out of scope, or '
+                           'already covered by the roadmap'))
         details = {'request': req['id'], 'choice': choice, 'filedBy': filed_by,
                    'room': req['room'], 'title': req['title'][:120]}
-        if choice == 'reject':
+        if suppression:
+            details['patternSuppressed'] = suppression
+        if choice == 'reject' and not suppression:
             # Absolute Zero rejection signal: a self-proposed work-request was
             # groomed OUT. Durable, queryable (the health check counts these) --
             # a rising reject rate is the think tank's own early warning that its

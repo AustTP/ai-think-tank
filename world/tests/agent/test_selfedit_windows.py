@@ -44,6 +44,40 @@ def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
     assert row['validator'] == 'reviewer'
 
 
+def test_window_row_precedes_escalation_and_is_findable_by_note(fake_repo, monkeypatch):
+    _, world = fake_repo
+    _arm_edit(monkeypatch, world)
+    _patch_roster(monkeypatch)
+    # Use the real create_escalation so the durable record + log are written,
+    # but keep the escalations file inside the fake repo. Without this patch
+    # the test wrote real pending escalations to the live tank's JSON.
+    monkeypatch.setattr(serve, 'ESCALATIONS_PATH',
+                        str(world / 'escalations.json'))
+    # Only the outbound channels are stubbed.
+    monkeypatch.setattr(serve, '_send_escalation_email_sync',
+                        lambda *a, **k: False)
+    monkeypatch.setattr(serve, 'send_player_telegram_sync',
+                        lambda *a, **k: False)
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '05:10', 15, 'nightly maintenance unique-%s' % os.getpid(),
+        'reviewer')
+    assert ok is True, payload
+    esc_id = payload['escalationId']
+    esc = serve._load_escalations()[esc_id]
+    assert esc['note']
+    # Simulate the old failure: the escalation exists but the link column was
+    # never written. The fallback must still find the window by its id.
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        conn.execute('UPDATE dormancy_windows SET escalation_id = NULL '
+                     'WHERE id = ?', (esc['note'],))
+    assert serve._dormancy_window_start(esc_id, esc) is not None
+    with sqlite3.connect(serve.DB_PATH) as conn:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'escalation_created' "
+            "AND details LIKE ?", ('%' + esc_id + '%',)).fetchone()[0]
+    assert n == 1
+
+
 def test_schedule_window_refused_by_conflicts(fake_repo, monkeypatch):
     _, world = fake_repo
     _approve(monkeypatch)

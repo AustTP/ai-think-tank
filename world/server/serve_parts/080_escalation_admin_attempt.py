@@ -89,12 +89,21 @@ _STALE_DENY_KINDS = ('owner safety decision', 'allowlist candidate',
                      'allowlist request', 'dormancy window request')
 
 
-def _dormancy_window_start(esc_id):
+def _dormancy_window_start(esc_id, esc=None):
     try:
         with _db() as conn:
             row = conn.execute(
                 "SELECT start_ts FROM dormancy_windows WHERE escalation_id = ? "
                 "AND status = 'pending'", (esc_id,)).fetchone()
+            if row is None:
+                # Fallback for a row whose escalation_id link was never
+                # written: create_escalation stores the window id in the
+                # escalation's `note`, so the record is still findable by id.
+                window_id = (esc or {}).get('note')
+                if window_id:
+                    row = conn.execute(
+                        "SELECT start_ts FROM dormancy_windows WHERE id = ? "
+                        "AND status = 'pending'", (window_id,)).fetchone()
     except Exception:
         return None
     return float(row[0]) if row else None
@@ -122,7 +131,7 @@ def _expire_stale_dormancy_window(esc_id, esc):
     that no longer exists."""
     if (esc or {}).get('kind') != 'dormancy window request':
         return False
-    start_ts = _dormancy_window_start(esc_id)
+    start_ts = _dormancy_window_start(esc_id, esc)
     now = time.time()
     if start_ts is None:
         # The window row is gone (or was never persisted). Approving this

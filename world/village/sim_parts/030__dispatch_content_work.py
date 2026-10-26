@@ -161,6 +161,10 @@ def queue_work(state, items):
             'projectLabel': item.get('projectLabel') or None,
             'research': item.get('research') or None,
             'taskType': item.get('taskType') or 'code',
+            # What the card must produce. Survives refinement -> queue ->
+            # assignment so the completion gate reads the explicit contract
+            # (code/report/note) instead of guessing from the title.
+            'deliverable': item.get('deliverable') or None,
             'approvedTools': list(item.get('approvedTools') or []),
             'skillReview': bool(item.get('skillReview')),
             # Hive mind: a distillation content-task that merges recent archive

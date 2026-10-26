@@ -59,6 +59,42 @@ def _state(**over):
     return base
 
 
+class IssueDeliverable(unittest.TestCase):
+    def test_defaults_from_issue_type(self):
+        state = _state()
+        bug = sim.file_issue(state, 'dev', 'bug', 'Fix it', 'checkout',
+                             'player', now_ms=_NOW_MS)
+        spike = sim.file_issue(state, 'dev', 'spike', 'Investigate it',
+                               'checkout', 'player', now_ms=_NOW_MS)
+        self.assertEqual(bug['deliverable'], 'code')
+        self.assertEqual(spike['deliverable'], 'report')
+        req = next(r for r in state['backlogRequests']
+                   if r.get('issueKey') == spike['key'])
+        self.assertEqual(req['deliverable'], 'report')
+
+    def test_explicit_report_deliverable_survives_on_the_issue(self):
+        state = _state()
+        issue = sim.file_issue(state, 'dev', 'bug', 'Save the report',
+                               'checkout', 'player', now_ms=_NOW_MS,
+                               deliverable='report')
+        self.assertEqual(issue['type'], 'bug')
+        self.assertEqual(issue['deliverable'], 'report')
+
+    def test_invalid_deliverable_is_rejected(self):
+        state = _state()
+        self.assertIsNone(sim.file_issue(
+            state, 'dev', 'bug', 'Fix it', 'checkout', 'player',
+            now_ms=_NOW_MS, deliverable='nonsense'))
+
+
+class DeliverableRoundTrip(unittest.TestCase):
+    def test_queue_work_preserves_deliverable(self):
+        state = {'workQueue': []}
+        sim.queue_work(state, [{'title': 'Save the report',
+                                'deliverable': 'report'}])
+        self.assertEqual(state['workQueue'][0]['deliverable'], 'report')
+
+
 class IssueValidation(unittest.TestCase):
     def test_requires_team_id(self):
         state = _state()

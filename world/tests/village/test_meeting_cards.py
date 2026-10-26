@@ -298,6 +298,27 @@ class MeetingGrooming(unittest.TestCase):
         self.assertEqual(state['backlogRequests'][0]['status'], 'rejected')
 
 
+class DeliverableAssignment(unittest.TestCase):
+    def test_assign_task_stamps_deliverable(self):
+        state = {'agents': {'ada': {'id': 'ada', 'x': 0, 'y': 0,
+                                    'busy': False, 'task': None,
+                                    'offDuty': False}},
+                 'tasks': {}}
+        extra = {'taskType': 'spike', 'deliverable': 'report',
+                 'budgetUsd': 0.10, 'budgetBand': 'standard'}
+        with mock.patch.object(sim, 'find_path',
+                               return_value=[{'x': 0, 'y': 0},
+                                             {'x': 40, 'y': 40}]):
+            task = sim.assign_task(state, 'ada', 'Save the report',
+                                   'pressoffice', 'Write it.',
+                                   None, extra, {},
+                                   {'pressoffice': {'x': 0, 'y': 0,
+                                                    'w': 40, 'h': 40}},
+                                   now_ms=1000, task_id_holder=[0])
+        self.assertIsNotNone(task)
+        self.assertEqual(task['deliverable'], 'report')
+
+
 class MeetingAssignment(unittest.TestCase):
     def test_assign_task_carries_meeting_fields(self):
         state = {'agents': {'ada': {'id': 'ada', 'x': 0, 'y': 0,

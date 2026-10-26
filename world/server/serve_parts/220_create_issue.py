@@ -48,7 +48,8 @@ async def create_issue(request: Request):
         assigned_to=body.get('assignedTo'),
         attendees=body.get('attendees'),
         facilitator_id=body.get('facilitatorId'),
-        approved_tools=body.get('approvedTools'))
+        approved_tools=body.get('approvedTools'),
+        deliverable=body.get('deliverable'))
     if issue is None:
         return JSONResponse({'error': 'issue could not be filed'}, status_code=400)
     save_state_to_db(state)

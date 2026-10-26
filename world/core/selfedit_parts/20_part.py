@@ -785,10 +785,15 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                        duration_min, reason, 'approved')
     else:
-        esc_id = serve.create_escalation(_WINDOW_JEV_KIND, question,
-                                         on_approve_note=window_id)
+        # Persist the window row BEFORE creating the escalation that points
+        # at it. The old order (escalation first, row second) left an
+        # escalation whose dormancy_windows row was missing whenever the
+        # insert failed, and every later expiry logged the opaque
+        # "dormancy window record missing" (task esc-e4dea969).
         _window_record(window_id, now, agent_id, date, start, start_ts, end_ts,
                        duration_min, reason, 'pending')
+        esc_id = serve.create_escalation(_WINDOW_JEV_KIND, question,
+                                         on_approve_note=window_id)
     _update_window(
         window_id, escalation_id=esc_id, validator=validator,
         validator_status='pending', supervisor=serve._supervisor_of(state, agent_id),

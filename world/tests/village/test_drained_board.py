@@ -98,6 +98,31 @@ class CompletionEvidence(unittest.TestCase):
         self.assertTrue(sim._completion_has_evidence({}, {
             'taskType': 'bug', 'room': 'pressoffice', 'codePublished': True}))
 
+    def test_bug_card_with_report_deliverable_accepts_a_saved_report(self):
+        # A bug whose remedy is a report is minted with deliverable='report';
+        # the gate follows the explicit contract, not the type or title.
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'bug', 'deliverable': 'report',
+            'reportPath': 'archive/report.md', 'note': 'Saved the report.'}))
+        self.assertFalse(sim._completion_has_evidence({}, {
+            'taskType': 'bug', 'deliverable': 'report',
+            'reportPath': 'archive/report.md'}))
+        self.assertFalse(sim._completion_has_evidence({}, {
+            'taskType': 'bug', 'deliverable': 'report',
+            'note': 'Saved the report.'}))
+
+    def test_code_deliverable_overrides_a_report_type(self):
+        self.assertFalse(sim._completion_has_evidence({}, {
+            'taskType': 'spike', 'deliverable': 'code',
+            'note': 'Analyzed it.'}))
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'spike', 'deliverable': 'code',
+            'codePublished': True}))
+
+    def test_report_deliverable_gap_names_the_report(self):
+        self.assertIn('reportPath', sim._completion_evidence_gap({
+            'taskType': 'bug', 'deliverable': 'report'}))
+
     def test_distill_card_accepts_the_wiki_write(self):
         # A distill records wikiPage on the task; requiring only task.note
         # refused a successful wiki merge (task-395).

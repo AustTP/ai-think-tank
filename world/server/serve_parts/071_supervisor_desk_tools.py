@@ -90,7 +90,7 @@ def supervisor_delegate(agent_id, title, instructions, task_type='spike',
 
 
 def supervisor_backlog_directive(agent_id, team, title, reason,
-                                 task_type='task', feature=None):
+                                 task_type='task', feature=None, deliverable=None):
     """Chief of staff only: instruct one team's director to put an immediate
     task in that team's backlog. Files a JIRA-style issue (the existing
     backlogRequests intake), marks the request HIGH priority so the groomed
@@ -123,7 +123,8 @@ def supervisor_backlog_directive(agent_id, team, title, reason,
             str(feature or 'chief-of-staff directive').strip(),
             reporter_id=agent_id,
             description=f'CHIEF OF STAFF DIRECTIVE (address immediately): {reason}',
-            title=title)
+            title=title,
+            deliverable=deliverable)
         if not issue:
             return False, {'error': 'could not file the backlog issue'}
         req = next((r for r in (state.get('backlogRequests') or [])
@@ -150,8 +151,8 @@ def supervisor_backlog_directive(agent_id, team, title, reason,
         log_action(agent_id, 'chief_backlog_directive', {
             'team': team_id, 'director': director_id,
             'issueKey': issue.get('key'), 'title': title[:120],
-            'taskType': issue_type, 'priority': 'high',
-            'reason': reason[:400],
+            'taskType': issue_type, 'deliverable': issue.get('deliverable'),
+            'priority': 'high', 'reason': reason[:400],
         }, authorized=True)
         return True, {
             'ok': True, 'issueKey': issue.get('key'), 'team': team_id,

@@ -122,6 +122,13 @@ def _make_github_tools_executor(agent_id, key):
     return execute_tool
 
 
+_SPIKE_REPORT_DELIVERABLE_SIGNALS = (
+    'library file', 'saved file', 'saved deliverable', 'saved artifact',
+    'missing deliverable', 'missing report', 'report is missing',
+    'write the file', 'save the file', 'save a file', 'write a report',
+    'saved report', 'deliverable is missing', 'artifact is missing',
+)
+
 _SPIKE_ISSUE_PROBLEM_SIGNALS = (
     'gap', 'problem', 'missing', 'broken', 'needs', 'fails', 'failed', 'unable',
     'should', 'recommend', 'issue', 'risk', 'limitation', 'error', 'bug',
@@ -178,8 +185,19 @@ def _spike_file_issue_wish(finding, task, name, backlog):
     feature = (task.get('projectLabel') or task.get('productId') or task.get('room') or 'pressoffice') or 'pressoffice'
     title = headline[:140]
     summary = f'{name} ({backlog[:120]}): {headline}'[:300]
+    # A finding whose remedy is a saved document is a report card, not a code
+    # fix. Mint it as a spike with an explicit report deliverable so the
+    # completion gate has a contract it can satisfy (task-417 looped because
+    # this became a bug card that could never publish code).
+    report_deliverable = any(sig in haystack for sig in _SPIKE_REPORT_DELIVERABLE_SIGNALS)
+    issue_type = 'bug' if choice == 'file_bug' else 'story'
+    deliverable = 'code'
+    if report_deliverable:
+        issue_type = 'spike'
+        deliverable = 'report'
     return {
-        'issueType': 'bug' if choice == 'file_bug' else 'story',
+        'issueType': issue_type,
+        'deliverable': deliverable,
         'summary': summary,
         'title': title,
         'feature': feature,

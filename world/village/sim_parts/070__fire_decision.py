@@ -311,6 +311,75 @@ def _open_fix_exists(state, title):
 REPAIR_LOOP_WINDOW_MS = 6 * 60 * 60 * 1000
 REPAIR_LOOP_MIN_FAILURES = 2
 
+# Adaptive suppression: a card pattern that keeps failing does not get an
+# infinite supply of fresh ids. The pattern is the issueKey (precise) with a
+# normalized-title fallback for cards that have no issue. Three failures
+# inside 24h freezes the pattern; a new issue with a new key is unaffected.
+CARD_PATTERN_WINDOW_MS = 24 * 60 * 60 * 1000
+CARD_PATTERN_FAILURE_LIMIT = 3
+
+
+def _card_pattern_key(task):
+    tid = (task or {}).get('issueKey')
+    if tid:
+        return 'issue:' + str(tid)
+    root = _fix_title_root((task or {}).get('title'))
+    return ('title:' + root) if root else None
+
+
+def _card_pattern_failures(state, key, now_ms):
+    if not key:
+        return []
+    recent = []
+    for t in (state.get('tasks') or {}).values():
+        if t.get('status') not in ('failed', 'blocked', 'abandoned'):
+            continue
+        if _card_pattern_key(t) != key:
+            continue
+        ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
+        if now_ms - int(ts) <= CARD_PATTERN_WINDOW_MS:
+            recent.append(t)
+    return recent
+
+
+def _card_pattern_suppressed(state, task, now_ms):
+    key = _card_pattern_key(task)
+    if not key:
+        return None
+    failures = _card_pattern_failures(state, key, now_ms)
+    if len(failures) < CARD_PATTERN_FAILURE_LIMIT:
+        return None
+    return {'key': key, 'failures': len(failures),
+            'taskIds': [t.get('id') for t in failures][:8]}
+
+
+def _stop_card_pattern(state, task, info, author):
+    now_ms = int(time.time() * 1000)
+    task['status'] = 'blocked'
+    task['blockedReason'] = 'pattern_suppressed'
+    task['blockedAt'] = now_ms
+    task['failNote'] = (f"Pattern suppressed after {info['failures']} failures in "
+                        f"24h ({info['key']}). Fix the card contract before minting "
+                        "another one.")[:300]
+    task['nextAction'] = ('Do not mint another card for this issue/pattern. '
+                          'Compare the lane output with the completion contract.')
+    notified = state.setdefault('_patternSuppressedNotified', {})
+    if now_ms - float(notified.get(info['key']) or 0) > CARD_PATTERN_WINDOW_MS:
+        notified[info['key']] = now_ms
+        director = _repair_loop_director(state, task)
+        agent = (state.get('agents') or {}).get(director) if director else None
+        if isinstance(agent, dict):
+            _append_mailbox(agent, {
+                'kind': 'card_pattern_suppressed', 'ts': now_ms, 'read': False,
+                'taskId': task.get('id'), 'title': task.get('title'),
+                'text': (f'Stopped minting cards for {info["key"]} after '
+                         f'{info["failures"]} failures in 24h '
+                         f'({", ".join(info["taskIds"])}). The card contract is '
+                         'wrong; fix it before another card is filed.')})
+        _log_governance(state, author, 'card_pattern_suppressed',
+                        {'taskId': task.get('id'), 'pattern': info['key'],
+                         'failures': info['failures'], 'taskIds': info['taskIds']})
+
 
 def _repair_loop_should_stop(state, title, now_ms):
     """Same root failed twice inside the window. A third fix card would repeat
@@ -392,8 +461,12 @@ def _queue_peer_repair(state, parent, rationale=None):
         parent['status'] = 'repairing'
         parent['_peerRepairPending'] = True
         return existing or active
-    loop = _repair_loop_should_stop(state, parent.get('title'),
-                                    int(time.time() * 1000))
+    now_ms = int(time.time() * 1000)
+    pattern = _card_pattern_suppressed(state, parent, now_ms)
+    if pattern:
+        _stop_card_pattern(state, parent, pattern, author)
+        return None
+    loop = _repair_loop_should_stop(state, parent.get('title'), now_ms)
     if loop:
         _stop_repair_loop(state, parent, loop, author)
         return None
@@ -411,6 +484,7 @@ def _queue_peer_repair(state, parent, rationale=None):
         'title': 'Fix: ' + str(parent.get('title') or tid),
         'room': parent.get('room') or 'pressoffice',
         'taskType': parent.get('taskType') or 'code',
+        'deliverable': parent.get('deliverable'),
         # Lane markers must survive a repair. Distill/skill-review cards are
         # queued with taskType 'code', so without these a repair ran the
         # coding executor and could never satisfy the lane's completion rule.
@@ -744,6 +818,10 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         task['status'] = 'failed'
         task['failedAt'] = now_ms
         task['failNote'] = note[:300]
+        pattern = _card_pattern_suppressed(state, task, now_ms)
+        if pattern:
+            _stop_card_pattern(state, task, pattern, author)
+            return
         loop = _repair_loop_should_stop(state, task.get('title'), now_ms)
         if loop:
             _stop_repair_loop(state, task, loop, author)
@@ -828,6 +906,7 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
             'goal': task.get('projectLabel') or task.get('goal'),
             'projectLabel': task.get('projectLabel') or task.get('title'),
             'taskType': 'code',
+            'deliverable': task.get('deliverable'),
             'reviewOf': task.get('id'),
             'reviewAuthorId': author,
             'assignedTo': author,
@@ -883,6 +962,7 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         'goal': task.get('projectLabel') or task.get('goal'),
         'projectLabel': task.get('projectLabel') or task.get('title'),
         'taskType': task.get('taskType') or 'code',
+        'deliverable': task.get('deliverable'),
         # Same lane-marker rule as the peer-repair card above.
         'distill': bool(task.get('distill')),
         'distillSince': task.get('distillSince') or 0,
