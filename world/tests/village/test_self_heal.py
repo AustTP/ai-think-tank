@@ -608,6 +608,34 @@ class ContentGraceHelpers(unittest.TestCase):
         self.assertEqual(sim._grant_content_grace(task, 500.0), 0.0,
                          'the cap must be hard')
 
+    def test_restart_reconcile_attaches_a_report_written_before_the_restart(self):
+        # A process restart kills the content thread but not the report it
+        # already wrote. The boot reconcile must attach that file instead of
+        # letting the completion loop call the run abandoned and refuse it.
+        import serve
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        archive = os.path.join(tmp, 'archive')
+        os.makedirs(archive)
+        report = os.path.join(archive, '123-spike-task-9.md')
+        with open(report, 'w', encoding='utf-8') as fh:
+            fh.write('report')
+        now = time.time()
+        state = {'tasks': {'task-9': {
+            'id': 'task-9', 'status': 'working', 'assignedTo': 'ada',
+            'taskType': 'spike', 'workUntil': now + 300,
+            '_contentInFlight': True, '_contentHeartbeat': now - 1200,
+            '_contentGraceUsed': 180.0}}}
+        with mock.patch.object(serve, 'LIBRARY_DIR', tmp), \
+             mock.patch.object(serve, 'log_action'):
+            n = sim._reconcile_restarted_content_runs(state)
+        task = state['tasks']['task-9']
+        self.assertEqual(n, 1)
+        self.assertFalse(task['_contentInFlight'])
+        self.assertEqual(task['reportPath'], 'archive/123-spike-task-9.md')
+        self.assertEqual(task['_contentGraceUsed'], 0.0)
+        self.assertLessEqual(task['workUntil'], time.time())
+
     def test_dispatch_clears_heartbeat_residue(self):
         # Task ids are reused; a prior occupant's heartbeat/grace must not let
         # (or deny) this run its own grace budget.

@@ -228,6 +228,70 @@ def _content_run_is_live(task, now):
     return (now - hb) < TASK_CONTENT_HB_STALE_S
 
 
+def _reconcile_restarted_content_runs(state):
+    """Recover content runs that were in flight when the process restarted.
+
+    The executor thread is process-local and does not survive a restart, so
+    these tasks keep `_contentInFlight` but their heartbeat is frozen. The
+    completion loop would then call them dead and refuse the work even when
+    the executor had already written its report. On boot, look for a report
+    file for the task id in the Library archive and attach it. If none exists,
+    clear the in-flight marker so the normal timeout/fallback path handles the
+    card instead of logging a false abandonment.
+
+    Returns the number of tasks reconciled. Safe to call once per boot.
+    """
+    import glob
+    import serve
+    tasks = state.get('tasks') or {}
+    if not tasks:
+        return 0
+    archive = os.path.join(serve.LIBRARY_DIR, 'archive')
+    now = time.time()
+    fixed = 0
+    for task_id, task in list(tasks.items()):
+        if not isinstance(task, dict) or task.get('status') != 'working':
+            continue
+        if not task.get('_contentInFlight'):
+            continue
+        hb = _content_heartbeat_at(task)
+        if isinstance(hb, (int, float)) and now - hb < 30:
+            continue
+        floor = (hb - 300) if isinstance(hb, (int, float)) else (now - 12 * 3600)
+        candidates = []
+        for pattern in (f'*-spike-{task_id}.md', f'*-report-{task_id}.md',
+                        f'*-research-{task_id}.md', f'*-{task_id}.md'):
+            candidates.extend(glob.glob(os.path.join(archive, pattern)))
+        candidates = [p for p in candidates
+                      if os.path.isfile(p) and os.path.getmtime(p) >= floor]
+        path = max(candidates, key=os.path.getmtime) if candidates else None
+        task['_contentInFlight'] = False
+        task['_contentGraceUsed'] = 0.0
+        task['_contentHeartbeat'] = None
+        task['workUntil'] = min(task.get('workUntil') or now, now)
+        if path:
+            rel = os.path.relpath(path, serve.LIBRARY_DIR)
+            if not task.get('reportPath') and not task.get('libraryPath'):
+                if (task.get('taskType') or '') == 'spike' or task.get('deliverable') == 'report':
+                    task['reportPath'] = rel
+                else:
+                    task['libraryPath'] = rel
+            task['note'] = task.get('note') or f'Recovered report written before restart: {rel}'
+            try:
+                serve.log_action(task.get('assignedTo'), 'content_restart_recovered',
+                                 {'taskId': task_id, 'path': rel}, authorized=False)
+            except Exception:
+                pass
+        else:
+            try:
+                serve.log_action(task.get('assignedTo'), 'content_restart_cleared',
+                                 {'taskId': task_id}, authorized=False)
+            except Exception:
+                pass
+        fixed += 1
+    return fixed
+
+
 def _grant_content_grace(task, now):
     """Extend workUntil by up to TASK_CONTENT_GRACE_STEP_S, bounded by the
     total TASK_CONTENT_GRACE_MAX_S. Returns seconds granted (0.0 when the cap

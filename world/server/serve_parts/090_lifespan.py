@@ -118,6 +118,16 @@ async def _lifespan(app):
         # so a top-level import would be the import-time cycle).
         from content import _server_content_dispatcher
         _sim_module._content_executor = _server_content_dispatcher
+        # A content executor is a process-local thread. Any task left in flight
+        # by the previous process has a frozen heartbeat; attach a report it
+        # already wrote, or clear the marker so the normal fallback handles it.
+        try:
+            _startup_state = get_state_from_db()
+            if (_startup_state is not None
+                    and _sim_module._reconcile_restarted_content_runs(_startup_state)):
+                save_state_to_db(_startup_state)
+        except Exception as e:
+            print(f'[sim] content restart reconcile failed: {e}', flush=True)
         sim_holder['task'] = asyncio.create_task(_sim_module._sim_loop())
     except Exception as e:
         print(f'[sim] failed to start loop: {e}', flush=True)
