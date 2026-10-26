@@ -57,6 +57,17 @@ class SouthVillageData(unittest.TestCase):
             self.assertEqual(south['x'], scaled_width - (main['x'] + main['w']))
             self.assertEqual(south['y'], main['y'])
 
+    def test_map_builder_does_not_mirror_the_main_outlet(self):
+        import importlib.util
+        path = os.path.join(os.path.dirname(ROOT), 'scripts', 'build_south_map.py')
+        spec = importlib.util.spec_from_file_location('build_south_map', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        doors = mod.build_doors()
+        self.assertIn('pressoffice', doors)
+        self.assertNotIn('south_outlet', doors,
+                         're-running the builder must not add a second selector south')
+
     def test_unknown_village_falls_back_to_main(self):
         main_grid, _ = sim._load_outdoor_geometry()
         fallback_grid, _ = sim._load_outdoor_geometry('not-a-village')

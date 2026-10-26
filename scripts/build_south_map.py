@@ -43,10 +43,13 @@ def _mirror_rect(rect):
 def build_doors():
     with open(os.path.join(WORLD, 'door_triggers.json'), encoding='utf-8') as fh:
         main = json.load(fh)
-    out = {name: _mirror_rect(rect) for name, rect in main.items()}
+    out = {name: _mirror_rect(rect) for name, rect in main.items() if name != 'south_outlet'}
     # The south arrival/return gate sits on the north edge road. It is handled
     # by the scene transition, not by the room-entry loop, so keep it out of
-    # this file: world.js owns SOUTH_GATE in world coordinates.
+    # this file: world.js owns SOUTH_GATE in world coordinates. Mirroring the
+    # main map's south_outlet would put a second selector on the south map's
+    # bottom edge and let the player "travel" to the map they are already in.
+    out.pop('south_outlet', None)
     return out
 
 
