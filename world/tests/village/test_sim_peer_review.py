@@ -68,6 +68,22 @@ class PeerGateMoraleGap(SimIsolation):
         with unittest.mock.patch.object(sim, '_pick_reviewer_ids', return_value=[]):
             self.assertIsNone(sim._enter_peer_review({}, task, now_ms=1000))
 
+    def test_enter_peer_review_is_idempotent_while_already_gated(self):
+        gate = {'enteredMs': 100, 'reviewerIds': ['r1', 'r2'],
+                'approvals': 1, 'approvers': ['r1'], 'reviewedTaskIds': ['x']}
+        task = {'id': 't', 'status': 'needs_review', 'assignedTo': 'ada',
+                'room': 'pressoffice', '_peerGate': gate}
+        with unittest.mock.patch.object(sim, '_pick_reviewer_ids',
+                                        return_value=['new1', 'new2']) as pick:
+            out = sim._enter_peer_review(
+                {'agents': {'r1': {'id': 'r1'}, 'r2': {'id': 'r2'}},
+                 'tasks': {}}, task, now_ms=999)
+        self.assertIs(out, gate)
+        self.assertIs(task['_peerGate'], gate)
+        self.assertEqual(gate['enteredMs'], 100)
+        self.assertEqual(gate['approvals'], 1)
+        pick.assert_not_called()
+
     def test_cascade_rereview_no_reopened_task(self):
         self.assertEqual(sim._cascade_rereview({'tasks': {}}, None), 0)
 

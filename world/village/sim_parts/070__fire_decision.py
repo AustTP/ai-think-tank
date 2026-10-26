@@ -578,6 +578,16 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     prior pair is unavailable."""
     author = task.get('assignedTo')
     prior = task.get('_peerGate') or {}
+    # Idempotent gate entry. A task already waiting on reviews must not be
+    # re-entered: doing so resets enteredMs and discards votes whose review
+    # subtasks were created before the reset. Re-entry is only for a NEW
+    # deliverable (status working/repairing) or an explicit re-open that
+    # cleared the prior gate.
+    if task.get('status') == 'needs_review' and prior.get('enteredMs'):
+        live_reviewers = [rid for rid in (prior.get('reviewerIds') or [])
+                          if rid in (state.get('agents') or {})]
+        if live_reviewers:
+            return prior
     if preferred is None:
         preferred = prior.get('reviewerIds') or None
     required = _peer_gate_required(state, task)
