@@ -705,6 +705,38 @@ class ContentRunGraceTimeout(unittest.TestCase):
                 "AND details LIKE '%task-9%'").fetchall()
         self.assertTrue(rows, 'an abandoned in-flight run must be logged')
 
+    def test_late_report_is_recovered_before_abandonment(self):
+        # A report can land between the executor's last heartbeat and the
+        # fallback. The task then has a real deliverable on disk even though
+        # the run looks dead. Recover it instead of failing the card.
+        tmp = tempfile.mkdtemp(prefix='late-report-')
+        self.addCleanup(shutil.rmtree, tmp, True)
+        archive = os.path.join(tmp, 'archive')
+        os.makedirs(archive)
+        report = os.path.join(archive, '1-spike-task-late-9.md')
+        with open(report, 'w', encoding='utf-8') as fh:
+            fh.write('# late report')
+        task = self._spike(id='task-late-9')
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - (sim.TASK_CONTENT_HB_STALE_S + 60.0)
+        with unittest.mock.patch.object(serve, 'LIBRARY_DIR', tmp):
+            self._cycle(state, now)
+        self.assertEqual(task['status'], 'working',
+                         'a recovered late report must not be failed')
+        self.assertEqual(task['reportPath'], 'archive/1-spike-task-late-9.md')
+        self.assertFalse(task['_contentInFlight'])
+        with serve._db() as conn:
+            recovered = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'content_run_report_recovered' "
+                "AND details LIKE '%task-late-9%'").fetchall()
+            abandoned = conn.execute(
+                "SELECT details FROM action_log WHERE action = 'content_run_abandoned' "
+                "AND details LIKE '%task-late-9%'").fetchall()
+        self.assertTrue(recovered, 'late-report recovery must be logged')
+        self.assertFalse(abandoned, 'recovered work must not be logged as abandoned')
+
     def test_grace_cap_bounds_the_extension(self):
         # Even a permanently-fresh heartbeat cannot extend past the total cap:
         # once TASK_CONTENT_GRACE_MAX_S is spent the run falls back.

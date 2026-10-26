@@ -95,10 +95,11 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
         # closes the connection while write_library_file is still reading the
         # body (the exact ClientDisconnect behind the first Nora recap's false
         # success). Give the write a real ceiling, then verify the file.
-        resp = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
-                                 {'agentId': agent_id, 'path': report_path,
-                                  'content': body, 'source': 'firsthand'}, key,
-                                 timeout=90)
+        with _sim_module.content_heartbeat_keepalive(task.get('id')):
+            resp = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                                     {'agentId': agent_id, 'path': report_path,
+                                      'content': body, 'source': 'firsthand'}, key,
+                                     timeout=90)
     except Exception as e:
         _sim_module._store_content_result(task.get('id'), {
             'ok': False, 'note': f'Report text was generated but the Library save failed: {e}'})

@@ -338,7 +338,8 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # reference in the close block).
     report_path = str(task.get('reportPath') or
                       f"archive/{int(time.time() * 1000)}-spike-{task.get('id') or 'adhoc'}.md")
-    spike_report_writer = _make_spike_report_writer(agent_id, key, report_path)
+    spike_report_writer = _make_spike_report_writer(agent_id, key, report_path,
+                                                    task.get('id'))
     treg_tool = _make_treg_tools_executor()
     pixellab_tool = _make_pixellab_tools_executor(agent_id, key)
     google_tool = _make_google_tools_executor(agent_id)
@@ -657,11 +658,12 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     except Exception:
         _already_written = False
     if not _already_written:
-        _serve._http_json('POST', base, '/api/library/file',
-                   {'agentId': agent_id,
-                    'path': library_path,
-                    'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
-                    'source': 'firsthand'}, key)
+        with _sim_module.content_heartbeat_keepalive(task.get('id')):
+            _serve._http_json('POST', base, '/api/library/file',
+                       {'agentId': agent_id,
+                        'path': library_path,
+                        'content': f'# Spike: {backlog}\n\nBy: {name}\n\n{finding}\n',
+                        'source': 'firsthand'}, key)
     # Data-minimization audit finding (Hermes Town comparison):
     # this was the ONE content executor (of 13) that duplicated the FULL
     # finding text into the task note -- which _apply_content_result (sim.py)

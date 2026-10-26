@@ -408,10 +408,12 @@ def _save_code_library_report(agent_id, task, result, key=None):
             f"Source digest: {result.get('sourceDigest') or 'n/a'}\n"
             f"Result: {(result.get('note') or '').strip()}\n"
         )
-        resp = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
-                                 {'agentId': agent_id, 'path': path, 'content': body,
-                                  'source': 'firsthand'},
-                                 key or _serve.get_or_create_agent_key(agent_id))
+        import sim as _sim_module
+        with _sim_module.content_heartbeat_keepalive(task.get('id')):
+            resp = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                                     {'agentId': agent_id, 'path': path, 'content': body,
+                                      'source': 'firsthand'},
+                                     key or _serve.get_or_create_agent_key(agent_id))
         if isinstance(resp, dict) and resp.get('error'):
             result['libraryError'] = str(resp['error'])[:200]
             result['note'] = ((result.get('note') or '') +

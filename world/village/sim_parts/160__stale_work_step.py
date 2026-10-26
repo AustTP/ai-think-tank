@@ -730,6 +730,26 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         continue
                 # Fallback completion. Same gate branching.
                 if task.get('_contentInFlight'):
+                    # Last-second recovery: a report can land between the
+                    # executor's final heartbeat and this fallback. If the
+                    # exact task file is already on disk, attach it and let
+                    # the next pass complete the card instead of abandoning
+                    # work that actually finished.
+                    recovered = _find_recent_content_report(task, now)
+                    if recovered:
+                        _attach_recovered_report(task, recovered)
+                        task['_contentInFlight'] = False
+                        task['_contentGraceUsed'] = 0.0
+                        task['_contentHeartbeat'] = None
+                        task['workUntil'] = now
+                        try:
+                            from serve import log_action
+                            log_action(aid, 'content_run_report_recovered',
+                                       {'taskId': task['id'], 'path': recovered},
+                                       authorized=False)
+                        except Exception:
+                            pass
+                        continue
                     # An in-flight run reaching the fallback means the thread
                     # died without storing a result (or spent all grace) --
                     # log it so an abandoned investigation is visible instead

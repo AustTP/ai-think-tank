@@ -691,7 +691,7 @@ def _make_library_tools_executor(agent_id, struck_tools=None):
     return execute_tool
 
 
-def _make_spike_report_writer(agent_id, key, report_path):
+def _make_spike_report_writer(agent_id, key, report_path, task_id=None):
     """write_spike_report executor: a document-length deliverable cannot fit in
     the single 1800-token closing _plain_completion (see _run_spike_content),
     so a report that long was being truncated mid-sentence and filed verbatim as
@@ -711,9 +711,11 @@ def _make_spike_report_writer(agent_id, key, report_path):
         if not content:
             return 'content is required -- pass the complete report markdown to save.'
         try:
-            _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
-                              {'agentId': agent_id, 'path': report_path,
-                               'content': content, 'source': 'firsthand'}, key)
+            import sim as _sim_module
+            with _sim_module.content_heartbeat_keepalive(task_id):
+                _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                                  {'agentId': agent_id, 'path': report_path,
+                                   'content': content, 'source': 'firsthand'}, key)
         except Exception as e:
             return f'write_spike_report failed to save the report: {e}'
         _serve.log_action(agent_id, 'spike_report_written',

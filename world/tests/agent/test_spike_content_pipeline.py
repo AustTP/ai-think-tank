@@ -900,9 +900,9 @@ class SpikeReportCloseDoesNotClobber(SpikeContent):
 
         captured = {}
         orig_writer = content._make_spike_report_writer
-        def capture(agent_id, key, report_path):
+        def capture(agent_id, key, report_path, task_id=None):
             captured['path'] = report_path
-            return orig_writer(agent_id, key, report_path)
+            return orig_writer(agent_id, key, report_path, task_id)
 
         self._common_mocks(tavily=True)
         seen = self._store()

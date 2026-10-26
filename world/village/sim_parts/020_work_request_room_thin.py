@@ -228,6 +228,43 @@ def _content_run_is_live(task, now):
     return (now - hb) < TASK_CONTENT_HB_STALE_S
 
 
+def _find_recent_content_report(task, now=None):
+    """The Library-relative path of a report this task wrote recently.
+
+    A report write can land after the completion loop has already decided the
+    run is dead. Look for the task's exact filename in the archive and reject
+    old files for the same reusable task id by mtime.
+    """
+    import glob
+    import serve
+    task_id = task.get('id')
+    if not task_id:
+        return None
+    now = now or time.time()
+    hb = _content_heartbeat_at(task)
+    floor = (hb - 300) if isinstance(hb, (int, float)) else (now - 12 * 3600)
+    archive = os.path.join(serve.LIBRARY_DIR, 'archive')
+    candidates = []
+    for pattern in (f'*-spike-{task_id}.md', f'*-report-{task_id}.md',
+                    f'*-research-{task_id}.md', f'*-{task_id}.md'):
+        candidates.extend(glob.glob(os.path.join(archive, pattern)))
+    candidates = [p for p in candidates
+                  if os.path.isfile(p) and os.path.getmtime(p) >= floor]
+    if not candidates:
+        return None
+    path = max(candidates, key=os.path.getmtime)
+    return os.path.relpath(path, serve.LIBRARY_DIR)
+
+
+def _attach_recovered_report(task, rel):
+    if not task.get('reportPath') and not task.get('libraryPath'):
+        if (task.get('taskType') or '') == 'spike' or task.get('deliverable') == 'report':
+            task['reportPath'] = rel
+        else:
+            task['libraryPath'] = rel
+    task['note'] = task.get('note') or f'Recovered report written before completion: {rel}'
+
+
 def _reconcile_restarted_content_runs(state):
     """Recover content runs that were in flight when the process restarted.
 
@@ -241,12 +278,10 @@ def _reconcile_restarted_content_runs(state):
 
     Returns the number of tasks reconciled. Safe to call once per boot.
     """
-    import glob
     import serve
     tasks = state.get('tasks') or {}
     if not tasks:
         return 0
-    archive = os.path.join(serve.LIBRARY_DIR, 'archive')
     now = time.time()
     fixed = 0
     for task_id, task in list(tasks.items()):
@@ -257,26 +292,13 @@ def _reconcile_restarted_content_runs(state):
         hb = _content_heartbeat_at(task)
         if isinstance(hb, (int, float)) and now - hb < 30:
             continue
-        floor = (hb - 300) if isinstance(hb, (int, float)) else (now - 12 * 3600)
-        candidates = []
-        for pattern in (f'*-spike-{task_id}.md', f'*-report-{task_id}.md',
-                        f'*-research-{task_id}.md', f'*-{task_id}.md'):
-            candidates.extend(glob.glob(os.path.join(archive, pattern)))
-        candidates = [p for p in candidates
-                      if os.path.isfile(p) and os.path.getmtime(p) >= floor]
-        path = max(candidates, key=os.path.getmtime) if candidates else None
+        rel = _find_recent_content_report(task, now)
         task['_contentInFlight'] = False
         task['_contentGraceUsed'] = 0.0
         task['_contentHeartbeat'] = None
         task['workUntil'] = min(task.get('workUntil') or now, now)
-        if path:
-            rel = os.path.relpath(path, serve.LIBRARY_DIR)
-            if not task.get('reportPath') and not task.get('libraryPath'):
-                if (task.get('taskType') or '') == 'spike' or task.get('deliverable') == 'report':
-                    task['reportPath'] = rel
-                else:
-                    task['libraryPath'] = rel
-            task['note'] = task.get('note') or f'Recovered report written before restart: {rel}'
+        if rel:
+            _attach_recovered_report(task, rel)
             try:
                 serve.log_action(task.get('assignedTo'), 'content_restart_recovered',
                                  {'taskId': task_id, 'path': rel}, authorized=False)
