@@ -67,6 +67,25 @@ def test_second_success_promotes_to_active():
     assert template['successCount'] == 2
 
 
+def test_single_deliverable_goal_ignores_a_historical_multicard_shape():
+    state = _base_state()
+    goal = ('Research and write a 300-word cited brief on repair-card loops. '
+            'Use at least three sources. End with one recommendation. '
+            'Save it under admin/repair-loop-brief.md.')
+    state['backlogRequests'] = [_request('r1', goal)]
+    state['tasks'] = {
+        't1': _task('t1', 'r1', title='Gather sources'),
+        't2': _task('t2', 'r1', title='Write the brief'),
+        't3': _task('t3', 'r1', title='Save the brief'),
+        't4': _task('t4', 'r1', title='Review: Save the brief'),
+        't5': _task('t5', 'r1', title='Fix: Save the brief'),
+    }
+    _sweep(state)
+    template = next(iter(state['workflowTemplates'].values()))
+    assert len(template['steps']) == 1
+    assert template['steps'][0]['type'] == 'report'
+
+
 def test_spike_and_report_deliverables_share_a_template():
     state = _learned_state()
     goal2 = ('Research and write a 300-word cited brief on retry storms. '

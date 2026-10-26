@@ -140,7 +140,25 @@ def _workflow_log(state, agent_id, action, details):
 def _workflow_record_success(state, req, tasks, team_id, now_ms):
     goal = req.get('goal') or req.get('title') or ''
     tokens = _workflow_tokens(goal)
-    steps = _workflow_steps(tasks)
+    single_goal = globals().get('_single_deliverable_goal')
+    if callable(single_goal) and single_goal(goal):
+        # The learned process is one deliverable card, even if history has a
+        # messy gather/write/save/verify chain behind it. This keeps the old
+        # broken shape from becoming the template.
+        total = sum(float(t.get('budgetUsd') or 0) for t in tasks) or 1.0
+        steps = [{
+            'role': 'deliverable',
+            'title': _ROLE_LABELS['deliverable'],
+            'type': 'report',
+            'acceptanceCriteria': 'One deliverable at the requested path.',
+            'sizeEstimate': 'M',
+            'never': None,
+            'budgetUsd': total,
+            'budgetShare': 1.0,
+            'sourceTaskId': (tasks[0].get('id') if tasks else None),
+        }]
+    else:
+        steps = _workflow_steps(tasks)
     if not tokens or not steps:
         return
     templates = state.setdefault('workflowTemplates', {})
