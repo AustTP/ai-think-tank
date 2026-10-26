@@ -241,5 +241,22 @@ class StuckGateSweep(unittest.TestCase):
         self.assertEqual(total_enqueued, (sim.MAX_REVIEW_CYCLES - 1) * 2)
 
 
+def test_sweep_does_not_widen_while_a_review_is_in_flight():
+    gate = {'reviewerIds': ['miles', 'clara'], 'approvals': 0,
+            'requiredApprovals': 2, 'approvers': [], 'enteredMs': 0,
+            'reviewedTaskIds': []}
+    parent = {'id': 'task-649', 'status': 'needs_review',
+              '_peerGate': gate, 'assignedTo': 'rhonda',
+              'title': 'Smoke', 'room': 'pressoffice'}
+    state = {'tasks': {'task-649': parent,
+                       'task-656': {'id': 'task-656', 'reviewOf': 'task-649',
+                                    'status': 'working', 'assignedTo': 'miles'}},
+             'workQueue': [], 'agents': {}, 'agentRoster': []}
+    sim._sweep_stuck_gates(state, sim.STUCK_GATE_GRACE_MS + 1)
+    assert gate['reviewerIds'] == ['miles', 'clara']
+    assert gate['enteredMs'] == 0
+    assert 'stuckRescueTs' not in gate
+
+
 if __name__ == '__main__':
     unittest.main()

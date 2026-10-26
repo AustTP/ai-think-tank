@@ -91,6 +91,17 @@ def _sweep_stuck_gates(state, now_ms):
         locked = gate.get('reviewerIds') or []
         pending_reviews = [q for q in (state.get('workQueue') or [])
                            if q.get('reviewOf') == task.get('id')]
+        in_flight_reviews = [
+            t for t in (state.get('tasks') or {}).values()
+            if t.get('reviewOf') == task.get('id')
+            and t.get('status') in ('walking', 'working')]
+        # A review already walking/working is not a lost review. Widening the
+        # gate here changes reviewerIds and resets enteredMs while those cards
+        # are still running, so their votes are discarded by the age guard
+        # (the 2026-10-26 task-649 gate). Wait for them; the stale-work sweep
+        # handles a review that genuinely died.
+        if in_flight_reviews:
+            continue
         # A gate with one clean vote needs a real second vote. If the timeout
         # window has passed and no review is pending from someone other than
         # the approver, re-queue one fresh review instead of lowering the bar.
