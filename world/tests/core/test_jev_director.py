@@ -44,19 +44,24 @@ def test_low_confidence_nora_deny_moves_to_chief_of_staff():
         {'id': 'ruth', 'name': 'Ruth', 'director': 'nora'},
     ]}
     calls = []
+    models = []
 
-    def quorum(instr, criteria):
+    def quorum(instr, criteria, **kwargs):
         calls.append('nora' if ', the senior director' in instr else 'theo')
+        models.append(kwargs.get('model'))
         return ('deny', 0.30, 0.0) if len(calls) == 1 else ('approve', 0.91, 0.0)
 
     with mock.patch.object(serve, 'get_state_from_db', return_value=state), \
          mock.patch.object(serve, '_effective_safety_confidence', return_value=0.55), \
          mock.patch.object(serve, '_jev_quorum_choice_sync', side_effect=quorum), \
+         mock.patch.object(serve, '_mid_tier_slug', return_value='mid-x'), \
+         mock.patch.object(serve, '_high_tier_slug', return_value='high-x'), \
          mock.patch.object(serve, 'create_escalation') as create, \
          mock.patch.object(serve, 'log_action') as log:
         assert serve._director_second_opinion(
             'ruth', 'execute_classify', 'command', 'pytest -q', 'run tests', 0.44)
     assert calls == ['nora', 'theo']
+    assert models == ['mid-x', 'high-x']
     create.assert_not_called()
     actions = [c[0][1] for c in log.call_args_list]
     assert actions == ['jev_chain_unsure', 'jev_chain_approved']

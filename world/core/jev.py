@@ -121,7 +121,7 @@ async def _jev_quorum_decision(instructions, criteria):
     return decision, confidence, total_cost, trace_id
 
 
-def _jev_quorum_choice_sync(instructions, criteria):
+def _jev_quorum_choice_sync(instructions, criteria, model=None):
     """gap caught: quorum sampling above only ever covered
     the SAFETY gates (a confirmed real problem -- the same DreyX URL got a
     confident 0.87 allow one run, a low-confidence 0.56 escalate-and-deny
@@ -151,9 +151,11 @@ def _jev_quorum_choice_sync(instructions, criteria):
     unchanged."""
     import serve as _serve
 
+    chosen = model or _serve._jev_model()
+
     def sample():
         data = _serve._call_openrouter_decision_sync(
-            _serve._jev_model(), {'messages': [], 'signals': {}},
+            chosen, {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}})
         return _serve._jev_choice(data)
 

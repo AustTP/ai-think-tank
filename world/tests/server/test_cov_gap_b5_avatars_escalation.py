@@ -280,6 +280,22 @@ class EscalationAdminTest(unittest.TestCase):
         self.assertFalse(self._call({}, 'approve', composite=0.0, floor=0.5,
                                     safety=0.0))
 
+    def test_admin_uses_the_high_tier_model(self):
+        esc = {'kind': 'routine', 'question': 'q'}
+        roster = {'admin': {'name': 'Admin'}}
+        with mock.patch.object(serve, '_admin_agent_id', return_value='admin'), \
+             mock.patch.object(serve, '_jev_quorum_choice_sync',
+                               return_value=('approve', 0.9, 0)) as quorum, \
+             mock.patch.object(serve, '_high_tier_slug', return_value='high-x'), \
+             mock.patch.object(serve, '_jev_directory_score', return_value=1.0), \
+             mock.patch.object(serve, '_escalation_floor', return_value=0.0), \
+             mock.patch.object(serve, '_effective_safety_confidence', return_value=0.0), \
+             mock.patch.object(serve, '_jev_judge_model', return_value=None), \
+             mock.patch.object(serve, 'log_action'):
+            self.assertTrue(serve._escalation_admin_attempt(
+                {}, 'e1', esc, 'routine', 'd1', roster))
+        self.assertEqual(quorum.call_args.kwargs['model'], 'high-x')
+
     def test_judge_refuses(self):
         self.assertFalse(self._call({}, 'approve', judge_model='jm',
                                     judge=(None, 0.0, 0)))

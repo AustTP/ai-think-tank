@@ -208,7 +208,7 @@ class ResolvePendingEscalations(unittest.TestCase):
                       'lastAskedAt': 0, 'askCount': 0}}
         calls = []
 
-        def quorum(instr, criteria):
+        def quorum(instr, criteria, **kwargs):
             calls.append(instr)
             return ('approve', 0.10, 0.0)
 

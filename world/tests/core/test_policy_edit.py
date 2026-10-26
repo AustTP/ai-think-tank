@@ -88,7 +88,7 @@ class _TempPolicyEdit(unittest.TestCase):
     def _review(self, decision='approve', confidence=0.9):
         calls = []
 
-        def fake_review(instructions, criteria):
+        def fake_review(instructions, criteria, **kwargs):
             calls.append((instructions, criteria))
             return decision, confidence, 0.0
 

@@ -37,11 +37,17 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
         'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
         'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
     }
-    decision, confidence, _cost = _jev_quorum_choice_sync(instr, criteria)
+    # The chief of staff is the last internal rung before the owner, so this
+    # pass uses the high tier rather than the primary JEV model. A different
+    # tier also gives the admin an independent read on the director's decline.
+    review_model = _high_tier_slug() or _jev_model()
+    decision, confidence, _cost = _jev_quorum_choice_sync(
+        instr, criteria, model=review_model)
     if decision not in ('approve', 'deny'):
         log_action(admin_id, 'escalation_admin_unsure',
                    {'escalationId': esc_id, 'kind': esc_kind,
-                    'decision': decision, 'confidence': confidence},
+                    'decision': decision, 'confidence': confidence,
+                    'model': review_model},
                    authorized=False)
         return False
     composite = _jev_directory_score(esc_kind, confidence)
@@ -50,7 +56,8 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
         log_action(admin_id, 'escalation_admin_unsure',
                    {'escalationId': esc_id, 'kind': esc_kind,
                     'decision': decision, 'confidence': confidence,
-                    'composite': round(composite, 3), 'floor': floor},
+                    'composite': round(composite, 3), 'floor': floor,
+                    'model': review_model},
                    authorized=False)
         return False
     judge_model = _jev_judge_model()
@@ -74,7 +81,8 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     log_action(admin_id, 'escalation_admin_' + ('approve' if decision == 'approve' else 'deny'),
                {'escalationId': esc_id, 'kind': esc_kind,
                 'question': esc.get('question'), 'confidence': confidence,
-                'composite': round(composite, 3), 'floor': floor},
+                'composite': round(composite, 3), 'floor': floor,
+                'model': review_model},
                authorized=False)
     return True
 
@@ -295,7 +303,10 @@ def _resolve_pending_escalations_sync():
         # _jev_quorum_choice_sync never raises (fails closed to (None, 0.0, 0.0)
         # internally) -- an unreachable/non-binary classifier is caught by the
         # decision-not-in-(approve,deny) check right below, same as before.
-        decision, confidence, _cost = _jev_quorum_choice_sync(instr, criteria)
+        # Senior-director delegation is the middle rung: use the mid tier.
+        review_model = (_mid_tier_slug() or _jev_model())
+        decision, confidence, _cost = _jev_quorum_choice_sync(
+            instr, criteria, model=review_model)
         if decision not in ('approve', 'deny'):
             # A non-binary answer is a non-decision: mark this rung tried and
             # move to the next one on the next pass. Never auto-approve on a
@@ -323,6 +334,7 @@ def _resolve_pending_escalations_sync():
             log_action(director_id, 'escalation_unsure',
                        {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
                         'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
+                        'model': review_model,
                         'reason': 'below-kind-floor' if composite < floor else 'low-confidence'}, authorized=False)
             _mark_escalation_rung(esc, rung)
             dirty = True

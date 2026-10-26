@@ -3,6 +3,19 @@
 from core.review_decode import review_target
 
 
+def _escalation_review_model(reviewer_id, admin_id):
+    """The model tier for one escalation rung.
+
+    The director and senior director get the mid tier. They are a second
+    opinion on a request the primary JEV model already declined or was unsure
+    about, so a different tier adds independence. The chief of staff gets the
+    high tier: that is the last internal rung before the owner.
+    """
+    if reviewer_id == admin_id:
+        return _high_tier_slug() or _jev_model()
+    return _mid_tier_slug() or _jev_model()
+
+
 def _director_second_opinion(agent_id, action, noun, target, purpose,
                              confidence, trace_id=None):
     """Ask the senior director to decide a low-confidence JEV allow.
@@ -47,7 +60,9 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
             'the low confidence was caution rather than a real risk. Deny if it '
             'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
         )
-        decision, reviewer_conf, _cost = _jev_quorum_choice_sync(instr, criteria)
+        review_model = _escalation_review_model(reviewer_id, admin_id)
+        decision, reviewer_conf, _cost = _jev_quorum_choice_sync(
+            instr, criteria, model=review_model)
         # A confident deny is final. A LOW-confidence deny is not a decision
         # yet -- it means this reviewer also cannot tell. Continue up the
         # chain (Nora -> Theo), exactly like a low-confidence approve. Before
@@ -58,21 +73,24 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
                        {'agent': agent_id, 'action': action, 'target': target,
                         'purpose': purpose, 'jevConfidence': confidence,
                         'reviewerConfidence': reviewer_conf, 'level': level,
-                        'traceId': trace_id}, authorized=False)
+                        'model': review_model, 'traceId': trace_id},
+                       authorized=False)
             return False
         if decision == 'approve' and reviewer_conf >= threshold:
             log_action(reviewer_id, 'jev_chain_approved',
                        {'agent': agent_id, 'action': action, 'target': target,
                         'purpose': purpose, 'jevConfidence': confidence,
                         'reviewerConfidence': reviewer_conf, 'level': level,
-                        'traceId': trace_id}, authorized=False)
+                        'model': review_model, 'traceId': trace_id},
+                       authorized=False)
             return True
         log_action(reviewer_id, 'jev_chain_unsure',
                    {'agent': agent_id, 'action': action, 'target': target,
                     'purpose': purpose, 'jevConfidence': confidence,
                     'reviewerConfidence': reviewer_conf,
                     'decision': decision, 'level': level,
-                    'traceId': trace_id}, authorized=False)
+                    'model': review_model, 'traceId': trace_id},
+                   authorized=False)
     # The whole chain could not decide: this is the one case that reaches
     # the owner, not an automatic block.
     try:
