@@ -1,5 +1,8 @@
 
 
+from core.review_decode import review_target
+
+
 def _director_second_opinion(agent_id, action, noun, target, purpose,
                              confidence, trace_id=None):
     """Ask the senior director to decide a low-confidence JEV allow.
@@ -23,6 +26,8 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
     if not chain:
         return False
     threshold = _effective_safety_confidence()
+    reviewed = review_target(target)
+    target_for_review = reviewed['text']
     criteria = {
         'approve': 'Ordinary, legitimate, in-scope work; the low JEV confidence was caution, not a concrete risk.',
         'deny': 'Unsafe, destructive, credential/secret access or exfiltration, out of scope, or not justified.',
@@ -34,7 +39,7 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
                 'senior director' if reviewer_id == senior_id else 'director')
         instr = (
             f'You are {name}, the {role} of the AI think tank. '
-            f'An agent asked to run this {noun}: {target}\n'
+            f'An agent asked to run this {noun}: {target_for_review}\n'
             f'Stated purpose: {purpose or "not given"}\n'
             f'JEV returned allow at low confidence ({confidence:.2f}, below '
             f'the {threshold:.2f} safety threshold). Decide whether the action '
@@ -73,13 +78,13 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
     try:
         esc_id = create_escalation(
             'owner safety decision',
-            f'Agent {agent_id} needs a decision on this {noun}: {target}\n'
+            f'Agent {agent_id} needs a decision on this {noun}: {target_for_review}\n'
             f'Stated purpose: {purpose or "not given"}\n'
             f'JEV confidence {confidence:.2f} was below the {threshold:.2f} '
             'safety threshold, and the director, senior director, and chief '
             'of staff all declined or could not decide.',
             what_checked='JEV plus the full director -> senior director -> chief of staff chain',
-            look_first=target)
+            look_first=target_for_review)
         log_action('player', 'jev_chain_owner_escalation',
                    {'escalationId': esc_id, 'agent': agent_id,
                     'action': action, 'target': target,

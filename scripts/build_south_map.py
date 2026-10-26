@@ -24,9 +24,7 @@ import sys
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from world.core.village_geometry import (  # noqa: E402
-    NATIVE_H, NATIVE_W, ROAD_BOTTOM, ROAD_X0, ROAD_X1, build as build_geometry,
-)
+from world.core.village_geometry import build as build_geometry  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORLD = os.path.join(ROOT, 'world')
