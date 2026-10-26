@@ -128,9 +128,29 @@ async def _openrouter_credits_probe_loop():
 
 
 def _provider_spec_for_band(band):
+    # An operator override is a deliberate PIN: refresh_model_tiers and the
+    # price watch both skip these bands, and calls resolve @provider:<band>
+    # before the model_tiers row, so a custom endpoint is never re-picked.
     cfg = MODEL_PROVIDER_OVERRIDES or {}
     tiers = cfg.get('tiers') or {}
     return tiers.get(band) or cfg.get('default')
+
+
+def _provider_override_tier_view():
+    """What the operator pinned, in the same shape as get_cached_model_tiers.
+    Merged over the DB rows for the read surfaces so a custom endpoint is
+    what the board shows, not the unused auto-pick underneath it."""
+    out = {}
+    for band in MODEL_BAND_PURPOSE:
+        spec = _provider_spec_for_band(band)
+        if not spec:
+            continue
+        out[band] = {
+            'slug': f'@provider:{band}',
+            'name': spec.get('model') or spec.get('base_url') or 'custom endpoint',
+            'price': float(spec.get('price_per_m') or 0),
+        }
+    return out
 
 
 def _raw_model_tier_slug(band):

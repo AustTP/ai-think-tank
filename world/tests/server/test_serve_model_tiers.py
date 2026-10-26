@@ -120,6 +120,18 @@ class TierWatchMoves(unittest.TestCase):
         moves = self._watch([self._model('low/other', 0.10)])
         self.assertEqual(moves, {'low'})
 
+    def test_pinned_custom_endpoint_is_never_a_value_window(self):
+        # A custom endpoint is an operator pin. It will not appear in the
+        # OpenRouter catalog, so without the skip it would look delisted and
+        # trigger a full re-pick every watch cycle.
+        self._select('low', '@provider:low', 2.0)
+        with unittest.mock.patch.object(serve, 'MODEL_PROVIDER_OVERRIDES', {
+                'default': None,
+                'tiers': {'low': {'base_url': 'http://127.0.0.1:9999/v1/chat/completions',
+                                  'model': 'SKY-001', 'price_per_m': 2.0}}}):
+            moves = self._watch([self._model('low/cheap', 0.01)])
+        self.assertEqual(moves, set())
+
 
 
 class RefreshModelTiers(unittest.TestCase):
@@ -440,6 +452,29 @@ class RefreshModelTiers(unittest.TestCase):
         self.assertNotEqual(self._logged_at('low'), first)
 
 
+
+    def test_pinned_custom_endpoint_band_is_not_repicked(self):
+        models = [self._model('low/auto', '0.000002', '0.000002')]
+        serve.set_model_benchmark_score('low/auto', 'intelligence_index', 50.0, 'u')
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO model_tiers (band, slug, name, price_per_m, chosen_at) VALUES (?,?,?,?,?)',
+                ('low', 'operator/old', 'Operator endpoint', 2.0, 0.0))
+        with unittest.mock.patch.object(serve, 'MODEL_PROVIDER_OVERRIDES', {
+                'default': None,
+                'tiers': {'low': {'base_url': 'http://127.0.0.1:9999/v1/chat/completions',
+                                  'model': 'SKY-001', 'price_per_m': 2.0}}}), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog', return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertNotIn('low', chosen, 'a pinned band is not re-picked')
+        with serve._db() as conn:
+            row = conn.execute("SELECT slug FROM model_tiers WHERE band = 'low'").fetchone()
+        self.assertEqual(row[0], 'operator/old', 'the pinned row is left untouched')
 
 class TierValueWindows(unittest.TestCase):
     def setUp(self):

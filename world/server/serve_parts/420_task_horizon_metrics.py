@@ -764,7 +764,10 @@ async def model_tiers():
     # otherwise just returns what's already chosen -- this is deliberately
     # NOT re-run on every request (real cost, and no reason for the
     # catalog to have meaningfully changed minute to minute).
-    cached = get_cached_model_tiers()
+    cached = get_cached_model_tiers() or {}
+    pins = _provider_override_tier_view()
+    if pins:
+        cached.update(pins)
     if not cached:
         try:
             fresh = await refresh_model_tiers()
@@ -792,7 +795,9 @@ async def model_tiers_refresh(request: Request):
         return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
     try:
         fresh = await refresh_model_tiers()
-        return JSONResponse({band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()})
+        view = {band: {'slug': m['id'], 'name': m['name'], 'price': m['price']} for band, m in fresh.items()}
+        view.update(_provider_override_tier_view())
+        return JSONResponse(view)
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=502)
 

@@ -43,6 +43,13 @@ def test_tier_override_becomes_provider_slug(monkeypatch):
     assert got['is_custom'] is True
 
 
+def test_tier_view_reports_the_pin_not_the_auto_pick(monkeypatch):
+    monkeypatch.setattr(serve, 'MODEL_PROVIDER_OVERRIDES',
+                        {'default': None, 'tiers': {'low': _spec()}})
+    view = serve._provider_override_tier_view()
+    assert view['low'] == {'slug': '@provider:low', 'name': 'SKY-001', 'price': 2.0}
+
+
 def test_default_override_without_model_uses_band_model(monkeypatch):
     monkeypatch.setattr(serve, 'MODEL_BAND_ALIASES', {'3d': 'coding'})
     monkeypatch.setattr(serve, 'MODEL_PROVIDER_OVERRIDES',

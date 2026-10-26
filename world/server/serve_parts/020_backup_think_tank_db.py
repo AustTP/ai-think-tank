@@ -280,6 +280,8 @@ def _tier_watch_moves_sync():
     pools = _band_candidate_pools(models)
     moves = set()
     for band, meta in selected.items():
+        if _provider_spec_for_band(band):
+            continue  # operator-pinned custom endpoint: never a value window
         slug, price = meta['slug'], meta['price']
         live = catalog.get(slug)
         if live is None or abs(live - (price or 0.0)) > 1e-9:

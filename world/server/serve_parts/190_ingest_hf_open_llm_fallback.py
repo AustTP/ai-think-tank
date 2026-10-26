@@ -224,7 +224,11 @@ async def refresh_model_tiers():
     chosen = {}
     fallbacks = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
-        if MODEL_BAND_ALIASES.get(band):
+        # Aliased bands have no model of their own, and an operator's custom
+        # endpoint is a PIN: re-picking it would overwrite the row the board
+        # shows, spend a verify probe, and still never be used at call time
+        # (_model_tier_slug returns @provider:<band> first).
+        if MODEL_BAND_ALIASES.get(band) or _provider_spec_for_band(band):
             continue
         pool = buckets.get(band, [])
 
