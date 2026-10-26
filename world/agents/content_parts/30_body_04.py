@@ -179,6 +179,17 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
     review_parent = (snapshot.get('tasks') or {}).get(task.get('reviewOf')) or {}
     context = _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, backlog)
+    parent_deliverable = str((review_parent or {}).get('deliverable') or '').strip().lower()
+    is_prose_review = (parent_deliverable in ('note', 'report')
+                       or (review_parent or {}).get('taskType') in ('spike', 'report', 'task'))
+    if is_prose_review:
+        prose = (review_parent.get('note') or '').strip()
+        doc = _read_library_document(review_parent.get('libraryPath')
+                                     or review_parent.get('reportPath'))
+        if doc:
+            prose = (prose + '\n\n' + doc).strip()
+        context = ('DELIVERABLE TEXT:\n' + (prose or '(no deliverable text attached)')
+                   + '\n\nOTHER CONTEXT:\n' + context)
     # Real review work (quality pipeline + up to 2 probe-round model calls + a
     # screenshot pass + the Jev verdict) can genuinely take longer than the
     # generic 120s content ceiling _dispatch_content_work installs -- widen it
@@ -212,9 +223,6 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         pipeline_is_code_class = bool(project_label or task.get('productId')
                                       or task.get('room') == 'pressoffice')
         review_scope = None
-    parent_deliverable = str((review_parent or {}).get('deliverable') or '').strip().lower()
-    is_prose_review = (parent_deliverable in ('note', 'report')
-                       or (review_parent or {}).get('taskType') in ('spike', 'report', 'task'))
     if pipeline_is_code_class and not is_prose_review:
         qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}',
