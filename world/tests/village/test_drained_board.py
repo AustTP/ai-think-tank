@@ -136,8 +136,22 @@ class CompletionEvidence(unittest.TestCase):
         }
         sim.finish_task(st, 'a')
         self.assertEqual(st['tasks']['t']['status'], 'failed')
+        self.assertIn('no saved Library artifact', st['tasks']['t']['failNote'])
         self.assertIsNone(st['agents']['a']['task'])
         self.assertFalse(st['agents']['a']['busy'])
+
+    def test_distill_refusal_names_the_missing_note(self):
+        st = {
+            'tasks': {'t': {'id': 't', 'title': 'Distill recent knowledge',
+                            'status': 'working', 'taskType': 'code',
+                            'distill': True, 'assignedTo': 'a'}},
+            'agents': {'a': {'id': 'a', 'task': 't', 'busy': True,
+                             'inRoom': 'observatory'}},
+            'agentRoster': [{'id': 'a'}],
+        }
+        sim.finish_task(st, 'a')
+        self.assertEqual(st['tasks']['t']['status'], 'failed')
+        self.assertIn('task note is empty', st['tasks']['t']['failNote'])
 
 
 if __name__ == '__main__':

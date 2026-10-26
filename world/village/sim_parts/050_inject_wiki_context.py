@@ -767,6 +767,21 @@ def _completion_has_evidence(state, task):
     return True
 
 
+def _completion_evidence_gap(task):
+    """Name the missing evidence so the refusal message matches the gate."""
+    ttype = str(task.get('taskType') or '')
+    if (task.get('distill') or task.get('research') or task.get('skillReview')
+            or ttype == 'research'):
+        return ('the task note is empty; record what the run produced in the note '
+                '(or the wiki page for a distill)')
+    if ttype == 'bug':
+        return ('no published change, written .py file, restore check, '
+                'or Library artifact')
+    if ttype in ('spike', 'report'):
+        return 'no reportPath or task note'
+    return 'no saved Library artifact'
+
+
 def finish_task(state, agent_id, grid=None):
     """Port of tasks.js finishTask: clear task/busy/inRoom, return to entry point
     (with the full-agent-width step-aside deadlock avoidance), bump approvedCount,
@@ -778,12 +793,14 @@ def finish_task(state, agent_id, grid=None):
         return
     task = (state.get('tasks') or {}).get(a.get('task'))
     completion_refused = False
+    completion_gap = None
     if task and task.get('status') not in ('blocked', 'failed', 'cancelled', 'abandoned'):
         if not _completion_has_evidence(state, task):
             completion_refused = True
+            completion_gap = _completion_evidence_gap(task)
             task['status'] = 'failed'
-            task['failNote'] = 'Completion blocked: no saved deliverable in the Library.'
-            task['nextAction'] = 'Save the deliverable and re-run the acceptance checks.'
+            task['failNote'] = f'Completion blocked: {completion_gap}.'
+            task['nextAction'] = 'Save or record the deliverable and re-run the acceptance checks.'
             task['deliveryState'] = 'blocked'
             task['manualAttention'] = False
             task['_peerRepairPending'] = True
@@ -855,9 +872,10 @@ def finish_task(state, agent_id, grid=None):
                         'wikiPage': bool(task and task.get('wikiPage')),
                         'note': bool(task and str(task.get('note') or '').strip()),
                     },
+                    'detail': completion_gap,
                     'reason': 'missing_saved_deliverable'}, authorized=True)
         _notify_card_failure(
-            state, task or {}, 'no saved deliverable in the Library',
+            state, task or {}, completion_gap or 'the completion contract was not met',
             category='refused')
     else:
         log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
