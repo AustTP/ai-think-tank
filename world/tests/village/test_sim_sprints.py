@@ -300,6 +300,70 @@ class BreakdownCeremony(SimIsolation):
         self.assertEqual([q['taskType'] for q in state['workQueue']],
                          ['report', 'code'])
 
+    def test_single_deliverable_goal_returns_one_report_card(self):
+        pending = {'scrumMasterId': 'sm1', 'teamId': 't1',
+                   'reqIds': ['r1'], 'people': {}}
+        state = {
+            'agentRoster': [{'id': 'sm1', 'name': 'Sam'}],
+            'agents': {'sm1': {'id': 'sm1'}},
+            'teams': [{'id': 't1', 'directorId': 'd1'}],
+            'backlogRequests': [{
+                'id': 'r1', 'status': 'pending', 'filedBy': 'm1',
+                'title': 'Brief', 'teamId': 't1',
+                'goal': ('Research and write a 300-word cited brief on repair-card '
+                         'loops. Save it under admin/repair-loop-brief.md.'),
+            }],
+            'workQueue': [],
+        }
+        called = []
+        def decider(*args):
+            called.append(1)
+            return {'items': [{'title': 'Gather'}, {'title': 'Write'},
+                              {'title': 'Save'}, {'title': 'Verify'}]}
+        sim._resolve_breakdown(state, pending, 1_000_000, decider=decider)
+        self.assertEqual(called, [])
+        self.assertEqual(len(state['workQueue']), 1)
+        card = state['workQueue'][0]
+        self.assertEqual(card['taskType'], 'report')
+        self.assertEqual(card['sequence'], 0)
+        self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
+
+    def test_multi_card_breakdown_sets_sequence(self):
+        pending = {'scrumMasterId': 'sm1', 'teamId': 't1',
+                   'reqIds': ['r1'], 'people': {}}
+        state = {
+            'agentRoster': [{'id': 'sm1', 'name': 'Sam'}],
+            'agents': {'sm1': {'id': 'sm1'}},
+            'teams': [{'id': 't1', 'directorId': 'd1'}],
+            'backlogRequests': [{
+                'id': 'r1', 'status': 'pending', 'filedBy': 'm1',
+                'title': 'Build', 'teamId': 't1',
+                'goal': 'Build a parser and a formatter.',
+            }],
+            'workQueue': [],
+        }
+        decider = lambda *args: {'items': [
+            {'title': 'A', 'type': 'story'},
+            {'title': 'B', 'type': 'story'},
+            {'title': 'C', 'type': 'story'},
+        ]}
+        sim._resolve_breakdown(state, pending, 1_000_000, decider=decider)
+        self.assertEqual([q['sequence'] for q in state['workQueue']], [0, 1, 2])
+
+    def test_request_sequence_waits_for_an_active_card(self):
+        pick = {'title': 'Later', 'requestId': 'r1', 'sequence': 1}
+        state = {'tasks': {'t1': {'requestId': 'r1', 'status': 'working'}},
+                 'workQueue': [pick]}
+        self.assertIs(sim._assign_due_item(state, pick, False, None, {}, 1_000_000),
+                      sim._ASSIGN_WAIT)
+
+    def test_request_sequence_waits_for_an_earlier_queued_card(self):
+        pick = {'title': 'Later', 'requestId': 'r1', 'sequence': 1}
+        earlier = {'title': 'Earlier', 'requestId': 'r1', 'sequence': 0}
+        state = {'tasks': {}, 'workQueue': [pick, earlier]}
+        self.assertIs(sim._assign_due_item(state, pick, False, None, {}, 1_000_000),
+                      sim._ASSIGN_WAIT)
+
     def test_breakdown_step_defers_unembarked_without_facilitator(self):
         state = {
             'teams': [{'id': 't1', 'directorId': 'd1'}],

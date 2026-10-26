@@ -185,6 +185,8 @@ def queue_work(state, items):
             # provenance -- same class of whitelist as 'distill'/'checklist'.
             'issueKey': item.get('issueKey') or None,
             'requestId': item.get('requestId') or None,
+            # Cards of one large request run in sequence (see _assign_due_item).
+            'sequence': item.get('sequence'),
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),

@@ -77,6 +77,59 @@ def _breakdown_decider_default(state, instructions, goal):
 _breakdown_decider = _breakdown_decider_default
 
 
+_SINGLE_DELIVERABLE_ARTIFACTS = (
+    'brief', 'memo', 'report', 'write-up', 'writeup', 'one-page', 'one page',
+    'summary', 'recommendation',
+)
+_SINGLE_DELIVERABLE_VERBS = ('write', 'draft', 'prepare', 'research', 'summarize', 'save')
+_SINGLE_DELIVERABLE_MULTI = (
+    'multiple', 'separate', 'series of', 'two reports', 'three reports',
+    'and also', 'as well as',
+)
+_SINGLE_DELIVERABLE_CODE = (
+    'implement', 'fix ', 'bug', 'code change', 'commit', 'endpoint', 'api',
+    'function', 'class', 'unit test',
+)
+
+
+def _single_deliverable_goal(goal):
+    """True when the goal names ONE written artifact. Such a goal must be one
+    report card, not a gather/write/save/verify chain that can run in parallel.
+    """
+    text = str(goal or '').lower()
+    if not any(word in text for word in _SINGLE_DELIVERABLE_ARTIFACTS):
+        return False
+    if not any(verb in text for verb in _SINGLE_DELIVERABLE_VERBS):
+        return False
+    if any(word in text for word in _SINGLE_DELIVERABLE_MULTI):
+        return False
+    if any(word in text for word in _SINGLE_DELIVERABLE_CODE):
+        return False
+    return True
+
+
+def _single_deliverable_item(goal, constraints):
+    """One report card carrying the whole goal. The report lane already gathers
+    sources and writes the file; splitting that into gather/write/save/verify
+    cards was the 2026-10-26 real-task failure."""
+    text = str(goal or '').lower()
+    task_type = 'report' if any(
+        word in text for word in _SINGLE_DELIVERABLE_ARTIFACTS) else 'code'
+    budget = None
+    raw_budget = (constraints or {}).get('budgetUsd')
+    if isinstance(raw_budget, (int, float)) and raw_budget > 0:
+        budget = float(raw_budget)
+    return {
+        'title': str(goal or 'untitled request').strip()[:120],
+        'type': task_type,
+        'acceptanceCriteria': ('One deliverable at the path named in the goal, '
+                               'with the requested sources and recommendation.'),
+        'sizeEstimate': 'M',
+        'budgetUsd': budget,
+        'singleDeliverable': True,
+    }
+
+
 def _resolve_breakdown(state, pending, now_ms, decider=None):
     """When the breakdown window elapses, the scrum master cards each pending
     large-request into concrete stories/spikes via the injectable decider; the
@@ -147,16 +200,22 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
             '{"items":[{"title":"short title","type":"story|spike|research|report","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
-        data = decider(state, instructions, goal)
-        items = []
-        if isinstance(data, dict):
-            items = [s for s in (data.get('items') or [])
-                     if isinstance(s, dict) and (s.get('title') or '').strip()]
-        if not items:
-            # Outage / unusable plan: never drop the ask -- queue a single card
-            # titled the goal so it stays in the pipeline for a worker to pick up.
-            items = [{'title': goal[:120], 'type': 'story'}]
-        for s in items:
+        if _single_deliverable_goal(goal):
+            items = [_single_deliverable_item(goal, pc)]
+            _log_governance(state, scrum_master_id, 'breakdown_single_deliverable',
+                            {'request': req.get('id'), 'goal': goal[:120],
+                             'type': items[0]['type']})
+        else:
+            data = decider(state, instructions, goal)
+            items = []
+            if isinstance(data, dict):
+                items = [s for s in (data.get('items') or [])
+                         if isinstance(s, dict) and (s.get('title') or '').strip()]
+            if not items:
+                # Outage / unusable plan: never drop the ask -- queue a single card
+                # titled the goal so it stays in the pipeline for a worker to pick up.
+                items = [{'title': goal[:120], 'type': 'story'}]
+        for seq, s in enumerate(items):
             title = (s.get('title') or '').strip()[:120]
             # Preserve the model's investigation-class type ('spike' or
             # 'research'); a story (or anything unrecognized) becomes 'code'.
@@ -205,6 +264,10 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 'sizeEstimate': s.get('sizeEstimate'),
                 'never': never,
                 'budgetUsd': card_budget,
+                # Serial group: cards of one request run in the model's order.
+                # The assignment guard waits while an earlier card is queued or
+                # active, so gather -> write -> save cannot run in parallel.
+                'sequence': seq,
             }])
         req['status'] = 'accepted'
         req['brokenDown'] = True

@@ -237,6 +237,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'reviewAuthorId': (extra or {}).get('reviewAuthorId'),
         'issueKey': (extra or {}).get('issueKey'),
         'requestId': (extra or {}).get('requestId'),
+        'sequence': (extra or {}).get('sequence'),
         # CS329A takeaway #2: checklist survives onto the task
         # object itself (see _assign_due_item's extra dict) -- the review
         # executor grades per-requirement from here.

@@ -421,6 +421,23 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
     assign. Returns the task dict or None. Mirrors assignTaskViaJev's
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
+    request_id = pick.get('requestId')
+    sequence = pick.get('sequence')
+    if request_id and sequence is not None:
+        # One request, one active card at a time, in the breakdown's order.
+        # Without this, gather/write/save/verify all started together and the
+        # save card ran before the brief existed.
+        for other in (state.get('tasks') or {}).values():
+            if other.get('requestId') != request_id:
+                continue
+            if other.get('status') in ('walking', 'working', 'repairing', 'needs_review'):
+                return _ASSIGN_WAIT
+        for other in (state.get('workQueue') or []):
+            if other is pick or other.get('requestId') != request_id:
+                continue
+            other_seq = other.get('sequence')
+            if other_seq is not None and other_seq < sequence:
+                return _ASSIGN_WAIT
     agents = state.get('agents') or {}
     # Human-in-the-loop: a card pinned to the PLAYER (assignedTo 'player') is
     # never an agent's job. Assign it to the player (durable 'needs_player'
@@ -705,6 +722,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'reviewAuthorId': pick.get('reviewAuthorId'),
         'issueKey': pick.get('issueKey'),
         'requestId': pick.get('requestId'),
+        'sequence': pick.get('sequence'),
         # Phase E2d: an INCIDENT routes to the owning team's on-call (taskType
         # 'bug' + productId + assignedTo travel so the fix is attributable and
         # the cap can be enforced against the open task set).
