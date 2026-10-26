@@ -8,7 +8,10 @@ that fail a template demote it. Nothing here calls a model.
 import hashlib
 import re
 
-WORKFLOW_TEMPLATE_CADENCE_MS = 6 * 60 * 60 * 1000
+# Weekly, not hourly: the tank may be idle for long stretches while the
+# operator ramps up, and there is no value in re-reading the same completed
+# requests every few hours.
+WORKFLOW_TEMPLATE_CADENCE_MS = 7 * 24 * 60 * 60 * 1000
 _WORKFLOW_STOP = {
     'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'under',
     'over', 'after', 'before', 'about', 'your', 'their', 'our', 'you',

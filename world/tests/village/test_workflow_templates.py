@@ -45,6 +45,10 @@ def _learned_state():
     return state
 
 
+def test_cadence_is_weekly():
+    assert sim.WORKFLOW_TEMPLATE_CADENCE_MS == 7 * 24 * 60 * 60 * 1000
+
+
 def test_first_success_is_a_candidate():
     state = _learned_state()
     templates = list(state['workflowTemplates'].values())
