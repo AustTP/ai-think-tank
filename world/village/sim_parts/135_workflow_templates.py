@@ -90,7 +90,15 @@ def _workflow_steps(tasks):
         if task.get('status') != 'done':
             continue
         task_type = task.get('taskType') or 'code'
-        role = _workflow_role(task.get('title'), task_type)
+        # Treat a spike/research card as report-shaped for role detection too,
+        # so a written deliverable gets the same role whichever lane ran it.
+        role_type = 'report' if task_type in ('spike', 'research') else task_type
+        role = _workflow_role(task.get('title'), role_type)
+        if role in ('deliverable', 'write', 'save') and task_type in ('spike', 'research'):
+            # A written deliverable that happened to run through the spike
+            # lane is the same workflow as one that ran through the report
+            # lane. Normalize the signature so they accumulate, not split.
+            task_type = 'report'
         steps.append({
             'role': role,
             'title': _ROLE_LABELS.get(role, role.title()),

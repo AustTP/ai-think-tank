@@ -67,6 +67,19 @@ def test_second_success_promotes_to_active():
     assert template['successCount'] == 2
 
 
+def test_spike_and_report_deliverables_share_a_template():
+    state = _learned_state()
+    goal2 = ('Research and write a 300-word cited brief on retry storms. '
+             'Use at least three sources. End with one recommendation.')
+    state['backlogRequests'].append(_request('r2', goal2))
+    state['tasks']['t2'] = _task('t2', 'r2', task_type='spike')
+    _sweep(state)
+    templates = list(state['workflowTemplates'].values())
+    assert len(templates) == 1
+    assert templates[0]['status'] == 'active'
+    assert templates[0]['steps'][0]['type'] == 'report'
+
+
 def test_match_is_topic_tolerant_but_not_for_code():
     state = _learned_state()
     state['backlogRequests'].append(_request(
