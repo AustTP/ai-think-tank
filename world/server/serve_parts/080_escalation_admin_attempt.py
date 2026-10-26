@@ -79,6 +79,42 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     return True
 
 
+DORMANCY_WINDOW_STALE_GRACE_S = 300
+
+
+def _dormancy_window_start(esc_id):
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                "SELECT start_ts FROM dormancy_windows WHERE escalation_id = ? "
+                "AND status = 'pending'", (esc_id,)).fetchone()
+    except Exception:
+        return None
+    return float(row[0]) if row else None
+
+
+def _expire_stale_dormancy_window(esc_id, esc):
+    """A dormancy window whose start time has passed cannot be approved. Deny
+    it and cancel the waiting window instead of paging the owner about a slot
+    that no longer exists."""
+    if (esc or {}).get('kind') != 'dormancy window request':
+        return False
+    start_ts = _dormancy_window_start(esc_id)
+    if start_ts is None or start_ts >= time.time() - DORMANCY_WINDOW_STALE_GRACE_S:
+        return False
+    esc['status'] = 'denied'
+    esc['resolvedBy'] = 'expired: the requested window has passed'
+    esc['resolvedAt'] = time.time()
+    try:
+        _selfedit.resolve_window_escalation(esc_id, False)
+    except Exception:
+        pass
+    log_action(None, 'escalation_expired', {
+        'escalationId': esc_id, 'kind': esc.get('kind'),
+        'startTs': start_ts, 'reason': 'dormancy window time passed'}, authorized=False)
+    return True
+
+
 def _mark_escalation_rung(esc, rung):
     if rung == 'immediate':
         esc['_immediateTried'] = True
@@ -146,6 +182,9 @@ def _resolve_pending_escalations_sync():
         director_id = reviewer_id or senior_id
         director_def = roster.get(director_id, {}) if director_id else {}
         director_name = director_def.get('name', director_id or 'the director')
+        if _expire_stale_dormancy_window(esc_id, esc):
+            dirty = True
+            continue
         # Escalations with a 1.0 risk floor are "never auto-approve" by design
         # (blocked command / blocked pipeline step) -- the director is not
         # permitted to resolve them, so don't burn a Jev call re-asking. They
