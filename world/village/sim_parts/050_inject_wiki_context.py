@@ -750,7 +750,11 @@ def _completion_has_evidence(state, task):
         if not artifact or not str(task.get('note') or '').strip():
             return False
     elif ttype in _DELIVERABLE_TASK_TYPES or task.get('_peerGate'):
-        if not task.get('libraryPath'):
+        # A published code change is itself the deliverable. The Library
+        # record is documentation; a failed Library write must not turn a
+        # real, validated publish into a repair card (the live code smoke
+        # test refused once for that reason before the record landed).
+        if not (task.get('libraryPath') or task.get('codePublished')):
             return False
     grade = task.get('grade')
     if isinstance(grade, (int, float)) and grade <= 0:

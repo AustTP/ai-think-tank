@@ -204,13 +204,24 @@ class CodeLibraryReport(_ExecutorTestCase):
         result = {'stagedWorkspace': 'ws-1', 'sourceDigest': 'abc',
                   'note': 'validated staged changes published'}
         with mock.patch.object(serve, '_http_json', return_value={'ok': True}) as post, \
-             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'):
+             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'), \
+             mock.patch.object(serve, '_safe_library_path', return_value='/tmp/x'), \
+             mock.patch('os.path.isfile', return_value=True):
             content._save_code_library_report('cora', {'id': 't1', 'title': 'Fix it'}, result)
         self.assertTrue(result['libraryPath'].startswith('archive/'))
         self.assertIn('-code-t1.md', result['libraryPath'])
         args, kwargs = post.call_args
         self.assertEqual(args[2], '/api/library/file')
         self.assertEqual(args[3]['source'], 'firsthand')
+
+    def test_library_write_error_is_reported_not_faked(self):
+        result = {'note': 'published'}
+        with mock.patch.object(serve, '_http_json', return_value={'error': 'denied'}), \
+             mock.patch.object(serve, 'get_or_create_agent_key', return_value='k'):
+            content._save_code_library_report('cora', {'id': 't2', 'title': 'Fix it'}, result)
+        self.assertNotIn('libraryPath', result)
+        self.assertIn('denied', result['libraryError'])
+        self.assertIn('not saved', result['note'])
 
 
 class ObservatoriesAndDispatcher(_ExecutorTestCase):

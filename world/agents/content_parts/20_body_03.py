@@ -408,13 +408,26 @@ def _save_code_library_report(agent_id, task, result, key=None):
             f"Source digest: {result.get('sourceDigest') or 'n/a'}\n"
             f"Result: {(result.get('note') or '').strip()}\n"
         )
-        _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
-                          {'agentId': agent_id, 'path': path, 'content': body,
-                           'source': 'firsthand'},
-                          key or _serve.get_or_create_agent_key(agent_id))
+        resp = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
+                                 {'agentId': agent_id, 'path': path, 'content': body,
+                                  'source': 'firsthand'},
+                                 key or _serve.get_or_create_agent_key(agent_id))
+        if isinstance(resp, dict) and resp.get('error'):
+            result['libraryError'] = str(resp['error'])[:200]
+            result['note'] = ((result.get('note') or '') +
+                              ' | Library record not saved: ' + result['libraryError'])
+            return
+        target = _serve._safe_library_path(path)
+        if not target or not os.path.isfile(target):
+            result['libraryError'] = 'library write did not land on disk'
+            result['note'] = ((result.get('note') or '') +
+                              ' | Library record not saved: write did not land')
+            return
         result['libraryPath'] = path
-    except Exception:
-        pass
+    except Exception as error:
+        result['libraryError'] = str(error)[:200]
+        result['note'] = ((result.get('note') or '') +
+                          ' | Library record not saved: ' + result['libraryError'])
 
 
 def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
@@ -450,6 +463,7 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                                       + '. Existing workspace preserved.')
                 else:
                     result['previousWorkspace'] = stage.publish()
+                    result['codePublished'] = True
                     _commit_story_workspace(workspace, task.get('id'))
                     result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
                     result['note'] = str(result.get('note') or '') + ' | validated staged changes published'

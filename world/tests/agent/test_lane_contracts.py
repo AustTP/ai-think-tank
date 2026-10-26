@@ -75,9 +75,10 @@ def test_distill_gate_refuses_an_empty_note():
     assert sim._completion_has_evidence({}, task) is False
 
 
-def test_code_gate_requires_a_library_record():
+def test_code_gate_requires_a_publish_or_library_record():
     base = {'id': 'c1', 'title': 'Fix the thing', 'taskType': 'code'}
     assert sim._completion_has_evidence({}, dict(base, libraryPath='archive/c1.md')) is True
+    assert sim._completion_has_evidence({}, dict(base, codePublished=True)) is True
     assert sim._completion_has_evidence({}, dict(base)) is False
 
 
