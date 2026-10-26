@@ -209,6 +209,8 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
             ('research', {'id': 'o3', 'research': {'topicId': 'x'}}),
             ('projectLabel', {'id': 'o4', 'projectLabel': 'proj'}),
             ('bare', {'id': 'o5'}),
+            # Old / repair cards can lose the flag; the title is the fallback.
+            ('distill', {'id': 'o6', 'title': 'Fix: Distill recent think tank knowledge'}),
         ]:
             with mock.patch.object(content, '_run_distill_content') as d, \
                  mock.patch.object(content, '_run_skill_review_content') as s, \

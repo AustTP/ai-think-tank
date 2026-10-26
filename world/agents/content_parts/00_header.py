@@ -713,7 +713,24 @@ def _run_observatory_content(snapshot, agent_id, task, base_ctx=None):
         # writes a cited report.
         _run_spike_content(snapshot, agent_id, task, base_ctx)
     else:
-        _run_research_bare_content(snapshot, agent_id, task, base_ctx)
+        # Old cards, and repair cards minted before the lane markers were
+        # carried over, can arrive with no flag at all. The title is the last
+        # stable signal: without this, a "Distill ..." card fell into the bare
+        # Research Center pass, which records only a note -- the completion
+        # gate then refused it, and every repair repeated the same mismatch.
+        title = str(task.get('title') or '').lower()
+        if 'distill' in title:
+            task['distill'] = True
+            task.setdefault('distillSince', 0)
+            _run_distill_content(snapshot, agent_id, task, base_ctx)
+        elif 'skill review' in title or 'skill-review' in title:
+            task['skillReview'] = True
+            _run_skill_review_content(snapshot, agent_id, task, base_ctx)
+        elif 'research' in title:
+            task['research'] = True
+            _run_research_content(snapshot, agent_id, task, base_ctx)
+        else:
+            _run_research_bare_content(snapshot, agent_id, task, base_ctx)
 
 
 def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):

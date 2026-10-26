@@ -308,6 +308,73 @@ def _open_fix_exists(state, title):
     return False
 
 
+REPAIR_LOOP_WINDOW_MS = 6 * 60 * 60 * 1000
+REPAIR_LOOP_MIN_FAILURES = 2
+
+
+def _repair_loop_should_stop(state, title, now_ms):
+    """Same root failed twice inside the window. A third fix card would repeat
+    the same contract, so stop and hand the mismatch to the director."""
+    root = _fix_title_root(title)
+    if not root:
+        return None
+    recent = []
+    for t in (state.get('tasks') or {}).values():
+        if t.get('status') not in ('failed', 'abandoned'):
+            continue
+        if _fix_title_root(t.get('title')) != root:
+            continue
+        ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
+        if now_ms - int(ts) <= REPAIR_LOOP_WINDOW_MS:
+            recent.append(t)
+    if len(recent) < REPAIR_LOOP_MIN_FAILURES:
+        return None
+    return {'root': root, 'failures': len(recent),
+            'taskIds': [t.get('id') for t in recent][:6]}
+
+
+def _repair_loop_director(state, task):
+    team_id = task.get('teamId')
+    for team in (state.get('teams') or []):
+        if team_id and team_id in (team.get('id'), team.get('directorId')):
+            return team.get('directorId')
+    author = task.get('assignedTo') or task.get('reviewAuthorId')
+    for d in (state.get('agentRoster') or []):
+        if d.get('id') == author:
+            return d.get('director')
+    return None
+
+
+def _stop_repair_loop(state, task, info, author):
+    now_ms = int(time.time() * 1000)
+    task['status'] = 'blocked'
+    task['blockedReason'] = 'repair_loop'
+    task['blockedAt'] = now_ms
+    task['failNote'] = (f"Repair loop stopped after {info['failures']} failures of "
+                        f"the same card: the lane output and the completion gate "
+                        f"disagree. Fix the contract before re-carding.")[:300]
+    task['nextAction'] = ('Compare what the lane produces with what the '
+                          'completion gate accepts; do not mint another Fix card.')
+    key = f"repair_loop:{info['root']}"
+    notified = state.setdefault('_repairLoopNotified', {})
+    if key not in notified:
+        notified[key] = now_ms
+        director = _repair_loop_director(state, task)
+        agent = (state.get('agents') or {}).get(director) if director else None
+        if isinstance(agent, dict):
+            _append_mailbox(agent, {
+                'kind': 'card_repair_loop', 'ts': now_ms, 'read': False,
+                'taskId': task.get('id'), 'title': task.get('title'),
+                'text': (f'Repair loop stopped for "{task.get("title")}" after '
+                         f'{info["failures"]} failures ({", ".join(info["taskIds"])}). '
+                         'The lane output and the completion gate disagree. '
+                         'Fix the contract before another card is minted.')})
+    _log_governance(state, author, 'repair_loop_stopped',
+                    {'taskId': task.get('id'), 'root': info['root'],
+                     'failures': info['failures'], 'taskIds': info['taskIds'],
+                     'note': (task.get('failNote') or '')[:200]})
+
+
 def _queue_peer_repair(state, parent, rationale=None):
     """Queue one author-owned repair for a rejected deliverable."""
     if (parent.get('_peerGate') or {}).get('escalated'):
@@ -325,6 +392,11 @@ def _queue_peer_repair(state, parent, rationale=None):
         parent['status'] = 'repairing'
         parent['_peerRepairPending'] = True
         return existing or active
+    loop = _repair_loop_should_stop(state, parent.get('title'),
+                                    int(time.time() * 1000))
+    if loop:
+        _stop_repair_loop(state, parent, loop, author)
+        return None
     findings = '\n'.join(
         f"{r.get('reviewer')}: {r.get('summary') or ''} "
         + '; '.join(str(check) for check in r.get('checks') or [])
@@ -662,10 +734,21 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     resent, and the parent tag alone misreads the cause."""
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
-    _notify_card_failure(state, task, note, category='failed',
-                         now_ms=int(time.time() * 1000))
+    now_ms = int(time.time() * 1000)
     if is_infra is None:
         is_infra = bool(task.get('_infraFailure'))
+    if not is_infra:
+        # Count this failure before the guard so the current card is part of
+        # the same-root count. Two recent failures of one root is a contract
+        # mismatch, not a retry.
+        task['status'] = 'failed'
+        task['failedAt'] = now_ms
+        task['failNote'] = note[:300]
+        loop = _repair_loop_should_stop(state, task.get('title'), now_ms)
+        if loop:
+            _stop_repair_loop(state, task, loop, author)
+            return
+    _notify_card_failure(state, task, note, category='failed', now_ms=now_ms)
     if not task.get('_peerGate'):
         task['_peerGate'] = {'approvals': 0, 'approvers': [],
                              'reviewerIds': [], 'enteredMs': 0}
