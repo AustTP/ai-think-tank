@@ -520,7 +520,7 @@ def _apply_content_result(state, task, result, now_ms=None):
     # Review diagnostics and workspace handoff survive the result channel.
     for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract',
                   'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace',
-                  'sourceUrls', 'noop'):
+                  'sourceUrls', 'noop', 'codePublished', 'libraryError'):
         if result.get(field) is not None:
             task[field] = result[field]
     if result.get('reviewContract') and task.get('reviewOf'):
