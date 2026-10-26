@@ -3,6 +3,28 @@
 
 let activeConversationAgent = null;
 
+// Temporary (2026-10-26): the south outlet is dialog-only while the south and
+// winter villages are revisited. Flip this to true to restore the south travel
+// button, the winter destination button, and the south "Call a Meeting" button.
+// The dialog and "Walk away" stay available either way.
+const SOUTH_OUTLET_EXTRAS_ENABLED = false;
+const SOUTH_OUTLET_EXTRA_IDS = [
+  'southOutletDestinations', 'southOutletTravelBtn', 'southOutletMeetingBtn',
+];
+
+function applySouthOutletAvailability() {
+  for (const id of SOUTH_OUTLET_EXTRA_IDS) {
+    const el = document.getElementById(id);
+    if (!el) continue;
+    el.hidden = !SOUTH_OUTLET_EXTRAS_ENABLED;
+    // The destinations wrapper carries an inline display:flex, which beats the
+    // [hidden] UA rule, so hide it explicitly.
+    el.style.display = SOUTH_OUTLET_EXTRAS_ENABLED
+      ? (id === 'southOutletDestinations' ? 'flex' : '')
+      : 'none';
+  }
+}
+
 // Who the player is currently standing next to (null if no one) -- the
 // prompt shows/hides based on this, and the 'b' keydown handler reads it
 // to know who to actually open a conversation with.
@@ -541,6 +563,7 @@ function renderSouthDestinations() {
   const box = document.getElementById('southOutletDestinations');
   if (!box) return;
   box.innerHTML = '';
+  if (!SOUTH_OUTLET_EXTRAS_ENABLED) return;
   for (const id in SCENES) {
     if (id === 'main' || id === 'south') continue;
     const btn = document.createElement('button');
@@ -565,6 +588,7 @@ function travelToVillage(id) {
 function openSouthMenu() {
   if (state.ui) return;
   state.ui = 'southOutlet';
+  applySouthOutletAvailability();
   renderSouthDestinations();
   document.getElementById('southOutletModal').classList.remove('hidden');
 }

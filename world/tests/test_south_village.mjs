@@ -87,6 +87,16 @@ await test('the outlet opens a three-option selector, not a room', () => {
   assert.ok(loop.includes('openSouthMenu()'));
 });
 
+await test('south travel, winter travel, and the south meeting button are temporarily closed', () => {
+  const ui = fs.readFileSync(path.join(worldDir, 'js', 'ui_agent.js'), 'utf8');
+  assert.match(ui, /const SOUTH_OUTLET_EXTRAS_ENABLED = false;/);
+  assert.ok(ui.includes('function applySouthOutletAvailability()'));
+  assert.ok(ui.includes('if (!SOUTH_OUTLET_EXTRAS_ENABLED) return;'));
+  const html = fs.readFileSync(path.join(worldDir, 'index.html'), 'utf8');
+  assert.ok(html.includes('The south path is closed for now'));
+  assert.ok(html.includes('id="southOutletCancelBtn"'), 'the dialog and Walk away stay');
+});
+
 await test('all three selector outcomes are wired', () => {
   const ui = fs.readFileSync(path.join(worldDir, 'js', 'ui_agent.js'), 'utf8');
   assert.ok(ui.includes('function southMenuTravel()'));
