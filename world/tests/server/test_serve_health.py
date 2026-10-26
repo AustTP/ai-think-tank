@@ -752,6 +752,15 @@ class HealthDigestMarkdown(unittest.TestCase):
         md = serve._health_digest_markdown(self._snapshot())
         self.assertIn('OVER CAP on openrouter', md)
 
+    def test_digest_surfaces_failure_fingerprints_and_repair_loops(self):
+        md = serve._health_digest_markdown(self._snapshot(
+            top_failure_reasons=[{'reason': 'missing deliverable', 'count': 3}],
+            repair_loop_roots_last_24h=2, stuck_cards=4))
+        self.assertIn('Top failure reasons:', md)
+        self.assertIn('missing deliverable x3', md)
+        self.assertIn('2 root(s) with 2+ failures', md)
+        self.assertIn('stuck cards:** 4', md)
+
 
 class CoordinationImbalanceScalar(unittest.TestCase):
     """Direct tests of the Reddit-Hot-style decayed signals + imbalance score

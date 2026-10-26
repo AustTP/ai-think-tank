@@ -1,5 +1,4 @@
-
-
+import collections
 def _task_horizon_metrics(now):
     """METR reliability-at-horizon, computed from action_log's
     task_assigned -> task_completed pairs (joined in Python on the taskId the
@@ -159,6 +158,7 @@ def compute_health_snapshot():
     if state_row is None:
         think_tank_active, seconds_since_last_save, work_queue_size, work_queue_due_size, agents_count = False, None, 0, 0, 0
         aging_in_flight, open_escalations, bank_over_cap, bank_used, bank_cap = 0, 0, [], 0.0, 0.0
+        top_failure_reasons, repair_loop_roots, stuck_cards = [], 0, 0
     else:
         blob, updated_at = state_row
         seconds_since_last_save = now - updated_at
@@ -186,6 +186,38 @@ def compute_health_snapshot():
         bank_over_cap = [row['service'] for row in bank_view.values() if row['over']]
         bank_used = sum(row['used'] for row in bank_view.values())
         bank_cap = sum(row['cap'] for row in bank_view.values())
+        # Failure fingerprint: the digest should say WHY the tank is failing,
+        # not just how many cards failed. Roots that fail twice in a day are
+        # repair loops, not independent incidents.
+        tasks = data.get('tasks') or {}
+        now_ms = now * 1000
+        failed_cards = [t for t in tasks.values()
+                        if t.get('status') in ('failed', 'abandoned', 'blocked')]
+
+        def _fingerprint(t):
+            raw = (t.get('blockedReason') or t.get('failNote')
+                   or t.get('note') or 'unknown')
+            return re.sub(r'\s+', ' ', str(raw)).strip()[:90] or 'unknown'
+
+        def _root_title(title):
+            root = str(title or '').strip()
+            while root.startswith('Fix: '):
+                root = root[len('Fix: '):].strip()
+            return re.sub(r'\s*\(retry\s+\d+\)\s*$', '', root).strip()
+
+        counts = collections.Counter(_fingerprint(t) for t in failed_cards)
+        top_failure_reasons = [{'reason': k, 'count': v}
+                               for k, v in counts.most_common(5)]
+        roots = collections.Counter(
+            _root_title(t.get('title')) for t in failed_cards
+            if now_ms - int(t.get('failedAt') or t.get('blockedAt')
+                            or t.get('createdAt') or 0) <= 86400000)
+        repair_loop_roots = sum(1 for v in roots.values() if v >= 2)
+        stuck_cards = sum(
+            1 for t in tasks.values()
+            if t.get('status') in ('working', 'repairing', 'blocked')
+            and now_ms - int(t.get('startedAt') or t.get('blockedAt')
+                             or t.get('createdAt') or 0) > 7200000)
 
     with _db() as conn:
         abandoned = conn.execute(
@@ -364,6 +396,9 @@ def compute_health_snapshot():
         # separately; the rework alert speaks up when a spiral is live.
         'fix_spawn_spirals_last_24h': spirals['spirals'],
         'fix_spawn_tasks_last_24h': spirals['tasks'],
+        'top_failure_reasons': top_failure_reasons,
+        'repair_loop_roots_last_24h': repair_loop_roots,
+        'stuck_cards': stuck_cards,
         'task_auto_closed_last_24h': auto_closed,
         # Grader agreement: samples, raw agreement, and kappa against the
         # mechanical pipeline anchor -- surfaced so the review-grade judge is
@@ -563,6 +598,13 @@ def _health_digest_markdown(snapshot):
     loop_cost = snapshot.get('loop_cost_usd_last_24h', 0.0)
     lines.append(f'**Rework:** {loops} loop(s) over {snapshot.get("looped_tasks_last_24h", 0)} '
                  f'task(s), straight-through {straight_s}, ${loop_cost:.2f} accrued on looped work')
+    top_failures = snapshot.get('top_failure_reasons') or []
+    if top_failures:
+        lines.append('**Top failure reasons:** ' + '; '.join(
+            f'{r.get("reason", "unknown")} x{r.get("count", 0)}'
+            for r in top_failures))
+    lines.append(f'**Repair loops:** {snapshot.get("repair_loop_roots_last_24h", 0)} '
+                 f'root(s) with 2+ failures; **stuck cards:** {snapshot.get("stuck_cards", 0)}')
     # Grader agreement: the review-grade judge's own number next to the grades
     # it produces -- kappa corrects raw agreement for the base rate.
     gs = snapshot.get('review_grader_samples', 0)
