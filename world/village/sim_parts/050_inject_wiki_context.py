@@ -738,10 +738,13 @@ def _completion_has_evidence(state, task):
         # artifact. Require the note, not a fabricated path. They are queued
         # as taskType 'code', so the generic code rule below would otherwise
         # refuse every successful distillation.
-        return bool(str(task.get('note') or '').strip())
+        return bool(str(task.get('note') or '').strip()) or bool(task.get('wikiPage'))
     if ttype == 'bug':
+        # codePublished is the coding lane's validated-publish signal. A bug
+        # fix that shipped a real staged change must not be refused for a
+        # missing Library record, the same way code/story cards are accepted.
         evidence = bool(task.get('libraryPath') or task.get('writtenPy')
-                        or task.get('restoreCheck'))
+                        or task.get('restoreCheck') or task.get('codePublished'))
         if not evidence:
             return False
     elif ttype in ('spike', 'report'):

@@ -73,7 +73,7 @@ def _supervisor_brief(state, team_id, now_ms=None):
     lines.append('Where to look:')
     lines.append("  - Live status: call the supervisor_report tool first (fresh, read-only, your team only).")
     lines.append("  - Files/sandbox: use execute_script to ls/cat the paths below. The sandbox has no network and no database.")
-    lines.append(f"  - Repo shell only (tasks live in the state JSON, filtered to your team):")
+    lines.append("  - Repo shell only (tasks live in the state JSON, filtered to your team):")
     lines.append("    sqlite3 " + os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'think_tank.db'))
                  + " \"select json_extract(value,'$.id'), json_extract(value,'$.status'), "
                    "json_extract(value,'$.assignedTo'), json_extract(value,'$.ownSpendUsd'), "

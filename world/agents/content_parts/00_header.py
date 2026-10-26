@@ -579,6 +579,12 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
     since = task.get('distillSince') or 0
+    # Distill is one long synchronous synthesis call with no tool rounds to
+    # bump on. Give it its own budget and keep the heartbeat alive, or the
+    # 120s content ceiling abandons a live run with an empty note and the
+    # completion gate then refuses it as missing_saved_deliverable (task-395).
+    task['workUntil'] = max(float(task.get('workUntil') or 0), time.time() + 240)
+    _sim_module._bump_content_heartbeat(task.get('id'))
 
     # 1. Collect recent archive findings (newest first, bounded).
     archive_dir = _serve.LIBRARY_ARCHIVE_DIR
@@ -645,13 +651,14 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
     reply = None
     r = None
     try:
-        r = _serve._http_json('POST', base, '/api/chat',
-                              {'model': tier_slug,
-                               'messages': [{'role': 'system', 'content': sys_msg},
-                                            {'role': 'user', 'content': f'Recent think tank findings:\n\n{sources_text}'}],
-                               'max_tokens': _serve.RESEARCH_SKILL_SYNTHESIS_TOKENS,
-                               'agentId': agent_id,
-                               'taskId': task.get('id')}, key)
+        with _sim_module.content_heartbeat_keepalive(task.get('id')):
+            r = _serve._http_json('POST', base, '/api/chat',
+                                  {'model': tier_slug,
+                                   'messages': [{'role': 'system', 'content': sys_msg},
+                                                {'role': 'user', 'content': f'Recent think tank findings:\n\n{sources_text}'}],
+                                   'max_tokens': _serve.RESEARCH_SKILL_SYNTHESIS_TOKENS,
+                                   'agentId': agent_id,
+                                   'taskId': task.get('id')}, key)
         if isinstance(r, dict) and not r.get('error') and r.get('reply'):
             reply = r['reply'].strip()
     except Exception:

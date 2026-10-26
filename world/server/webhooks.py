@@ -114,7 +114,6 @@ def _webhook_goal_text(payload, channel='x-mention'):
     channel's goal descriptor. Unknown channels get the raw payload id-free
     text with the generic label, so a new watcher is usable before it has a
     formatter."""
-    import serve as _serve
     payload = payload or {}
     spec = CHANNELS.get(channel) or {}
     goal = spec.get('goal') or {}
@@ -233,7 +232,6 @@ async def _webhook_poll_loop():
     """Standing loop (created in _lifespan when any channel is enabled): tail
     the webhook file and route new entries for every enabled channel through
     _dispatch_big_task."""
-    import serve as _serve
     _WEBHOOK_SEEN.update(_webhook_seed_seen())
     offset = 0
     while True:

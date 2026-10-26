@@ -23,10 +23,8 @@ import hashlib
 import hmac
 import json
 import mimetypes
-import os
 import secrets
 import sqlite3
-import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path

@@ -92,6 +92,19 @@ class CompletionEvidence(unittest.TestCase):
             'taskType': 'code', 'room': 'pressoffice',
             'libraryPath': 'library/x.md'}))
 
+    def test_bug_card_accepts_a_validated_publish(self):
+        # A bug fix that shipped a real staged change is the deliverable; the
+        # missing Library record must not refuse it (task-374/377 chain).
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'bug', 'room': 'pressoffice', 'codePublished': True}))
+
+    def test_distill_card_accepts_the_wiki_write(self):
+        # A distill records wikiPage on the task; requiring only task.note
+        # refused a successful wiki merge (task-395).
+        self.assertTrue(sim._completion_has_evidence({}, {
+            'taskType': 'code', 'distill': True,
+            'wikiPage': 'state-of-knowledge'}))
+
     def test_zero_grade_is_refused(self):
         self.assertFalse(sim._completion_has_evidence({}, {
             'taskType': 'code', 'room': 'pressoffice',

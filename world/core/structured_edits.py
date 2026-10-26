@@ -58,7 +58,10 @@ for edit in edits:
     old=edit['old']
     text=pending.get(path,path.read_text(encoding='utf-8') if path.exists() else None)
     if old is None:
-        if text is not None: raise ValueError('Create would overwrite existing file: '+edit['path'])
+        # Create-or-replace. Retrying a save under the same filename used to
+        # dead-end with "Create would overwrite existing file", which blocked
+        # the completion gate and spawned repair cards (task-392). An explicit
+        # old-text edit below still refuses to touch an unexpected file.
         text=edit['new']
     else:
         if text is None or text.count(old)!=1: raise ValueError('Old text must match exactly once: '+edit['path'])

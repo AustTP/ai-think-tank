@@ -702,15 +702,21 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                            {'agentId': agent_id, 'command': command,
                             'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
     if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
+        if not isinstance(exec_data, dict):
+            _block_reason = 'no response from the execution service'
+        elif exec_data.get('timedOut'):
+            _block_reason = 'the command timed out before the execution service returned'
+        else:
+            _block_reason = exec_data.get('reason') or 'the execution service refused the command without a reason'
         store_result(task.get('id'),
-                                          {'note': f"blocked: {exec_data.get('reason') if isinstance(exec_data, dict) else 'no response'}",
+                                          {'note': f"blocked: {_block_reason}",
                                            'command': command, 'ok': False, 'tier': tier_slug,
                                            # Item 2: the block reason rides the result channel
                                            # into sim._apply_content_result, where it lands in the
                                            # author's feedback buffer and shows up on the next
                                            # dispatch's perception block.
                                            'feedback': (f'Your command was blocked before running: '
-                                                        f'{exec_data.get("reason") if isinstance(exec_data, dict) else "no response"}.')})
+                                                        f'{_block_reason}.')})
         return False
     ok = bool(exec_data.get('exitCode') == 0 and not exec_data.get('timedOut'))
     result = {'ok': ok, 'exitCode': exec_data.get('exitCode'), 'command': command, 'tier': tier_slug}
