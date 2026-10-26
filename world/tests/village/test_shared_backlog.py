@@ -528,6 +528,10 @@ class BreakdownCeremony(unittest.TestCase):
         self.assertEqual(spike['title'], 'Study the soil')
         self.assertEqual(spike['taskType'], 'spike')
         self.assertEqual(spike['teamId'], 'dev')
+        # Every card links back to the request that asked for it (the A2A
+        # facade reads completion through this, not by matching titles).
+        self.assertEqual(story['requestId'], req['id'])
+        self.assertEqual(spike['requestId'], req['id'])
         # Attendees were restored to their prior (idle) state.
         for aid in ('ada', 'ben'):
             self.assertFalse(state['agents'][aid]['busy'])

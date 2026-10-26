@@ -893,7 +893,7 @@ class VillagePolicyOverlaysTest(unittest.TestCase):
         self.assertIn('/api/new-board', serve._NON_WAKING_READS)
         self.assertNotIn('not-a-path', serve._NON_WAKING_READS)
         self.assertEqual(serve._NON_WAKING_WRITES,
-                         {'/api/device/checkin', '/api/new-ping'})
+                         {'/api/device/checkin', '/a2a', '/api/new-ping'})
 
     def test_room_override_merges_and_delegatable_replaces(self):
         import serve

@@ -539,7 +539,7 @@ _NON_WAKING_READS = set(_NON_WAKING_READS_BASE) | NON_WAKING_READS_EXTRA
 # BEFORE the method test: the device check-in is a POST, but a phone Shortcut
 # must never keep the think tank awake. Check-ins still land while asleep
 # (the endpoint itself is not gated on _dormant()).
-_NON_WAKING_WRITES_BASE = {'/api/device/checkin'}
+_NON_WAKING_WRITES_BASE = {'/api/device/checkin', '/a2a'}
 _NON_WAKING_WRITES = set(_NON_WAKING_WRITES_BASE) | NON_WAKING_WRITES_EXTRA
 
 
@@ -721,6 +721,9 @@ AUTH_PUBLIC_PATHS = (
     '/api/sms',                                         # incl. inbound (X-SMS-Forward-Secret)
     '/api/experiments',                                 # incl. inference (grant token)
     '/api/rule-proposals', '/api/success-proposals',
+    # A2A Agent Card is public metadata (no secrets); the /a2a endpoint itself
+    # still requires a player session or a director/admin key.
+    '/.well-known/agent-card.json', '/.well-known/agent.json',
 )
 # Static assets the login shell needs before any session exists. This
 # extension allowlist is what stops world/*.py, grants.json, api_services.json,
@@ -825,11 +828,23 @@ def _work_trust_from_body(body):
     return _redeem_work_trust_nonce(body.get('workTrustNonce'))
 
 
+def _a2a_bearer_agent(request):
+    """A2A clients send `Authorization: Bearer <agent key>`; accept that only
+    on /a2a so the rest of the surface keeps its existing auth rules."""
+    if request.url.path != '/a2a':
+        return False
+    auth = (request.headers.get('Authorization') or '').strip()
+    if not auth.lower().startswith('bearer '):
+        return False
+    return _valid_agent_key_presented(auth[7:].strip())
+
+
 @app.middleware('http')
 async def require_login(request: Request, call_next):
     if not _is_public_path(request.url.path):
         if not verify_session(request.cookies.get(SESSION_COOKIE_NAME)) \
                 and not _valid_agent_key_presented(request.headers.get('X-Agent-Key')) \
+                and not _a2a_bearer_agent(request) \
                 and not _valid_theo_ask_credential(request):
             return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     return await call_next(request)

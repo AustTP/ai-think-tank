@@ -41,6 +41,10 @@ EXPECTED_PUBLIC = (
     '/api/sms',
     '/api/experiments',
     '/api/rule-proposals', '/api/success-proposals',
+    # A2A Agent Card: public metadata only (name, skills, auth scheme). The
+    # /a2a endpoint itself is NOT public; it requires a session or a
+    # director/admin bearer key.
+    '/.well-known/agent-card.json', '/.well-known/agent.json',
     # Inbound webhook intake. Not a village route: the handler requires the
     # X-Webhook-Key header (403 without it) and only appends to the JSONL
     # queue; a bad or missing key stores nothing.

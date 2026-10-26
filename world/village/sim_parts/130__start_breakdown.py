@@ -195,6 +195,10 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             queue_work(state, [{
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
+                # Provenance: every card a breakdown creates points back at the
+                # request that asked for it. The A2A facade reads completion back
+                # through this link instead of matching titles.
+                'requestId': req.get('id'),
                 # The decider was told to size each story S/M/L (see the
                 # breakdown prompt); carry it so the queued item + task keep the
                 # estimate and same-priority work is ordered largest-first.
