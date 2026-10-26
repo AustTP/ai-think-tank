@@ -195,6 +195,12 @@ def generate_village_map(actor_id, village, theme='', mirror=True, dry_run=False
         cost = float((data.get('usage') or {}).get('usd') or 0)
         if cost > 0:
             _accrue_spend('pixellab', cost, agent_id=actor)
+            try:
+                record_service_price_observation(
+                    'pixellab', VILLAGE_ART_ENDPOINT, estimate, cost,
+                    (quote.get('estimate') or {}).get('basis'), 'village_art', actor)
+            except Exception:
+                pass
         image_b64 = (data.get('image') or {}).get('base64') or ''
         if not image_b64:
             return {**result, 'ok': False, 'costUsd': cost,

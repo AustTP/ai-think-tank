@@ -874,6 +874,7 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
     # Accrue spend ONLY on a successful terminal -- a failed/canceled/NSFW
     # generation is never charged (same rule _higgsfield_generate enforced).
     charged = bool(success) and final_status in success
+    actual_cost = None
     if charged and spend.get('kind') == 'estimate_first' and usd > 0:
         _accrue_spend(spend_service, usd, agent_id=agent_id)
     elif charged and spend.get('kind') == 'balance_delta':
@@ -881,8 +882,10 @@ def _api_execute_workflow(service, spend_kind, base_url, method, req_headers, re
         balance_after = (bal or {}).get('balance')
         if isinstance(balance_before, (int, float)) and isinstance(balance_after, (int, float)):
             real_cost = max(0.0, balance_before - balance_after)
+            actual_cost = real_cost
             if real_cost > 0:
                 _accrue_spend(spend_service, real_cost, agent_id=agent_id)
 
     return {'data': final_data, 'status': final_status, 'contentType': 'application/json',
-            'usd': usd if spend.get('kind') == 'estimate_first' else None, 'ids': values}
+            'usd': usd if spend.get('kind') == 'estimate_first' else None,
+            'actualUsd': actual_cost, 'ids': values}

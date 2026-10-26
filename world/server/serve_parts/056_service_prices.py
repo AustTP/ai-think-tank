@@ -58,9 +58,12 @@ def service_price_report(service=None, path=None, body=None):
             return {'ok': False, 'error': f'unknown service: {service}'}
         pricing = describe_service_pricing(spec)
         quote = estimate_service_spec_cost(spec, path or '', body)
+        drift = [r for r in service_price_drift_report()
+                 if r['service'] == service and (not path or r['endpoint'] == path)]
         return {'ok': True, 'service': service, 'name': spec.get('name'),
                 'baseUrl': spec.get('base_url'), 'pricing': pricing,
-                'quote': quote, 'budget': _service_budget(service),
+                'sourceUrl': pricing.get('sourceUrl'),
+                'quote': quote, 'drift': drift, 'budget': _service_budget(service),
                 'sharedCap': shared}
     rows = []
     for sid, spec in sorted(_catalog().items()):
@@ -72,5 +75,6 @@ def service_price_report(service=None, path=None, body=None):
                      'priceKind': pricing.get('kind'),
                      'note': pricing.get('note'),
                      'enforcedBy': pricing.get('enforcedBy'),
+                     'sourceUrl': pricing.get('sourceUrl'),
                      'endpoints': pricing.get('endpoints')})
     return {'ok': True, 'services': rows, 'sharedCap': shared}

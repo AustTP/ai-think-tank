@@ -147,4 +147,5 @@ def describe_service_pricing(service: dict) -> dict:
     return {'kind': kind or 'unknown',
             'note': pricing.get('note') or '',
             'enforcedBy': pricing.get('enforced_by'),
+            'sourceUrl': pricing.get('source_url'),
             'endpoints': sorted(endpoints) if endpoints else []}

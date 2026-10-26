@@ -152,9 +152,17 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
         price_line = _api_price_line(price_quote)
         if price_line:
             instruction = (instruction + '\n' + price_line).strip()
+        try:
+            record_service_price_observation(
+                _api_service_id(service), quote_path,
+                (price_quote or {}).get('usd'), wf.get('actualUsd'),
+                (price_quote or {}).get('basis'), 'api_call', agent_id)
+        except Exception:
+            pass
         return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
                 'status': 200, 'service': (service or {}).get('name'), 'data': wf['data'], 'wrapped_json': wrapped,
-                'ids': wf.get('ids') or {}, 'usd': wf.get('usd'), 'priceQuote': price_quote, 'finalUrl': url}
+                'ids': wf.get('ids') or {}, 'usd': wf.get('usd'), 'actualUsd': wf.get('actualUsd'),
+                'priceQuote': price_quote, 'finalUrl': url}
 
     try:
         result = _api_request_sync(method, url, req_headers, req_body)
@@ -165,11 +173,19 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     price_line = _api_price_line(price_quote)
     if price_line:
         instruction = (instruction + '\n' + price_line).strip()
+    actual_usd = _api_actual_usd(parsed_json)
+    try:
+        record_service_price_observation(
+            _api_service_id(service), parsed.path,
+            (price_quote or {}).get('usd'), actual_usd,
+            (price_quote or {}).get('basis'), 'api_call', agent_id)
+    except Exception:
+        pass
     _api_accrue(spend_kind, ctype, parsed_json)
     _api_accrue_daily_call(service)
     return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
             'status': result['status'], 'service': (service or {}).get('name'), 'data': parsed_json, 'wrapped_json': wrapped,
-            'priceQuote': price_quote, 'finalUrl': result.get('finalUrl') or url}
+            'priceQuote': price_quote, 'actualUsd': actual_usd, 'finalUrl': result.get('finalUrl') or url}
 
 
 def _api_call_response(agent_id, authorized, out, trace_id=None, url='', method='', purpose=''):

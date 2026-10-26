@@ -80,6 +80,7 @@ async def _lifespan(app):
     tier_boot_backfill_task = asyncio.create_task(_model_tier_boot_backfill())
     photo_watch_task = asyncio.create_task(_photo_album_watch_loop())
     tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
+    service_price_drift_task = asyncio.create_task(_service_price_drift_loop())
     tier_failure_recheck_task = asyncio.create_task(_tier_failure_recheck_loop())
     calibration_task = asyncio.create_task(_calibration_loop())
     weekly_review_task = asyncio.create_task(_weekly_review_loop())
@@ -135,6 +136,7 @@ async def _lifespan(app):
     tier_boot_backfill_task.cancel()
     photo_watch_task.cancel()
     tier_price_watch_task.cancel()
+    service_price_drift_task.cancel()
     tier_failure_recheck_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()

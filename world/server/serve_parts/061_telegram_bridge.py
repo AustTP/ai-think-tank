@@ -458,6 +458,7 @@ _TELEGRAM_HELP = (
     '/approve <planId> [version] -- approve and apply a plan\n'
     '/reject <planId> [version] [reason] -- reject a plan\n'
     '/status -- agent, task, and queue counts\n'
+    '/prices [service] -- API price catalog, budgets, and drift\n'
     '/help -- this list\n'
     'Anything else is sent to the think tank admin.')
 
@@ -541,6 +542,48 @@ async def _telegram_operator_command(chat_id, text):
             return chat_id, f'Rejected {plan_id} v{version}.'
         except plan_approvals.PlanError as exc:
             return chat_id, f'Could not {verb} {plan_id} v{version}: {exc}'
+    if verb in ('prices', 'costs'):
+        report = service_price_report(args[0] if args else None,
+                                      args[1] if len(args) > 1 else None)
+        if not report.get('ok'):
+            return chat_id, report.get('error') or 'Could not read the price catalog.'
+        if report.get('service'):
+            q = report.get('quote') or {}
+            b = report.get('budget') or {}
+            usd = q.get('usd')
+            price = ('free' if usd == 0 else f'${float(usd):.4f}') if isinstance(usd, (int, float)) else 'variable/unknown'
+            lines = [f"{report.get('name')} ({report['service']}): {price}",
+                     f"Kind: {(report.get('pricing') or {}).get('kind')}"]
+            if q.get('basis'):
+                lines.append(f"Basis: {q['basis']}")
+            if b.get('unit') == 'usd':
+                lines.append(f"Budget: ${float(b.get('used') or 0):.4f} used"
+                             + (f"; balance ${float(b['balanceUsd']):.2f}" if b.get('balanceUsd') is not None else ''))
+            elif b.get('unit'):
+                lines.append(f"Budget: {b.get('used')} of {b.get('cap')} {b.get('unit')}")
+            for d in report.get('drift') or []:
+                lines.append(f"Drift: billed ${float(d['medianActualUsd']):.4f} vs quoted "
+                             f"${float(d['medianEstimateUsd']):.4f} over {d['samples']} calls "
+                             f"({float(d['deltaPct']):+.1f}%)")
+            if report.get('sourceUrl'):
+                lines.append(f"Published: {report['sourceUrl']}")
+            return chat_id, '\n'.join(lines)
+        rows = report.get('services') or []
+        paid = [r for r in rows if r.get('priceKind') not in ('free', 'daily_calls')]
+        free = [r for r in rows if r.get('priceKind') in ('free', 'daily_calls')]
+        lines = [f'{len(rows)} services. Metered:']
+        for r in paid:
+            lines.append(f"- {r['id']}: {r.get('priceKind')}"
+                         + (f" ({r['enforcedBy']})" if r.get('enforcedBy') else ''))
+        if free:
+            lines.append('Free: ' + ', '.join(r['id'] for r in free))
+        drift = service_price_drift_report()
+        if drift:
+            lines.append('Drift:')
+            for d in drift[:5]:
+                lines.append(f"- {d['service']}{d['endpoint'] or ''}: {d['deltaPct']:+.1f}%")
+        lines.append('Quote one with /prices <service> [path].')
+        return chat_id, '\n'.join(lines)
     if verb == 'status':
         return chat_id, _telegram_status_text()
     return chat_id, f'Unknown command /{verb}.\n' + _TELEGRAM_HELP
@@ -591,6 +634,7 @@ async def _telegram_poll_loop():
             {'command': 'approve', 'description': 'Approve a plan: /approve <planId> [version]'},
             {'command': 'reject', 'description': 'Reject a plan: /reject <planId> [version] [reason]'},
             {'command': 'status', 'description': 'Agent, task, and queue counts'},
+            {'command': 'prices', 'description': 'API price catalog, budgets, and drift'},
             {'command': 'help', 'description': 'Command list'},
         ]})
     except Exception as e:  # noqa: BLE001 -- a cosmetic menu must never stop the bridge

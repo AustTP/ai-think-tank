@@ -116,6 +116,20 @@ class TelegramBridge(unittest.TestCase):
         self.assertIn('Queue: 1', outcome[1])
         routed.assert_not_called()
 
+    def test_prices_command_lists_metered_services_and_drift(self):
+        report = {'ok': True, 'services': [
+            {'id': 'pixellab', 'priceKind': 'endpoint_table', 'enforcedBy': None},
+            {'id': 'github', 'priceKind': 'free', 'enforcedBy': None}], 'sharedCap': {}}
+        with unittest.mock.patch.object(serve, 'service_price_report', return_value=report), \
+             unittest.mock.patch.object(serve, 'service_price_drift_report', return_value=[
+                 {'service': 'pixellab', 'endpoint': '/create-image-pixflux',
+                  'deltaPct': 30.0, 'medianActualUsd': 0.0172,
+                  'medianEstimateUsd': 0.0132, 'samples': 3}]):
+            outcome = asyncio.run(serve._telegram_operator_command('1', '/prices'))
+        self.assertIn('pixellab', outcome[1])
+        self.assertIn('Drift', outcome[1])
+        self.assertIn('+30.0%', outcome[1])
+
     def test_unknown_command_returns_help(self):
         outcome = asyncio.run(serve._telegram_process_update(
             self._update(text='/wat')))

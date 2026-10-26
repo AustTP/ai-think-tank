@@ -129,7 +129,8 @@
         "kind": "page_request",
         "usd_per_request": 0.008,
         "enforced_by": "page_request_budget",
-        "note": "One page request per search. Tavily list price is about $0.008 per basic credit; the tank's monthly page-request cap is the enforced limit."
+        "note": "One page request per search. Tavily list price is about $0.008 per basic credit; the tank's monthly page-request cap is the enforced limit.",
+        "source_url": "https://tavily.com/#pricing"
       }
     },
     "apify": {
@@ -187,7 +188,8 @@
       "pricing": {
         "kind": "variable",
         "enforced_by": "apify_monthly_budget",
-        "note": "Actor runs are priced per actor and usage, so there is no single per-call price. Pass maxTotalChargeUsd in the run input; the monthly Apify budget is the hard cap."
+        "note": "Actor runs are priced per actor and usage, so there is no single per-call price. Pass maxTotalChargeUsd in the run input; the monthly Apify budget is the hard cap.",
+        "source_url": "https://apify.com/pricing"
       }
     },
     "pixellab": {
@@ -350,7 +352,8 @@
             "unit_usd": 0.0099,
             "item_key": "objects"
           }
-        }
+        },
+        "source_url": "https://www.pixellab.ai/pixellab-api"
       }
     },
     "higgsfield": {
@@ -437,7 +440,8 @@
       "pricing": {
         "kind": "variable",
         "enforced_by": "pixellab_like_balance",
-        "note": "Credit-based generation; the workflow logs the real balance delta. Check the quote/credit before submitting a large job."
+        "note": "Credit-based generation; the workflow logs the real balance delta. Check the quote/credit before submitting a large job.",
+        "source_url": "https://higgsfield.ai/pricing"
       }
     },
     "opensky": {
@@ -704,7 +708,8 @@
       },
       "pricing": {
         "kind": "per_token",
-        "note": "/api/ metadata and file listing are free. Inference Providers are billed per model and token; check the model card before a paid /v1/ call."
+        "note": "/api/ metadata and file listing are free. Inference Providers are billed per model and token; check the model card before a paid /v1/ call.",
+        "source_url": "https://huggingface.co/pricing"
       }
     }
   },

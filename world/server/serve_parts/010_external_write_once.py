@@ -522,6 +522,25 @@ def init_db():
             logged_at REAL NOT NULL,
             PRIMARY KEY (log_date, model_id)
         )''')
+        # Per-call external-service price observations: the estimate quoted
+        # before the call and the actual billed amount the provider returned
+        # (when it returns one). The drift audit compares recent actuals with
+        # the estimates used for the same calls, so a provider price change is
+        # visible without trusting a scraped pricing page.
+        conn.execute('''CREATE TABLE IF NOT EXISTS service_price_observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts REAL NOT NULL,
+            service TEXT NOT NULL,
+            endpoint TEXT,
+            estimate_usd REAL,
+            actual_usd REAL,
+            basis TEXT,
+            source TEXT,
+            agent_id TEXT,
+            task_id TEXT
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS idx_service_price_obs '
+                     'ON service_price_observations(service, endpoint, ts)')
         # Daily OpenRouter catalog snapshot -- the persistent record of "what
         # models existed, at what price, on which day" that the live fetch
         # (_fetch_openrouter_catalog_sync) otherwise leaves nowhere in the DB.

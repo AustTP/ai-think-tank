@@ -545,6 +545,12 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                             lines.append(f"Budget: {b.get('used')} used of {b.get('cap')} {b.get('unit')}")
                     if cap.get('left') is not None:
                         lines.append(f"Shared monthly cap: ${float(cap['left']):.2f} left of ${float(cap.get('cap') or 0):.2f}")
+                    for d in result.get('drift') or []:
+                        lines.append(f"Drift: median billed ${float(d['medianActualUsd']):.4f} vs quoted "
+                                     f"${float(d['medianEstimateUsd']):.4f} over {d['samples']} calls "
+                                     f"({float(d['deltaPct']):+.1f}%)")
+                    if result.get('sourceUrl'):
+                        lines.append(f"Published prices: {result['sourceUrl']}")
                     return '\n'.join(lines)
                 rows = result.get('services') or []
                 lines = ['Registered external services and their prices (quote one with service + path + body):', '']
