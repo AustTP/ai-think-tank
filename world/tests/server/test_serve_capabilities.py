@@ -707,6 +707,18 @@ class ClassifyCommand(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, 'block')
 
+    def test_host_home_path_blocks_before_the_model(self):
+        # Host paths are refused deterministically so the classifier cannot
+        # allow a read that the sandbox can never satisfy, or block a
+        # container-local /tmp path it wrongly reads as the host's (task-389).
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+             unittest.mock.patch.object(serve, '_jev_quorum_decision',
+                                        side_effect=AssertionError('model should not run')):
+            allowed, reason = asyncio.run(serve._classify_command(
+                'cat ' + os.path.expanduser('~') + '/secret.txt', 'read a file', 'ada'))
+        self.assertFalse(allowed)
+        self.assertIn('host filesystem', reason)
+
 
 
 class CredentialVaultEndpoints(unittest.TestCase):

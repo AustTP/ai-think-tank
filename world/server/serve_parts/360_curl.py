@@ -438,7 +438,19 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
     }
     reviewed = review_target(command)
-    instructions = f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\nStated reason: {purpose or "not given"}\nDecide allow or block.'
+    # Deterministic host-path refusal before the model is asked. The sandbox
+    # mounts the task directory at /workspace and has its own ephemeral /tmp;
+    # a host home path is never ordinary work. This also keeps the read path
+    # consistent with the write path, which previously allowed a /tmp scratch
+    # write and then blocked reading the same file (task-389).
+    _host_home = os.path.expanduser('~')
+    if _host_home and _host_home != '/' and _host_home in reviewed['text']:
+        return False, ('blocked: the command references a host filesystem path outside the sandbox. '
+                       'Use /workspace, or the sandbox\'s own /tmp.')
+    instructions = (f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\n'
+                    f'Stated reason: {purpose or "not given"}\n'
+                    'The sandbox is a container: /workspace is the task directory and its /tmp is '
+                    'ephemeral and internal, not the host filesystem. Decide allow or block.')
     if reviewed['decoded']:
         instructions += ('\n(The command above was decoded from a base64 wrapper for review. '
                          'The original wrapper is what would run.)')
