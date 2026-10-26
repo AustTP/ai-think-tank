@@ -467,7 +467,7 @@ AGENT_ASK_TOOLS = [
             },
         },
     },
-] + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL, _LIST_SERVICES_TOOL] + [
+] + [_API_CALL_TOOL, _PROPOSE_API_SERVICE_TOOL, _LIST_SERVICES_TOOL, _SERVICE_PRICES_TOOL] + [
     {
         'type': 'function',
         'function': {

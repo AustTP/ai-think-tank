@@ -537,9 +537,35 @@ function doorMenuCallMeeting() {
   openMeetingUI('townhall');
 }
 
+function renderSouthDestinations() {
+  const box = document.getElementById('southOutletDestinations');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const id in SCENES) {
+    if (id === 'main' || id === 'south') continue;
+    const btn = document.createElement('button');
+    btn.textContent = 'Walk to the ' + id.replace(/-/g, ' ') + ' village';
+    btn.addEventListener('click', () => travelToVillage(id));
+    box.appendChild(btn);
+  }
+}
+
+function travelToVillage(id) {
+  const scene = SCENES[id];
+  if (!scene || !scene.bg || !scene.grid) {
+    showToast('That village is not ready yet.');
+    return;
+  }
+  document.getElementById('southOutletModal').classList.add('hidden');
+  state.ui = null;
+  switchScene(id);
+  showToast('Arrived in the ' + id.replace(/-/g, ' ') + ' village.');
+}
+
 function openSouthMenu() {
   if (state.ui) return;
   state.ui = 'southOutlet';
+  renderSouthDestinations();
   document.getElementById('southOutletModal').classList.remove('hidden');
 }
 

@@ -771,6 +771,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     db_tool = _make_supervisor_db_executor(agent_id)
     state_tool = _make_supervisor_state_executor(agent_id)
     avatar_tool = _make_generate_agent_avatar_executor(agent_id)
+    village_tool = _make_generate_village_map_executor(agent_id)
+    prices_tool = _make_service_prices_executor(agent_id)
 
     def _execute_tool_raw(tool_name, args):
         _hb()
@@ -790,6 +792,10 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             return state_tool(tool_name, args)
         if tool_name == 'generate_agent_avatar':
             return avatar_tool(tool_name, args)
+        if tool_name == 'generate_village_map':
+            return village_tool(tool_name, args)
+        if tool_name == 'service_prices':
+            return prices_tool(tool_name, args)
         if tool_name == 'schedules':
             return schedules_tool(tool_name, args)
         if tool_name == 'runbook':
@@ -805,7 +811,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     tools = [_SPIKE_SANDBOX_TOOL, _SUPERVISOR_REPORT_TOOL, _SUPERVISOR_GRANT_TOOL,
              _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
              _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL,
-             _GENERATE_AGENT_AVATAR_TOOL]
+             _GENERATE_AGENT_AVATAR_TOOL, _GENERATE_VILLAGE_MAP_TOOL,
+             _serve._SERVICE_PRICES_TOOL]
     if is_admin:
         tools += [_SUPERVISOR_BACKLOG_TOOL, _SUPERVISOR_DB_TOOL,
                   _SUPERVISOR_STATE_TOOL]
@@ -822,7 +829,10 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             '(list/create/edit/delete any), runbook (standard procedures), '
             'supervisor_grant_budget (any team), direct_backlog (instruct a team to put an '
             'immediate high-priority task in its backlog), generate_agent_avatar (generate '
-            'the four directional images for any non-admin agent), db_records (read or modify '
+            'the four directional images for any non-admin agent), generate_village_map '
+            '(quote then generate a village background plus collision and door maps; '
+            'metered), service_prices (list or quote every external API price and '
+            'its remaining budget), db_records (read or modify '
             'non-secret SQL tables; every write is audited), state_records (read or '
             'modify live business records in the state blob by path).\n'
             'Look for anything unusual across the tank: a failure, a card stuck in review, '
@@ -854,7 +864,10 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'log), delegate (queue a scoped check for a worker with a return contract), schedules '
             '(list/create/edit/delete), runbook (standard procedures), supervisor_grant_budget, '
             'generate_agent_avatar (generate the four directional images for a team member or '
-            'yourself; checks PixelLab availability and budget).\n'
+            'yourself; checks PixelLab availability and budget), generate_village_map '
+            '(quote then generate a village background plus exact collision and door '
+            'maps; metered, so check the quote against your budget first), '
+            'service_prices (quote any registered external API before delegating a call).\n'
             'Act on four things:\n'
             '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
             'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
@@ -883,7 +896,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             conversation_policy=task_tool_policy({
                 **task,
                 'approvedTools': ['delegate', 'schedules', 'supervisor_grant_budget',
-                                  'direct_backlog', 'generate_agent_avatar', 'execute_script'],
+                                  'direct_backlog', 'generate_agent_avatar', 'generate_village_map',
+                                  'service_prices', 'execute_script'],
             }))
     except Exception as error:
         _sim_module._store_content_result(task.get('id'), {

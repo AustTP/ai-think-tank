@@ -27,6 +27,10 @@
       "spend": {
         "kind": "none",
         "note": "Free keyless weather forecasts and current conditions for any lat/lon, no account or quota needed for light use. Reach for it whenever a task needs real current weather or a multi-day forecast for a place (pair with open-meteo-geocoding to turn a place name into coordinates first)."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free keyless forecasts; no account charge. Fair-use rate limits only."
       }
     },
     "open-meteo-geocoding": {
@@ -54,6 +58,10 @@
       "spend": {
         "kind": "none",
         "note": "Free keyless geocoding: turn a place name or address into latitude/longitude (and vice versa). Reach for it to resolve a city/region name into coordinates before calling the weather API or any other lat/lon-based service."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free keyless geocoding; no account charge."
       }
     },
     "github": {
@@ -85,6 +93,10 @@
       "spend": {
         "kind": "none",
         "note": "Read-only access to public GitHub data: repositories, file contents, issues, releases, commit history, and user/org profiles. Reach for it when a task needs real source code, a repo's README/changelog, open issues, or release notes straight from GitHub instead of a scraped page."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Public GitHub REST API is free. Unauthenticated requests are rate-limited (60/hour per IP)."
       }
     },
     "tavily": {
@@ -112,6 +124,12 @@
       "spend": {
         "kind": "page_request",
         "note": "Real web search that returns clean, ranked result snippets (the search behind research tasks). Reach for it when you need to find current pages on a topic and do NOT already know a specific URL -- it is a search, not a page fetch. Counts against a monthly budget, so prefer browse_page when you already have the exact URL."
+      },
+      "pricing": {
+        "kind": "page_request",
+        "usd_per_request": 0.008,
+        "enforced_by": "page_request_budget",
+        "note": "One page request per search. Tavily list price is about $0.008 per basic credit; the tank's monthly page-request cap is the enforced limit."
       }
     },
     "apify": {
@@ -165,6 +183,11 @@
       "spend": {
         "kind": "apify",
         "note": "Run pre-built scrapers/crawlers (actors) against websites that block plain fetches, and pull the structured results from datasets. Reach for it when a page is JS-heavy, login-walled, or paginated in a way browse_page cannot handle, or when you need to scrape many pages at scale. Each actor run costs money against a monthly budget, so use it only when cheaper approaches fail."
+      },
+      "pricing": {
+        "kind": "variable",
+        "enforced_by": "apify_monthly_budget",
+        "note": "Actor runs are priced per actor and usage, so there is no single per-call price. Pass maxTotalChargeUsd in the run input; the monthly Apify budget is the hard cap."
       }
     },
     "pixellab": {
@@ -226,6 +249,107 @@
           "kind": "balance_delta",
           "service": "pixellab",
           "balance_path": "/balance"
+        }
+      },
+      "pricing": {
+        "currency": "USD",
+        "note": "Published list prices. The API returns real usage.usd per call, which is logged; estimates use these buckets and may differ slightly.",
+        "endpoints": {
+          "/create-image-pixflux": {
+            "kind": "size_bucket",
+            "unit": "max_side_px",
+            "prices": [
+              [
+                64,
+                0.00793
+              ],
+              [
+                128,
+                0.00793
+              ],
+              [
+                320,
+                0.0101
+              ],
+              [
+                400,
+                0.0132
+              ]
+            ]
+          },
+          "/create-image-pixen": {
+            "kind": "size_bucket",
+            "unit": "max_side_px",
+            "prices": [
+              [
+                32,
+                0.007
+              ],
+              [
+                64,
+                0.00718
+              ],
+              [
+                128,
+                0.00793
+              ],
+              [
+                256,
+                0.0089
+              ],
+              [
+                512,
+                0.0169
+              ]
+            ]
+          },
+          "/create-tileset": {
+            "kind": "tile_bucket",
+            "unit": "tile_px",
+            "prices": [
+              [
+                16,
+                0.0079
+              ],
+              [
+                32,
+                0.0099
+              ]
+            ]
+          },
+          "/create-character-with-4-directions": {
+            "kind": "size_bucket",
+            "unit": "max_side_px",
+            "prices": [
+              [
+                48,
+                0.0105
+              ],
+              [
+                64,
+                0.0122
+              ]
+            ]
+          },
+          "/create-isometric-tile": {
+            "kind": "size_bucket",
+            "unit": "max_side_px",
+            "prices": [
+              [
+                32,
+                0.0156
+              ],
+              [
+                64,
+                0.0166
+              ]
+            ]
+          },
+          "/map-objects": {
+            "kind": "per_item",
+            "unit_usd": 0.0099,
+            "item_key": "objects"
+          }
         }
       }
     },
@@ -309,6 +433,11 @@
           "kind": "estimate_first",
           "service": "higgsfield"
         }
+      },
+      "pricing": {
+        "kind": "variable",
+        "enforced_by": "pixellab_like_balance",
+        "note": "Credit-based generation; the workflow logs the real balance delta. Check the quote/credit before submitting a large job."
       }
     },
     "opensky": {
@@ -340,6 +469,11 @@
         "kind": "daily_calls",
         "cap": 200,
         "note": "Live and historical civil aircraft ADS-B data: current air positions, flight tracks, and departures/arrivals by airport or bounding box. Reach for it when a task needs real live air traffic or a specific flight's path. Standard account, ~4,000 credits/day; heavier endpoints cost more credits."
+      },
+      "pricing": {
+        "kind": "free",
+        "enforced_by": "daily_calls",
+        "note": "Free API with a daily call limit; no USD charge."
       }
     },
     "adsb-lol": {
@@ -367,6 +501,10 @@
       "spend": {
         "kind": "none",
         "note": "Free keyless live ADS-B aircraft positions (neighborhood of a point, by hex/flight, or by airport). Reach for it for quick live air-traffic lookups without an account. Fair-use rate limits, no uptime guarantee -- prefer it over OpenSky for light/keyless checks."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free keyless ADS-B; fair-use rate limits only."
       }
     },
     "celestrak": {
@@ -394,6 +532,10 @@
       "spend": {
         "kind": "none",
         "note": "Free keyless NORAD orbital element sets (TLE data) for satellites and rocket bodies. Reach for it when a task needs to know what satellites are in orbit, a satellite's identity/orbit, or data to propagate a position with an SGP4 library."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free keyless orbital data; no account charge."
       }
     },
     "transitland": {
@@ -425,6 +567,11 @@
         "kind": "daily_calls",
         "cap": 330,
         "note": "Public-transit data: transit agencies, routes, stops, and schedules across many cities. Reach for it when a task needs real transit routes/operators/feeds (e.g. Charlotte CATS). Free tier ~10k REST queries/month; routing API is a separate quota. Attribution to transit.land required. Stop geography can be sparse for some agencies."
+      },
+      "pricing": {
+        "kind": "free",
+        "enforced_by": "daily_calls",
+        "note": "Free tier with a daily call limit; no USD charge."
       }
     },
     "jina-reader": {
@@ -452,6 +599,10 @@
       "spend": {
         "kind": "none",
         "note": "Free keyless reader: fetch any public URL and get back clean markdown instead of raw HTML. Reach for it to read a webpage's real content when browse_page returns navigation junk or a JS-heavy shell -- especially useful as a cheap fallback before spending an Apify run."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free keyless reader; fair-use rate limits only."
       }
     },
     "aisstream": {
@@ -478,6 +629,10 @@
       "spend": {
         "kind": "none",
         "note": "Live AIS ship-tracking data, but it is WebSocket-only (wss://stream.aisstream.io/v0/stream) with no REST endpoint, so the generic HTTP api_call tool CANNOT stream it. The think tank has a dedicated read_ais_feed collector for the live feed instead. This registry entry only documents the key; use read_ais_feed for real vessel positions."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Free live AIS WebSocket feed; no REST per-call charge. This service is not reachable through api_call."
       }
     },
     "mullvad": {
@@ -505,6 +660,10 @@
       "spend": {
         "kind": "none",
         "note": "Account status for the think tank's Mullvad VPN account (expiry, device slots, payment). It cannot route a fetch through a foreign exit. To fetch a page as if from another country, use browse_page's exit parameter -- a named sandbox VPN container with its own WireGuard tunnel (see GET /api/vpn-exits) -- or its country parameter for the host's own Mullvad tunnel."
+      },
+      "pricing": {
+        "kind": "free",
+        "note": "Account/device management only; no per-call USD charge. The VPN tunnel is a shared host resource, not a metered API call."
       }
     },
     "huggingface": {
@@ -542,6 +701,10 @@
         "kind": "daily_calls",
         "cap": 200,
         "note": "Discover and pull open AI models/datasets from the Hugging Face Hub. /api/ paths give free model metadata, files, and gated-model info; /v1/ is the paid Inference Providers chat router (separate spend). Reach for it to find a model, read its card/config, or download weights (e.g. to run on Colab). Gated models need the license accepted on the account before their files are downloadable."
+      },
+      "pricing": {
+        "kind": "per_token",
+        "note": "/api/ metadata and file listing are free. Inference Providers are billed per model and token; check the model card before a paid /v1/ call."
       }
     }
   },

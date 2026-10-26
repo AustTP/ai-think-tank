@@ -19,8 +19,14 @@ and world/door_triggers_south.json. It does not touch the main map.
 import json
 import os
 import random
+import sys
 
 from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from world.core.village_geometry import (  # noqa: E402
+    NATIVE_H, NATIVE_W, ROAD_BOTTOM, ROAD_X0, ROAD_X1, build as build_geometry,
+)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORLD = os.path.join(ROOT, 'world')
@@ -35,43 +41,14 @@ ROAD_BOTTOM = 214
 PLAZA_Y = 46
 
 
-def _mirror_rect(rect):
-    return {'x': NATIVE_W - (rect['x'] + rect['w']), 'y': rect['y'],
-            'w': rect['w'], 'h': rect['h']}
-
-
 def build_doors():
-    with open(os.path.join(WORLD, 'door_triggers.json'), encoding='utf-8') as fh:
-        main = json.load(fh)
-    out = {name: _mirror_rect(rect) for name, rect in main.items() if name != 'south_outlet'}
-    # The south arrival/return gate sits on the north edge road. It is handled
-    # by the scene transition, not by the room-entry loop, so keep it out of
-    # this file: world.js owns SOUTH_GATE in world coordinates. Mirroring the
-    # main map's south_outlet would put a second selector on the south map's
-    # bottom edge and let the player "travel" to the map they are already in.
-    out.pop('south_outlet', None)
-    return out
+    # The south map returns through its north gate, not the main outlet: a
+    # mirrored south_outlet would put a second selector on the bottom edge.
+    return build_geometry(WORLD)[1]
 
 
 def build_grid():
-    with open(os.path.join(WORLD, 'collision_grid.json'), encoding='utf-8') as fh:
-        main = json.load(fh)
-    cols, rows = main['cols'], main['rows']
-    grid = [list(row) for row in main['grid']]
-    # Mirror columns to match the mirrored background.
-    grid = [list(reversed(row)) for row in grid]
-    # Open the north border and carve the arrival road down to the central road.
-    x0, x1 = ROAD_X0 // CELL, ROAD_X1 // CELL
-    y_bottom = ROAD_BOTTOM // CELL
-    for y in range(0, y_bottom + 1):
-        for x in range(x0, x1 + 1):
-            grid[y][x] = 0
-    # A little arrival plaza so the gate does not feel like a corridor mouth.
-    for y in range(0, PLAZA_Y // CELL):
-        for x in range(x0 - 2, x1 + 3):
-            if 0 <= x < cols:
-                grid[y][x] = 0
-    return {'cols': cols, 'rows': rows, 'cell': main['cell'], 'grid': grid}
+    return build_geometry(WORLD)[0]
 
 
 def _path_patch(src):

@@ -641,7 +641,7 @@ const SCENES = {
 // Runtime scene state. SCENE.bg/grid/doors are populated by
 // loadSceneAssets() (background + grid) and rooms.js's loadDoorTriggers()
 // (doors) before the game loop starts.
-let SCENE = { name: 'main', bg: null, grid: null, doors: null };
+let SCENE = { name: 'main', bg: null, grid: null, doors: null, gate: null };
 let WINTER_ENABLED = false; // mirrors state.adversarialVillage.enabled
 
 // Compatibility shims: legacy callers reference BG_SPRITE / GRID_SPRITE /
@@ -651,7 +651,27 @@ let GRID_SPRITE = SCENES.main.gridSprite;
 let SPAWN = SCENES.main.spawn;
 let COLLISION_GRID = null;
 
+async function loadSceneManifest() {
+  // New villages are data, not code: the generator writes a scenes.json entry
+  // and the client picks it up on the next boot. Built-in scenes win on
+  // conflicts so a bad manifest can never remove the main map.
+  try {
+    const res = await fetch('/scenes.json?v=' + Date.now());
+    if (!res.ok) return;
+    const extra = await res.json();
+    for (const id in extra) {
+      if (id === 'main' || !extra[id] || typeof extra[id] !== 'object') continue;
+      const base = SCENES[id] || {};
+      SCENES[id] = { ...base, ...extra[id] };
+    }
+  } catch (e) {
+    // A missing or malformed manifest leaves the built-in scenes untouched.
+  }
+}
+
+
 async function loadSceneAssets() {
+  await loadSceneManifest();
   for (const key in SCENES) {
     const s = SCENES[key];
     // Best-effort per scene: a missing winter background/grid must never break
@@ -672,7 +692,8 @@ async function loadSceneAssets() {
 // (rooms.js).
 function applyScene(name) {
   const s = SCENES[name] || SCENES.main;
-  SCENE = { name: s.name || name, bg: s.bg, grid: s.grid, doors: null };
+  SCENE = { name: s.name || name, bg: s.bg, grid: s.grid, doors: null,
+            gate: s.gate || null };
   COLLISION_GRID = s.grid;
   BG_SPRITE = s.bgSprite;
   GRID_SPRITE = s.gridSprite;

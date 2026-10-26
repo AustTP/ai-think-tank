@@ -516,6 +516,47 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 return (f"Could not file the service proposal: {result['error']} "
                         "[do not keep retrying the same invalid proposal -- fix the spec or drop it]")
             return 'Could not file the service proposal (unexpected response).'
+        if name == 'service_prices':
+            result = _http_json('POST', SELF_BASE_URL, '/api/service-pricing', {
+                'service': (args or {}).get('service') or None,
+                'path': (args or {}).get('path') or None,
+                'body': (args or {}).get('body') or {},
+            }, agent_key, timeout=API_CALL_TIMEOUT_S + 5)
+            if isinstance(result, dict) and result.get('ok'):
+                if result.get('service'):
+                    q = result.get('quote') or {}
+                    p = result.get('pricing') or {}
+                    b = result.get('budget') or {}
+                    cap = result.get('sharedCap') or {}
+                    usd = q.get('usd')
+                    price = ('free' if usd == 0 else f'${float(usd):.4f}') if isinstance(usd, (int, float)) else 'variable/unknown'
+                    lines = [f"Service: {result.get('name')} ({result.get('service')})",
+                             f"Price: {price}" + (f" ({q.get('basis')})" if q.get('basis') else ''),
+                             f"Kind: {p.get('kind') or q.get('kind') or 'unknown'}"]
+                    if q.get('note'):
+                        lines.append(f"Note: {q['note']}")
+                    if q.get('enforcedBy') or p.get('enforcedBy'):
+                        lines.append(f"Enforced by: {q.get('enforcedBy') or p.get('enforcedBy')}")
+                    if b.get('unit'):
+                        if b.get('unit') == 'usd':
+                            lines.append(f"Budget: ${float(b.get('used') or 0):.4f} used of ${float(b.get('cap') or 0):.2f}"
+                                         + (f"; balance ${float(b['balanceUsd']):.4f}" if b.get('balanceUsd') is not None else ''))
+                        else:
+                            lines.append(f"Budget: {b.get('used')} used of {b.get('cap')} {b.get('unit')}")
+                    if cap.get('left') is not None:
+                        lines.append(f"Shared monthly cap: ${float(cap['left']):.2f} left of ${float(cap.get('cap') or 0):.2f}")
+                    return '\n'.join(lines)
+                rows = result.get('services') or []
+                lines = ['Registered external services and their prices (quote one with service + path + body):', '']
+                for s in rows:
+                    lines.append(f"- {s.get('name')} [{s.get('id')}]: {s.get('priceKind')}"
+                                 + (f" (enforced by {s['enforcedBy']})" if s.get('enforcedBy') else ''))
+                    if s.get('note'):
+                        lines.append(f"    {s['note']}")
+                return '\n'.join(lines)
+            if isinstance(result, dict) and result.get('error'):
+                return f"Could not read the service prices: {result['error']}"
+            return 'Could not read the service prices (unexpected response).'
         if name == 'list_services':
             result = _http_json('GET', SELF_BASE_URL, '/api/api-service/list', None, agent_key,
                                 timeout=API_CALL_TIMEOUT_S + 5)
@@ -526,8 +567,10 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                     methods = ', '.join(s.get('methods') or [])
                     desc = (s.get('description') or '').strip()
                     lines.append(f"- {s.get('name')}  [id: {s.get('id')}]")
+                    pricing = s.get('pricing') or {}
+                    price_kind = pricing.get('kind') or 'unknown'
                     lines.append(f"    base_url: {s.get('baseUrl')}   methods: {methods}   "
-                                 f"spend: {s.get('spend')}")
+                                 f"spend: {s.get('spend')}   price: {price_kind}")
                     if desc:
                         lines.append(f"    when to use: {desc}")
                 lines.append('')

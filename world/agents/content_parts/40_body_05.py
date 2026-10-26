@@ -559,6 +559,68 @@ def _make_generate_agent_avatar_executor(agent_id):
     return run
 
 
+def _make_service_prices_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        a = args or {}
+        return _json.dumps(_serve.service_price_report(
+            a.get('service'), a.get('path'), a.get('body') if isinstance(a.get('body'), dict) else None
+        ), default=str)
+    return run
+
+
+_GENERATE_VILLAGE_MAP_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'generate_village_map',
+        'description': (
+            'Generate a village map package with PixelLab: a new background plus '
+            'exact collision and door maps derived from the main map. Quotes the '
+            "service's per-endpoint price first and refuses when the estimate "
+            'exceeds maxUsd, the PixelLab balance, or the shared monthly cap. '
+            'Regenerating an existing village needs force=true. main and winter '
+            'are refused.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'village': {'type': 'string',
+                            'description': 'Village id, e.g. south or a new id.'},
+                'theme': {'type': 'string',
+                          'description': 'Visual theme for the restyle.'},
+                'mirror': {'type': 'boolean',
+                           'description': 'Mirror the main geometry (default true).'},
+                'force': {'type': 'boolean',
+                          'description': 'Overwrite existing art.'},
+                'dryRun': {'type': 'boolean',
+                           'description': 'Write geometry and the zero-cost mirrored background; no PixelLab spend.'},
+                'quoteOnly': {'type': 'boolean',
+                              'description': 'Return the cost quote without writing or spending.'},
+                'maxUsd': {'type': 'number',
+                           'description': 'Per-call cap in USD (default 0.05).'},
+            },
+            'required': ['village'],
+        },
+    },
+}
+
+
+def _make_generate_village_map_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        a = args or {}
+        return _json.dumps(_serve.generate_village_map(
+            agent_id, a.get('village'), a.get('theme') or '',
+            mirror=bool(a.get('mirror', True)),
+            dry_run=bool(a.get('dryRun')),
+            force=bool(a.get('force')),
+            max_usd=a.get('maxUsd'),
+            quote_only=bool(a.get('quoteOnly'))), sort_keys=True)
+    return run
+
+
 def _make_supervisor_backlog_executor(agent_id):
     def run(name, args):
         import json as _json

@@ -43,6 +43,22 @@ def _api_channel_execute(agent_id, agent_key, channel, url, method, req_headers,
     return {'ok': False, 'allowed': True, 'error': f"All backends for channel {channel.get('name')} failed: {'; '.join(errors)}"}
 
 
+def _api_price_line(quote):
+    """One line the model sees before it reads an API response: what the call
+    cost, or why there is no single price."""
+    if not isinstance(quote, dict):
+        return ''
+    kind = quote.get('kind') or 'unknown'
+    usd = quote.get('usd')
+    if isinstance(usd, (int, float)):
+        basis = (quote.get('basis') or kind).strip()
+        return f'Price: ${float(usd):.4f} ({basis}).'
+    note = (quote.get('note') or '').strip()
+    enforced = quote.get('enforcedBy')
+    tail = f' Enforced by: {enforced}.' if enforced else ''
+    return (f'Price: {kind}.' + (f' {note}' if note else '') + tail).strip()[:400]
+
+
 def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_headers=None,
                  purpose='', workflow=False, workflow_params=None, trace_id=None, _channel_depth=0):
     """Shared sync chokepoint for the generic api_call path. Used by BOTH the
@@ -118,6 +134,13 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     for hdr_name, hdr_value in ((service or {}).get('default_headers') or {}).items():
         req_headers.setdefault(hdr_name, hdr_value)
 
+    quote_path = parsed.path
+    if workflow and (service or {}).get('workflow'):
+        quote_path = ((service.get('workflow') or {}).get('submit') or {}).get('path_template') or quote_path
+    try:
+        price_quote = estimate_service_spec_cost(service, quote_path, req_body)
+    except Exception:
+        price_quote = None
     if workflow and (service or {}).get('workflow'):
         try:
             wf = _api_execute_workflow(service, spend_kind, url, method, req_headers, req_body, workflow_params, agent_id=agent_id)
@@ -126,9 +149,12 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
         parsed_json, ctype, wrapped, instruction = _api_build_text(
             {'body': json.dumps(wf['data']) if wf['data'] is not None else '', 'contentType': wf.get('contentType', 'application/json'),
              'truncated': False, 'status': 200, 'finalUrl': url}, service, True, parsed.hostname)
+        price_line = _api_price_line(price_quote)
+        if price_line:
+            instruction = (instruction + '\n' + price_line).strip()
         return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
                 'status': 200, 'service': (service or {}).get('name'), 'data': wf['data'], 'wrapped_json': wrapped,
-                'ids': wf.get('ids') or {}, 'usd': wf.get('usd'), 'finalUrl': url}
+                'ids': wf.get('ids') or {}, 'usd': wf.get('usd'), 'priceQuote': price_quote, 'finalUrl': url}
 
     try:
         result = _api_request_sync(method, url, req_headers, req_body)
@@ -136,11 +162,14 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
         return {'ok': False, 'allowed': True, 'error': f'Approved, but the request failed: {e}'}
 
     parsed_json, ctype, wrapped, instruction = _api_build_text(result, service, registered, parsed.hostname)
+    price_line = _api_price_line(price_quote)
+    if price_line:
+        instruction = (instruction + '\n' + price_line).strip()
     _api_accrue(spend_kind, ctype, parsed_json)
     _api_accrue_daily_call(service)
     return {'ok': True, 'allowed': True, 'textForModel': wrapped, 'modelInstruction': instruction,
             'status': result['status'], 'service': (service or {}).get('name'), 'data': parsed_json, 'wrapped_json': wrapped,
-            'finalUrl': result.get('finalUrl') or url}
+            'priceQuote': price_quote, 'finalUrl': result.get('finalUrl') or url}
 
 
 def _api_call_response(agent_id, authorized, out, trace_id=None, url='', method='', purpose=''):
@@ -152,7 +181,7 @@ def _api_call_response(agent_id, authorized, out, trace_id=None, url='', method=
     if out.get('ok') is False:
         log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed_but_failed', 'reason': out.get('error')}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': out.get('error')})
-    log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed', 'status': out.get('status'), 'service': out.get('service'), 'channel': out.get('channel'), 'backend': out.get('backend')}, authorized=authorized, trace_id=trace_id)
+    log_action(agent_id, 'api-call', {'url': url, 'method': method, 'purpose': purpose, 'decision': 'allowed', 'status': out.get('status'), 'service': out.get('service'), 'channel': out.get('channel'), 'backend': out.get('backend'), 'estimateUsd': (out.get('priceQuote') or {}).get('usd')}, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, 'textForModel': out.get('textForModel'), 'modelInstruction': out.get('modelInstruction'), 'status': out.get('status')})
 
 
@@ -831,6 +860,7 @@ async def api_service_list():
                         'auth': (spec.get('auth') or {}).get('type'),
                         'methods': sorted(spec.get('methods') or []),
                         'spend': (spec.get('spend') or {}).get('kind'),
+                        'pricing': describe_service_pricing(spec),
                         'description': (spec.get('spend') or {}).get('note'),
                         'hasWorkflow': bool(spec.get('workflow'))})
     return JSONResponse({'services': sorted(entries, key=lambda e: e['id'])})

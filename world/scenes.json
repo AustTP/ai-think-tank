@@ -1,0 +1,17 @@
+{
+  "south": {
+    "bgSprite": "/assets/think_tank_south.png",
+    "doorsSprite": "/door_triggers_south.json",
+    "gate": {
+      "h": 20,
+      "w": 112,
+      "x": 584,
+      "y": 0
+    },
+    "gridSprite": "/collision_grid_south.json",
+    "spawn": {
+      "x": 630,
+      "y": 68
+    }
+  }
+}

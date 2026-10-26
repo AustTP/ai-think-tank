@@ -83,7 +83,11 @@ function updateOutside(dt) {
 
   // The south village's north gate leads back to the main village, landing
   // just above the south outlet (not the default spawn).
-  if (state.scene === 'south' && overlaps(p, SOUTH_GATE)) {
+  // Every satellite map has its own north return gate. The built-in south
+  // scene keeps SOUTH_GATE for compatibility; a generated village gets its
+  // gate from scenes.json.
+  const sceneGate = (SCENE && SCENE.gate) || (state.scene === 'south' ? SOUTH_GATE : null);
+  if (state.scene !== 'main' && sceneGate && overlaps(p, sceneGate)) {
     returnToMainFromSouth();
     return;
   }
