@@ -137,8 +137,13 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
     # with taskType 'code' (the default), so the code-first rule below would
     # otherwise run the coding executor on them -- a distill card landed in a
     # bash sandbox and failed on shell errors instead of merging the wiki.
+    title_lane_marked = (
+        'distill' in str(task.get('title') or '').lower()
+        or 'skill review' in str(task.get('title') or '').lower()
+        or 'skill-review' in str(task.get('title') or '').lower())
     lane_marked = bool(task.get('distill') or task.get('skillReview')
-                       or task.get('research') or task_type == 'research')
+                       or task.get('research') or task_type == 'research'
+                       or title_lane_marked)
     if lane_marked:
         executor = _run_observatory_content
     elif task_type in ('code', 'bug'):
