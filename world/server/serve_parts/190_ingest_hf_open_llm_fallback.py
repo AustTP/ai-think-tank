@@ -724,6 +724,9 @@ AUTH_PUBLIC_PATHS = (
     # A2A Agent Card is public metadata (no secrets); the /a2a endpoint itself
     # still requires a player session or a director/admin key.
     '/.well-known/agent-card.json', '/.well-known/agent.json',
+    # Enterprise page shell: public HTML only. Its data endpoints stay
+    # operator-only and enforce auth in their own handlers.
+    '/admin/enterprise',
 )
 # Static assets the login shell needs before any session exists. This
 # extension allowlist is what stops world/*.py, grants.json, api_services.json,

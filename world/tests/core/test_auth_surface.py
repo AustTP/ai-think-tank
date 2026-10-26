@@ -45,6 +45,9 @@ EXPECTED_PUBLIC = (
     # /a2a endpoint itself is NOT public; it requires a session or a
     # director/admin bearer key.
     '/.well-known/agent-card.json', '/.well-known/agent.json',
+    # Public shell only; posture and audit data require an operator session
+    # or admin agent key in the handlers.
+    '/admin/enterprise',
     # Inbound webhook intake. Not a village route: the handler requires the
     # X-Webhook-Key header (403 without it) and only appends to the JSONL
     # queue; a bad or missing key stores nothing.
