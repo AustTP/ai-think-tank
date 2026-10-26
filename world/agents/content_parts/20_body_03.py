@@ -775,20 +775,27 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     # somehow reached _run_coding_content) skip the pipeline instead of failing
     # flake8/mypy/pytest on prose or empty sandboxes.
     if (task.get('taskType') or 'code') == 'code':
-        if python_task:
-            missing = python_delivery.check(os.path.join(_serve.SANDBOXES_DIR, sandbox_id))
-            if missing:
-                store_result(task.get('id'), {
-                    'note': 'Python deliverable is incomplete: ' + ' '.join(missing),
-                    'command': command, 'ok': False, 'pipelineOk': False,
-                    'tier': tier_slug, 'writtenPy': written_py, 'deliveryFailure': True,
-                    'feedback': ('The Python deliverable is incomplete: ' + ' '.join(missing) +
-                                 ' Create the missing tests/test_*.py files, importing the actual '
-                                 'implementation module by its real path.')})
-                return False
-        qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
-                                   f'Quality gate for coding task: {backlog_item}',
-                                   scope_files=written_py or None)
+        if not written and not written_py and not python_task:
+            # A code card that produced no Python or JS is not a Python
+            # deliverable. Running the whole-tree pipeline here failed every
+            # such card on pre-existing lint in unrelated files.
+            qp = _skipped_pipeline_result(
+                'no Python or JS files written -- quality pipeline skipped')
+        else:
+            if python_task:
+                missing = python_delivery.check(os.path.join(_serve.SANDBOXES_DIR, sandbox_id))
+                if missing:
+                    store_result(task.get('id'), {
+                        'note': 'Python deliverable is incomplete: ' + ' '.join(missing),
+                        'command': command, 'ok': False, 'pipelineOk': False,
+                        'tier': tier_slug, 'writtenPy': written_py, 'deliveryFailure': True,
+                        'feedback': ('The Python deliverable is incomplete: ' + ' '.join(missing) +
+                                     ' Create the missing tests/test_*.py files, importing the actual '
+                                     'implementation module by its real path.')})
+                    return False
+            qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
+                                       f'Quality gate for coding task: {backlog_item}',
+                                       scope_files=written_py or None)
     else:
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
     # writtenPy rides the result channel so _apply_content_result can persist
