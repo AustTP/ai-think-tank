@@ -447,18 +447,14 @@ class DirectorGivesUpNotifiesHuman(unittest.TestCase):
             serve._resolve_pending_escalations_sync()
         return sent
 
-    def test_ask_cap_transition_notifies_once(self):
-        # Cooldown must be elapsed (its check fires BEFORE the cap check) and
-        # the cap already reached: this is the pass where the loop crosses
-        # into "gave up".
+    def test_all_rungs_tried_notifies_once(self):
         esc = {'status': 'pending', 'kind': 'allowlist candidate', 'question': 'host?',
-               'askCount': serve.DIRECTOR_ESCALATION_MAX_ASKS,
-               'lastAskedAt': time.time() - serve.DIRECTOR_ESCALATION_REASK_COOLDOWN_S - 1}
+               'askCount': 0, 'lastAskedAt': 0,
+               '_immediateTried': True, '_seniorTried': True, '_adminTried': True}
         sent = self._run_resolver(esc)
-        self.assertEqual(len(sent), 1, 'the transition into the ask cap must notify once')
+        self.assertEqual(len(sent), 1, 'the exhausted chain must notify once')
         self.assertTrue(esc.get('humanNotified'))
         self.assertEqual(esc['status'], 'pending', 'give-up leaves it pending for the human link')
-        # A second pass must NOT re-notify.
         sent2 = self._run_resolver(esc)
         self.assertEqual(sent2, [], 'humanNotified guards against repeat pings')
 

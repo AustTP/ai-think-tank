@@ -301,8 +301,10 @@ class ResolveEscalationsTest(unittest.TestCase):
         with mock.patch.object(serve, '_load_escalations',
                                return_value={'e1': esc}), \
              mock.patch.object(serve, 'get_state_from_db', return_value={
-                 'agentRoster': [{'id': 'd1'}, {'id': 'a1', 'director': 'd1'}]}), \
-             mock.patch.object(serve, '_senior_most_director_id', return_value='d1'), \
+                 'agentRoster': [{'id': 'd1'}, {'id': 'a1', 'director': 'd1'},
+                                 {'id': 'admin1', 'isAdmin': True}]}), \
+             mock.patch.object(serve, '_senior_most_director_id',
+                               return_value=patches.get('senior', 'd1')), \
              mock.patch.object(serve, '_escalation_requester_director',
                                return_value='d1'), \
              mock.patch.object(serve, '_escalation_floor',
@@ -327,26 +329,35 @@ class ResolveEscalationsTest(unittest.TestCase):
                                patches.get('max_asks', 3)):
             return serve._resolve_pending_escalations_sync()
 
-    def test_drift_immediate_reset(self):
+    def test_judge_drift_goes_straight_to_the_human(self):
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1'}
         self.assertEqual(self._run(esc, drift=999), 0)
-        self.assertTrue(esc['_immediateTried'])
+        self.assertTrue(esc['humanNotified'])
+        self.assertEqual(self._run(esc, drift=999), 0)
+        self.assertFalse(esc.get('_immediateTried'))
 
-    def test_drift_admin_resolves(self):
+    def test_judge_drift_does_not_use_the_admin(self):
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
                '_immediateTried': True}
-        self.assertEqual(self._run(esc, drift=999, admin=True), 1)
+        self.assertEqual(self._run(esc, drift=999, admin=True), 0)
+        self.assertTrue(esc['humanNotified'])
 
-    def test_ask_cap_immediate_reset(self):
-        esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
-               'askCount': 1, 'lastAskedAt': 0}
-        self.assertEqual(self._run(esc, max_asks=1), 0)
+    def test_unsure_immediate_advances_to_next_rung(self):
+        esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1'}
+        self.assertEqual(self._run(esc, floor=0.9, score=0.0), 0)
         self.assertTrue(esc['_immediateTried'])
 
-    def test_ask_cap_admin_resolves(self):
+    def test_admin_resolves_after_the_director(self):
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
-               'askCount': 1, 'lastAskedAt': 0, '_immediateTried': True}
-        self.assertEqual(self._run(esc, max_asks=1, admin=True), 1)
+               '_immediateTried': True}
+        self.assertEqual(self._run(esc, admin=True), 1)
+        self.assertFalse(esc.get('_adminTried'))
+
+    def test_unsure_senior_marks_senior_tried(self):
+        esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
+               '_immediateTried': True}
+        self.assertEqual(self._run(esc, senior='d2', floor=0.9, score=0.0), 0)
+        self.assertTrue(esc['_seniorTried'])
 
     def test_below_floor_resets_immediate(self):
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',

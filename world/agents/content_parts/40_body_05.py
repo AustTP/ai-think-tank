@@ -570,6 +570,48 @@ def _make_service_prices_executor(agent_id):
     return run
 
 
+_REVIEW_EXECUTE_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'review_execute',
+        'description': (
+            'Run the candidate command from ONE pending escalation in the isolated '
+            'sandbox so you can decide it with real evidence. This is a review tool, '
+            'not a coding tool: the command must already belong to that escalation, '
+            'and you must never edit project files or write new code. Use it when '
+            'reading the decoded code is not enough to approve or deny.'
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'escalationId': {'type': 'string',
+                                 'description': 'The pending escalation id (esc-...).'},
+                'command': {'type': 'string',
+                            'description': 'The exact candidate command from the escalation; omit to run the decoded review target.'},
+                'purpose': {'type': 'string',
+                            'description': 'One sentence: what evidence you need.'},
+            },
+            'required': ['escalationId'],
+        },
+    },
+}
+
+
+def _make_review_execute_executor(agent_id):
+    def run(name, args):
+        import json as _json
+        import serve as _serve
+        a = args or {}
+        result = _serve._http_json('POST', _serve.SELF_BASE_URL,
+                                   '/api/escalation/review-execute', {
+                                       'escalationId': a.get('escalationId'),
+                                       'command': a.get('command') or '',
+                                       'purpose': a.get('purpose') or 'escalation review',
+                                   }, _serve.get_or_create_agent_key(agent_id), timeout=90)
+        return _json.dumps(result, default=str)
+    return run
+
+
 _GENERATE_VILLAGE_MAP_TOOL = {
     'type': 'function',
     'function': {

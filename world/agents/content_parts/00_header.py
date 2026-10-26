@@ -773,6 +773,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
     avatar_tool = _make_generate_agent_avatar_executor(agent_id)
     village_tool = _make_generate_village_map_executor(agent_id)
     prices_tool = _make_service_prices_executor(agent_id)
+    review_exec_tool = _make_review_execute_executor(agent_id)
 
     def _execute_tool_raw(tool_name, args):
         _hb()
@@ -796,6 +797,8 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             return village_tool(tool_name, args)
         if tool_name == 'service_prices':
             return prices_tool(tool_name, args)
+        if tool_name == 'review_execute':
+            return review_exec_tool(tool_name, args)
         if tool_name == 'schedules':
             return schedules_tool(tool_name, args)
         if tool_name == 'runbook':
@@ -812,7 +815,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
              _SUPERVISOR_LIVE_READ_TOOL, _SUPERVISOR_DELEGATE_TOOL,
              _SUPERVISOR_SCHEDULES_TOOL, _SUPERVISOR_RUNBOOK_TOOL,
              _GENERATE_AGENT_AVATAR_TOOL, _GENERATE_VILLAGE_MAP_TOOL,
-             _serve._SERVICE_PRICES_TOOL]
+             _serve._SERVICE_PRICES_TOOL, _REVIEW_EXECUTE_TOOL]
     if is_admin:
         tools += [_SUPERVISOR_BACKLOG_TOOL, _SUPERVISOR_DB_TOOL,
                   _SUPERVISOR_STATE_TOOL]
@@ -832,9 +835,14 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'the four directional images for any non-admin agent), generate_village_map '
             '(quote then generate a village background plus collision and door maps; '
             'metered), service_prices (list or quote every external API price and '
-            'its remaining budget), db_records (read or modify '
+            'its remaining budget), review_execute (run a pending escalation\'s own '
+            'candidate command in the sandbox for a decision; never edit files), '
+            'db_records (read or modify '
             'non-secret SQL tables; every write is audited), state_records (read or '
-            'modify live business records in the state blob by path).\n'
+            'modify live business records in the state blob by path). '
+            'When reviewing a pending escalation, you may use review_execute to run '
+            'that escalation\'s own candidate command in the isolated sandbox. That is '
+            'the only code execution allowed; never edit project files or write new code.\n'
             'Look for anything unusual across the tank: a failure, a card stuck in review, '
             'budget pressure, a missing deliverable, a missed schedule, or work that is not '
             'resolving. If something needs action, instruct the owning team with '
@@ -867,7 +875,11 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
             'yourself; checks PixelLab availability and budget), generate_village_map '
             '(quote then generate a village background plus exact collision and door '
             'maps; metered, so check the quote against your budget first), '
-            'service_prices (quote any registered external API before delegating a call).\n'
+            'service_prices (quote any registered external API before delegating a call), '
+            'review_execute (run a pending escalation\'s own candidate command in the '
+            'sandbox for a decision; never edit files or write code). '
+            'Outside an escalation review, execute_script is for inspecting what the report '
+            'names only; do not write or edit project code.\n'
             'Act on four things:\n'
             '1. Budget. If a card spent its ceiling before close, say what the spend bought and either '
             'grant a top-up with supervisor_grant_budget (with a clear reason) or recommend stopping.\n'
@@ -897,7 +909,7 @@ def _run_supervisor_content(snapshot, agent_id, task, base_ctx=None):
                 **task,
                 'approvedTools': ['delegate', 'schedules', 'supervisor_grant_budget',
                                   'direct_backlog', 'generate_agent_avatar', 'generate_village_map',
-                                  'service_prices', 'execute_script'],
+                                  'service_prices', 'review_execute', 'execute_script'],
             }))
     except Exception as error:
         _sim_module._store_content_result(task.get('id'), {

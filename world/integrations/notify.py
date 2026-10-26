@@ -23,6 +23,8 @@ Imported back into serve.py as `from notify import ...`; no call site changes.
 import email.mime.text
 import json
 import os
+
+from core.review_decode import review_target
 import secrets
 import smtplib
 import threading
@@ -267,6 +269,14 @@ _ESCALATION_KIND_GUIDANCE = {
         'A review requirement could not be resolved by the team -- the card is waiting.',
         'Approve the resolution described if it genuinely addresses the requirement; else deny '
         'so it goes back for real work.'),
+    'dormancy window request': (
+        'The self-edit lander is waiting for a dormancy slot -- no code has been applied yet.',
+        'Approve only if the requested window and reason are legitimate and the edits were '
+        'reviewed; otherwise deny so the change is re-planned.'),
+    'owner safety decision': (
+        'The full Jev decision chain could not decide; the action has not run.',
+        'Read the command/code above. Approve only if it is ordinary, in-scope work; '
+        'deny if it is unsafe, destructive, or unjustified.'),
     'personnel_strike': (
         'A firing strike is on record for this agent -- no personnel action was taken '
         'automatically.',
@@ -286,7 +296,13 @@ def notify_human_of_escalation(esc_id, esc, context=''):
     esc_id = esc.get('id') or esc_id
     token = esc.get('token') or ''
     kind = esc.get('kind') or 'unknown'
-    question = esc.get('question') or ''
+    question = esc.get('reviewQuestion') or esc.get('question') or ''
+    decoded_note = ' (decoded from a base64 wrapper for review)' if esc.get('decodedForReview') else ''
+    if not esc.get('decodedForReview'):
+        reviewed = review_target(question)
+        if reviewed['decoded']:
+            question = reviewed['text']
+            decoded_note = ' (decoded from a base64 wrapper for review)'
     prefix = f'{context}\n\n' if context else ''
     impact, action = _ESCALATION_KIND_GUIDANCE.get(
         kind,
@@ -295,7 +311,7 @@ def notify_human_of_escalation(esc_id, esc, context=''):
          'denying is always the safe default.'))
     approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
-    body = (f'{prefix}{question}\n\n'
+    body = (f'{prefix}{question}{decoded_note}\n\n'
             f'What is blocked: {impact}\n'
             f'Suggested call: {action}\n'
             f'What I checked: {esc.get("whatChecked") or "(see question)"}\n'
@@ -308,7 +324,7 @@ def notify_human_of_escalation(esc_id, esc, context=''):
     # like every other optional push. Telegram caps message text at 4096
     # chars; truncate the free-text middle (question/checked/look) but NEVER
     # the resolve URLs -- a truncated Approve link is a dead escalation.
-    _tg_head = f'Needs your call: {kind}\n\n{(prefix + question)[:1000]}'
+    _tg_head = f'Needs your call: {kind}\n\n{(prefix + question + decoded_note)[:1000]}'
     _tg_tail = (f'\n\nWhat is blocked: {impact[:300]}\n'
                 f'Suggested call: {action[:300]}\n'
                 f'What I checked: {(esc.get("whatChecked") or "(see question)")[:300]}\n'
@@ -335,7 +351,11 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     # would be sequential and guessable).
     esc_id = 'esc-' + secrets.token_hex(4)
     token = secrets.token_urlsafe(24)
+    reviewed = review_target(question)
     escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
+    if reviewed['decoded']:
+        escalations[esc_id]['reviewQuestion'] = reviewed['text']
+        escalations[esc_id]['decodedForReview'] = True
     if agent_id:
         escalations[esc_id]['agentId'] = agent_id
     _serve._save_escalations(escalations)

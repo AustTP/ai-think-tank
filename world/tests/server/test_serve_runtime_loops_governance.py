@@ -155,23 +155,48 @@ class ResolvePendingEscalations(unittest.TestCase):
                                         return_value={'agentRoster': [{'id': 'w', 'director': 'nora'}]}):
             self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
 
-    def test_skips_within_reask_cooldown(self):
+    def test_an_unsure_rung_is_not_reasked(self):
         esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'q?',
-                      'lastAskedAt': time.time(), 'askCount': 0}}
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
-             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()):
-            with self._patch_checks():
-                with unittest.mock.patch.object(serve, '_save_escalations') as save:
-                    self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
-            save.assert_not_called()
+                      'lastAskedAt': 0, 'askCount': 0}}
+        calls = []
 
-    def test_stops_at_ask_cap(self):
+        def quorum(instr, criteria):
+            calls.append(instr)
+            return ('approve', 0.10, 0.0)
+
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
+             unittest.mock.patch.object(serve, '_escalation_floor', return_value=0.9), \
+             unittest.mock.patch.object(serve, '_escalation_judge_drift', return_value=0), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync', side_effect=quorum), \
+             unittest.mock.patch.object(serve, '_jev_directory_score', return_value=0.1), \
+             unittest.mock.patch.object(serve, '_effective_safety_confidence', return_value=0.6), \
+             unittest.mock.patch.object(serve, '_jev_judge_model', return_value=None), \
+             unittest.mock.patch.object(serve, '_escalation_jev_errors', _FakeCounter()), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, 'notify_human_of_escalation'), \
+             unittest.mock.patch.object(serve, '_save_escalations'):
+            self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
+            self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
+        self.assertEqual(len(calls), 1, 'the second pass must move on, not re-ask the same rung')
+        self.assertTrue(esc['e1'].get('_seniorTried'))
+
+    def test_high_ask_count_does_not_block_the_next_rung(self):
         esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'q?',
                       'lastAskedAt': 0, 'askCount': serve.DIRECTOR_ESCALATION_MAX_ASKS}}
         with unittest.mock.patch.object(serve, '_load_escalations', return_value=esc), \
-             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()):
-            with self._patch_checks():
-                self.assertEqual(serve._resolve_pending_escalations_sync(), 0)
+             unittest.mock.patch.object(serve, 'get_state_from_db', return_value=self._state()), \
+             unittest.mock.patch.object(serve, '_escalation_floor', return_value=0.0), \
+             unittest.mock.patch.object(serve, '_escalation_judge_drift', return_value=0), \
+             unittest.mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                        return_value=('approve', 0.95, 0.0)), \
+             unittest.mock.patch.object(serve, '_jev_directory_score', return_value=0.95), \
+             unittest.mock.patch.object(serve, '_effective_safety_confidence', return_value=0.6), \
+             unittest.mock.patch.object(serve, '_jev_judge_model', return_value=None), \
+             unittest.mock.patch.object(serve, '_escalation_jev_errors', _FakeCounter()), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch.object(serve, '_save_escalations'):
+            self.assertEqual(serve._resolve_pending_escalations_sync(), 1)
 
     def test_approves_escalation(self):
         esc = {'e1': {'status': 'pending', 'kind': 'routine', 'question': 'Approve this?',

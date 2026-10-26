@@ -1,5 +1,15 @@
 
 
+from core.review_decode import review_target
+
+
+def _review_question(esc):
+    q = (esc or {}).get('reviewQuestion')
+    if q:
+        return q
+    return review_target((esc or {}).get('question') or '')['text']
+
+
 def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster):
     """One chief-of-staff/admin attempt after the senior director gives up.
 
@@ -19,7 +29,7 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
         f'The senior director already tried {esc.get("askCount") or 0} time(s) '
         f'and could not decide this escalation. This is the admin pass before '
         f'the owner is asked. Kind: {esc.get("kind")}. '
-        f'Question: {esc.get("question")}. Approve only if clearly legitimate, '
+        f'Question: {_review_question(esc)}. Approve only if clearly legitimate, '
         'in-scope, and safe. Deny if out of scope, unsafe, or clearly no. '
         'When genuinely unsure, leave it for the owner.'
     )
@@ -69,6 +79,17 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     return True
 
 
+def _mark_escalation_rung(esc, rung):
+    if rung == 'immediate':
+        esc['_immediateTried'] = True
+    elif rung == 'senior':
+        esc['_seniorTried'] = True
+    elif rung == 'admin':
+        esc['_adminTried'] = True
+    esc['askCount'] = 0
+    esc['lastAskedAt'] = 0
+
+
 def _escalation_requester_director(state, esc):
     """The agent's own director, the first rung of the escalation chain."""
     agent_id = (esc or {}).get('agentId')
@@ -103,8 +124,19 @@ def _resolve_pending_escalations_sync():
         # the chief of staff. `_immediateTried` is set when the first rung
         # gives up or cannot decide.
         immediate_id = _escalation_requester_director(state, esc)
-        director_id = (immediate_id if (immediate_id and not esc.get('_immediateTried'))
-                       else senior_id)
+        admin_id = _admin_agent_id(state)
+        # One attempt per rung: the requester's own director, then the senior
+        # director (only when distinct), then the chief of staff/admin. A
+        # non-decision marks that rung tried and the NEXT pass asks the next
+        # rung, instead of re-asking the same unsure reviewer for hours.
+        reviewer_id, rung = None, None
+        if immediate_id and not esc.get('_immediateTried'):
+            reviewer_id, rung = immediate_id, 'immediate'
+        elif senior_id and senior_id != immediate_id and not esc.get('_seniorTried'):
+            reviewer_id, rung = senior_id, 'senior'
+        elif admin_id and admin_id not in (immediate_id, senior_id) and not esc.get('_adminTried'):
+            reviewer_id, rung = admin_id, 'admin'
+        director_id = reviewer_id or senior_id
         director_def = roster.get(director_id, {}) if director_id else {}
         director_name = director_def.get('name', director_id or 'the director')
         # Escalations with a 1.0 risk floor are "never auto-approve" by design
@@ -114,71 +146,50 @@ def _resolve_pending_escalations_sync():
         if _escalation_floor(esc_kind) >= 1.0:
             continue
         # Heterogeneous-judge drift circuit: a kind whose judge cross-check has
-        # repeatedly failed closed (judge down, disagreeing, or colluding) is
-        # taken out of the director's delegation entirely and waits for the
-        # human's link, exactly like the floor-1.0 kinds. Checked BEFORE the
-        # primary Jev call so a tripped circuit doesn't burn model spend. The
-        # human is notified ONCE at the moment the circuit trips -- delegable
-        # kinds are silent at creation, so this is when the ping actually
-        # means "the director cannot handle this".
+        # repeatedly failed closed is taken out of delegation entirely and waits
+        # for the human's link. Notify once, immediately; do not spend a pass
+        # marking rungs or re-asking a chain the judge gate no longer trusts.
         if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
-            if immediate_id and not esc.get('_immediateTried'):
-                esc['_immediateTried'] = True
-                esc['askCount'] = 0
-                esc['lastAskedAt'] = 0
+            if not esc.get('humanNotified'):
+                esc['humanNotified'] = True
+                notify_human_of_escalation(
+                    esc_id, esc,
+                    context='The director chain could not resolve this automatically '
+                            '(the judge cross-check kept failing closed), so it is now yours.')
                 dirty = True
-                continue
+            continue
+        if rung is None:
+            if not esc.get('humanNotified'):
+                esc['humanNotified'] = True
+                notify_human_of_escalation(
+                    esc_id, esc,
+                    context='The director, senior director, and chief of staff all '
+                            'declined or could not decide this, so it is now yours.')
+                dirty = True
+            continue
+        if rung == 'admin':
             if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
                                          director_id, roster):
                 dirty = True
                 resolved += 1
                 continue
+            esc['_adminTried'] = True
             dirty = True
             if not esc.get('humanNotified'):
                 esc['humanNotified'] = True
                 notify_human_of_escalation(
                     esc_id, esc,
-                    context='The director and the admin both could not resolve this '
-                            'automatically (judge cross-check kept failing closed), so it is now yours.')
-            continue
-        # Re-ask backoff: don't hit Jev again until the cooldown has elapsed,
-        # and stop asking entirely once this escalation has exceeded the
-        # attempt cap -- the human's email link is the remaining path. Without
-        # this, one long-stuck escalation is re-queried every 30s forever. The
-        # transition INTO the cap notifies the human once (delegable kinds are
-        # silent at creation -- this is the give-up moment).
-        last_asked = esc.get('lastAskedAt') or 0
-        asks = esc.get('askCount') or 0
-        if now - last_asked < DIRECTOR_ESCALATION_REASK_COOLDOWN_S:
-            continue
-        if asks >= DIRECTOR_ESCALATION_MAX_ASKS:
-            if immediate_id and not esc.get('_immediateTried'):
-                esc['_immediateTried'] = True
-                esc['askCount'] = 0
-                esc['lastAskedAt'] = 0
-                dirty = True
-                continue
-            if _escalation_admin_attempt(state, esc_id, esc, esc_kind,
-                                         director_id, roster):
-                dirty = True
-                resolved += 1
-                continue
-            dirty = True
-            if not esc.get('humanNotified'):
-                esc['humanNotified'] = True
-                notify_human_of_escalation(
-                    esc_id, esc,
-                    context=f'The director tried {asks} times and the admin also could '
-                            f'not decide this automatically, so it is now yours.')
+                    context='The director, senior director, and chief of staff all '
+                            'declined or could not decide this, so it is now yours.')
             continue
         esc['lastAskedAt'] = now
-        esc['askCount'] = asks + 1
+        esc['askCount'] = (esc.get('askCount') or 0) + 1
         dirty = True
         instr = (
             f'You are {director_name}, the senior-most director of the AI think tank, '
             f'standing in for the owner on this request. The chief of staff has delegated '
             f'routine approval/denial to you. Decide the following escalation. '
-            f'Kind: {esc.get("kind")}. Question: {esc.get("question")}.\n'
+            f'Kind: {esc.get("kind")}. Question: {_review_question(esc)}.\n'
             f'Approve if the request is clearly legitimate, in-scope, and safe for the think tank. '
             f'Deny if it is out of scope, unsafe, or the answer is clearly no. Favor denying '
             f'when genuinely unsure -- an unconvincing approval is the real risk.'
@@ -192,9 +203,12 @@ def _resolve_pending_escalations_sync():
         # decision-not-in-(approve,deny) check right below, same as before.
         decision, confidence, _cost = _jev_quorum_choice_sync(instr, criteria)
         if decision not in ('approve', 'deny'):
-            # fail toward leaving it pending for the human -- never auto-approve
-            # on a classifier failure (a non-binary answer is also a failure).
+            # A non-binary answer is a non-decision: mark this rung tried and
+            # move to the next one on the next pass. Never auto-approve on a
+            # classifier failure.
             _escalation_jev_errors.bump(esc_kind)
+            _mark_escalation_rung(esc, rung)
+            dirty = True
             continue
         # Composite multi-signal trust gate: confidence is just one signal. We
         # (a) blend in the per-kind Jev-error history (a model that's been
@@ -216,11 +230,8 @@ def _resolve_pending_escalations_sync():
                        {'escalationId': esc_id, 'kind': esc_kind, 'question': esc.get('question'),
                         'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
                         'reason': 'below-kind-floor' if composite < floor else 'low-confidence'}, authorized=False)
-            if immediate_id and not esc.get('_immediateTried'):
-                esc['_immediateTried'] = True
-                esc['askCount'] = 0
-                esc['lastAskedAt'] = 0
-                dirty = True
+            _mark_escalation_rung(esc, rung)
+            dirty = True
             continue
         # Heterogeneous-judge cross-check: the director's auto-approval now has
         # to survive a SECOND, different decisions model independently agreeing
@@ -240,6 +251,8 @@ def _resolve_pending_escalations_sync():
                            {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
                             'primary': decision, 'primary_confidence': confidence},
                            authorized=False)
+                _mark_escalation_rung(esc, rung)
+                dirty = True
                 continue
             if judge_decision != decision:
                 _bump_escalation_judge_drift(esc_kind)
@@ -248,6 +261,8 @@ def _resolve_pending_escalations_sync():
                             'primary': decision, 'judge_decision': judge_decision,
                             'primary_confidence': confidence, 'judge_confidence': judge_conf},
                            authorized=False)
+                _mark_escalation_rung(esc, rung)
+                dirty = True
                 continue
             if (confidence >= ESCALATION_JUDGE_ALPHA_HIGH
                     and judge_conf >= ESCALATION_JUDGE_ALPHA_HIGH
@@ -257,6 +272,8 @@ def _resolve_pending_escalations_sync():
                            {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
                             'decision': decision, 'confidence': confidence, 'judge_confidence': judge_conf},
                            authorized=False)
+                _mark_escalation_rung(esc, rung)
+                dirty = True
                 continue
         esc['status'] = 'approved' if decision == 'approve' else 'denied'
         esc['resolvedBy'] = f'{director_name} ({director_id})'

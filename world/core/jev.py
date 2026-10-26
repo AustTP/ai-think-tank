@@ -235,10 +235,12 @@ ESCALATION_KIND_RISK = {
     'allowlist request': {'floor': JEV_SAFETY_CONFIDENCE},
     # Agent-scheduled dormant apply window (self-modification change
     # request, 2026-10-18): pausing the whole tank to land code edits is
-    # a consequential operational decision -- the supervisor's JEV
-    # judgment happens upstream of the escalation, and this floor makes
-    # the PLAYER's email/telegram link the final, mandatory signature.
-    'dormancy window request': {'floor': 1.0},
+    # consequential, so it keeps a high bar. It is DELEGABLE (floor 0.85,
+    # not 1.0) since 2026-10-25: the daily self-edit window is routine
+    # operational work, and the operator asked for the director -> senior
+    # director -> chief of staff chain to handle it. An unsure rung still
+    # advances; only a fully unresolved chain reaches the owner.
+    'dormancy window request': {'floor': 0.85},
 }
 ESCALATION_DEFAULT_FLOOR = JEV_SAFETY_CONFIDENCE  # unknown kinds keep the old bar
 ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecutive Jev error

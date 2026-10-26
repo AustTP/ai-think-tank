@@ -1,3 +1,4 @@
+from core.review_decode import review_target
 
 
 @app.post('/api/curl')
@@ -436,7 +437,11 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         'allow': 'Ordinary development/CI work -- running tests, building, linting, installing from a well-known package registry, writing/reading files inside the working directory.',
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
     }
-    instructions = f'An in-game agent in the Work Room wants to run this command: {command}\nStated reason: {purpose or "not given"}\nDecide allow or block.'
+    reviewed = review_target(command)
+    instructions = f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\nStated reason: {purpose or "not given"}\nDecide allow or block.'
+    if reviewed['decoded']:
+        instructions += ('\n(The command above was decoded from a base64 wrapper for review. '
+                         'The original wrapper is what would run.)')
     # Gap fixed: this used to hand-duplicate _jev_safety_
     # gate's own low-confidence-escalation logic (and its own separate,
     # non-quorum-sampled single Jev call) instead of sharing it -- the
@@ -571,7 +576,7 @@ async def _supervisor_override_decision(agent_id, action_kind, detail, purpose, 
     prompt = (
         f'You are {director_name}, the supervisor of {agent_name} at an AI research think tank.\n'
         f'Your subordinate tried this action and the automated safety classifier (Jev) blocked it.\n'
-        f'Action ({action_kind}): {detail}\n'
+        f'Action ({action_kind}): {review_target(detail)["text"]}\n'
         f'Stated purpose: {purpose or "not given"}\n'
         f"Jev's block reason: {block_reason}\n"
         f'Hard-blocked categories the classifier enforces: {"; ".join(cats)}\n\n'
