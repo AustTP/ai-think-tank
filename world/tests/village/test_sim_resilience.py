@@ -637,6 +637,20 @@ def test_request_player_input_backlog_cap(monkeypatch):
     sim.request_player_input(state, 'c', 'ben', 'q', now_ms=0)
 
 
+def test_peer_coding_class_respects_an_explicit_note_or_report():
+    # A note/report card queued into pressoffice is prose, not code. Treating
+    # pressoffice as code made the peer review run the code pipeline and demand
+    # an executable shell command, which wedged the 2026-10-26 smoke card.
+    assert not sim._peer_coding_class({'room': 'pressoffice', 'deliverable': 'note'})
+    assert not sim._peer_coding_class({'room': 'pressoffice', 'deliverable': 'report'})
+    assert not sim._peer_coding_class({'room': 'pressoffice', 'taskType': 'task'})
+    assert not sim._peer_coding_class({'room': 'pressoffice', 'taskType': 'spike'})
+    assert sim._peer_coding_class({'room': 'pressoffice', 'deliverable': 'code'})
+    assert sim._peer_coding_class({'room': 'pressoffice', 'taskType': 'story'})
+    assert sim._peer_coding_class({'room': 'pressoffice', 'taskType': 'bug'})
+    assert sim._peer_coding_class({'productId': 'p1'})
+
+
 def test_notify_card_non_dict_and_mail_done_unknown():
     assert sim._notify_card_failure({}, 'x', 'why') is None
     assert sim._mail_card_update({'agents': {'ben': {'mailbox': []}}}, 'ben',

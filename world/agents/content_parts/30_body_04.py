@@ -212,7 +212,10 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         pipeline_is_code_class = bool(project_label or task.get('productId')
                                       or task.get('room') == 'pressoffice')
         review_scope = None
-    if pipeline_is_code_class:
+    parent_deliverable = str((review_parent or {}).get('deliverable') or '').strip().lower()
+    is_prose_review = (parent_deliverable in ('note', 'report')
+                       or (review_parent or {}).get('taskType') in ('spike', 'report', 'task'))
+    if pipeline_is_code_class and not is_prose_review:
         qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                    f'Quality gate for {("QA" if is_qa else "review")} of: {backlog_item}',
                                    scope_files=review_scope)
@@ -232,6 +235,12 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                 'Assess, as a real playtester/QA would, whether this is actually usable end to end for its intended purpose -- '
                 'not just "a file that sounds related exists." Call out anything broken, missing, or incomplete, as specifically as you can. '
                 'Be honest either way.')
+    elif is_prose_review:
+        lead = (f'You are {name}, reviewing a teammate\'s written deliverable. '
+                f'Current deliverable:\n{context}\n\nTask: {backlog_item}\n\n'
+                'Judge the content against the stated task: is it specific, complete, sourced where '
+                'required, and actually useful? Name concrete omissions or errors, or say plainly if it '
+                'meets the task. Do not ask for a shell command or a code change. Be honest either way.')
     else:
         lead = (f'You are {name}, reviewing a teammate\'s real code for a project: {project_label}. '
                 f'Be a genuine, skeptical reviewer, not a rubber stamp. Current code:\n{context}\n\nTask: {backlog_item}\n\n'
@@ -254,16 +263,19 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     else:
         pipeline_clause = (f'Quality pipeline status (run live in the sandbox just now): {qp["note"]}. '
                            'This is the bar the code must clear -- taking the pipeline result as given.')
+    probe_clause = ''
+    if not is_prose_review:
+        probe_clause = (' Before answering, you may check real facts about how the ACTUAL running page behaves right now -- what a button '
+                        'click or keypress actually does -- instead of guessing from the source alone. To do this, respond with ONLY a JSON '
+                        'object, no markdown fences, no explanation, in exactly this shape: '
+                        '{"probeRequest": {"path": "index.html", "actions": [{"type":"click","selector":"text=Some Button"}, '
+                        '{"type":"keydown","key":"a"}], "probes": ["document.body.className", "typeof window.SomeGlobal"]}}\n'
+                        'Action types are click ({selector}), keydown ({key}), wait ({ms}), eval ({code}). '
+                        f'You can do this up to {MAX_REVIEW_PROBE_ROUNDS} times if you genuinely need to. ')
     system_prompt = (lead +
                      _perception_block(base_ctx) +
                      f'\n\n{pipeline_clause}' +
-                     ' Before answering, you may check real facts about how the ACTUAL running page behaves right now -- what a button '
-                     'click or keypress actually does -- instead of guessing from the source alone. To do this, respond with ONLY a JSON '
-                     'object, no markdown fences, no explanation, in exactly this shape: '
-                     '{"probeRequest": {"path": "index.html", "actions": [{"type":"click","selector":"text=Some Button"}, '
-                     '{"type":"keydown","key":"a"}], "probes": ["document.body.className", "typeof window.SomeGlobal"]}}\n'
-                     'Action types are click ({selector}), keydown ({key}), wait ({ms}), eval ({code}). '
-                     f'You can do this up to {MAX_REVIEW_PROBE_ROUNDS} times if you genuinely need to. '
+                     probe_clause +
                      # Item 6: the reviewer's final answer carries a structured
                      # verdict -- approve/send_back + the WHY (summary/checks/risks)
                      # -- so the gate decision is the reviewer's own explicit call,
@@ -317,11 +329,14 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                                            'ok': False})
         return
 
-    visual = _review_screenshot(base, key, agent_id, sandbox_id, 'index.html',
-                                f'You\'re reviewing a real screenshot of this project\'s main page. Task: {backlog_item}. '
-                                'Describe what you actually see, and call out anything that looks visually broken -- elements in the '
-                                'wrong place, overlapping, cut off, or missing.',
-                                task_id=task.get('id'))
+    if is_prose_review:
+        visual = {'ok': True, 'review': '(Skipped: this is a written deliverable, not a rendered page.)'}
+    else:
+        visual = _review_screenshot(base, key, agent_id, sandbox_id, 'index.html',
+                                    f'You\'re reviewing a real screenshot of this project\'s main page. Task: {backlog_item}. '
+                                    'Describe what you actually see, and call out anything that looks visually broken -- elements in the '
+                                    'wrong place, overlapping, cut off, or missing.',
+                                    task_id=task.get('id'))
     visual_budget_hit = bool(visual.get('budgetExhausted'))
     full_review = (f'{review}\n\n## Visual check (real screenshot)\n\n{visual["review"]}' if visual['ok']
                    else f'{review}\n\n## Visual check\n\n(could not complete: {visual["note"]})')
@@ -428,6 +443,9 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                      # shared sandbox instead, contaminating it while the real
                      # project sandbox stayed empty.
                      'productId': task.get('productId')}
+        if is_prose_review:
+            queue_fix['deliverable'] = parent_deliverable or 'note'
+            queue_fix['taskType'] = 'task' if queue_fix['deliverable'] == 'note' else 'report'
         if is_gate_review:
             # A gate review that rejects: the fix must go back to the SAME author
             # and re-open the SAME story (carry reviewOf), not a fresh free task.

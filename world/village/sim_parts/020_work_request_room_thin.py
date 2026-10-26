@@ -599,8 +599,20 @@ def _peer_coding_class(parent):
     A pressoffice story (the workroom delivers code there) or any product-backed
     card (has a productId) counts. Pure-research lanes (observatory, etc.) are
     NOT coding-class: their clean vote rests on pipelineOk alone (they don't run
-    the flake8/mypy/bandit/pytest-cov stack the way a code review does)."""
+    the flake8/mypy/bandit/pytest-cov stack the way a code review does).
+
+    An EXPLICIT non-code deliverable wins over the room. A note or report card
+    queued into pressoffice is still prose; running the code pipeline on it
+    makes the reviewer demand a shell command and wedges the note in review
+    (the 2026-10-26 smoke task-623 failure)."""
     if not isinstance(parent, dict):
+        return False
+    deliverable = str(parent.get('deliverable') or '').strip().lower()
+    if deliverable in ('note', 'report'):
+        return False
+    if deliverable == 'code':
+        return True
+    if parent.get('taskType') in ('spike', 'report', 'meeting', 'task', 'supervision'):
         return False
     return parent.get('room') == 'pressoffice' or bool(parent.get('productId'))
 

@@ -742,6 +742,27 @@ def test_run_review_content_repairs_document_and_citation(monkeypatch):
         'acceptanceAssessment' in result
 
 
+def test_note_parent_review_skips_code_pipeline_and_screenshot(monkeypatch):
+    stored = _review_harness(monkeypatch)
+    import sim
+    called = []
+    # Simulate the old lane classifier that treated every pressoffice card as
+    # code. The review executor must still skip the code pipeline for prose.
+    monkeypatch.setattr(sim, '_peer_coding_class',
+                        lambda parent: parent.get('room') == 'pressoffice')
+    monkeypatch.setattr(content, '_run_quality_pipeline',
+                        lambda *a, **k: called.append('pipeline') or {'ok': True, 'note': 'green'})
+    monkeypatch.setattr(content, '_review_screenshot',
+                        lambda *a, **k: called.append('screenshot') or {'ok': True, 'review': 'good'})
+    snapshot = {'tasks': {'p': {'id': 'p', 'room': 'pressoffice',
+                                'deliverable': 'note', 'note': 'done'}}}
+    task = {'id': 't', 'title': 'Review: note', 'reviewOf': 'p',
+            'room': 'pressoffice', 'taskType': 'review'}
+    content._run_review_content(snapshot, 'cora', task)
+    assert called == [], 'a note review must not run the code pipeline or a page screenshot'
+    assert stored and stored[-1].get('ok') is not False
+
+
 def test_supervisor_unknown_tool_branch(monkeypatch):
     import sim
     monkeypatch.setattr(sim, '_store_content_result', lambda t, r: None)
