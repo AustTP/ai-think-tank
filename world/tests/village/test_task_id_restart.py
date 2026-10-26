@@ -24,11 +24,14 @@ def test_restart_counter_reset_skips_every_live_id():
     assert holder == [13]
 
 
-def test_gap_is_filled_without_touching_later_ids():
+def test_gap_is_not_backfilled():
+    # Ids are monotonic so a retired id (task-2 here) can never be handed to
+    # unrelated work later.
     state = {'tasks': {'task-1': _task(1), 'task-3': _task(3)}}
     holder = [0]
-    assert sim._next_task_id(state, holder) == 'task-2'
-    assert holder == [2]
+    assert sim._next_task_id(state, holder) == 'task-4'
+    assert holder == [4]
+    assert state['taskIdSeq'] == 4
 
 
 def test_empty_state_starts_at_one_and_advances():
@@ -37,3 +40,14 @@ def test_empty_state_starts_at_one_and_advances():
     assert sim._next_task_id(state, holder) == 'task-1'
     assert sim._next_task_id(state, holder) == 'task-2'
     assert holder == [2]
+    assert state['taskIdSeq'] == 2
+
+
+def test_retired_id_is_not_reused_after_restart():
+    # The task that owned task-50 is gone from state['tasks'], and the process
+    # restarted with holder=0. The durable high-water mark must still prevent
+    # unrelated work from inheriting task-50 (the Oct 13 / Oct 26 reuse).
+    state = {'tasks': {}, 'taskIdSeq': 50}
+    holder = [0]
+    assert sim._next_task_id(state, holder) == 'task-51'
+    assert state['taskIdSeq'] == 51

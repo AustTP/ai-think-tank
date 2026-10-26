@@ -334,23 +334,36 @@ def _overrun_factor_for(state, room=None, scope=None):
     except Exception:
         return 1.0
 
-# Server in-memory task-id counter (mirrors tasks.js nextTaskId). Not persisted
-# -- on restart it resets. state['tasks'] IS durable, so a bare counter would
-# re-mint task-1..task-N over live stories that survived the restart (seen live:
-# a restart re-assigned task-9..task-20 and clobbered 10 peer-gated wrq-8
-# parents). _next_task_id skips any id already held.
+# Server task-id counter (mirrors tasks.js nextTaskId), persisted in the durable
+# state as state['taskIdSeq']. The in-memory holder resets on restart, and a
+# bare counter re-minted task-1..task-N over live stories (seen live: a restart
+# re-assigned task-9..task-20 and clobbered 10 peer-gated wrq-8 parents).
+# taskIdSeq is the high-water mark: it survives restart and task archival, so a
+# retired id is never handed to unrelated work again.
 _TASK_ID_HOLDER = [0]
 
 
 def _next_task_id(state, task_id_holder):
-    """Mint the next task-N id, skipping any id already in state['tasks'].
-    The counter is in-memory and resets on restart; the task dict is durable,
-    so collision-skipping is mandatory, not cosmetic."""
+    """Mint the next never-before-used task-N id.
+
+    Ids are monotonic, never gap-filled. The durable state carries the
+    high-water mark, so a retired id is not reused after a restart or after its
+    task leaves state['tasks']. The max over live ids also seeds a legacy state
+    that predates the counter."""
     tasks = state.get('tasks') or {}
+    seq = max(int(state.get('taskIdSeq') or 0), int(task_id_holder[0] or 0))
+    for tid in tasks:
+        if isinstance(tid, str) and tid.startswith('task-'):
+            try:
+                seq = max(seq, int(tid[5:]))
+            except ValueError:
+                continue
     while True:
-        task_id_holder[0] += 1
-        task_id = 'task-' + str(task_id_holder[0])
+        seq += 1
+        task_id = 'task-' + str(seq)
         if task_id not in tasks:
+            state['taskIdSeq'] = seq
+            task_id_holder[0] = seq
             return task_id
 
 # Phase 3 slice 2: completed content-executor results, keyed by task id. A real
@@ -560,9 +573,9 @@ def _apply_content_result(state, task, result, now_ms=None):
     # story) only ever had task.note to work with, so promoting a spike
     # handed the new story's author a vague pointer, never the actual
     # research (source lists, CSVs, feasibility data). Recording the exact
-    # path here (not a task-id glob -- task ids get REUSED across unrelated
-    # investigations, confirmed, so a glob could match the wrong
-    # finding) lets promotion pull the real content forward.
+    # path here (not a task-id glob -- a restored or imported state can reuse
+    # an id, so a glob could match the wrong finding) lets promotion pull the
+    # real content forward.
     library_path = result.get('libraryPath')
     if library_path:
         task['libraryPath'] = library_path

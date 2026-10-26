@@ -30,10 +30,10 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
     # OWN bumps (see TASK_CONTENT_GRACE_*).
     task['_contentHeartbeat'] = None
     task['_contentGraceUsed'] = 0.0
-    # Drop any result a PRIOR run left behind for this (reusable) task id.
-    # Task ids are re-minted when an id is no longer in state['tasks'], and a
-    # run that finishes after its card was already closed leaves its result in
-    # the registry forever. A new dispatch that picked that stale entry up
+    # Drop any result a PRIOR run left behind for this task id. New ids are
+    # monotonic, but a restored or imported state can still hand back an id,
+    # and a run that finishes after its card was already closed leaves its
+    # result in the registry forever. A new dispatch that picked that stale entry up
     # applied the OLD outcome (the live 2026-10-25 task-260 incident: a fresh
     # spike wrote an 8KB report, but the sim consumed a leftover "model call
     # returned nothing usable" result, cleared the in-flight flag, refused
