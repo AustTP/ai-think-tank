@@ -215,6 +215,20 @@ def _sweep_stuck_gates(state, now_ms):
                             'from': locked, 'to': fresh[:needed]}, authorized=True)
             except Exception:
                 pass
+        else:
+            # No queued subtask was available to re-pin: the old reviews were
+            # consumed or never enqueued. Widen alone leaves the new pair with
+            # no work and the gate waits out the full rescue cooldown. Queue
+            # fresh reviews now (the 2026-10-26 task-649 gate).
+            reenqueued = _reenter_gate_review(state, task, fresh[:needed])
+            if reenqueued:
+                try:
+                    from serve import log_action
+                    log_action(None, 'task_review_requeued',
+                               {'taskId': task.get('id'), 'title': task.get('title'),
+                                'to': reenqueued}, authorized=True)
+                except Exception:
+                    pass
 
 
 def _reenter_gate_review(state, parent, reviewer_ids):

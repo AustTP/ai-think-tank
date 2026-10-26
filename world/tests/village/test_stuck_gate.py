@@ -127,6 +127,21 @@ class StuckGateSweep(unittest.TestCase):
         self.assertNotIn('cora', gate['reviewerIds'])
         self.assertNotIn('dax', gate['reviewerIds'])
 
+    def test_widen_with_no_queued_review_enqueues_fresh_reviews(self):
+        # The locked pair is gone and no review subtask is queued. Widening
+        # alone would leave the new pair without work and burn the full rescue
+        # cooldown, so the sweep must enqueue fresh reviews immediately.
+        state = _state()
+        del state['agents']['cora']
+        del state['agents']['dax']
+        _gated_task(state, entered_ms=0)
+        sim._sweep_stuck_gates(state, now_ms=40 * 60 * 1000)
+        gate = state['tasks']['task-1']['_peerGate']
+        self.assertEqual(gate['reviewerIds'], ['ben', 'zia'])
+        queued = [q for q in state['workQueue'] if q.get('reviewOf') == 'task-1']
+        self.assertEqual({q['assignedTo'] for q in queued}, {'ben', 'zia'})
+        self.assertEqual({q['taskType'] for q in queued}, {'review'})
+
     def test_reachable_locked_reviewer_is_left_alone(self):
         # A locked reviewer who is on-duty-and-idle is reachable; the watchdog
         # must NOT churn (no re-pick, no re-pin) while she could still vote.
