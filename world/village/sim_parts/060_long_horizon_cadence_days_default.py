@@ -498,6 +498,14 @@ def _check_schedules(state, now, now_ms):
                 'kbClass': 'changes_how_we_work',
             }])
 
+    # Scrum-master workflow memory: completed requests become card templates,
+    # a second clean run promotes them, and any team's scrum master can reuse
+    # them at breakdown. Cheap state work; no model call.
+    if _cadence_due(state, 'lastWorkflowTemplateAt', WORKFLOW_TEMPLATE_CADENCE_MS,
+                    now_ms=now_ms):
+        state['lastWorkflowTemplateAt'] = now_ms
+        _workflow_template_sweep(state, now_ms)
+
     # Ordered pipelines (the player-facing scheduling lane): fire the next step
     # of each due pipeline in strict sequence, gating step N+1 on step N's
     # completion. Stamps the run's cadence marker at the START of a run (not per

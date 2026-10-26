@@ -723,6 +723,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'issueKey': pick.get('issueKey'),
         'requestId': pick.get('requestId'),
         'sequence': pick.get('sequence'),
+        'templateId': pick.get('templateId'),
         # Phase E2d: an INCIDENT routes to the owning team's on-call (taskType
         # 'bug' + productId + assignedTo travel so the fix is attributable and
         # the cap can be enforced against the open task set).

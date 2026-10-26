@@ -219,7 +219,19 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
             '{"items":[{"title":"short title","type":"story|spike|research|report","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
-        if _single_deliverable_goal(goal):
+        template = _workflow_match_template(state, goal, team_id)
+        if template:
+            items = _workflow_template_items(template, goal, pc)
+            req['workflowTemplateId'] = template.get('id')
+            req['workflowTemplateOwnerTeam'] = template.get('ownerTeamId')
+            req['workflowTemplateUsedByTeam'] = team_id
+            template['useCount'] = int(template.get('useCount') or 0) + 1
+            template['lastUsedAt'] = now_ms
+            _log_governance(state, scrum_master_id, 'workflow_template_used',
+                            {'request': req.get('id'), 'templateId': template.get('id'),
+                             'ownerTeam': template.get('ownerTeamId'),
+                             'usingTeam': team_id, 'steps': len(items)})
+        elif _single_deliverable_goal(goal):
             items = [_single_deliverable_item(goal, pc)]
             _log_governance(state, scrum_master_id, 'breakdown_single_deliverable',
                             {'request': req.get('id'), 'goal': goal[:120],
@@ -287,6 +299,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # report/spike closer writes the requested file, not a generic
                 # archive name.
                 'reportPath': s.get('reportPath'),
+                'templateId': template.get('id') if template else None,
                 # Serial group: cards of one request run in the model's order.
                 # The assignment guard waits while an earlier card is queued or
                 # active, so gather -> write -> save cannot run in parallel.

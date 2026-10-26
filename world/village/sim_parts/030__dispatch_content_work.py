@@ -187,6 +187,7 @@ def queue_work(state, items):
             'requestId': item.get('requestId') or None,
             # Cards of one large request run in sequence (see _assign_due_item).
             'sequence': item.get('sequence'),
+            'templateId': item.get('templateId') or None,
             # Phase E2d: an INCIDENT (bug) is pinned to the owning team's on-call
             # and pin-woken even though it carries no reviewOf.
             'incident': bool(item.get('incident')),
