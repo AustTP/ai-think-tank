@@ -90,10 +90,16 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     if (completed_task.get('taskType') or 'code') in ('spike', 'bug', 'review', 'research', 'meeting'):
         # spike/bug/research already IS the investigation itself (incident
         # response or open-ended question); a review is meta-process work, not
-        # a fresh deliverable; a meeting is a conversation whose minutes ARE
+        # a fresh deliverable; a meeting is a conversation whose minutes are
         # the artifact -- none of them should propose the next story
         # (that's the recursion: 'Follow-up ... after completing Review:
         # Follow-up ...' cards grew indefinitely).
+        return
+    if (completed_task.get('distill') or completed_task.get('skillReview')
+            or completed_task.get('research')):
+        # Distill and skill-review cards write the wiki or promote files; they
+        # are not a fresh room deliverable, and their completions filed dozens
+        # of identical 'further observatory work' requests.
         return
     # A follow-up to a follow-up: a completed card that was ITSELF a follow-up
     # (taskType 'code', title prefixed 'Follow-up:') must not propose yet another
@@ -115,6 +121,12 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
     if backlog > WORK_REQUEST_ROOM_THIN:
         return
     title = f"Follow-up: further {room_label} work after completing '{completed_task.get('title') or 'previous task'}'"
+    # Accepted duplicates do not re-file either. The old check only saw
+    # pending duplicates, so one accepted follow-up plus its next completion
+    # could mint the same request again every sprint.
+    for q in (state.get('backlogRequests') or []):
+        if q.get('title') == title and q.get('status') in ('pending', 'accepted'):
+            return
     file_work_request(
         state, agent_id, title, room_label,
         reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {backlog} item(s); this room can absorb another story. {ABSOLUTE_ZERO_SCOPING_GUIDANCE}")

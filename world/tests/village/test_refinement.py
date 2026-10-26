@@ -476,6 +476,21 @@ class RefinementSignalGenerator(unittest.TestCase):
                                   'taskType': 'code'}, 1_000_000)
         self.assertEqual(state['backlogRequests'], [])
 
+    def test_distill_completion_does_not_file(self):
+        state = _seed()
+        sim._maybe_file_followup(state, 'ben',
+                                 {'room': 'observatory', 'title': 'Distill recent think tank knowledge',
+                                  'taskType': 'code', 'distill': True}, 1_000_000)
+        self.assertEqual(state['backlogRequests'], [])
+
+    def test_accepted_duplicate_deduped(self):
+        state = _seed()
+        task = {'room': 'pressoffice', 'title': 'Build ledger tool', 'taskType': 'code'}
+        sim._maybe_file_followup(state, 'ben', task, 1_000_000)
+        state['backlogRequests'][0]['status'] = 'accepted'
+        sim._maybe_file_followup(state, 'ada', task, 1_000_000)
+        self.assertEqual(len(state['backlogRequests']), 1)
+
     def test_real_deliverable_still_files(self):
         # The guard only stops meta-work; a genuine deliverable still files.
         state = _seed()
