@@ -633,7 +633,7 @@ def _apply_content_result(state, task, result, now_ms=None):
     for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract',
                   'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace',
                   'sourceUrls', 'noop', 'codePublished', 'libraryError',
-                  'wikiPage'):
+                  'wikiPage', 'deliverableText', 'wordCount'):
         if result.get(field) is not None:
             task[field] = result[field]
     if result.get('reviewContract') and task.get('reviewOf'):
@@ -727,7 +727,25 @@ def _apply_content_result(state, task, result, now_ms=None):
     if qf:
         # A gate review that must go BACK to the same author + the same gate
         # carries the parent id; a free-form pressoffice fix does not.
-        queue_work(state, [qf])
+        # Two reviewers rejecting the same parent in one cycle must not queue
+        # two identical fix cards (the task-671 cycle spawned four). One open
+        # fix per parent is enough; the gate re-arms when that fix lands.
+        parent_id = qf.get('reviewOf')
+        duplicate = False
+        if parent_id:
+            duplicate = any(
+                q.get('reviewOf') == parent_id
+                and q.get('taskType') not in ('review', 'qa')
+                for q in (state.get('workQueue') or []))
+            if not duplicate:
+                duplicate = any(
+                    t.get('reviewOf') == parent_id
+                    and t.get('taskType') not in ('review', 'qa')
+                    and t.get('status') not in ('done', 'cancelled', 'failed',
+                                                'quarantined')
+                    for t in (state.get('tasks') or {}).values())
+        if not duplicate:
+            queue_work(state, [qf])
     # W3: a worker's spike can PROPOSE an issue (a Jev verdict that the spike's
     # finding names a real, actionable gap). The executor reports a WISH -- the
     # same safe indirection as queueFix/notifyPlayer: it runs off-thread against

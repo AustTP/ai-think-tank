@@ -183,7 +183,8 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     is_prose_review = (parent_deliverable in ('note', 'report')
                        or (review_parent or {}).get('taskType') in ('spike', 'report', 'task'))
     if is_prose_review:
-        prose = (review_parent.get('note') or '').strip()
+        prose = (review_parent.get('deliverableText')
+                 or review_parent.get('note') or '').strip()
         doc = _read_library_document(review_parent.get('libraryPath')
                                      or review_parent.get('reportPath'))
         if doc:
@@ -454,6 +455,7 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         if is_prose_review:
             queue_fix['deliverable'] = parent_deliverable or 'note'
             queue_fix['taskType'] = 'task' if queue_fix['deliverable'] == 'note' else 'report'
+            queue_fix['wordLimit'] = (review_parent or {}).get('wordLimit')
         if is_gate_review:
             # A gate review that rejects: the fix must go back to the SAME author
             # and re-open the SAME story (carry reviewOf), not a fresh free task.

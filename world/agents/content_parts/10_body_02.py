@@ -1,27 +1,66 @@
 
 
+def _note_word_limit(task):
+    """The card's explicit word cap, from the structured field or the prose."""
+    import re
+    raw = task.get('wordLimit')
+    try:
+        if raw is not None:
+            return max(1, int(raw))
+    except (TypeError, ValueError):
+        pass
+    text = str(task.get('instructions') or '')
+    for pattern in (
+            r'at\s+most\s+(\d+)\s+words?',
+            r'no\s+more\s+than\s+(\d+)\s+words?',
+            r'under\s+(\d+)\s+words?',
+            r'(\d+)[-\s]word',
+            r'<=?\s*(\d+)\s+words?'):
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return max(1, int(match.group(1)))
+    return None
+
+
+def _word_count(text):
+    import re
+    return len(re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", text or ''))
+
+
 def _run_note_content(snapshot, agent_id, task, base_ctx=None):
-    """A note-only card: record the outcome, no code and no shell.
+    """A note-only card: the note itself is the deliverable, no code or shell.
 
     Operational task cards (close/reset/audit/decide) have no code deliverable.
     Running them through the coding lane ended in the executable-command gate
     rejecting them twice and closing the card as failed. This lane makes the
     note the explicit deliverable. It cannot execute or mutate state, so the
-    prompt forbids claiming an action the lane cannot perform; the note names
-    what was verified and what action remains.
+    prompt forbids claiming an action the lane cannot perform.
+
+    The note and the completion record are the same text here, but the review
+    reads `deliverableText` so a card's word cap applies to the requested note,
+    not to boilerplate or a self-review preamble (task-666/671).
     """
     import sim as _sim_module
     name = _agent_name(snapshot, agent_id)
     model = _serve._low_tier_slug() or _serve._mid_tier_slug()
+    limit = _note_word_limit(task)
+    limit_line = (f'The entire response must be {limit} words or fewer. '
+                  'Do not add a heading, preamble, self-review, or next-action '
+                  'section unless the card asks for one.\n' if limit else
+                  'Output only the note the card requests. Do not add a preamble '
+                  'or self-review.\n')
     prompt = (
-        f'You are {name}. Write the completion note for this operational card.\n'
+        f'You are {name}. Write the note requested by this operational card. '
+        'The note is the deliverable.\n'
         f'Card: {task.get("title") or ""}\n'
         f'Instructions: {task.get("instructions") or ""}\n'
         + (f'Context:\n{base_ctx}\n' if base_ctx else '')
+        + limit_line
+        + ('' if limit else
+           'If the card does not specify the note content, record what it asked, '
+           'what you verified, and the exact next action, in at most 150 words. ')
         + 'You cannot run shell commands or change tank state in this lane. '
-          'Do not claim you performed an action you could not perform. '
-          'Record, in at most 150 words: what the card asked, what you verified '
-          'from the context, and the exact next action for a human or a code card.'
+          'Do not claim you performed an action you could not perform.'
     )
     text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
                              max_tokens=1200, service='note',
@@ -30,8 +69,27 @@ def _run_note_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'ok': False, 'note': 'Note synthesis returned nothing.'})
         return
+    text = text.strip()
+    count = _word_count(text)
+    if limit and count > limit:
+        trim_prompt = (
+            f'Rewrite the note below to {limit} words or fewer. Keep the requested '
+            'content and remove all preamble, headings, and extra commentary. '
+            'Return only the note.\n\n' + text)
+        trimmed = _plain_completion(model, [{'role': 'user', 'content': trim_prompt}],
+                                    max_tokens=1200, service='note',
+                                    task_id=task.get('id'))
+        if trimmed and _word_count(trimmed) <= limit:
+            text, count = trimmed.strip(), _word_count(trimmed)
+        else:
+            _sim_module._store_content_result(task.get('id'), {
+                'ok': False,
+                'note': (f'The note is {count} words; the card limit is {limit}. '
+                         'Rewrite it within the limit.')})
+            return
     _sim_module._store_content_result(task.get('id'), {
-        'ok': True, 'note': text.strip()})
+        'ok': True, 'note': text, 'deliverableText': text,
+        'wordCount': count, 'wordLimit': limit})
 
 
 def _run_report_content(snapshot, agent_id, task, base_ctx=None):

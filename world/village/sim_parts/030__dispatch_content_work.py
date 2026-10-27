@@ -165,6 +165,10 @@ def queue_work(state, items):
             # assignment so the completion gate reads the explicit contract
             # (code/report/note) instead of guessing from the title.
             'deliverable': item.get('deliverable') or None,
+            # Explicit prose cap for note/report cards. Also parsed from the
+            # instructions as a fallback, but this survives template/card
+            # rewrites and is what the note executor enforces.
+            'wordLimit': item.get('wordLimit') or None,
             'approvedTools': list(item.get('approvedTools') or []),
             'skillReview': bool(item.get('skillReview')),
             # Hive mind: a distillation content-task that merges recent archive

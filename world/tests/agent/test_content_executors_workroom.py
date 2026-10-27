@@ -350,6 +350,35 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
                  'instructions': 'Reset the stale cards.'})
         self.assertTrue(seen['n1']['ok'])
         self.assertEqual(seen['n1']['note'], 'Verified X. Next: Y.')
+        self.assertEqual(seen['n1']['deliverableText'], 'Verified X. Next: Y.')
+
+    def test_note_content_enforces_the_card_word_limit(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(content, '_plain_completion',
+                               return_value='one two three four five six'):
+            content._run_note_content(
+                _snapshot(), 'cora',
+                {'id': 'n2', 'title': 'Short note',
+                 'deliverable': 'note',
+                 'instructions': 'Write a note of at most 5 words.'})
+        self.assertFalse(seen['n2']['ok'])
+        self.assertIn('6 words', seen['n2']['note'])
+        self.assertIn('limit is 5', seen['n2']['note'])
+
+    def test_note_content_sets_deliverable_text_under_the_limit(self):
+        seen = _store()
+        _base_mocks()
+        with mock.patch.object(content, '_plain_completion',
+                               return_value='one two three four five'):
+            content._run_note_content(
+                _snapshot(), 'cora',
+                {'id': 'n3', 'title': 'Short note',
+                 'deliverable': 'note', 'wordLimit': 5,
+                 'instructions': 'Short note.'})
+        self.assertTrue(seen['n3']['ok'])
+        self.assertEqual(seen['n3']['deliverableText'], 'one two three four five')
+        self.assertEqual(seen['n3']['wordCount'], 5)
 
     def test_dispatcher_pipeline_step_overrides_everything(self):
         with mock.patch.object(content, '_run_pipeline_step_content') as ps:

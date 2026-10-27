@@ -696,6 +696,7 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'research': pick.get('research'),
         'taskType': pick.get('taskType'),
         'deliverable': pick.get('deliverable'),
+        'wordLimit': pick.get('wordLimit'),
         'approvedTools': pick.get('approvedTools'),
         'skillReview': pick.get('skillReview'),
         # CS329A takeaway #2: thread the review checklist through

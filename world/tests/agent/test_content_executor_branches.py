@@ -761,13 +761,15 @@ def test_note_parent_review_skips_code_pipeline_and_screenshot(monkeypatch):
         return {'reply': 'The note is clear. {"verdict": "approve", "summary": "ok"}'}
     monkeypatch.setattr(content._serve, '_http_json', fake_http)
     snapshot = {'tasks': {'p': {'id': 'p', 'room': 'pressoffice',
-                                'deliverable': 'note', 'note': 'the actual note text'}}}
+                                'deliverable': 'note', 'note': 'completion boilerplate',
+                                'deliverableText': 'the actual note text'}}}
     task = {'id': 't', 'title': 'Review: note', 'reviewOf': 'p',
             'room': 'pressoffice', 'taskType': 'review'}
     content._run_review_content(snapshot, 'cora', task)
     assert called == [], 'a note review must not run the code pipeline or a page screenshot'
     assert prompts and 'DELIVERABLE TEXT' in str(prompts[0])
     assert 'the actual note text' in str(prompts[0])
+    assert 'completion boilerplate' not in str(prompts[0])
     assert stored and stored[-1].get('ok') is not False
 
 

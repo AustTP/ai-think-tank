@@ -762,3 +762,15 @@ def test_peer_repair_carries_original_context():
     assert queued['issueKey'] == 'BEN-6'
     assert queued['requestId'] == 'iss-1'
     assert queued['never'] == ['do not refetch']
+
+
+def test_apply_content_result_dedupes_gate_fix_cards():
+    state = {'agents': {}, 'tasks': {'p': {'id': 'p'}}, 'workQueue': []}
+    qf = {'title': 'Fix it', 'reviewOf': 'p', 'taskType': 'task',
+          'assignedTo': 'author', 'room': 'pressoffice'}
+    for rid in ('r1', 'r2'):
+        sim._apply_content_result(
+            state, {'id': rid, 'assignedTo': 'reviewer', 'taskType': 'review'},
+            {'ok': True, 'note': 'rejected', 'queueFix': dict(qf)}, 1000)
+    fixes = [q for q in state['workQueue'] if q.get('reviewOf') == 'p']
+    assert len(fixes) == 1

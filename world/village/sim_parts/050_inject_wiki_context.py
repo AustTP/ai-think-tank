@@ -250,6 +250,7 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'research': (extra or {}).get('research'),
         'taskType': (extra or {}).get('taskType', 'code'),
         'deliverable': (extra or {}).get('deliverable') or None,
+        'wordLimit': (extra or {}).get('wordLimit') or None,
         # A scheduled item's notBefore rides onto the task (see _assign_due_item)
         # so the preemption picker can recognize TIME-CRITICAL work: a card that
         # was scheduled for a specific time must not be yanked off the agent for
