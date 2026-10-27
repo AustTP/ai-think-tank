@@ -29,6 +29,26 @@ def _team_open_stuck_count(state, director_id):
     return count
 
 
+def _team_missed_ceremonies(state, team_id):
+    """Closed sprints for this team whose retrospective never ran, recent first.
+
+    A retrospective is recorded in state['retrospectives'][sprint_id] when the
+    ceremony resolves. Two of a team's last five closed sprints missing one is
+    the ceremony-side signal that the director's implicit facilitation has
+    stopped holding.
+    """
+    closed = []
+    for sid, sprint in (state.get('sprints') or {}).items():
+        if sprint.get('status') != 'closed':
+            continue
+        if team_id not in (sprint.get('teamIds') or []):
+            continue
+        closed.append((sprint.get('closedAt') or 0, sid))
+    closed.sort(reverse=True)
+    retros = state.get('retrospectives') or {}
+    return sum(1 for _ts, sid in closed[:5] if sid not in retros)
+
+
 def _teams_missing_scrum_master(state, team_ids):
     """Which of the given team ids are missing a REQUIRED scrum master. Returns
     a list of {id, name} for enforcement at sprint creation, so a caller can
@@ -37,7 +57,8 @@ def _teams_missing_scrum_master(state, team_ids):
     Scrum masters scale with team size: a team below
     SCRUM_MASTER_MIN_TEAM_SIZE workers usually doesn't need a dedicated
     facilitator -- its director stands in -- so it is not flagged. It is
-    flagged once it has three or more open stuck cards and has not explicitly
+    flagged once it has three or more open stuck cards, or two of its last five
+    closed sprints missed a retrospective, and it has not explicitly
     acknowledged director facilitation. Teams at/above the threshold that still
     lack a designated scrum master always block a sprint."""
     import sim as _sim
@@ -57,7 +78,9 @@ def _teams_missing_scrum_master(state, team_ids):
         if director_id and _sim._team_member_count(state, director_id) < floor:
             if t.get('directorFacilitation'):
                 continue  # the director explicitly owns facilitation
-            if _team_open_stuck_count(state, director_id) < stuck_trigger:
+            stuck = _team_open_stuck_count(state, director_id)
+            missed = _team_missed_ceremonies(state, tid)
+            if stuck < stuck_trigger and missed < 2:
                 continue  # small team, still healthy -- director stands in
             missing.append({'id': tid, 'name': t.get('name') or tid})
             continue
