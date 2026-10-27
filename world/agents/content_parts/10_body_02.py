@@ -71,6 +71,7 @@ def _run_note_content(snapshot, agent_id, task, base_ctx=None):
         return
     text = text.strip()
     count = _word_count(text)
+    word_trimmed = False
     if limit and count > limit:
         trim_prompt = (
             f'Rewrite the note below to {limit} words or fewer. Keep the requested '
@@ -82,14 +83,22 @@ def _run_note_content(snapshot, agent_id, task, base_ctx=None):
         if trimmed and _word_count(trimmed) <= limit:
             text, count = trimmed.strip(), _word_count(trimmed)
         else:
-            _sim_module._store_content_result(task.get('id'), {
-                'ok': False,
-                'note': (f'The note is {count} words; the card limit is {limit}. '
-                         'Rewrite it within the limit.')})
-            return
+            # The model can overshoot by a few words even after being asked to
+            # trim. The cap is a hard card constraint, so make a deterministic
+            # word-boundary trim rather than failing the whole card; the
+            # reviewer still grades the retained prose.
+            words = text.split()
+            while words and _word_count(' '.join(words)) > limit:
+                words.pop()
+            text = ' '.join(words).rstrip(' ,;:-')
+            if text and text[-1] not in '.!?':
+                text += '.'
+            count = _word_count(text)
+            word_trimmed = True
     _sim_module._store_content_result(task.get('id'), {
         'ok': True, 'note': text, 'deliverableText': text,
-        'wordCount': count, 'wordLimit': limit})
+        'wordCount': count, 'wordLimit': limit,
+        'wordTrimmed': word_trimmed})
 
 
 def _run_report_content(snapshot, agent_id, task, base_ctx=None):

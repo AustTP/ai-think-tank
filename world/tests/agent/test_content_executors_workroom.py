@@ -352,7 +352,7 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
         self.assertEqual(seen['n1']['note'], 'Verified X. Next: Y.')
         self.assertEqual(seen['n1']['deliverableText'], 'Verified X. Next: Y.')
 
-    def test_note_content_enforces_the_card_word_limit(self):
+    def test_note_content_hard_trims_to_the_card_word_limit(self):
         seen = _store()
         _base_mocks()
         with mock.patch.object(content, '_plain_completion',
@@ -362,9 +362,11 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
                 {'id': 'n2', 'title': 'Short note',
                  'deliverable': 'note',
                  'instructions': 'Write a note of at most 5 words.'})
-        self.assertFalse(seen['n2']['ok'])
-        self.assertIn('6 words', seen['n2']['note'])
-        self.assertIn('limit is 5', seen['n2']['note'])
+        self.assertTrue(seen['n2']['ok'])
+        self.assertTrue(seen['n2']['wordTrimmed'])
+        self.assertLessEqual(seen['n2']['wordCount'], 5)
+        self.assertEqual(seen['n2']['wordCount'],
+                         content._word_count(seen['n2']['deliverableText']))
 
     def test_note_content_sets_deliverable_text_under_the_limit(self):
         seen = _store()
