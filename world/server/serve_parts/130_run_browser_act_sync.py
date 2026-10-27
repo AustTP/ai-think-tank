@@ -581,11 +581,14 @@ OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions
 
 
 def _model_provider_for(model):
-    """Resolve a synthetic @provider:<band> slug to its operator override.
-    Returns None for ordinary OpenRouter slugs. `is_custom` is true only when
-    a base_url is configured, so a model-only override still rides OpenRouter
-    auth, credits, and failover."""
+    """Resolve a synthetic @provider:<band> slug to its operator override, or
+    a synthetic @freepool:<band>:<endpoint> slug to its free-pool endpoint
+    spec. Returns None for ordinary OpenRouter slugs. `is_custom` is true only
+    when a base_url is configured, so a model-only override still rides
+    OpenRouter auth, credits, and failover."""
     cfg = MODEL_PROVIDER_OVERRIDES or {}
+    if isinstance(model, str) and model.startswith('@freepool:'):
+        return _freepool_provider_for(model)
     if not isinstance(model, str) or not model.startswith('@provider:'):
         return None
     band = model.split(':', 1)[1]
@@ -654,6 +657,8 @@ def _openrouter_chat_post(body):
         body['model'] = provider['model']
         if not provider.get('send_reasoning'):
             body.pop('reasoning', None)
+        if provider.get('extra'):
+            body.update(provider['extra'])
     body = constitution.with_rules(body)
     source = provider.get('provider') if provider and is_custom else 'openrouter'
     base_url = provider.get('base_url') if is_custom else OPENROUTER_CHAT_COMPLETIONS_URL
@@ -665,7 +670,10 @@ def _openrouter_chat_post(body):
         api_key = OPENROUTER_API_KEY
 
     def _post_once(payload):
-        headers = {'Content-Type': 'application/json'}
+        # A real User-Agent on every model POST: Groq's edge blocks the bare
+        # Python-urllib signature with a Cloudflare 403 (error 1010) before
+        # auth is even considered -- confirmed live against api.groq.com.
+        headers = {'Content-Type': 'application/json', 'User-Agent': 'AIThinkTankAgent/1.0'}
         if api_key:
             headers['Authorization'] = f'Bearer {api_key}'
         req = urllib.request.Request(
@@ -690,6 +698,11 @@ def _openrouter_chat_post(body):
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
         _apply_provider_cost(result, provider)
+        if provider and provider.get('free'):
+            # Quota accounting for the free pool: RPM/TPM/RPD windows are fed
+            # from the real POST, not the pick, so the picker's view stays
+            # honest. Fail-open inside the helper.
+            _note_free_pool_call(provider, result)
         training_capture.record(source, payload, result,
                                 duration_ms=duration_ms)
         # BP-63: the same wall-clock measurement feeds the tier pick's
@@ -707,6 +720,17 @@ def _openrouter_chat_post(body):
             detail = e.read().decode('utf-8', 'ignore').lower()
         except Exception:
             pass
+        if e.code == 429 and provider and provider.get('free'):
+            # A quota rejection from a free endpoint: cool it down so the
+            # picker routes the next calls around it (the in-flight call
+            # still falls through to the paid pick in the call layers).
+            _note_free_pool_rate_limited(provider, detail,
+                                         (e.headers or {}).get('Retry-After'))
+        if (provider and provider.get('openrouter_free')
+                and e.code in (403, 404)):
+            # OpenRouter refused this :free model outright (harness-gated or
+            # gone): ban it and let the pick rotate to the next candidate.
+            _freepool_note_rejected(provider)
         if e.code == 402 and not is_custom:
             _set_credits_pause(True, source='openrouter_402')
         if e.code != 400 or 'reasoning is mandatory' not in detail:
@@ -728,6 +752,12 @@ def _openrouter_chat_post(body):
                 detail2 = e2.read().decode('utf-8', 'ignore').lower()
             except Exception:
                 pass
+            if e2.code == 429 and provider and provider.get('free'):
+                _note_free_pool_rate_limited(provider, detail2,
+                                             (e2.headers or {}).get('Retry-After'))
+            if (provider and provider.get('openrouter_free')
+                    and e2.code in (403, 404)):
+                _freepool_note_rejected(provider)
             if e2.code == 402 and not is_custom:
                 _set_credits_pause(True, source='openrouter_402')
             if not is_custom:
@@ -737,13 +767,62 @@ def _openrouter_chat_post(body):
             raise
 
 
+def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
+    """Where a failed call should be retried when the free pool is in play:
+    a freepool slug falls through to the band's OTHER healthy free endpoints
+    first (a 503 on one provider says nothing about the next one, and every
+    failed hop is marked so the cascade cannot loop), and only then to the
+    band's PAID pick -- free quota is best-effort; the agent must still get
+    an answer. A failed low-band paid pick falls through to a healthy
+    freepool route (the paid-first assist -- and in free-first mode this is
+    how a paid call that also failed gets one more shot at a different free
+    endpoint). Ordered, deduped, depth-bounded like the tier fallbacks.
+    Empty outside those two cases."""
+    out = []
+    if _fallback_depth >= TIER_FALLBACK_MAX_DEPTH:
+        return out
+    tried = set(_tried or ())
+    tried.add(model)
+    if isinstance(model, str) and model.startswith('@freepool:'):
+        parts = model.split(':', 2)
+        failed_name = parts[2] if len(parts) == 3 else None
+        band = parts[1] if len(parts) == 3 else None
+        cfg = _free_pool_cfg() or {}
+        for ep in cfg.get('endpoints') or []:
+            if ep['name'] == failed_name or band not in (cfg.get('bands') or []):
+                continue
+            slug = f'@freepool:{band}:{ep["name"]}'
+            if slug in tried:
+                continue
+            if _freepool_ready(ep, band) and slug not in out:
+                out.append(slug)
+        paid = _freepool_paid_fallback(model)
+        if paid and paid not in tried:
+            out.append(paid)
+        return out
+    try:
+        paid_low = _raw_model_tier_slug('low')
+    except Exception:
+        paid_low = None
+    if model and paid_low and model == paid_low:
+        free = _freepool_route_for_band('low', force=True)
+        if free and free not in tried:
+            out.append(free)
+    return out
+
+
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
-                               reasoning_override=None):
+                               reasoning_override=None, _tried=None):
     provider = _model_provider_for(model)
     is_custom = bool(provider and provider.get('is_custom'))
-    if not is_custom and credits_pause_active():
+    free_route = bool(provider and provider.get('free'))
+    # Free routes are exempt from the credits pause and the monthly spend cap
+    # by construction: price_per_m 0 spends nothing, and serving low-band work
+    # for free while the account is out of credits is exactly the fallback the
+    # free pool exists to provide.
+    if not is_custom and not free_route and credits_pause_active():
         raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
-    if (not is_custom or _provider_is_billable(provider)) and _think_tank_spend_cap_exceeded():
+    if (not is_custom or _provider_is_billable(provider)) and not free_route and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
@@ -769,13 +848,43 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
     try:
         result = _openrouter_chat_post(body)
         if _reasoning_starved(result):
+            if free_route:
+                # A free 200 with null content is a FAILED free attempt, not a
+                # success to hand back: reasoning-heavy free models burn the
+                # whole budget thinking (confirmed live on :free catalog
+                # models at the tank's max_tokens budgets). Treat it like any
+                # other free failure -- rotate an OpenRouter-free pick that is
+                # systematically starved, and let the fallback land on the
+                # band's paid pick.
+                if provider.get('openrouter_free'):
+                    _freepool_note_rejected(provider)
+                raise RuntimeError(f'{model} returned no content (reasoning starved)')
             recovered = _retry_reasoning_starved(body, result)
             if recovered is not None:
                 result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
-        if e.code in (401, 403) and not is_custom:
-            _note_api_key_failure('openrouter', e.code)
+        if e.code in (401, 403):
+            if free_route and is_custom:
+                _note_api_key_failure(provider['service'], e.code)
+            elif not is_custom and not free_route:
+                _note_api_key_failure('openrouter', e.code)
+        for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
+            if is_model_circuit_broken(slug):
+                continue
+            try:
+                result = _call_openrouter_once_sync(
+                    slug, messages, max_tokens,
+                    _fallback_depth=_fallback_depth + 1,
+                    _tried=(_tried or ()) + (model,))
+            except Exception:
+                continue
+            print(f'[free-pool] {model} unavailable; served the call with '
+                  f'{slug}', flush=True)
+            log_action(None, 'free_pool_fallback',
+                       {'from': model, 'to': slug, 'depth': _fallback_depth},
+                       authorized=False)
+            return result
         if (getattr(e, 'availability_failure', False)
                 and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
             fallback = _try_tier_fallbacks(
@@ -788,10 +897,28 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         raise
     except Exception:
         record_model_result(model, success=False)
+        for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
+            if is_model_circuit_broken(slug):
+                continue
+            try:
+                result = _call_openrouter_once_sync(
+                    slug, messages, max_tokens,
+                    _fallback_depth=_fallback_depth + 1,
+                    _tried=(_tried or ()) + (model,))
+            except Exception:
+                continue
+            print(f'[free-pool] {model} unavailable; served the call with '
+                  f'{slug}', flush=True)
+            log_action(None, 'free_pool_fallback',
+                       {'from': model, 'to': slug, 'depth': _fallback_depth},
+                       authorized=False)
+            return result
         raise
     record_model_result(model, success=True)
     if not is_custom:
         _note_api_key_success('openrouter')
+    elif free_route:
+        _note_api_key_success(provider['service'])
     return result
 
 
@@ -865,7 +992,7 @@ def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
 
 
 def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choice=None,
-                         _fallback_depth=0):
+                         _fallback_depth=0, _tried=None):
     """Lowest-level OpenRouter chat-completions POST, shared by the plain
     `_call_openrouter_sync` and the /api/intent/ask tool loop. `tools`,
     `max_tokens`, and `tool_choice` are optional; bodies only include what
@@ -877,9 +1004,10 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     parsed OpenRouter JSON document."""
     provider = _model_provider_for(model)
     is_custom = bool(provider and provider.get('is_custom'))
-    if not is_custom and credits_pause_active():
+    free_route = bool(provider and provider.get('free'))
+    if not is_custom and not free_route and credits_pause_active():
         raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
-    if (not is_custom or _provider_is_billable(provider)) and _think_tank_spend_cap_exceeded():
+    if (not is_custom or _provider_is_billable(provider)) and not free_route and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
@@ -912,13 +1040,39 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     try:
         result = _openrouter_chat_post(body)
         if _reasoning_starved(result):
+            if free_route:
+                # Same rule as the plain call layer: a free 200 with null
+                # content is a failed free attempt -- rotate a systematically
+                # starved OpenRouter-free pick and land on the paid pick.
+                if provider.get('openrouter_free'):
+                    _freepool_note_rejected(provider)
+                raise RuntimeError(f'{model} returned no content (reasoning starved)')
             recovered = _retry_reasoning_starved(body, result)
             if recovered is not None:
                 result = recovered
     except urllib.error.HTTPError as e:
         record_model_result(model, success=False)
-        if e.code in (401, 403) and not is_custom:
-            _note_api_key_failure('openrouter', e.code)
+        if e.code in (401, 403):
+            if free_route and is_custom:
+                _note_api_key_failure(provider['service'], e.code)
+            elif not is_custom and not free_route:
+                _note_api_key_failure('openrouter', e.code)
+        for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
+            if is_model_circuit_broken(slug):
+                continue
+            try:
+                result = _post_openrouter_raw(
+                    slug, messages, tools, max_tokens, tool_choice,
+                    _fallback_depth=_fallback_depth + 1,
+                    _tried=(_tried or ()) + (model,))
+            except Exception:
+                continue
+            print(f'[free-pool] {model} unavailable; served the call with '
+                  f'{slug}', flush=True)
+            log_action(None, 'free_pool_fallback',
+                       {'from': model, 'to': slug, 'depth': _fallback_depth},
+                       authorized=False)
+            return result
         if (getattr(e, 'availability_failure', False)
                 and _fallback_depth < TIER_FALLBACK_MAX_DEPTH):
             fallback = _try_tier_fallbacks(
@@ -931,8 +1085,26 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         raise
     except Exception:
         record_model_result(model, success=False)
+        for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
+            if is_model_circuit_broken(slug):
+                continue
+            try:
+                result = _post_openrouter_raw(
+                    slug, messages, tools, max_tokens, tool_choice,
+                    _fallback_depth=_fallback_depth + 1,
+                    _tried=(_tried or ()) + (model,))
+            except Exception:
+                continue
+            print(f'[free-pool] {model} unavailable; served the call with '
+                  f'{slug}', flush=True)
+            log_action(None, 'free_pool_fallback',
+                       {'from': model, 'to': slug, 'depth': _fallback_depth},
+                       authorized=False)
+            return result
         raise
     record_model_result(model, success=True)
     if not is_custom:
         _note_api_key_success('openrouter')
+    elif free_route:
+        _note_api_key_success(provider['service'])
     return result

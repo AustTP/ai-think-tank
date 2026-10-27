@@ -232,9 +232,18 @@ def _mid_tier_slug():
 
 
 def _low_tier_slug():
-    # The default tier for routine work: cheap above all else.
+    # The default tier for routine work: cheap above all else. When the
+    # operator configured a free provider pool (model_providers.json
+    # free_pool), the band resolves to a free endpoint first --
+    # '@freepool:<band>:<endpoint>' -- and the call layers fall through to the
+    # paid pick underneath whenever the free quota is exhausted or the free
+    # call fails. The DB pick stays live either way: refresh keeps picking it,
+    # and it is the paid leg of the conjunction.
     # Kept as its own accessor (like _mid_tier_slug) so tests can mock it and
     # the JEV tier gate can fail closed to it.
+    free = _freepool_route_for_band('low')
+    if free:
+        return free
     return _model_tier_slug('low')
 
 

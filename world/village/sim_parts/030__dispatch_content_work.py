@@ -50,6 +50,14 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
 
     def _run():
         try:
+            # Stamp whose work this thread is doing so free-pool picks honor
+            # the team's switches (the ContextVar does not cross a raw
+            # Thread boundary -- it must be set HERE, in the worker).
+            import serve
+            serve._set_free_pool_actor(agent_id)
+        except Exception:
+            pass
+        try:
             executor(snapshot, agent_id, task, base_ctx=perception)
         except Exception as e:  # never let a content failure strand the agent
             if getattr(e, 'credits_paused', False):

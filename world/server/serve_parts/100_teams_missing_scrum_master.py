@@ -93,10 +93,12 @@ def _teams_missing_scrum_master(state, team_ids):
 app = FastAPI(lifespan=_lifespan)
 from server.confirmations_api import router as _confirmations_router  # noqa: E402
 from server.supervision_api import router as _supervision_router  # noqa: E402
+from server.free_pool_policy_api import router as _free_pool_policy_router  # noqa: E402
 from server.feedback_api import router as _feedback_router  # noqa: E402
 from server.live_coverage_api import router as _live_coverage_router  # noqa: E402
 app.include_router(_confirmations_router)
 app.include_router(_supervision_router)
+app.include_router(_free_pool_policy_router)
 app.include_router(_feedback_router)
 app.include_router(_live_coverage_router)
 
@@ -601,7 +603,10 @@ def _ttc_should_deliberate(model, deliberate=None, best_of=None):
         return False
     # Low and mid tiers (None is the fail-closed slug from _resolve_model_tier
     # when the model_tiers table is empty -- no configured tiers, no guessing).
-    return model in (_low_tier_slug(), _mid_tier_slug())
+    # A freepool route stands in for the band it was picked for, so it counts
+    # as that band here.
+    return (model in (_low_tier_slug(), _mid_tier_slug())
+            or _freepool_slug_band(model) in ('low', 'mid'))
 
 
 def _ttc_best_of(best_of=None):
