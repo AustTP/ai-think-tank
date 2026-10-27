@@ -756,7 +756,7 @@ async def intent_sprint(request: Request):
         missing = _teams_missing_scrum_master(state, team_ids)
         if missing:
             names = ', '.join(f"{m['name']} ({m['id']})" for m in missing)
-            return JSONResponse({'error': f'Every team in a sprint needs a scrum master. Designate one first (POST /api/teams/{missing[0]["id"]}/scrum-master): missing for {names}.', 'missingTeams': missing}, status_code=409)
+            return JSONResponse({'error': f'Every team in a sprint needs a scrum master or explicit director facilitation. Designate one (POST /api/teams/{missing[0]["id"]}/scrum-master) or set directorFacilitation: missing for {names}.', 'missingTeams': missing}, status_code=409)
     # targetDate -> epoch ms (ISO 8601 or numeric; malformed degrades to None).
     target_date = body.get('targetDate')
     if target_date:

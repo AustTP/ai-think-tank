@@ -374,6 +374,25 @@ class SetTeamScrumMaster(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertIsNone(state["teams"][0]["scrumMasterId"])
 
+    def test_director_facilitation_acknowledgement(self):
+        state = _roster_state()
+        with _agent_env(state):
+            r = _post(_client(), "/api/teams/team-1/scrum-master",
+                      {"directorFacilitation": True})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(state["teams"][0]["directorFacilitation"])
+        # A facilitation-only update must not clear the named scrum master.
+        self.assertEqual(state["teams"][0]["scrumMasterId"], "agent-3")
+
+    def test_named_scrum_master_clears_facilitation_ack(self):
+        state = _roster_state()
+        state["teams"][0]["directorFacilitation"] = True
+        with _agent_env(state):
+            r = _post(_client(), "/api/teams/team-1/scrum-master",
+                      {"scrumMasterId": "agent-1"})
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("directorFacilitation", state["teams"][0])
+
 
 
 class UpdateRoomPurpose(unittest.TestCase):

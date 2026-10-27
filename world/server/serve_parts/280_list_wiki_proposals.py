@@ -433,17 +433,37 @@ async def set_team_scrum_master(team_id: str, request: Request):
     if not _can_write_team(state, requester, team_id):
         return JSONResponse({'error': 'only this team\'s director, a chain-above director, or the chief of staff may designate its scrum master'}, status_code=403)
     body = await request.json()
+    has_sm = 'scrumMasterId' in body
     sm_id = (body.get('scrumMasterId') or '').strip()
+    if 'directorFacilitation' in body:
+        # A lean team may explicitly acknowledge that its director owns
+        # facilitation instead of naming a scrum master. The stuck-card trigger
+        # in _teams_missing_scrum_master checks this acknowledgement.
+        t['directorFacilitation'] = bool(body.get('directorFacilitation'))
+        t['directorFacilitationSetBy'] = requester
+        t['directorFacilitationSetAt'] = int(time.time() * 1000)
+    if not has_sm:
+        save_state_to_db(state)
+        log_action(requester, 'director_facilitation_set',
+                   {'team': team_id,
+                    'directorFacilitation': t.get('directorFacilitation')},
+                   authorized=True)
+        return JSONResponse({'ok': True, 'team': _team_record(state, team_id)})
     if sm_id:
         members = _derive_team_members(state, team_id)
         # Valid: the team director themself, a derived member, or the admin.
         if sm_id != t.get('directorId') and sm_id not in members and not _is_admin(state, sm_id):
             return JSONResponse({'error': 'the scrum master must be a current member of this team (or its director)'}, status_code=400)
     t['scrumMasterId'] = sm_id or None
+    if sm_id:
+        # A named facilitator makes the lean-team acknowledgement redundant.
+        t.pop('directorFacilitation', None)
     t['scrumMasterSetBy'] = requester
     t['scrumMasterSetAt'] = int(time.time() * 1000)
     save_state_to_db(state)
-    log_action(requester, 'scrum_master_set', {'team': team_id, 'scrumMaster': sm_id or None},
+    log_action(requester, 'scrum_master_set',
+               {'team': team_id, 'scrumMaster': sm_id or None,
+                'directorFacilitation': t.get('directorFacilitation')},
                authorized=True)
     return JSONResponse({'ok': True, 'team': _team_record(state, team_id)})
 

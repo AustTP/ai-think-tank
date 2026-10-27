@@ -549,6 +549,13 @@ MAX_TEAM_MEMBERS = 6
 # many workers does a dedicated scrum master become REQUIRED. Below it, the
 # team's director stands in as the groomer/facilitator for ceremonies.
 SCRUM_MASTER_MIN_TEAM_SIZE = 4
+# A lean team normally has its director stand in as facilitator. But a small
+# team that accumulates stuck cards has outgrown implicit facilitation; at that
+# point a real scrum master (or an explicit director-facilitation acknowledgement)
+# is required. The `directorFacilitation` flag on the team record is the
+# acknowledgement that keeps a lean team exempt while its director owns
+# ceremonies.
+SMALL_TEAM_STUCK_TRIGGER = 3
 
 
 def _team_member_count(state, director_id):

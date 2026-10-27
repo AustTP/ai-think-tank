@@ -1,15 +1,48 @@
 
 
+def _team_open_stuck_count(state, director_id):
+    """Open cards on a director's direct reports that are visibly stuck.
+
+    Counts failed/repairing/blocked cards and review cards that have already
+    cycled at least twice. A single normal review is not a stuck card; three
+    of these on a lean team mean the director's implicit facilitation is not
+    holding and the team needs a real facilitator or an explicit acknowledgement.
+    """
+    members = {d.get('id') for d in (state.get('agentRoster') or [])
+               if d.get('director') == director_id}
+    if not members:
+        return 0
+    count = 0
+    for task in (state.get('tasks') or {}).values():
+        if task.get('assignedTo') not in members:
+            continue
+        status = task.get('status')
+        if status in ('done', 'cancelled', 'quarantined'):
+            continue
+        gate = task.get('_peerGate') or {}
+        if status in ('failed', 'repairing', 'blocked'):
+            count += 1
+        elif status == 'needs_review' and int(gate.get('cycleCount') or 0) >= 2:
+            count += 1
+        elif task.get('_stuck') or task.get('needsHelp'):
+            count += 1
+    return count
+
+
 def _teams_missing_scrum_master(state, team_ids):
     """Which of the given team ids are missing a REQUIRED scrum master. Returns
     a list of {id, name} for enforcement at sprint creation, so a caller can
     tell the player exactly which teams to fix first.
 
     Scrum masters scale with team size: a team below
-    SCRUM_MASTER_MIN_TEAM_SIZE workers doesn't need a dedicated facilitator yet
-    -- its director stands in -- so it is NOT flagged. Only teams at/above the
-    threshold that still lack a designated scrum master block a sprint."""
+    SCRUM_MASTER_MIN_TEAM_SIZE workers usually doesn't need a dedicated
+    facilitator -- its director stands in -- so it is not flagged. It is
+    flagged once it has three or more open stuck cards and has not explicitly
+    acknowledged director facilitation. Teams at/above the threshold that still
+    lack a designated scrum master always block a sprint."""
     import sim as _sim
+    floor_default = getattr(_sim, 'SCRUM_MASTER_MIN_TEAM_SIZE', 4)
+    stuck_trigger = getattr(_sim, 'SMALL_TEAM_STUCK_TRIGGER', 3)
     missing = []
     existing_ids = {(t.get('id')) for t in (state.get('teams') or [])}
     for tid in team_ids:
@@ -19,8 +52,15 @@ def _teams_missing_scrum_master(state, team_ids):
         if t.get('scrumMasterId'):
             continue
         director_id = t.get('directorId')
-        if director_id and _sim._team_member_count(state, director_id) < _sim.team_policy(state, tid, 'scrumMasterMinTeamSize'):
-            continue  # small team -- the director stands in
+        floor = (_sim.team_policy(state, tid, 'scrumMasterMinTeamSize')
+                 if hasattr(_sim, 'team_policy') else floor_default)
+        if director_id and _sim._team_member_count(state, director_id) < floor:
+            if t.get('directorFacilitation'):
+                continue  # the director explicitly owns facilitation
+            if _team_open_stuck_count(state, director_id) < stuck_trigger:
+                continue  # small team, still healthy -- director stands in
+            missing.append({'id': tid, 'name': t.get('name') or tid})
+            continue
         missing.append({'id': tid, 'name': t.get('name') or tid})
     return missing
 

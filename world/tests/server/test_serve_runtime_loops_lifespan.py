@@ -298,6 +298,63 @@ class PromoteAndTeamRecords(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
             self.assertEqual(serve._teams_missing_scrum_master(state, ['t1']), [])
 
+    def test_teams_missing_scrum_master_flags_stuck_small_team(self):
+        fake_sim = types.ModuleType('sim')
+        fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
+        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim._team_member_count = lambda state, did: 2
+        state = {
+            'agentRoster': [{'id': 'w1', 'director': 'nora'},
+                            {'id': 'w2', 'director': 'nora'}],
+            'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One'}],
+            'tasks': {
+                'a': {'assignedTo': 'w1', 'status': 'failed'},
+                'b': {'assignedTo': 'w1', 'status': 'repairing'},
+                'c': {'assignedTo': 'w2', 'status': 'needs_review',
+                      '_peerGate': {'cycleCount': 2}},
+            },
+        }
+        with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
+            missing = serve._teams_missing_scrum_master(state, ['t1'])
+        self.assertEqual(missing, [{'id': 't1', 'name': 'Team One'}])
+
+    def test_teams_missing_scrum_master_small_team_two_stuck_ok(self):
+        fake_sim = types.ModuleType('sim')
+        fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
+        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim._team_member_count = lambda state, did: 2
+        state = {
+            'agentRoster': [{'id': 'w1', 'director': 'nora'}],
+            'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One'}],
+            'tasks': {
+                'a': {'assignedTo': 'w1', 'status': 'failed'},
+                'b': {'assignedTo': 'w1', 'status': 'repairing'},
+            },
+        }
+        with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
+            self.assertEqual(serve._teams_missing_scrum_master(state, ['t1']), [])
+
+    def test_teams_missing_scrum_master_stuck_small_team_ack_ok(self):
+        fake_sim = types.ModuleType('sim')
+        fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
+        fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
+        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim._team_member_count = lambda state, did: 2
+        state = {
+            'agentRoster': [{'id': 'w1', 'director': 'nora'}],
+            'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One',
+                       'directorFacilitation': True}],
+            'tasks': {
+                'a': {'assignedTo': 'w1', 'status': 'failed'},
+                'b': {'assignedTo': 'w1', 'status': 'repairing'},
+                'c': {'assignedTo': 'w1', 'status': 'failed'},
+            },
+        }
+        with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
+            self.assertEqual(serve._teams_missing_scrum_master(state, ['t1']), [])
+
     def test_teams_missing_scrum_master_small_team_ok(self):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
