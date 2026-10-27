@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
             'gpu': {'maxConcurrent': 1, 'cpus': 4.0, 'memoryMb': 8192,
                     'pidsLimit': 128, 'timeoutS': 1800},
         },
-        'villageDefaults': {'maxConcurrent': 2, 'maxHeavy': 1,
+        'villageDefaults': {'maxConcurrent': 4, 'maxHeavy': 1,
                             'hold': [], 'reason': ''},
     }
 }

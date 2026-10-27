@@ -930,6 +930,7 @@ class ExecuteEndpoint(unittest.TestCase):
             self.assertEqual(r.status_code, 429)
             self.assertTrue(r.json()['resourceHold'])
             self.assertEqual(r.json()['resourceClass'], 'media')
+            self.assertIn('hold', r.json()['reason'])
             run.assert_not_called()
         finally:
             for p in patchers:

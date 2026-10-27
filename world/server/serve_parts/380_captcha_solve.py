@@ -765,7 +765,7 @@ async def execute(request: Request):
                      {})
     _village = _agent.get('villageId') or _task.get('villageId') or 'main'
     _class = resources.resource_class_for(_task, command)
-    _wait = 30 if _class in ('media', 'gpu') else 0
+    _wait = 30 if _class in ('media', 'gpu') else 15
     try:
         _lease = resources.GOVERNOR.acquire(
             _village, _class, _task_id, agent_id, state=_state, wait_s=_wait)
@@ -776,7 +776,8 @@ async def execute(request: Request):
             'resourceClass': _class, 'reason': _denied.reason,
         }, authorized=authorized)
         return JSONResponse({
-            'error': str(_denied), 'resourceHold': True,
+            'error': str(_denied), 'reason': str(_denied),
+            'resourceHold': True,
             'villageId': _village, 'resourceClass': _class,
             'retryAfterS': _denied.retry_after_s,
         }, status_code=429, headers={'Retry-After': str(_denied.retry_after_s)})

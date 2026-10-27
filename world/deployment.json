@@ -38,7 +38,7 @@
       }
     },
     "villageDefaults": {
-      "maxConcurrent": 2,
+      "maxConcurrent": 4,
       "maxHeavy": 1,
       "hold": [],
       "reason": ""

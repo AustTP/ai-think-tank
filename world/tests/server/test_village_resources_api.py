@@ -46,7 +46,7 @@ class VillageResourceEndpoint(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body['villageId'], 'main')
-        self.assertEqual(body['policy']['maxConcurrent'], 2)
+        self.assertEqual(body['policy']['maxConcurrent'], 4)
         self.assertIn('usage', body)
 
     def test_other_village_director_is_denied(self):
