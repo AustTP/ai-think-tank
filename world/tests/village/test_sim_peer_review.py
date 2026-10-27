@@ -84,6 +84,25 @@ class PeerGateMoraleGap(SimIsolation):
         self.assertEqual(gate['approvals'], 1)
         pick.assert_not_called()
 
+    def test_force_rearm_reopens_a_gate_after_a_fix(self):
+        gate = {'enteredMs': 100, 'reviewerIds': ['r1', 'r2'],
+                'approvals': 1, 'approvers': ['r1'], 'reviewedTaskIds': ['x']}
+        task = {'id': 't', 'status': 'needs_review', 'assignedTo': 'ada',
+                'room': 'pressoffice', 'title': 't', '_peerGate': gate}
+        state = {'agents': {'r1': {'id': 'r1'}, 'r2': {'id': 'r2'}},
+                 'tasks': {'t': task}, 'workQueue': [],
+                 'agentRoster': [{'id': 'r1'}, {'id': 'r2'}]}
+        with unittest.mock.patch.object(sim, '_pick_reviewer_ids',
+                                        return_value=['r1', 'r2']):
+            out = sim._enter_peer_review(state, task, now_ms=999,
+                                         force_rearm=True)
+        self.assertIsNotNone(out)
+        self.assertIsNot(out, gate)
+        self.assertEqual(out['enteredMs'], 999)
+        self.assertEqual(out['approvals'], 0)
+        self.assertEqual(len([q for q in state['workQueue']
+                              if q.get('reviewOf') == 't']), 2)
+
     def test_cascade_rereview_no_reopened_task(self):
         self.assertEqual(sim._cascade_rereview({'tasks': {}}, None), 0)
 

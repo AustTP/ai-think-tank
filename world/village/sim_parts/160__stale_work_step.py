@@ -661,7 +661,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # escalated) gate -- an escalated story stays paused for
                         # manual attention, not silently re-entered.
                         if not (parent.get('_peerGate') or {}).get('escalated'):
-                            _enter_peer_review(state, parent, now_ms)
+                            _enter_peer_review(state, parent, now_ms,
+                                               force_rearm=True)
                     elif parent is not None and _peer_gated_lane(parent):
                         # Fail-closed: the FIX itself failed the pipeline. Do NOT
                         # re-arm the gate; the story stays 'failed' and another

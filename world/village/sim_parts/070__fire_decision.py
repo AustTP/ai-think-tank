@@ -557,7 +557,7 @@ def _peer_gate_required(state, task):
     return PEER_APPROVALS_DEFAULT
 
 
-def _enter_peer_review(state, task, now_ms, preferred=None):
+def _enter_peer_review(state, task, now_ms, preferred=None, force_rearm=False):
     """Move a deliverable task whose primary content work just finished into the
     peer-approval gate: status -> 'needs_review', pick two reviewers (see
     _pick_reviewer_ids -- one is forced cross-team when the tank can supply it),
@@ -583,7 +583,8 @@ def _enter_peer_review(state, task, now_ms, preferred=None):
     # subtasks were created before the reset. Re-entry is only for a NEW
     # deliverable (status working/repairing) or an explicit re-open that
     # cleared the prior gate.
-    if task.get('status') == 'needs_review' and prior.get('enteredMs'):
+    if (not force_rearm and task.get('status') == 'needs_review'
+            and prior.get('enteredMs')):
         live_reviewers = [rid for rid in (prior.get('reviewerIds') or [])
                           if rid in (state.get('agents') or {})]
         if live_reviewers:
