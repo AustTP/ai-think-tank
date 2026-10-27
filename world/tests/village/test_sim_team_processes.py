@@ -341,6 +341,23 @@ class Refocus(unittest.TestCase):
         aug = sim._augment_task_instructions(state, 'ben', 'prd-1', 'Review the diff', refocus=True)
         self.assertEqual(aug, 'Review the diff')
 
+    def test_assign_due_item_keeps_consensus_off_note_cards(self):
+        state = self._state_with_product()
+        state['consensusRelay'] = {
+            'consensus': 'Focus next work on observatory (weak trailing grade).'}
+        state['workQueue'] = [{
+            'id': 'n1', 'title': 'Write the note', 'room': 'pressoffice',
+            'instructions': 'Write the note the card asks for.',
+            'deliverable': 'note', 'wordLimit': 80, 'assignedTo': 'ben'}]
+        with unittest.mock.patch.object(sim, '_eligible_candidates',
+                                        return_value=['ben']), \
+             unittest.mock.patch.object(sim, 'assign_task') as assign_mock:
+            sim._assign_due_item(state, state['workQueue'][0], True,
+                                 object(), object(), 1_000)
+            instructions = assign_mock.call_args[0][4]
+        self.assertNotIn('Focus next work', instructions)
+        self.assertIn('Write the note the card asks for.', instructions)
+
     def test_assign_due_item_sets_refocus_for_review_and_incident_only(self):
         # The real call site: refocus=True iff the queued item is a review
         # (reviewOf set) or an incident, never a plain fresh task.

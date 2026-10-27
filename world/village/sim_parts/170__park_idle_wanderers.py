@@ -788,7 +788,13 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         state, chosen_id, pick.get('productId'), pick.get('instructions'),
         refocus=bool(pick.get('reviewOf') or pick.get('incident')),
         scoped=bool(pick.get('playerAuthored') or pick.get('reviewOf')
-                    or pick.get('issueKey')))
+                    or pick.get('issueKey')
+                    # A note/report card already names its own deliverable.
+                    # Prepending the global room focus steered the 2026-10-26
+                    # note smoke cards into observatory instead of the note
+                    # they were asked to write.
+                    or pick.get('deliverable') in ('note', 'report')
+                    or pick.get('wordLimit')))
     task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)
