@@ -165,6 +165,10 @@ def queue_work(state, items):
             # assignment so the completion gate reads the explicit contract
             # (code/report/note) instead of guessing from the title.
             'deliverable': item.get('deliverable') or None,
+            # Optional laptop/host resource class (light/browser/media/gpu).
+            # Directors can set it when filing a card; the governor also
+            # infers a class from the command/card text.
+            'resourceClass': item.get('resourceClass') or None,
             # Explicit prose cap for note/report cards. Also parsed from the
             # instructions as a fallback, but this survives template/card
             # rewrites and is what the note executor enforces.

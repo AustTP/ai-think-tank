@@ -298,8 +298,8 @@ class ExecuteTest(unittest.TestCase):
         req.json = mock.AsyncMock(return_value=body)
         req.headers = {'X-Agent-Key': 'k'}
 
-        async def fake_to_thread(f, *a):
-            return f(*a)
+        async def fake_to_thread(f, *a, **kw):
+            return f(*a, **kw)
         with mock.patch.object(serve, 'EXECUTION_ENABLED', True), \
              mock.patch.object(serve, '_village_sandbox_id',
                                side_effect=lambda a, s: s), \

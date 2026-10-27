@@ -63,7 +63,7 @@ def _teams_missing_scrum_master(state, team_ids):
     lack a designated scrum master always block a sprint."""
     import sim as _sim
     floor_default = getattr(_sim, 'SCRUM_MASTER_MIN_TEAM_SIZE', 4)
-    stuck_trigger = getattr(_sim, 'SMALL_TEAM_STUCK_TRIGGER', 3)
+    stuck_default = getattr(_sim, 'SMALL_TEAM_STUCK_TRIGGER', 3)
     missing = []
     existing_ids = {(t.get('id')) for t in (state.get('teams') or [])}
     for tid in team_ids:
@@ -80,6 +80,8 @@ def _teams_missing_scrum_master(state, team_ids):
                 continue  # the director explicitly owns facilitation
             stuck = _team_open_stuck_count(state, director_id)
             missed = _team_missed_ceremonies(state, tid)
+            stuck_trigger = (int(_sim.team_policy(state, tid, 'smallTeamStuckTrigger'))
+                             if hasattr(_sim, 'team_policy') else stuck_default)
             if stuck < stuck_trigger and missed < 2:
                 continue  # small team, still healthy -- director stands in
             missing.append({'id': tid, 'name': t.get('name') or tid})

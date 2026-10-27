@@ -1,3 +1,5 @@
+import core.resources as resources
+
 
 
 def _browser_block_payload(parsed_result, agent_id, op, url, purpose):
@@ -677,7 +679,7 @@ def _run_docker_sandbox(docker_cmd, timeout_s):
             pass
 
 
-def _run_in_sandbox_sync(sandbox_dir, command):
+def _run_in_sandbox_sync(sandbox_dir, command, limits=None):
     # Backend dispatch: SANDBOX_EXECUTION chooses WHERE agent
     # commands run. `local` (default) -> the local Docker sandbox below;
     # `digitalocean` -> a provisioned Droplet. The digitalocean branch FAILS
@@ -705,6 +707,7 @@ def _run_in_sandbox_sync(sandbox_dir, command):
     # inside the container -- confirmed (an `ls /Users` from inside
     # an identical container found nothing there at all).
     proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    limits = limits or resources.limits_for('light')
     docker_cmd = [
         'docker', 'run', '--rm',
         '--network', SANDBOX_NETWORK,
@@ -712,9 +715,9 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         '--security-opt', 'no-new-privileges',
         '-e', f'http_proxy={proxy_url}', '-e', f'https_proxy={proxy_url}',
         '-e', f'HTTP_PROXY={proxy_url}', '-e', f'HTTPS_PROXY={proxy_url}',
-        '--memory', '256m',
-        '--cpus', '1',
-        '--pids-limit', '128',
+        '--memory', f"{int(limits.get('memoryMb') or 512)}m",
+        '--cpus', str(limits.get('cpus') or 1),
+        '--pids-limit', str(int(limits.get('pidsLimit') or 128)),
         '-v', f'{sandbox_dir}:/workspace',
         '-w', '/workspace',
         SANDBOX_IMAGE,
@@ -726,7 +729,8 @@ def _run_in_sandbox_sync(sandbox_dir, command):
         'bash', '-c', command,
     ]
     try:
-        result = _run_docker_sandbox(docker_cmd, SANDBOX_TIMEOUT_S)
+        result = _run_docker_sandbox(
+            docker_cmd, int(limits.get('timeoutS') or SANDBOX_TIMEOUT_S))
         return {
             'exitCode': result.returncode,
             'stdout': _compact_command_output(result.stdout),

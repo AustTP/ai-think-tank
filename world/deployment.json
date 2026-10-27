@@ -1,0 +1,47 @@
+{
+  "_notes": [
+    "Machine and village resource policy. Non-secret operational limits only;",
+    "secrets belong in .env. Global class limits are the laptop/host ceiling.",
+    "Village limits are the share a village may use and are editable by its",
+    "directors through /api/villages/{id}/resources. A village hold pauses the",
+    "listed classes until the director clears it."
+  ],
+  "resources": {
+    "classes": {
+      "light": {
+        "maxConcurrent": 4,
+        "cpus": 1.0,
+        "memoryMb": 512,
+        "pidsLimit": 128,
+        "timeoutS": 120
+      },
+      "browser": {
+        "maxConcurrent": 2,
+        "cpus": 1.0,
+        "memoryMb": 1024,
+        "pidsLimit": 256,
+        "timeoutS": 180
+      },
+      "media": {
+        "maxConcurrent": 1,
+        "cpus": 2.0,
+        "memoryMb": 2048,
+        "pidsLimit": 128,
+        "timeoutS": 900
+      },
+      "gpu": {
+        "maxConcurrent": 1,
+        "cpus": 4.0,
+        "memoryMb": 8192,
+        "pidsLimit": 128,
+        "timeoutS": 1800
+      }
+    },
+    "villageDefaults": {
+      "maxConcurrent": 2,
+      "maxHeavy": 1,
+      "hold": [],
+      "reason": ""
+    }
+  }
+}

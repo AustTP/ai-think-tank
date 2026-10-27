@@ -1,3 +1,5 @@
+import core.resources as resources
+
 
 
 @app.post('/api/captcha/{request_id}/solve')
@@ -745,11 +747,48 @@ async def execute(request: Request):
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
+    # Resource governor: a village's directors can hold heavy work, and the
+    # host ceiling in deployment.json keeps several agents from saturating the
+    # laptop at once. The class is explicit on the card when set, otherwise
+    # inferred from the command/card text.
+    try:
+        _state = get_state_from_db() or {}
+    except Exception:
+        _state = {}
+    _agent = (_state.get('agents') or {}).get(agent_id) or {}
+    _task_id = body.get('taskId') or _agent.get('task') or ''
+    _task = (_state.get('tasks') or {}).get(_task_id) or {}
+    if not _task and _state.get('tasks'):
+        _task = next((t for t in _state['tasks'].values()
+                      if t.get('assignedTo') == agent_id
+                      and t.get('status') in ('walking', 'working', 'repairing')),
+                     {})
+    _village = _agent.get('villageId') or _task.get('villageId') or 'main'
+    _class = resources.resource_class_for(_task, command)
+    _wait = 30 if _class in ('media', 'gpu') else 0
+    try:
+        _lease = resources.GOVERNOR.acquire(
+            _village, _class, _task_id, agent_id, state=_state, wait_s=_wait)
+    except resources.ResourceDenied as _denied:
+        log_action(agent_id, 'execute', {
+            'sandboxId': sandbox_id, 'command': command, 'purpose': purpose,
+            'decision': 'resource_hold', 'villageId': _village,
+            'resourceClass': _class, 'reason': _denied.reason,
+        }, authorized=authorized)
+        return JSONResponse({
+            'error': str(_denied), 'resourceHold': True,
+            'villageId': _village, 'resourceClass': _class,
+            'retryAfterS': _denied.retry_after_s,
+        }, status_code=429, headers={'Retry-After': str(_denied.retry_after_s)})
     # BEFORE the write, not after -- a snapshot taken after a destructive
     # command has already run would just capture the damage.
     await asyncio.to_thread(_snapshot_sandbox, sandbox_id, sandbox_dir)
-    result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
-    log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut']}, authorized=authorized)
+    try:
+        result = await asyncio.to_thread(
+            _run_in_sandbox_sync, sandbox_dir, command, limits=_lease)
+    finally:
+        resources.GOVERNOR.release(_lease['id'])
+    log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut'], 'villageId': _village, 'resourceClass': _class}, authorized=authorized)
     _finish_confirmation(confirmation_id, 'executed')
     sync_prototypes(agent_id, sandbox_dir)
     return JSONResponse({'allowed': True, 'sandboxId': sandbox_id, **result})

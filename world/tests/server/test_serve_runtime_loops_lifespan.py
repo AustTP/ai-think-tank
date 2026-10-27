@@ -279,7 +279,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
     def test_teams_missing_scrum_master_flags_big_team(self):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 5
         state = {'teams': [{'id': 't1', 'directorId': 'nora', 'name': 'Team One'}]}
         with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):
@@ -302,7 +302,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
         fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 2
         state = {
             'agentRoster': [{'id': 'w1', 'director': 'nora'},
@@ -323,7 +323,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
         fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 2
         state = {
             'agentRoster': [{'id': 'w1', 'director': 'nora'}],
@@ -340,7 +340,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
         fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 2
         state = {
             'agentRoster': [{'id': 'w1', 'director': 'nora'}],
@@ -361,7 +361,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
         fake_sim.SMALL_TEAM_STUCK_TRIGGER = 3
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 2
         state = {
             'agentRoster': [{'id': 'w1', 'director': 'nora'}],
@@ -379,7 +379,7 @@ class PromoteAndTeamRecords(unittest.TestCase):
     def test_teams_missing_scrum_master_small_team_ok(self):
         fake_sim = types.ModuleType('sim')
         fake_sim.SCRUM_MASTER_MIN_TEAM_SIZE = 4
-        fake_sim.team_policy = lambda state, ref, key=None: 4
+        fake_sim.team_policy = lambda state, ref, key=None: (3 if key == 'smallTeamStuckTrigger' else 4)
         fake_sim._team_member_count = lambda state, did: 2
         state = {'teams': [{'id': 't1', 'directorId': 'nora'}]}
         with unittest.mock.patch.dict(sys.modules, {'sim': fake_sim}):

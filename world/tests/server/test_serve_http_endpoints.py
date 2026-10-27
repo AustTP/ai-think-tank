@@ -906,6 +906,35 @@ class ExecuteEndpoint(unittest.TestCase):
             for p in patchers:
                 p.stop()
 
+    def test_village_media_hold_blocks_execute(self):
+        state = {
+            'agents': {'eli': {'villageId': 'main', 'task': 't1'}},
+            'tasks': {'t1': {'id': 't1', 'assignedTo': 'eli',
+                             'status': 'working', 'title': 'edit the launch video',
+                             'resourceClass': 'media'}},
+            'villages': [{'id': 'main', 'resourcePolicy': {
+                'maxConcurrent': 2, 'maxHeavy': 1,
+                'hold': ['media'], 'reason': 'laptop busy'}}],
+        }
+        patchers = self._patchers()
+        for p in patchers:
+            p.start()
+        try:
+            with unittest.mock.patch.object(
+                    serve, 'get_state_from_db', return_value=state), \
+                 unittest.mock.patch.object(
+                    serve, '_run_in_sandbox_sync') as run:
+                r = TestClient(serve.app).post(
+                    '/api/execute',
+                    json={'agentId': 'eli', 'command': 'ffmpeg -i in.mp4 out.mp4'})
+            self.assertEqual(r.status_code, 429)
+            self.assertTrue(r.json()['resourceHold'])
+            self.assertEqual(r.json()['resourceClass'], 'media')
+            run.assert_not_called()
+        finally:
+            for p in patchers:
+                p.stop()
+
     def test_disabled_is_403(self):
         r = self._post({'agentId': 'eli', 'command': 'ls'}, exec_enabled=False)
         self.assertEqual(r.status_code, 403)

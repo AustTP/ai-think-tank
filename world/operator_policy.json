@@ -16,6 +16,7 @@
   ],
   "maxTeamMembers": 6,
   "scrumMasterMinTeamSize": 4,
+  "smallTeamStuckTrigger": 3,
   "maxActiveAgents": 25,
   "maxTotalAgents": 500,
   "deliverableGradeFloor": 5.0,

@@ -17,6 +17,7 @@ OPERATOR_POLICY_DEFAULT: dict = {
     # Teams & workforce
     'maxTeamMembers': 6,
     'scrumMasterMinTeamSize': 4,
+    'smallTeamStuckTrigger': 3,
     'maxActiveAgents': 25,
     'maxTotalAgents': 500,
     # Grading floors (a deliverable graded below is coaching-worthy; at/above
@@ -195,6 +196,7 @@ OPERATOR_POLICY_DEFAULT: dict = {
 _OPERATOR_SCHEMA: dict = {
     'maxTeamMembers': ('int', 1, 12),
     'scrumMasterMinTeamSize': ('int', 1, 12),
+    'smallTeamStuckTrigger': ('int', 1, 20),
     'maxActiveAgents': ('int', 1, 100),
     'maxTotalAgents': ('int', 1, 1000),
     'deliverableGradeFloor': ('float', 0.0, 10.0),

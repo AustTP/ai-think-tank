@@ -152,6 +152,7 @@ TEAM_VELOCITY_MAX = 20
 bind_policy(__name__, [
     ('MAX_TEAM_MEMBERS', 'maxTeamMembers'),
     ('SCRUM_MASTER_MIN_TEAM_SIZE', 'scrumMasterMinTeamSize'),
+    ('SMALL_TEAM_STUCK_TRIGGER', 'smallTeamStuckTrigger'),
     ('MAX_ACTIVE_AGENTS', 'maxActiveAgents'),
     ('MAX_TOTAL_AGENTS', 'maxTotalAgents'),
     ('DELIVERABLE_GRADE_FLOOR', 'deliverableGradeFloor'),

@@ -391,6 +391,7 @@ async def list_villages(request: Request):
             'memberNames': {aid: roster.get(aid, aid) for aid in agents
                             if (agents[aid].get('villageId') or _sim.DEFAULT_VILLAGE) == vid},
             'spend': village_spend.get(vid, {'used': 0.0, 'calls': 0}),
+            'resources': _village_resource_view(state, vid),
         })
     return JSONResponse({'villages': out})
 
