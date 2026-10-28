@@ -145,3 +145,19 @@ world/coverage.json
 
 # Conditional HTTP response cache (runtime).
 .http_cache/
+
+# Runtime artifacts that must never enter git (2026-10-27 incident: a blanket
+# `git add -A` pushed 265MB of sandbox archives -- containing browser session
+# cookie databases -- plus internal library media to the public repo).
+sandboxes_archive/
+agents/*/downloads/
+agents/*/prototypes/
+watches_free_models.json
+watches_osv.json
+watches_github.json
+calendar_blackouts.json
+escalations.json.sha256
+VPS-MIGRATION.md
+
+# blanket: everything the tank generates under media (incident 6a5b7fc)
+library/media/

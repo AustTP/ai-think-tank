@@ -1,0 +1,29 @@
+#!/bin/bash
+# Blocks runtime artifacts from ever entering git again.
+# Incident 2026-10-27: a blanket `git add -A` pushed 265MB of sandbox
+# archives -- containing browser session-cookie databases -- plus internal
+# library media to this PUBLIC repo (commit 6a5b7fc). The tank generates
+# these constantly; none of them belong in version control.
+# Install: git config core.hooksPath scripts/git-hooks  (set in the repo)
+BLOCKED=(
+  'sandboxes/' 'sandboxes_archive/' 'library/media/' 'library/.passport.json'
+  'agents/*/downloads/' 'agents/*/prototypes/' 'agents/*/sandboxes/'
+  '*.tar.gz' '*.sqlite' '*.db' '*.db-journal' '*.db-wal' '*.db-shm'
+  'watches_*.json' 'calendar_blackouts.json' 'escalations.json.sha256'
+  'webhooks.jsonl' 'browse_trail.json' 'event_streams.json' 'workspace.json'
+  '.env' '.env.*' '!.env.template' 'failures.json' 'decisions.json'
+)
+staged=$(git diff --cached --name-only)
+violations=""
+for pattern in "${BLOCKED[@]}"; do
+  case "$pattern" in '!'*) continue;; esac
+  hits=$(printf '%s\n' "$staged" | grep -E "^${pattern//\*/[^/]*}$" | head -3)
+  [ -n "$hits" ] && violations="$violations$hits"$'\n'
+done
+if [ -n "$violations" ]; then
+  echo "ERROR: commit blocked -- runtime artifacts must never enter git:" >&2
+  printf '%s\n' "$violations" >&2
+  echo "Unstage them: git restore --staged <path>" >&2
+  exit 1
+fi
+exit 0
