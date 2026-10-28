@@ -575,7 +575,12 @@ def test_request_window_rejects_bad_start_and_coerces_duration(
     _approve(monkeypatch)
     ok, payload = selfedit.request_window('worker', '1000-01-01', '03:10',
                                           15, 'why', 'reviewer')
-    assert ok is False and 'invalid window start' in payload['error']
+    # A far-past date must be refused. The message is platform-dependent:
+    # glibc mktime accepts year 1000 and the 24h lead-time check (ad47809)
+    # rejects it; macOS mktime raises out-of-range and the generic
+    # window-start error fires. Both are correct refusals.
+    assert ok is False and ('24 hours from now' in payload['error'] or
+                            'invalid window start' in payload['error'])
     ok, payload = selfedit.request_window('worker', _window_slot(), '03:10',
                                           'garbage', 'why', 'reviewer')
     assert ok is False and 'invalid window start' not in payload['error']
