@@ -69,10 +69,13 @@ def _save_watch_file(path, data):
 
 
 def _watch_env(key):
+    # Read via the `env.get(KEY)` shape the env-template guard scans for, so
+    # a new watch key cannot be added undocumented.
     try:
-        return (_load_env() or {}).get(key, '')
+        env = _load_env()
     except Exception:
         return ''
+    return (env.get(key) or '') if env else ''
 
 
 def _http_get_json(url, headers=None, timeout=WATCH_HTTP_TIMEOUT_S):

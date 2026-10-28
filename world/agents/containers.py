@@ -22,9 +22,13 @@ import secrets
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import docker
-
 from core.egress import EgressRoute
+
+# The docker SDK is optional runtime infra (the in-memory driver is the
+# default and needs nothing). Import it lazily inside DockerDriver._connect
+# so environments without docker -- CI, the env-template guard -- can import
+# this module.
+docker = None
 
 
 @dataclass
@@ -107,6 +111,10 @@ class DockerDriver(ContainerDriver):
         self._client = client
 
     def _connect(self):
+        global docker
+        if docker is None:
+            import docker as _docker  # noqa: PLC0415 -- lazy, optional SDK
+            docker = _docker
         return self._client if self._client is not None \
             else docker.from_env()
 
