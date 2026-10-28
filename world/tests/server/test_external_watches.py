@@ -23,7 +23,13 @@ import selfedit  # noqa: E402
 class TempWatchFiles(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix='external-watches-')
+        # Hermetic like the other suites: the loops log through log_action,
+        # which writes the think_tank.db action_log -- without a patched
+        # DB_PATH these tests would leak rows into the LIVE database.
         self._patches = [
+            mock.patch.object(serve, 'DB_PATH',
+                              os.path.join(self.tmp, 'test.db')),
+            mock.patch.object(serve, 'THINK_TANK_DIR', self.tmp),
             mock.patch.object(serve, 'WATCH_FREE_MODELS_PATH',
                               os.path.join(self.tmp, 'watches_free_models.json')),
             mock.patch.object(serve, 'WATCH_OSV_PATH',
@@ -37,6 +43,7 @@ class TempWatchFiles(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
+        serve.init_db()
 
     def tearDown(self):
         for p in self._patches:

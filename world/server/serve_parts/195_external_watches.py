@@ -152,6 +152,10 @@ def _free_model_discovery_once():
     catalog = _fetch_openrouter_catalog_sync()
     free = _free_models_from_catalog(catalog)
     data = _load_watch_file(WATCH_FREE_MODELS_PATH, None)
+    if data is None and not free:
+        # A failed/empty fetch must not become the baseline: it would make
+        # the next successful fetch re-announce every existing model.
+        return []
     if data is None:
         # First-ever run: baseline the whole catalog silently. Everything
         # already on the catalog is not "news" -- only models that appear
@@ -235,10 +239,10 @@ async def _osv_dependency_audit_loop():
 
 
 def _osv_dependency_audit_once(requirements_path=None):
-    path = requirements_path or os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        '..', '..', 'requirements.txt')
-    path = os.path.normpath(path)
+    # THINK_TANK_DIR is the repo root (think_tank.db, requirements.txt,
+    # webhooks.jsonl all live there). Parts exec into serve's namespace, so
+    # __file__ here is serve.py's -- never derive repo paths from it.
+    path = requirements_path or os.path.join(THINK_TANK_DIR, 'requirements.txt')
     pins = _parse_requirements_pins(path)
     hits = _osv_query_sync(pins)
     _save_watch_file(WATCH_OSV_PATH, {
