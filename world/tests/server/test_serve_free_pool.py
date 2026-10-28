@@ -37,6 +37,12 @@ def setUpModule():
         # This suite exercises the pool on purpose: keep its hermeticity gate
         # satisfied while every other path stays patched to the temp dir.
         _FREE_POOL_PROJECT_ROOT=_MODULE_TMP_DIR,
+        # Vendor-key tests must not inherit the operator's real .env keys
+        # (previously they passed only on machines whose .env had them).
+        _load_env=lambda key=None: {
+            'GEMINI_API_KEY': 'test-gemini-key',
+            'GROQ_API_KEY': 'test-groq-key',
+        },
     )
     _MODULE_PATCHER.start()
     serve.init_db()

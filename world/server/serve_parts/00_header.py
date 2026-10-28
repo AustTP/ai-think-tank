@@ -536,8 +536,12 @@ def _load_env():
     # (~/ai-think-tank/.env, one directory above world/) -- manual parsing,
     # matching the rest of the project's own convention, rather than
     # adding a python-dotenv dependency for one file read.
+    # Reads through THINK_TANK_DIR (not ROOT): on the live server they are
+    # the same directory, and hermetic tests that repoint THINK_TANK_DIR
+    # then get an empty env instead of silently inheriting the operator's
+    # real keys -- the free-pool picker tests were passing on that leak.
     env = {}
-    env_path = os.path.join(os.path.dirname(ROOT), '.env')
+    env_path = os.path.join(THINK_TANK_DIR, '.env')
     if os.path.exists(env_path):
         try:
             with open(env_path, encoding='utf-8') as f:

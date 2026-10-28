@@ -89,6 +89,7 @@ _sweep_stale_test_dbs(tempfile.gettempdir())
 _tmpdir = tempfile.mkdtemp(prefix=f'{_TMP_PREFIX}{os.getpid()}-')
 atexit.register(_remove_tmpdir, _tmpdir)
 _TEST_DB = os.path.join(_tmpdir, 'think_tank.db')
+os.environ['THINK_TANK_DB'] = _TEST_DB
 if os.path.exists(_LIVE_DB):
     _src = sqlite3.connect(_LIVE_DB)
     _dst = sqlite3.connect(_TEST_DB)
@@ -98,11 +99,36 @@ if os.path.exists(_LIVE_DB):
         _dst.close()
         _src.close()
 else:
-    # No live DB (fresh checkout / CI): an empty file; tests that need
-    # tables call init_db() or patch DB_PATH to their own temp file.
+    # No live DB (fresh checkout / CI): build the full schema so unpatched
+    # tests hit a valid empty-state database instead of "no such table".
+    # (The old behavior left a zero-byte file and relied on every test
+    # module initializing its own DB -- only true where a live DB existed
+    # to silently back them.)
     open(_TEST_DB, 'ab').close()
+    import serve  # THINK_TANK_DB is set above; serve reads it at import
+    serve.init_db()
 
-os.environ['THINK_TANK_DB'] = _TEST_DB
+
+@pytest.fixture(autouse=True)
+def _ensure_test_db_schema():
+    """Tests that point serve.DB_PATH at a not-yet-existing file get the full
+    schema built for them. Without this, a suite run on a machine (or CI
+    runner) with no live think_tank.db fails every such test with
+    "no such table" -- locally the live-DB copy masked the gap."""
+    import serve
+    try:
+        db_path = str(serve.DB_PATH)
+    except Exception:
+        db_path = None
+    if db_path and not os.path.exists(db_path):
+        parent = os.path.dirname(db_path)
+        if parent and not os.path.isdir(parent):
+            return  # a missing parent dir is the test's own scenario
+        try:
+            serve.init_db()
+        except Exception:
+            pass
+    yield
 
 
 @pytest.fixture(autouse=True)
