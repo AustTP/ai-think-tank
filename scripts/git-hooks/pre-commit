@@ -20,6 +20,26 @@ for pattern in "${BLOCKED[@]}"; do
   hits=$(printf '%s\n' "$staged" | grep -E "^${pattern//\*/[^/]*}$" | head -3)
   [ -n "$hits" ] && violations="$violations$hits"$'\n'
 done
+# Honor whitelist entries ('!pattern'): drop allowed files from violations.
+if [ -n "$violations" ]; then
+  filtered=""
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    ok=0
+    for pattern in "${BLOCKED[@]}"; do
+      case "$pattern" in
+        '!'*)
+          p="${pattern#!}"
+          case "$f" in
+            ($p) ok=1; break;;
+          esac
+          ;;
+      esac
+    done
+    [ "$ok" -eq 0 ] && filtered="$filtered$f"$'\n'
+  done <<< "$violations"
+  violations="$filtered"
+fi
 if [ -n "$violations" ]; then
   echo "ERROR: commit blocked -- runtime artifacts must never enter git:" >&2
   printf '%s\n' "$violations" >&2
