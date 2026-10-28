@@ -542,13 +542,35 @@ def _is_archived_task(task):
     # A failed task mid-recovery must stay in the blob: the completion
     # watchdog flips it back to 'repairing' and the retry child's completion
     # looks the parent up in the live blob -- an archived recovering parent
-    # would orphan its own repair chain. Same for anything the operator has
-    # flagged for manual attention. (DEV-31 probe finding F-C, 2026-10-28:
-    # failed/quarantined cards were the only terminal statuses never swept,
-    # so 267 dead tasks accumulated in the live blob.)
-    if task.get('_peerRepairPending') or task.get('manualAttention'):
+    # would orphan its own repair chain. (DEV-31 probe finding F-C,
+    # 2026-10-28: failed/quarantined cards were the only terminal statuses
+    # never swept, so 267 dead tasks accumulated in the live blob.)
+    if task.get('_peerRepairPending'):
         return False
+    if task.get('manualAttention'):
+        # The operator's flag holds a task out of the archive while it is
+        # fresh -- that is the flag's whole job. But the flag is invisible on
+        # the board (no JS reads it) and dead cards carried it for days, so
+        # the operator asked (2026-10-28) for aged-out flags to stop holding
+        # the blob: a week is far beyond any real attention window.
+        if _task_attention_age_ms(task) < MANUAL_ATTENTION_ARCHIVE_TTL_MS:
+            return False
     return True
+
+
+def _task_attention_age_ms(task):
+    """Milliseconds since the task's own last state change. lastProgressAt is
+    NOT usable here: the watchdog's observe pass re-stamps it on every pass,
+    which would make dead cards look forever-fresh. No anchor at all means
+    unknown age: return 0 so the flag keeps doing its job (fail-safe); an
+    explicit operator clear handles those."""
+    anchors = [task.get(k) for k in ('createdAt', 'closedAt', 'blockedAt') if task.get(k)]
+    if not anchors:
+        return 0
+    return max(0, int(time.time() * 1000) - int(max(anchors)))
+
+
+MANUAL_ATTENTION_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 
 def _task_archive_load_locked():

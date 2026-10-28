@@ -153,6 +153,40 @@ class TaskArchive(_StateCase):
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
         self.assertEqual(set(archived), {'t-done'})
 
+    def test_fresh_manual_attention_task_stays_in_the_blob(self):
+        # The operator flag holds a fresh task out of the archive; lastProgressAt
+        # is unusable as an age anchor because the observe pass re-stamps it.
+        state = self._state()
+        state['tasks']['t-manual'] = {'id': 't-manual', 'status': 'failed',
+                                      'manualAttention': True,
+                                      'createdAt': int(time.time() * 1000) - 3600_000}
+        state['tasks']['t-recent'] = {'id': 't-recent', 'status': 'cancelled',
+                                      'manualAttention': True,
+                                      'blockedAt': int(time.time() * 1000) - 1000}
+        serve.save_state_to_db(state)
+        self.assertEqual(set(self._blob_tasks()),
+                         {'t-active', 't-manual', 't-recent'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived), {'t-done'})
+
+    def test_aged_manual_attention_task_archives_out(self):
+        # Operator decision 2026-10-28: a week-old flag on a dead card is
+        # stale noise and must not hold the blob forever.
+        week_plus = serve.MANUAL_ATTENTION_ARCHIVE_TTL_MS + 3600_000
+        state = self._state()
+        state['tasks']['t-old'] = {'id': 't-old', 'status': 'failed',
+                                   'manualAttention': True,
+                                   'createdAt': int(time.time() * 1000) - week_plus}
+        state['tasks']['t-old2'] = {'id': 't-old2', 'status': 'quarantined',
+                                    'manualAttention': True,
+                                    'blockedAt': int(time.time() * 1000) - week_plus}
+        serve.save_state_to_db(state)
+        self.assertEqual(set(self._blob_tasks()), {'t-active'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived), {'t-done', 't-old', 't-old2'})
+
     def test_terminal_task_referenced_by_a_live_task_stays_in_the_blob(self):
         # A repair child mid-flight references its failed parent; archiving
         # the parent would break the child's completion lookup.
