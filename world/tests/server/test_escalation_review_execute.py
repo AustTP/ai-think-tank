@@ -11,7 +11,12 @@ import unittest.mock
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-import serve
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+import serve  # noqa: E402
+from test_serve_helpers import setUpModule, tearDownModule  # noqa: E402
 
 
 def _wrapped(code):
