@@ -105,16 +105,19 @@ jobs:
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        # The hosted runner dies ~15s into this directory (killed three
-        # runs; not test_tank_accounts -- ignored and still died). A/B split
-        # of the file list localizes the killer; rejoin the steps once found.
+        # The hosted runner dies intermittently mid-directory (five kills,
+        # two complete survivals -- flaky, not file-deterministic). Run the
+        # two halves as SEPARATE STEPS so a death preserves the survivor's
+        # results, echo memory around them, and keep tank_accounts ignored
+        # (it was associated with two early kills).
         run: |
-          files_a=$(ls tests/integrations/test_*.py | head -26 | tr '\n' ' ')
-          files_b=$(ls tests/integrations/test_*.py | tail -26 | tr '\n' ' ')
-          echo "A: $files_a"
+          files_a=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -26 | tr '\n' ' ')
+          files_b=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -26 | tr '\n' ' ')
+          echo "A: $files_a"; free -m | head -2
           python -m pytest $files_a -v --tb=line -p no:cacheprovider
-          echo "B: $files_b"
+          echo "B: $files_b"; free -m | head -2
           python -m pytest $files_b -v --tb=line -p no:cacheprovider
+          free -m | head -2
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
