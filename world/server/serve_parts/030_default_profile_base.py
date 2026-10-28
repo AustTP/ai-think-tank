@@ -585,19 +585,31 @@ def _backfill_decision_tape_hashes(conn):
     return changed
 
 
-def _verify_decision_tape(limit=100000):
+def _verify_decision_tape(limit=100000, tail=0):
     """Walk the tape's hash chain and report any row that does not verify:
     a content edit (hash mismatch), a chain break (prev_hash doesn't match the
     previous row's hash), or a row with no hash at all. The FIRST row's
     prev_hash is an anchor to the (possibly pruned) past and is not itself
     checkable -- retention pruning of old head rows is expected. Returns
-    (ok, problems) with problems a list of {id, issue} dicts."""
+    (ok, problems) with problems a list of {id, issue} dicts.
+
+    tail > 0 walks only the LAST `tail` rows (the live operational window):
+    the periodic health check uses this so historical chain breaks -- known
+    concurrent-append races already baked into early rows -- don't re-alert
+    forever, while any NEW break still surfaces immediately."""
     try:
         with _db() as conn:
-            rows = conn.execute(
-                'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
-                'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
-                'ORDER BY id ASC LIMIT ?', (limit,)).fetchall()
+            if tail and tail > 0:
+                rows = conn.execute(
+                    'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
+                    'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
+                    'WHERE id > (SELECT COALESCE(MAX(id), 0) FROM decision_tape) - ? '
+                    'ORDER BY id ASC', (tail,)).fetchall()
+            else:
+                rows = conn.execute(
+                    'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
+                    'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
+                    'ORDER BY id ASC LIMIT ?', (limit,)).fetchall()
     except Exception as e:
         return False, [{'id': None, 'issue': f'verify unavailable: {e}'}]
     problems = []

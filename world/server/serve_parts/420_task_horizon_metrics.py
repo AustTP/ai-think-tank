@@ -453,7 +453,7 @@ def compute_health_snapshot():
     # Integrity gates (015): tape hash chain + action-log parity windows.
     # None means the check could not run; False means it ran and FAILED.
     try:
-        tape_ok, tape_problems = _verify_decision_tape(limit=4000)
+        tape_ok, tape_problems = _verify_decision_tape(tail=1000)
     except Exception:
         tape_ok, tape_problems = None, []
     try:

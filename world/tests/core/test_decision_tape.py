@@ -205,6 +205,40 @@ class DecisionTapeChainTests(unittest.TestCase):
         ok, problems = serve._verify_decision_tape()
         self.assertTrue(ok, problems)
 
+    def test_tail_walk_ignores_historical_breaks_flags_new_ones(self):
+        # The live tape carries acknowledged historical chain breaks (old
+        # concurrent-append races). The health signal walks the TAIL so those
+        # don't re-alert forever, while a fresh break inside the window still
+        # surfaces.
+        for _ in range(4):
+            self._append()
+        with serve._db() as conn:
+            # Simulate a HISTORICAL stale-anchor row: prev_hash points at a
+            # head that was concurrently replaced, but the row's own hash is
+            # self-consistent with that anchor (no content tampering).
+            conn.execute('UPDATE decision_tape SET prev_hash = ? WHERE id = 3',
+                         ('stale-historical-anchor',))
+            row = conn.execute(
+                'SELECT ts, kind, model, prompt, criteria, choice, confidence, '
+                'cost, raw, ok, trace_id FROM decision_tape WHERE id = 3').fetchone()
+            new_hash = serve._tape_row_hash('stale-historical-anchor', *row)
+            conn.execute('UPDATE decision_tape SET hash = ? WHERE id = 3', (new_hash,))
+            # The NEXT row was born chained off row 3's actual stored hash (as
+            # the race produced), so re-anchor row 4 and recompute its hash,
+            # leaving exactly ONE broken edge (row3.prev != row2.hash).
+            row4 = conn.execute(
+                'SELECT ts, kind, model, prompt, criteria, choice, confidence, '
+                'cost, raw, ok, trace_id FROM decision_tape WHERE id = 4').fetchone()
+            conn.execute('UPDATE decision_tape SET prev_hash = ? WHERE id = 4',
+                         (new_hash,))
+            conn.execute('UPDATE decision_tape SET hash = ? WHERE id = 4',
+                         (serve._tape_row_hash(new_hash, *row4),))
+        ok, _problems = serve._verify_decision_tape(tail=2)
+        self.assertTrue(ok)
+        ok, problems = serve._verify_decision_tape(tail=3)
+        self.assertFalse(ok)
+        self.assertTrue(any('chain break' in p['issue'] for p in problems))
+
     def test_verify_endpoint_reports_clean_then_tampered(self):
         self._append()
         self._append()
