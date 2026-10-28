@@ -53,6 +53,45 @@ FEED_SEED = {
         'url': 'https://rss.arxiv.org/rss/cs.CL',
         'interval_s': 1800,
     },
+    # Owner expansion (2026-10-27): research + operational awareness. The two
+    # provider_status feeds are scanned by the health snapshot (410) for live
+    # incident keywords so the tank learns about provider degradation before
+    # the circuit breakers find it the hard way.
+    'hn_frontpage': {
+        'name': 'Hacker News front page',
+        'url': 'https://hnrss.org/frontpage',
+        'interval_s': 600,
+    },
+    'arxiv_cs_se': {
+        'name': 'arXiv cs.SE (software engineering)',
+        'url': 'https://rss.arxiv.org/rss/cs.SE',
+        'interval_s': 1800,
+    },
+    'arxiv_cs_ai': {
+        'name': 'arXiv cs.AI',
+        'url': 'https://rss.arxiv.org/rss/cs.AI',
+        'interval_s': 1800,
+    },
+    'openai_blog': {
+        'name': 'OpenAI news',
+        'url': 'https://openai.com/news/rss.xml',
+        'interval_s': 3600,
+    },
+    'deepmind_blog': {
+        'name': 'Google DeepMind blog',
+        'url': 'https://deepmind.google/blog/rss.xml',
+        'interval_s': 3600,
+    },
+    'provider_status_openai': {
+        'name': 'OpenAI status incidents',
+        'url': 'https://status.openai.com/history.rss',
+        'interval_s': 600,
+    },
+    'provider_status_anthropic': {
+        'name': 'Anthropic status incidents',
+        'url': 'https://status.anthropic.com/feed.rss',
+        'interval_s': 600,
+    },
 }
 
 # Public aliases used by serve.py's routes and lifespan wiring. The underscore

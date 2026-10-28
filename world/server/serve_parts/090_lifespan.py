@@ -83,6 +83,14 @@ async def _lifespan(app):
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
+    # External watches (owner expansion, 2026-10-27): dead-man switch ping,
+    # new free-model discovery, weekly OSV dependency audit, GitHub CI/issue
+    # watcher, owner calendar ICS sync. Each loop is env-gated and fails open.
+    deadman_task = asyncio.create_task(_deadman_ping_loop())
+    free_model_task = asyncio.create_task(_free_model_discovery_loop())
+    osv_audit_task = asyncio.create_task(_osv_dependency_audit_loop())
+    github_watch_task = asyncio.create_task(_github_watch_loop())
+    owner_calendar_task = asyncio.create_task(_owner_calendar_loop())
     tier_boot_backfill_task = asyncio.create_task(_model_tier_boot_backfill())
     photo_watch_task = asyncio.create_task(_photo_album_watch_loop())
     tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
@@ -154,6 +162,11 @@ async def _lifespan(app):
     tier_price_watch_task.cancel()
     service_price_drift_task.cancel()
     tier_failure_recheck_task.cancel()
+    deadman_task.cancel()
+    free_model_task.cancel()
+    osv_audit_task.cancel()
+    github_watch_task.cancel()
+    owner_calendar_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
     if webhook_task is not None:

@@ -446,6 +446,22 @@ def _health_alerts_for_signals(signals):
         alert('integrity', 'critical',
               'action-log parity window(s) FAILED verification -- audit log truncated or edited: '
               + '; '.join(str(p.get('issue')) for p in signals.get('action_log_parity_problems', [])[:3]))
+    # External watches (owner expansion, 2026-10-27).
+    if signals.get('provider_status_incidents_count'):
+        names = '; '.join(i.get('title', '')[:80] for i in signals.get('provider_status_incidents', [])[:3])
+        alert('providers', 'warning',
+              f'model provider status feed reports incidents ({signals["provider_status_incidents_count"]}): {names} '
+              '-- expect model-call failures; the free pool may need its breaker')
+    if signals.get('osv_audit_hits_count'):
+        alert('dependencies', 'warning',
+              f'OSV reports known advisories for {signals["osv_audit_hits_count"]} pinned '
+              f'dependency(ies): {", ".join(signals.get("osv_audit_hits", [])[:5])} '
+              '-- review watches_osv.json and plan an upgrade')
+    if signals.get('new_free_models'):
+        alert('providers', 'warning',
+              'new :free models on the OpenRouter catalog: '
+              + ', '.join(signals.get('new_free_models', [])[:5])
+              + ' -- candidates for the free pool (owner decision)')
 
     if signals['missing_model_tier_bands']:
         alert('model_tiers', 'warning',

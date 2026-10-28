@@ -464,6 +464,35 @@ def compute_health_snapshot():
     signals['action_log_parity'] = parity_ok
     signals['tape_integrity_problems'] = (tape_problems or [])[:5]
     signals['action_log_parity_problems'] = (parity_problems or [])[:5]
+    # External watches (195): provider status feeds, OSV dependency audit,
+    # new free-model discovery. All file-backed side cars -- no network here.
+    try:
+        incidents = []
+        for fid in (_RSS_FEEDS or {}):
+            if not str(fid).startswith('provider_status_'):
+                continue
+            for item in (_rss_recent(fid, max_items=10) or []):
+                text = f"{item.get('title') or ''} {item.get('summary') or ''}".lower()
+                if any(k in text for k in _PROVIDER_STATUS_KEYWORDS):
+                    incidents.append({'feed': fid, 'title': item.get('title') or ''})
+        signals['provider_status_incidents'] = incidents[:5]
+        signals['provider_status_incidents_count'] = len(incidents)
+    except Exception:
+        pass
+    try:
+        osv = _load_watch_file(WATCH_OSV_PATH, {})
+        hits = osv.get('hits') or {}
+        age = now - (osv.get('lastRun') or 0)
+        signals['osv_audit_age_s'] = age
+        signals['osv_audit_hits'] = sorted(hits.keys())[:10]
+        signals['osv_audit_hits_count'] = len(hits)
+    except Exception:
+        pass
+    try:
+        fm = _load_watch_file(WATCH_FREE_MODELS_PATH, {})
+        signals['new_free_models'] = list(fm.get('new') or [])[:10]
+    except Exception:
+        pass
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
 

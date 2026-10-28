@@ -49,6 +49,23 @@ class SelfMentionGateTest(unittest.TestCase):
 
 
 class DedupeTest(unittest.TestCase):
+    def test_github_channel_renders_normalized_payload(self):
+        text = serve._webhook_goal_text(
+            {'author': 'developer',
+             'text': 'CI run on main @ abc123 finished: failure (tests)',
+             'url': 'https://github.com/x/y/actions/runs/11'},
+            channel='github')
+        self.assertTrue(text.startswith('GitHub developer'))
+        self.assertIn('failure', text)
+        self.assertIn('[https://github.com/x/y/actions/runs/11]', text)
+
+    def test_github_channel_is_enabled_without_a_handle_gate(self):
+        # github has no own_handle_attr: the tank never posts AS the repo,
+        # so nothing can be self-activity.
+        self.assertTrue(serve._webhook_channel_enabled('github'))
+        self.assertFalse(serve._webhook_self_mention(
+            {'author': 'ai-think-tank[bot]', 'text': 'x'}, channel='github'))
+
     def test_seen_key_prefers_id_then_thread(self):
         self.assertEqual(serve._webhook_seen_key(
             {'channel': 'x-mention', 'payload': {'id': 'n1'}}), 'x-mention:n1')
@@ -182,13 +199,29 @@ class ChannelRegistryTest(unittest.TestCase):
         self.assertFalse(webhooks._webhook_channel_enabled('nope'))
 
     def test_active_list_follows_config(self):
-        serve.X_HANDLE = ''
-        try:
-            self.assertEqual(webhooks.active_webhook_channels(), ())
-            serve.X_HANDLE = 'ourhandle'
-            self.assertEqual(webhooks.active_webhook_channels(), ('x-mention',))
-        finally:
+        # github is gated on its producer's env; with the repo unset and no
+        # X handle, nothing is active.
+        with mock.patch.object(webhooks, 'CHANNELS',
+                               {k: v for k, v in webhooks.CHANNELS.items()
+                                if k != 'github'}):
             serve.X_HANDLE = ''
+            try:
+                self.assertEqual(webhooks.active_webhook_channels(), ())
+                serve.X_HANDLE = 'ourhandle'
+                self.assertEqual(webhooks.active_webhook_channels(), ('x-mention',))
+            finally:
+                serve.X_HANDLE = ''
+
+    def test_github_channel_follows_the_watch_repo(self):
+        # no repo configured -> channel off; repo set -> on
+        def env_without(key):
+            env = serve._load_env()
+            return {k: v for k, v in env.items() if k != key}
+        with mock.patch.object(serve, '_load_env', lambda: {}):
+            self.assertFalse(webhooks._webhook_channel_enabled('github'))
+        with mock.patch.object(serve, '_load_env',
+                               lambda: {'GITHUB_WATCH_REPO': 'owner/repo'}):
+            self.assertTrue(webhooks._webhook_channel_enabled('github'))
 
     def test_descriptor_carries_goal_and_gate(self):
         spec = webhooks.CHANNELS['x-mention']

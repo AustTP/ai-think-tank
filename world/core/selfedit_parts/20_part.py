@@ -521,10 +521,33 @@ def _standing_task_conflicts(start_ts, end_ts):
     return conflicts
 
 
+def _calendar_conflicts(start_ts, end_ts):
+    """Owner-calendar events (materialized by serve's ICS watch loop into
+    calendar_blackouts.json) that overlap the requested slot. The owner's
+    own commitments are a scheduling surface exactly like standing tasks:
+    a change window must not land on top of the owner's day."""
+    serve = _s()
+    try:
+        events = serve._calendar_blackouts() or []
+    except Exception:
+        return []
+    conflicts = []
+    for e in events:
+        if e.get('start_ts', 0) < end_ts and e.get('end_ts', 0) > start_ts:
+            local = time.localtime(e['start_ts'])
+            conflicts.append({
+                'kind': 'owner calendar',
+                'name': e.get('summary') or 'owner event',
+                'date': time.strftime('%Y-%m-%d', local),
+                'start': time.strftime('%H:%M', local)})
+    return conflicts
+
+
 def _window_conflicts(start_ts, end_ts, exclude_window_id=None):
     return (_standing_task_conflicts(start_ts, end_ts)
             + _occupied_window_conflicts(start_ts, end_ts,
-                                         exclude_window_id=exclude_window_id))
+                                         exclude_window_id=exclude_window_id)
+            + _calendar_conflicts(start_ts, end_ts))
 
 
 def _parse_window_target(date_text, start_text, now):

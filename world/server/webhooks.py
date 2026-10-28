@@ -35,6 +35,22 @@ import json
 #                            it appears in own_handle_fields the entry is our own
 #                            activity and must not be delegated (unset -> skip all)
 CHANNELS = {
+    'github': {
+        'label': 'GitHub event',
+        # Producer: the tank's own watch loop (195_external_watches) polls
+        # the registered GitHub API for CI runs and new issues on the
+        # watched repo and appends normalized entries to webhooks.jsonl --
+        # no external relay needed. Payload shape: {author, text, url}.
+        'goal': {
+            'author_template': 'GitHub {author}',
+            'body_fields': ('text', 'subject'),
+            'include_url': True,
+            'empty': 'GitHub event (no text captured)',
+        },
+        # The producer is the tank's own watch loop; without a repo to watch
+        # it has nothing to relay, so the channel stays off.
+        'requires_env': 'GITHUB_WATCH_REPO',
+    },
     'x-mention': {
         'label': 'X mention',
         'goal': {
@@ -61,10 +77,15 @@ def _webhook_channel_spec(channel):
 
 def _webhook_channel_enabled(channel):
     """True when the channel has everything it needs to run. A channel gated on
-    our own handle stays off until that handle is configured."""
+    our own handle stays off until that handle is configured; a channel with a
+    requires_env gate stays off until that env value exists (its producer --
+    e.g. the GitHub watch loop -- has nothing to watch without it)."""
     import serve as _serve
     spec = CHANNELS.get(channel)
     if spec is None:
+        return False
+    required = str(spec.get('requires_env') or '')
+    if required and not (str((_serve._load_env() or {}).get(required, '') or '').strip()):
         return False
     attr = spec.get('own_handle_attr')
     if not attr:
