@@ -17,8 +17,8 @@ def _grade_jev_requirement(req, review):
                                         f'Relevant part of the deliverable: "{review[:1500]}" '
                                         f'Answer whether THIS requirement is met by THIS deliverable.',
                         'criteria': {GRADE_MEETS: 'The deliverable satisfies this specific requirement.',
-                                     GRADE_FAILS: 'The deliverable does not satisfy this specific requirement.',
-                                     GRADE_UNSURE: 'Not enough evidence in the deliverable to judge, or the question cannot be answered from it.'}}})
+                        GRADE_FAILS: 'The deliverable does not satisfy this specific requirement.',
+                        GRADE_UNSURE: 'Not enough evidence in the deliverable to judge, or the question cannot be answered from it.'}}})
         choice, confidence, _cost = _serve._jev_choice(decision)
     except Exception:
         return GRADE_UNSURE, 0.0
