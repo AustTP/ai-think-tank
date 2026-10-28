@@ -671,16 +671,21 @@ def morale_for(state, agent_id, now_ms=None):
     return int(max(0, min(100, round(raw))))
 
 
-def _governance_decider_default(state, instructions, candidates):
+def _governance_decider_default(state, instructions, candidates, kind=None):
     """Default Jev resolver for governance, late-importing serve.py so sim.py
     stays importable/unit-testable offline. `candidates` is a list of
-    {id, description}; returns a choice id (or None on a Jev outage)."""
+    {id, description}; returns a choice id (or None on a Jev outage).
+    `kind` threads an explicit decision-tape tag (the worker-pick call site
+    passes 'worker_pick'; other governance call sites keep the prompt-sniffed
+    fallback)."""
     import serve
     try:
+        questions = {'choice': {'type': 'choice', 'instructions': instructions,
+                                'criteria': {c['id']: c['description'] for c in candidates}}}
+        if kind:
+            questions['_kind'] = kind
         data = serve._call_openrouter_decision_sync(
-            serve._jev_model(), {'messages': [], 'signals': {}},
-            {'choice': {'type': 'choice', 'instructions': instructions,
-                        'criteria': {c['id']: c['description'] for c in candidates}}})
+            serve._jev_model(), {'messages': [], 'signals': {}}, questions)
         choice, _, _ = serve._jev_choice(data)
         return choice if any(c['id'] == choice for c in candidates) else None
     except Exception:

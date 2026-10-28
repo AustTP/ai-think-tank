@@ -132,16 +132,21 @@ def _maybe_file_followup(state, agent_id, completed_task, now_ms):
         reason=f"Completed '{completed_task.get('title') or 'previous task'}' in {room_label} and the remaining backlog there has thinned to {backlog} item(s); this room can absorb another story. {ABSOLUTE_ZERO_SCOPING_GUIDANCE}")
 
 
-def _refinement_decider_default(instructions, criteria):
+def _refinement_decider_default(instructions, criteria, kind=None):
     """Default Jev resolver for a single work-request groom: accept (it becomes
     a story) or reject (groomed out). Late-imports serve.py so sim.py stays
-    importable/unit-testable offline. Returns a choice id, or None on outage."""
+    importable/unit-testable offline. Returns a choice id, or None on outage.
+    `kind` threads an explicit decision-tape tag through to the tape layer
+    (the production call site passes 'groom'; older 2-arg test stubs keep
+    working because the caller falls back positionally)."""
     import serve
     try:
+        questions = {'choice': {'type': 'choice', 'instructions': instructions,
+                                'criteria': {c['id']: c['description'] for c in criteria}}}
+        if kind:
+            questions['_kind'] = kind
         data = serve._call_openrouter_decision_sync(
-            serve._jev_model(), {'messages': [], 'signals': {}},
-            {'choice': {'type': 'choice', 'instructions': instructions,
-                        'criteria': {c['id']: c['description'] for c in criteria}}})
+            serve._jev_model(), {'messages': [], 'signals': {}}, questions)
         choice, _, _ = serve._jev_choice(data)
         return choice if any(c['id'] == choice for c in criteria) else None
     except Exception:
@@ -557,6 +562,28 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                         f"({author.get('name') or filed_by} / {author.get('role') or 'worker'}) work request "
                         f"in the {req.get('room')} room. Requested card: '{req.get('title')}'. "
                         f"Card type: {card_type}. Reason: {req.get('reason')}.{pin_text}")
+        # The filed contract: the card's own user story + acceptance criteria +
+        # hard prohibitions travel on the request record (file_issue stores
+        # them "so the refinement ceremony can hand the WORKER the full spec")
+        # -- but the scrum master's own accept/reject judgment never saw them,
+        # so grooming decided on a one-line reason while the actual contract
+        # sat unread on the record. Present it here; a well-specified request
+        # is now judgeable as well-specified instead of looking thin.
+        contract_bits = []
+        if req.get('userStory'):
+            contract_bits.append('user story: ' + str(req['userStory'])[:600])
+        if req.get('acceptanceCriteria'):
+            _ac = req['acceptanceCriteria']
+            if isinstance(_ac, (list, tuple)):
+                _ac = '; '.join(str(c) for c in list(_ac)[:8])
+            contract_bits.append('acceptance criteria: ' + str(_ac)[:800])
+        if req.get('never'):
+            _nv = req['never']
+            if isinstance(_nv, (list, tuple)):
+                _nv = '; '.join(str(n) for n in list(_nv)[:8])
+            contract_bits.append('hard prohibitions: ' + str(_nv)[:400])
+        if contract_bits:
+            instructions += ' Filed contract: ' + ' | '.join(contract_bits) + '.'
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room (prioritization only, not a scope gate): {ctx}."
@@ -599,7 +626,14 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             # copy only repeats the failure.
             choice = 'reject'
         else:
-            choice = decider(instructions, criteria)
+            # Thread the tape kind tag when the decider accepts it (the real
+            # default does; older 2-arg test stubs fall back positionally).
+            # The real decider swallows its own exceptions, so a TypeError here
+            # can only be the stub's arity -- safe to retry 2-arg.
+            try:
+                choice = decider(instructions, criteria, kind='groom')
+            except TypeError:
+                choice = decider(instructions, criteria)
             if choice is None:
                 # Outage fallback: accept only a request that names a real
                 # delegatable-room gap (same determinism as the governance fallback --

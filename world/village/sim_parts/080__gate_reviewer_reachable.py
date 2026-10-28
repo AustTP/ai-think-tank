@@ -356,11 +356,26 @@ def _team_member_candidates(state, director_id, member_ids, now_ms):
         # Display name from the roster ideal (capitalized), fall back to live.
         display = roster.get(member_id, {}).get('name') or a.get('name') or member_id
         morale = morale_for(state, member_id, now_ms)
+        # Two more real signals the old description lacked: the trailing grade
+        # (the actual delivery-quality history, exactly what a "who needs
+        # help" pick should weigh) and the member's current open-task load
+        # with the title of what they are on right now. Morale alone produced
+        # near-tied candidates (73 vs 72 vs 70) and Jev answered at 0.2-0.3
+        # confidence 85% of the time -- the pick was effectively a coin flip
+        # dressed as a decision. Grades + live load separate the field.
+        grade = _agent_trailing_grade(state, member_id)
+        open_tasks = [t for t in (state.get('tasks') or {}).values()
+                      if isinstance(t, dict) and t.get('assignedTo') == member_id
+                      and t.get('status') not in ('done', 'cancelled', 'abandoned')]
+        open_tasks.sort(key=lambda t: t.get('updatedAt') or 0, reverse=True)
+        current = open_tasks[0].get('title') if open_tasks else 'none'
         out.append({'id': member_id, 'name': display,
                     'description': f"{display}, {a.get('role')}, on the {director_id} team. "
                                    f"Morale: {morale}/100. Approved work: {a.get('approvedCount')}. "
                                    f"Dropped work: {a.get('droppedCount')}. "
-                                   f"Reports filed against them: {len(reports_about(state, member_id))}."})
+                                   f"Reports filed against them: {len(reports_about(state, member_id))}. "
+                                   f"Trailing grade: {grade if grade is not None else 'none yet'}/10. "
+                                   f"Open tasks right now: {len(open_tasks)} (currently on: {str(current)[:80]})."})
     return out
 
 
@@ -570,7 +585,13 @@ def _start_auto_hire(state, now_ms, grid, decider):
         for c in cands:
             c['directorId'] = did
             flat.append(c)
-    pick = decider(state, 'Pick whoever most needs additional help right now -- weigh morale, workload signals (approved vs. dropped work), and any reports filed against them. You may only assign help WITHIN a team: choose a director who is free, then one of their own overloaded direct reports to add an assistant to. Someone already busy or off-duty cannot run a hire.', flat)
+    # Thread the tape kind tag when the decider accepts it (the real default
+    # does; older 3-arg test stubs fall back positionally -- the real decider
+    # swallows its own exceptions, so a TypeError here can only be arity).
+    try:
+        pick = decider(state, 'Pick whoever most needs additional help right now -- weigh morale, workload signals (approved vs. dropped work), trailing grades, current open-task load, and any reports filed against them. You may only assign help WITHIN a team: choose a director who is free, then one of their own overloaded direct reports to add an assistant to. Someone already busy or off-duty cannot run a hire.', flat, kind='worker_pick')
+    except TypeError:
+        pick = decider(state, 'Pick whoever most needs additional help right now -- weigh morale, workload signals (approved vs. dropped work), trailing grades, current open-task load, and any reports filed against them. You may only assign help WITHIN a team: choose a director who is free, then one of their own overloaded direct reports to add an assistant to. Someone already busy or off-duty cannot run a hire.', flat)
     picked = next((c for c in flat if c['id'] == pick), None) if pick else None
     if not picked:
         # Fallback: the lowest-morale report across all available teams.

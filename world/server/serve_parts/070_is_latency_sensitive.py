@@ -64,10 +64,34 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
         return _low_tier_slug() or _mid_tier_slug()
     decider = decider or _tier_gate_decider
     try:
-        decision, confidence = decider(
-            f'Pick the model tier this think tank call deserves. The work: {purpose or "routine task"}.',
-            _TIER_GATE_CRITERIA,
-        )
+        # The old prompt was the purpose line alone: JEV judged a one-liner and
+        # came back under the 0.55 floor 97% of the time, so the gate failed
+        # closed to the cheap tier almost always. Two additions: the task_type
+        # axis (code/review/qa never even reach here, but research/agent
+        # intent does) and an explicit calibration line naming what each band
+        # is FOR, so borderline one-step work stops reading as "needs judgment".
+        try:
+            decision, confidence = decider(
+                f'Pick the model tier this think tank call deserves. '
+                f'Work type: {task_type or "unspecified"}. The work: {purpose or "routine task"}. '
+                f'A short single-step reply, lookup, or extraction stays low even when '
+                f'it matters; mid is for real synthesis or multi-step judgment; high is '
+                f'only for one-shot planning where a mistake wastes downstream work.',
+                _TIER_GATE_CRITERIA,
+                kind='tier_gate',
+            )
+        except TypeError:
+            # Injectable test stubs keep the older 2-arg shape; the real
+            # decider swallows its own exceptions, so a TypeError escaping
+            # here can only be the stub's arity.
+            decision, confidence = decider(
+                f'Pick the model tier this think tank call deserves. '
+                f'Work type: {task_type or "unspecified"}. The work: {purpose or "routine task"}. '
+                f'A short single-step reply, lookup, or extraction stays low even when '
+                f'it matters; mid is for real synthesis or multi-step judgment; high is '
+                f'only for one-shot planning where a mistake wastes downstream work.',
+                _TIER_GATE_CRITERIA,
+            )
     except Exception:
         decision, confidence = None, 0.0
     if decision == 'high' and allow_high and confidence >= TIER_GATE_MIN_CONFIDENCE:

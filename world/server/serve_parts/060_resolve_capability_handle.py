@@ -421,13 +421,13 @@ def _reasoning_tier_slug():
 TIER_GATE_MIN_CONFIDENCE = 0.55
 
 
-def _tier_gate_decider_default(instructions, criteria):
+def _tier_gate_decider_default(instructions, criteria, kind=None):
     # Injectable seam (mirrors the other ceremony deciders); the live loop uses
     # the real Jev quorum choice so a noisy classifier doesn't spend up on a
     # fluke. Fails closed to (None, 0.0) on any outage -- the gate then stays
-    # on the cheap tier.
+    # on the cheap tier. `kind` threads the decision-tape tag through.
     try:
-        decision, confidence, _cost = _jev_quorum_choice_sync(instructions, criteria)
+        decision, confidence, _cost = _jev_quorum_choice_sync(instructions, criteria, kind=kind)
         return decision, confidence
     except Exception:
         return None, 0.0

@@ -461,7 +461,7 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     # different, un-shared code path than every other Jev-gated action, so
     # a future fix to the shared gate (quorum sampling, right here) would
     # silently never have reached command execution.
-    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria)
+    decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria, kind='cmd_allow')
     if not _jev_safety_gate(agent_id, 'execute_classify', 'This command', command, purpose, decision, confidence, cost, None, trace_id):
         if decision not in ('allow', 'approve'):
             return False, decision or 'classifier unavailable or gave no answer'

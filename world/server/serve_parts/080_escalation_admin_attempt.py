@@ -10,6 +10,38 @@ def _review_question(esc):
     return review_target((esc or {}).get('question') or '')['text']
 
 
+def _escalation_context_lines(esc):
+    """The escalation-record context the delegated-approval prompt was
+    silently dropping: the requester's note, what they already checked, and
+    where to look first (fields set by the escalation creators; mostly empty
+    for safety escalations, real for allowlist and review kinds). Also renders
+    the rung votes earlier internal reviewers already cast on THIS escalation
+    -- the old chain asked each rung the same under-specified question in
+    isolation, so three similar-strength models kept re-deriving the same
+    uncertainty (90% of delegated decisions came back under the confidence
+    floor) instead of converging on, or visibly disagreeing about, a decision.
+    Returns a list of sentence strings; empty when there is nothing to add."""
+    lines = []
+    if esc.get('note'):
+        lines.append(f'Note: {esc["note"]}')
+    if esc.get('whatChecked'):
+        lines.append(f'What the requester already checked: {esc["whatChecked"]}')
+    if esc.get('lookFirst'):
+        lines.append(f'Suggested first look: {esc["lookFirst"]}')
+    votes = esc.get('rungVotes') or []
+    if votes:
+        bits = '; '.join(
+            f"{v.get('rung') or 'an earlier rung'} leaned {v.get('decision')} "
+            f"(confidence {v.get('confidence')})"
+            for v in votes[-3:] if isinstance(v, dict))
+        if bits:
+            lines.append(
+                f'Prior internal votes on this same escalation: {bits}. '
+                'Weigh them, but decide independently -- persistent disagreement '
+                'across rungs is itself a reason to leave this for the owner.')
+    return lines
+
+
 def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster):
     """One chief-of-staff/admin attempt after the senior director gives up.
 
@@ -33,6 +65,9 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
         'in-scope, and safe. Deny if out of scope, unsafe, or clearly no. '
         'When genuinely unsure, leave it for the owner.'
     )
+    _ctx = _escalation_context_lines(esc)
+    if _ctx:
+        instr += ' ' + ' '.join(_ctx)
     criteria = {
         'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
         'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
@@ -42,7 +77,14 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     # tier also gives the admin an independent read on the director's decline.
     review_model = _high_tier_slug() or _jev_model()
     decision, confidence, _cost = _jev_quorum_choice_sync(
-        instr, criteria, model=review_model)
+        instr, criteria, model=review_model, kind='escalation_resolve')
+    # Same vote record the director rungs keep (see the loop): the admin's
+    # read is the last internal opinion, and the escalation record should
+    # show it even when the composite gate refuses to act on it.
+    if decision in ('approve', 'deny'):
+        esc.setdefault('rungVotes', []).append({
+            'rung': 'admin', 'decision': decision,
+            'confidence': round(float(confidence or 0.0), 3)})
     if decision not in ('approve', 'deny'):
         log_action(admin_id, 'escalation_admin_unsure',
                    {'escalationId': esc_id, 'kind': esc_kind,
@@ -309,6 +351,9 @@ def _resolve_pending_escalations_sync():
             f'Deny if it is out of scope, unsafe, or the answer is clearly no. Favor denying '
             f'when genuinely unsure -- an unconvincing approval is the real risk.'
         )
+        _ctx = _escalation_context_lines(esc)
+        if _ctx:
+            instr += ' ' + ' '.join(_ctx)
         criteria = {
             'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
             'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
@@ -319,7 +364,17 @@ def _resolve_pending_escalations_sync():
         # Senior-director delegation is the middle rung: use the mid tier.
         review_model = (_mid_tier_slug() or _jev_model())
         decision, confidence, _cost = _jev_quorum_choice_sync(
-            instr, criteria, model=review_model)
+            instr, criteria, model=review_model, kind='escalation_resolve')
+        # Record this rung's vote on the escalation record BEFORE the gate
+        # decides what to do with it: the next rung's prompt renders prior
+        # votes (see _escalation_context_lines), so the chain converges on, or
+        # visibly disagrees about, a decision instead of re-deriving the same
+        # uncertainty in isolation. Only a real binary vote is recorded; a
+        # non-decision or an outage left no vote (the next rung sees none).
+        if decision in ('approve', 'deny'):
+            esc.setdefault('rungVotes', []).append({
+                'rung': rung, 'decision': decision,
+                'confidence': round(float(confidence or 0.0), 3)})
         if decision not in ('approve', 'deny'):
             # A non-binary answer is a non-decision: mark this rung tried and
             # move to the next one on the next pass. Never auto-approve on a

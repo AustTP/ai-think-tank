@@ -155,7 +155,10 @@ def _spike_file_issue_wish(finding, task, name, backlog):
     informational and should stay that way -- a spike worker who files on
     every investigation would be spamming the backlog). Only when a signal is
     present do we ask Jev for an explicit file/no-file verdict (file_bug /
-    file_story / none)."""
+    file_story / none / inconclusive -- the fourth option exists because a
+    large share of real findings report "could not verify" rather than "all
+    fine", and forcing that class into the none-vs-bug binary was the single
+    biggest driver of low-confidence triage answers)."""
     signals = _SPIKE_ISSUE_PROBLEM_SIGNALS
     if not (finding or '').strip():
         return None
@@ -178,7 +181,9 @@ def _spike_file_issue_wish(finding, task, name, backlog):
                     'criteria': {
                         'file_bug': 'Yes -- it names a concrete defect or breakage that should be FIXED (something behaves wrongly or not at all).',
                         'file_story': 'Yes -- it names a real missing capability or gap worth BUILDING or adding (not a defect, but something that should exist).',
-                        'none': 'No -- the finding is informational, says things are fine, or only surfaces expected limitations with nothing worth filing.'}}})
+                        'none': 'No -- the finding is informational, says things are fine, or only surfaces expected limitations with nothing worth filing.',
+                        'inconclusive': 'No -- the finding could not gather enough evidence to say either way (unverified, blocked access, empty workspace): not worth filing until someone re-runs it with working access.'}},
+             '_kind': 'finding_triage'})
     choice, _, _ = _serve._jev_choice(decision)
     if choice not in ('file_bug', 'file_story'):
         return None

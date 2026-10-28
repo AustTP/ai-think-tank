@@ -342,6 +342,51 @@ _GRADE_BUCKETS = {
     '10': 'Excellent -- fully meets the spec, no real gaps, cleanly serves the roadmap.',
 }
 
+# Cap on the deliverable evidence embedded in a grade prompt. The work order
+# and the deliverable body are the two signals that decide a grade; everything
+# else is corroboration, so it gets a smaller slice. Without these caps a
+# runaway report would push the prompt past what the decision endpoint accepts
+# (tape maxes have already shown 27k-char prompts on other sites).
+_GRADE_WORK_ORDER_CAP = 2000
+_GRADE_BODY_CAP = 4000
+_GRADE_NOTE_CAP = 1500
+
+
+def _deliverable_evidence_lines(task):
+    """The actual deliverable evidence a grader needs, one section per signal
+    the task record carries. The original grade prompt carried ONLY the
+    deliverable's title -- Jev never saw the work, so every real grade came
+    back '0' ("useless") at 0.98+ confidence: from a title alone, '0' IS the
+    defensible answer, and the whole coaching/firing loop downstream fed on
+    those rubber-stamped zeros. This gathers what the completion path already
+    stored on the task (see _apply_content_result): the work order with its
+    acceptance criteria, the deliverable text itself, the agent's completion
+    note, written files, and where the artifact landed. Returns a list of
+    section strings (possibly empty) -- the caller decides what absence means."""
+    lines = []
+    order = (task.get('instructions') or '').strip()
+    if order:
+        lines.append('Work order (what this task asked for):\n' + order[:_GRADE_WORK_ORDER_CAP])
+    body = (task.get('deliverableText') or '').strip()
+    if body:
+        lines.append('Deliverable text:\n' + body[:_GRADE_BODY_CAP])
+    note = (task.get('note') or '').strip()
+    if note:
+        lines.append("Agent's completion note:\n" + note[:_GRADE_NOTE_CAP])
+    files = task.get('writtenPy') or []
+    if files:
+        lines.append('Code files written: ' + ', '.join(str(f) for f in files[:20]))
+    lib = (task.get('libraryPath') or '').strip()
+    if lib:
+        lines.append('Library artifact: ' + lib)
+    wiki = (task.get('wikiPage') or '').strip()
+    if wiki:
+        lines.append('Wiki page: ' + wiki)
+    urls = task.get('sourceUrls') or []
+    if urls:
+        lines.append('Sources cited: ' + ', '.join(str(u)[:80] for u in urls[:8]))
+    return lines
+
 
 def _grading_decider_default(state, instructions, task_title, room):
     """Default Jev resolver for grading a landed deliverable (0-10 score).
@@ -367,7 +412,8 @@ def _grading_decider_default(state, instructions, task_title, room):
         data = serve._call_openrouter_decision_sync(
             serve._jev_model(), {'messages': [], 'signals': {}},
             {'choice': {'type': 'choice', 'instructions': instructions,
-                        'criteria': dict(_GRADE_BUCKETS)}})
+                        'criteria': dict(_GRADE_BUCKETS)},
+             '_kind': 'grade'})
         choice, _, _ = serve._jev_choice(data)
         if choice in _GRADE_BUCKETS:
             return float(choice)
@@ -564,7 +610,19 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     a = (state.get('agents') or {}).get(agent_id) or {}
     instructions = (f"Grade the deliverable '{title}' landed in the {room} room by "
                     f"{a.get('name') or agent_id} ({a.get('role') or 'worker'}). "
-                    f"Did it meet the roadmap and the room's spec? Give a 0-10 score.")
+                    f"Did it meet the work order and the room's spec? Judge ONLY from "
+                    f"the evidence below and choose the 0-10 bucket that best matches "
+                    f"what was actually produced.")
+    evidence = _deliverable_evidence_lines(task)
+    if evidence:
+        instructions += '\n\n' + '\n\n'.join(evidence)
+    else:
+        # Honest absence: a task record with no deliverable content beyond the
+        # title is a legitimate 0 -- but Jev should know it is judging an empty
+        # record, not silently treat the title as the whole deliverable.
+        instructions += ('\n\nThe task record carries no deliverable content beyond '
+                         'the title itself: no deliverable text, no completion note, '
+                         'no written files, no artifact path. Grade what is actually here.')
     real_grade = _grading_decider(state, instructions, title, room)
     grade_is_real = real_grade is not None
     if real_grade is None:

@@ -64,7 +64,7 @@ def _jev_choice(data):
     return choice, confidence, float(cost) if isinstance(cost, (int, float)) else 0.0
 
 
-async def _jev_quorum_decision(instructions, criteria):
+async def _jev_quorum_decision(instructions, criteria, kind=None):
     """Shared by every Jev safety-gated call site (browse, download, curl,
     sandbox_download, sandbox_save_page, access_request, execute/pipeline's
     _classify_command) -- replaces each site's own single
@@ -75,14 +75,24 @@ async def _jev_quorum_decision(instructions, criteria):
     queryable), so every existing call site's downstream _jev_safety_gate
     call is unchanged except threading that trace_id. Fails closed exactly
     as every call site already did: an unreachable classifier is not consent
-    to skip the gate."""
+    to skip the gate.
+
+    `kind` is the call site's decision-tape tag (e.g. 'cmd_allow', 'browse'):
+    it rides the questions payload as a private `_kind` key that the tape
+    layer reads and the wire edge strips, so the tape's per-kind stats stop
+    depending on substring guesses about the prompt text. Optional -- an
+    untagged call site falls back to the old prompt sniffing."""
     import serve as _serve
+
+    questions = {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}}
+    if kind:
+        questions['_kind'] = kind
 
     async def sample():
         data = await asyncio.to_thread(
             _serve._call_openrouter_decision_sync, _serve._jev_model(),
             {'messages': [], 'signals': {}},
-            {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}},
+            questions,
         )
         decision, confidence, cost = _serve._jev_choice(data)
         # trace_id only exists on a real decision dict; a mocked/broken caller
@@ -121,7 +131,7 @@ async def _jev_quorum_decision(instructions, criteria):
     return decision, confidence, total_cost, trace_id
 
 
-def _jev_quorum_choice_sync(instructions, criteria, model=None):
+def _jev_quorum_choice_sync(instructions, criteria, model=None, kind=None):
     """gap caught: quorum sampling above only ever covered
     the SAFETY gates (a confirmed real problem -- the same DreyX URL got a
     confident 0.87 allow one run, a low-confidence 0.56 escalate-and-deny
@@ -148,15 +158,21 @@ def _jev_quorum_choice_sync(instructions, criteria, model=None):
     confidence, total_cost), the same 3-tuple shape _jev_choice returns, so
     every caller's existing post-processing (matching against its own
     candidate list, falling back on None/an unrecognized choice) is
-    unchanged."""
+    unchanged.
+
+    `kind` threads an explicit decision-tape tag through to the tape layer
+    (same `_kind` private-key mechanism as _jev_quorum_decision)."""
     import serve as _serve
 
     chosen = model or _serve._jev_model()
 
+    questions = {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}}
+    if kind:
+        questions['_kind'] = kind
+
     def sample():
         data = _serve._call_openrouter_decision_sync(
-            chosen, {'messages': [], 'signals': {}},
-            {'choice': {'type': 'choice', 'instructions': instructions, 'criteria': criteria}})
+            chosen, {'messages': [], 'signals': {}}, questions)
         return _serve._jev_choice(data)
 
     try:
