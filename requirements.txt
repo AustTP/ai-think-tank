@@ -14,12 +14,12 @@ pydantic==2.13.4
 # Credential vault encryption (world/serve.py _fernet) and host-side browser
 # rendering for browse_page(render=true). Pinned to the versions verified on
 # this host.
-cryptography==42.0.2
+cryptography==49.0.0
 playwright==1.60.0
 # Document ingestion (/api/library/ingest) -- optional, degrade with a clear
 # per-file error when absent (serve.py guards each import).
 openpyxl==3.0.10
-pypdf==6.19.0
+pypdf==6.21.2
 python-docx==1.2.0
 python-pptx==1.0.2
 # XML hardening for untrusted RSS/Atom feeds (world/serve.py). Pinned like
@@ -39,5 +39,5 @@ redis==8.1.0
 flake8==7.1.1  # 6.0.0 + Python 3.12 misparses PEP-701 f-strings (E713 false positives inside string text)
 mypy==1.8.0
 bandit==1.9.4
-pytest==7.4.0
+pytest==9.0.3
 pytest-cov==7.1.0
