@@ -107,6 +107,47 @@ def test_schedule_window_refused_by_conflicts(fake_repo, monkeypatch):
     assert selfedit.windows_snapshot(limit=10)[-1]['agent'] == 'other'
 
 
+def test_emergency_lane_shorter_lead_time(fake_repo, monkeypatch):
+    """The emergency lane: changeType 'emergency' may start under 24h out
+    (never under 1h), at the same slot a normal change is refused. The lane
+    is loud -- the window record lands and the telegram announce fires even
+    without notify_created -- while the 7-day cap stays for everyone."""
+    import datetime
+    _, world = fake_repo
+    _approve(monkeypatch)
+    _patch_player_approval(monkeypatch)
+    _arm_edit(monkeypatch, world)
+    announced = []
+    monkeypatch.setattr(selfedit, '_telegram_change_request_created',
+                        lambda wid: announced.append(wid))
+    target = datetime.datetime.now() + datetime.timedelta(hours=2)
+    date = target.strftime('%Y-%m-%d')
+    start = target.strftime('%H:%M')
+    # normal change at the same near-term slot: refused
+    ok, payload = selfedit.request_window('worker', date, start, 15, 'why')
+    assert ok is False and 'at least 24 hours' in payload['error']
+    # emergency at the same slot: accepted, announced, recorded
+    ok, payload = selfedit.request_window('worker', date, start, 15, 'why',
+                                          validator='reviewer',
+                                          change_type='emergency')
+    assert ok is True, payload
+    assert announced == [payload['id']]
+    assert any(w['agent'] == 'worker' for w in selfedit.windows_snapshot(limit=10))
+    # emergency still has a floor: 30 minutes out is refused
+    soon = datetime.datetime.now() + datetime.timedelta(minutes=30)
+    ok, payload = selfedit.request_window('worker', soon.strftime('%Y-%m-%d'),
+                                          soon.strftime('%H:%M'), 15, 'why',
+                                          validator='reviewer',
+                                          change_type='emergency')
+    assert ok is False and 'at least 1 hour' in payload['error']
+    # and the 7-day cap applies to the lane too
+    ok, payload = selfedit.request_window('worker', _window_slot(31),
+                                          '03:00', 15, 'why',
+                                          validator='reviewer',
+                                          change_type='emergency')
+    assert ok is False and '7 days' in payload['error']
+
+
 def test_schedule_window_time_and_range_validation(fake_repo, monkeypatch):
     _, world = fake_repo
     _approve(monkeypatch)

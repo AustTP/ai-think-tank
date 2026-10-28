@@ -48,7 +48,12 @@ and `world/core/constitution.py` are immutable.
    and assign an eligible worker. Change requests must be scheduled at least
    24 hours before the change window -- the owner needs a real chance to
    review the request and veto -- and no more than 7 days before it, so
-   far-future requests do not go stale before the window arrives.
+   far-future requests do not go stale before the window arrives. A genuine
+   emergency may use the emergency change type with a shorter runway, but
+   never under one hour before the window: the owner's veto must still be
+   possible, emergency requests are logged and announced immediately, and
+   labeling routine work as emergency to skip the notice period is a Rule 12
+   violation.
 10. **Truthful evidence.** Never fabricate tool results, transcripts, grades,
     sources, or completion. Report failures and uncertainty. Mark partial,
     auto-captioned, or unverified sources as partial, and retire an unsourced

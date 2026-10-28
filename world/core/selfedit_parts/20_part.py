@@ -61,8 +61,16 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 # the request and use the veto link, and no more than 7 days out -- requests
 # filed further ahead go stale before the window arrives; re-request closer
 # to the work.
+#
+# The emergency lane (owner decision, 2026-10-27): changeType 'emergency' may
+# use a shorter runway, but never under one hour -- the owner's veto link
+# still needs a realistic chance to land. The lane is loud: the request is
+# logged as emergency_change_requested and telegram-notified immediately, and
+# the supervisor review + owner veto still apply unchanged. Labeling routine
+# work as emergency to skip the notice period is a Rule 12 violation.
 WINDOW_MIN_LEAD_S = 24 * 60 * 60
 WINDOW_MAX_LEAD_S = 7 * 24 * 60 * 60
+WINDOW_EMERGENCY_MIN_LEAD_S = 60 * 60
 
 # Validator turn (operator decision, 2026-10-19). The tank is dormant while a
 # change window holds for validation, so the sim tick cannot run and the
@@ -618,7 +626,13 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     start_ts, _day_end, err = _parse_window_target(date, start, now)
     if err:
         return False, {'error': err}
-    if start_ts < now + WINDOW_MIN_LEAD_S:
+    emergency = change_type == 'emergency'
+    min_lead = WINDOW_EMERGENCY_MIN_LEAD_S if emergency else WINDOW_MIN_LEAD_S
+    if start_ts < now + min_lead:
+        if emergency:
+            return False, {'error': 'emergency change requests must start at '
+                                    'least 1 hour from now -- the owner '
+                                    'still needs a chance to veto'}
         return False, {'error': 'the window must start at least 24 hours '
                                 'from now -- change requests need a day of '
                                 'notice so the owner can review and veto'}
@@ -844,8 +858,15 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                       'files': manifest, 'highRisk': high_risk,
                       'preApply': pre_apply_result},
                      authorized=True)
-    if notify_created:
-        _telegram_change_request_created(window_id)
+    if emergency:
+        serve.log_action(agent_id, 'emergency_change_requested',
+                         {'windowId': window_id, 'reason': reason[:200],
+                          'start': f'{date} {start}'}, authorized=True)
+    if notify_created or emergency:
+        try:
+            _telegram_change_request_created(window_id)
+        except Exception:
+            pass  # notification is best-effort; the window itself is recorded
     return True, {'id': window_id,
                   'status': 'approved' if admin_mode else 'pending',
                   'escalationId': esc_id,
