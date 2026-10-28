@@ -1,54 +1,83 @@
 {
   "_comment": [
     "Lane declarations for the fast path (world/server/fast_path.py).",
-    "Each entry under 'lanes' needs a unique 'name' and a 'type' from the",
-    "audited registry: http_watch (GET-only observation; declare program +",
-    "targets as the scope) or paper_markets (simulated fills against public",
-    "spot prices; no order-placement code path exists).",
-    "Unknown types are rejected visibly at boot and never run.",
-    "Kill switch: create the file data/fast-kill to pause every lane.",
-    "Tune or add lanes here without touching code; a new KIND of behavior",
-    "is a code change and gets reviewed like one.",
+    "",
+    "A lane is a PIPELINE of stages, declared here and hot-reloaded on",
+    "file change. Stage vocabulary (audited code; JSON only composes):",
+    "  observe:  http_get | vps_dispatch | price_spot",
+    "  decide:   sma_band",
+    "  act:      paper_fill | log",
+    "  analyze:  llm",
+    "Unknown kinds and impossible compositions are rejected at build and",
+    "never run. LLM output is recorded as text, never executed.",
+    "",
+    "DEFAULT STATE: every lane ships enabled=false -> the service is a",
+    "cheap silent watcher. Flip enabled=true to activate a lane; no",
+    "restart needed (hot-reloaded within ~10s).",
+    "",
+    "Kill switch: touch data/fast-kill to pause every lane within a cycle.",
     "",
     "BUG BOUNTY LANES RUN THEIR WORK ON A VPS, NEVER IN DOCKER AND NEVER",
-    "FROM THE HOME IP. Declare executor.kind=vps plus host/user/key_path/",
-    "known_hosts. Pin the host key first:",
+    "FROM THE HOME IP. Declare executor (host/user/port/key_path/", 
+    "known_hosts) and pin the host key first:",
     "  ssh-keyscan -H <host> >> .secret_keys/fast_vps_known_hosts",
-    "The 'work' list is the ONLY thing the VPS will ever run; LLM output is",
-    "analyzed, never executed. Missing/empty executor = lane idles loudly."
+    "The 'work' list is the ONLY thing the VPS will ever run. Missing or",
+    "unpinned executor config fails closed: the lane idles and says so.",
+    "",
+    "MARKETS LANES ARE PAPER ONLY. No order-placement code path exists.",
+    "notional is per simulated trade in USD, hard-capped at 500 by env"
   ],
   "lanes": [
     {
       "name": "bounty-recon",
-      "type": "http_watch",
+      "enabled": false,
       "cadence_s": 300,
-      "program": "",
-      "targets": [],
-      "rate_limit_s": 2.0,
-      "analysis_prompt": "You are a bug bounty recon analyst. Work only within the declared scope. Be concise: list anything unusual worth a human look, or say \"nothing notable\".",
-      "executor": {
-        "kind": "vps",
-        "host": "",
-        "user": "",
-        "port": 22,
-        "key_path": "",
-        "known_hosts": ".secret_keys/fast_vps_known_hosts",
-        "command_timeout_s": 120
-      },
-      "work": []
+      "pipeline": [
+        {
+          "kind": "vps_dispatch",
+          "work_timeout_s": 120,
+          "executor": {
+            "host": "",
+            "user": "",
+            "port": 22,
+            "key_path": "",
+            "known_hosts": ".secret_keys/fast_vps_known_hosts",
+            "command_timeout_s": 120
+          },
+          "work": []
+        },
+        {
+          "kind": "llm",
+          "every": 1,
+          "prompt": "You are a bug bounty recon analyst. Work only within the declared scope. Be concise: list anything unusual worth a human look, or say \"nothing notable\"."
+        }
+      ]
     },
     {
       "name": "markets-paper",
-      "type": "paper_markets",
+      "enabled": false,
       "cadence_s": 30,
-      "price_source": "coinbase_spot",
-      "symbols": [
-        "BTC-USD",
-        "ETH-USD"
-      ],
-      "notional": 100,
-      "band_pct": 2.0,
-      "window": 30
+      "pipeline": [
+        {
+          "kind": "price_spot",
+          "source": "coinbase_spot",
+          "symbols": ["BTC-USD", "ETH-USD"]
+        },
+        {
+          "kind": "sma_band",
+          "window": 30,
+          "band_pct": 2.0
+        },
+        {
+          "kind": "paper_fill",
+          "notional": 100
+        },
+        {
+          "kind": "llm",
+          "every": 5,
+          "prompt": "You are a trading analyst on a PAPER trading lane. No real money. One short paragraph on price action and positions. Never give financial advice; this is system telemetry commentary."
+        }
+      ]
     }
   ]
 }

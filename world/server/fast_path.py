@@ -1,50 +1,57 @@
 """Fast path: dedicated always-on lanes outside the tank's sim loop.
 
-Design (2026-10-28, after the tape-race and runner-kill fixes):
+Design (2026-10-28, second revision after the tape-race and runner-kill
+fixes):
 
 - SEPARATE PROCESS. The main tank's ceiling is one contended interpreter:
   sim tick, watches, API and model calls all share it, and a stalled tick
-  costs minutes (the watchdog recycles at 180s). Latency-sensitive work gets
-  its own process with no sim, no watches, no shared GIL contention.
+  costs minutes (the watchdog recycles at 180s). Latency-sensitive work
+  gets its own process with no sim, no watches, no shared GIL contention.
 
-- LANES ARE CONFIGURED, NOT CODED. `fast_lanes.json` declares any number of
-  lane instances; each has a `type` from a small, safety-audited registry:
+- ONE GENERIC LANE ENGINE, FULLY JSON-PARAMETERIZED. There are no
+  per-use-case lane classes. A lane is a pipeline of stages declared in
+  fast_lanes.json; the stage vocabulary is small and safety-audited:
 
-      http_watch    GET-only observation of declared targets, rate-limited,
-                    optional LLM analysis. Use it for bug-bounty recon
-                    (declare `program` + in-scope `targets`), surface
-                    monitoring, or any watch-shaped job.
-      paper_markets Simulated fills against public spot prices. There is NO
-                    order-placement code path to any exchange anywhere in
-                    this file. Caps and the kill switch bound it.
+      observe.http_get      GET-only observation of declared targets,
+                            rate-limited. No redirects followed.
+      observe.vps_dispatch  Declared work runs on a dedicated VPS over
+                            pinned-host-key ssh. Bug-bounty work lives
+                            here: never in Docker, never from the home IP.
+                            Only the config-declared work list ever runs;
+                            there is no code path from model output to a
+                            shell command.
+      observe.price_spot    Public spot prices (coinbase_spot only).
+      decide.sma_band       Rule decision over price ticks.
+      act.paper_fill        Simulated fills with hard structural caps.
+                            There is NO order-placement code path to any
+                            exchange in this file.
+      analyze.llm           Read-only model commentary, cadence-throttled.
 
-    JSON tunes and adds lane instances freely; a NEW kind of behavior is a
-    code change and gets reviewed like one. That boundary is deliberate:
-    config changes behavior, code changes capability.
+    Unknown stage kinds and impossible compositions are rejected at build
+    and never run. The boundary: stages define what is possible (audited
+    code); JSON decides what runs (hot-reloaded).
+
+- IDLE BY DEFAULT. A lane with `enabled: false` (or an incomplete config)
+  emits one transition event and then goes silent: no polling, no
+  probing, no noise. The service itself stays up as a cheap watcher and
+  hot-reloads fast_lanes.json on change, so flipping a lane on is a JSON
+  edit, not a deployment.
 
 - OWN AUDIT CHAIN, SINGLE WRITER. The 39 decision-tape breaks were two
-  writers interleaving on one hash chain. Here every lane event goes through
-  a queue to ONE flusher thread that is the only writer of fast_lane.db, so
-  the chain race is impossible by construction. The chain is HMAC-SHA256,
-  keyed by .secret_keys/fast_lane.key (independent of the tank's boundary
-  secret). A later tank-side watch can anchor lane head hashes into the main
-  decision_tape as checkpoints without any cross-process write contention.
-
-- BLAST RADIUS IS STRUCTURAL, NOT HOPED FOR.
-    * http_watch never issues anything but GET, never touches a host outside
-      its declared targets, and idles loudly when unconfigured.
-    * paper_markets caps trades/day and notional in code; the kill-switch
-      file (data/fast-kill) pauses every lane.
-    * The service binds 127.0.0.1 by default; it is reachable only on this
-      machine unless the operator explicitly rebinds it.
+  writers interleaving on one hash chain. Lane events go through a queue
+  to ONE flusher thread that is the only writer of the events table, so
+  the chain race is impossible by construction. HMAC-SHA256, keyed by
+  .secret_keys/fast_lane.key, independent of the tank's boundary secret.
+  Mutable lane state (paper portfolios) lives in a separate unchained
+  state table so rebuilds and reloads never touch the audit chain.
 
 - FAIL FAST, DEGRADE HONESTLY. One pinned model with hard deadlines
   (connect 2s, read 8s). A slow or missing model never stalls a lane: the
-  lane logs a degraded event and keeps running on its rule layer. Provider
-  roulette is a background-lane luxury; a fast lane fails visibly instead.
+  lane logs a degraded event and keeps running on its rule layer.
 
 Run:  python3 fast_path.py          (env: FAST_PORT, FAST_HOST, FAST_MODEL)
 Stop: launchctl kickstart -k gui/501/com.austtp.tank-fast  (or SIGTERM)
+Kill: touch data/fast-kill         (pauses every lane within one cycle)
 """
 
 import asyncio
@@ -53,8 +60,8 @@ import hmac
 import json
 import os
 import queue
-import subprocess
 import sqlite3
+import subprocess
 import threading
 import time
 from collections import deque
@@ -75,12 +82,11 @@ LANE_KEY_PATH = REPO_ROOT / '.secret_keys' / 'fast_lane.key'
 FAST_PORT = int(os.environ.get('FAST_PORT', '8938'))
 FAST_HOST = os.environ.get('FAST_HOST', '127.0.0.1')
 FAST_MODEL = os.environ.get('FAST_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
-MAX_TRADES_PER_DAY = int(os.environ.get('FAST_MAX_TRADES_PER_DAY', '10'))
-MAX_NOTIONAL_PER_TRADE = float(os.environ.get('FAST_MAX_NOTIONAL', '500'))
-MAX_TRADES_PER_DAY = max(1, MAX_TRADES_PER_DAY)
-MAX_NOTIONAL_PER_TRADE = max(1.0, MAX_NOTIONAL_PER_TRADE)
+MAX_TRADES_PER_DAY = max(1, int(os.environ.get('FAST_MAX_TRADES_PER_DAY', '10')))
+MAX_NOTIONAL_PER_TRADE = max(1.0, float(os.environ.get('FAST_MAX_NOTIONAL', '500')))
 HTTP_TIMEOUT = httpx.Timeout(8.0, connect=2.0)
 CYCLE_TIMEOUT_FRACTION = 0.9
+RELOAD_POLL_S = 10.0
 
 
 def _load_env_file(path):
@@ -118,8 +124,10 @@ def _kill_switch_active():
 
 
 class LaneLog:
-    """Append-only, hash-chained event log. ALL writes go through one
-    flusher thread; callers only enqueue. verify() walks the chain."""
+    """Append-only, hash-chained event log plus a separate unchained state
+    table. Events: ALL writes go through one flusher thread (callers only
+    enqueue). State: short-lived connections, plain key/value, never part
+    of the chain."""
 
     def __init__(self, db_path=LANE_DB_PATH):
         self.db_path = Path(db_path)
@@ -128,22 +136,19 @@ class LaneLog:
         # Dedicated connection for the flusher thread ONLY (writes).
         # check_same_thread=False is safe here because the single-writer
         # discipline is enforced by construction: nothing but _flush_loop
-        # ever issues a statement on _conn. Every read path (head, verify,
-        # recent) opens its own short-lived connection instead.
+        # ever issues a statement on _conn. Every read path opens its own
+        # short-lived connection instead.
         self._conn = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False)
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('''CREATE TABLE IF NOT EXISTS lane_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, lane TEXT,
             agent_id TEXT, kind TEXT, payload TEXT,
             prev_hash TEXT, hash TEXT)''')
+        self._conn.execute('''CREATE TABLE IF NOT EXISTS lane_state (
+            lane TEXT PRIMARY KEY, state TEXT, updated_at REAL)''')
         self._conn.commit()
         self._writer = threading.Thread(target=self._flush_loop, name='lane-writer', daemon=True)
         self._writer.start()
-
-    def _reader(self):
-        conn = sqlite3.connect(self.db_path, timeout=10)
-        conn.execute('PRAGMA journal_mode=WAL')
-        return conn
 
     def _row_hash(self, prev_hash, ts, lane, agent_id, kind, payload):
         blob = json.dumps([ts, lane, agent_id, kind, payload], sort_keys=True, default=str)
@@ -187,51 +192,77 @@ class LaneLog:
         self.emit('__sync__', 'fast-path', 'sync', {'marker': marker})
         deadline = time.time() + timeout
         while time.time() < deadline:
-            conn = sqlite3.connect(self.db_path, timeout=10)
-            try:
-                row = conn.execute(
+            if self._read(lambda conn: conn.execute(
                     'SELECT 1 FROM lane_events WHERE payload LIKE ? LIMIT 1',
-                    (f'%{marker}%',)).fetchone()
-            finally:
-                conn.close()
-            if row:
+                    (f'%{marker}%',)).fetchone()):
                 return True
             time.sleep(0.02)
         return False
 
+    def _read(self, fn):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute('PRAGMA journal_mode=WAL')
+        try:
+            return fn(conn)
+        finally:
+            conn.close()
+
     def head(self):
-        with self._reader() as conn:
-            cur = conn.execute(
-                'SELECT id, hash FROM lane_events ORDER BY id DESC LIMIT 1').fetchone()
+        cur = self._read(lambda conn: conn.execute(
+            'SELECT id, hash FROM lane_events ORDER BY id DESC LIMIT 1').fetchone())
         return {'id': cur[0], 'hash': cur[1]} if cur else {'id': 0, 'hash': ''}
 
     def verify(self):
-        with self._reader() as conn:
+        def walk(conn):
             rows = conn.execute(
                 'SELECT id, prev_hash, hash, ts, lane, agent_id, kind, payload '
                 'FROM lane_events ORDER BY id ASC').fetchall()
-        problems, prev_hash = [], ''
-        for i, (rid, row_prev, row_hash, ts, lane, agent_id, kind, payload) in enumerate(rows):
-            if i > 0 and row_prev != prev_hash:
-                problems.append({'id': rid, 'issue': 'chain break'})
-            expected = self._row_hash(row_prev, ts, lane, agent_id, kind, payload)
-            if expected != row_hash:
-                problems.append({'id': rid, 'issue': 'hash mismatch (content tampered)'})
-            prev_hash = row_hash
-        return problems
+            problems, prev_hash = [], ''
+            for i, (rid, row_prev, row_hash, ts, lane, agent_id, kind, payload) in enumerate(rows):
+                if i > 0 and row_prev != prev_hash:
+                    problems.append({'id': rid, 'issue': 'chain break'})
+                expected = self._row_hash(row_prev, ts, lane, agent_id, kind, payload)
+                if expected != row_hash:
+                    problems.append({'id': rid, 'issue': 'hash mismatch (content tampered)'})
+                prev_hash = row_hash
+            return problems
+        return self._read(walk)
 
     def recent(self, lane=None, limit=50):
-        with self._reader() as conn:
+        def query(conn):
             if lane:
-                rows = conn.execute(
+                return conn.execute(
                     'SELECT ts, lane, agent_id, kind, payload FROM lane_events '
                     'WHERE lane = ? ORDER BY id DESC LIMIT ?', (lane, limit)).fetchall()
-            else:
-                rows = conn.execute(
-                    'SELECT ts, lane, agent_id, kind, payload FROM lane_events '
-                    'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+            return conn.execute(
+                'SELECT ts, lane, agent_id, kind, payload FROM lane_events '
+                'ORDER BY id DESC LIMIT ?', (limit,)).fetchall()
+        rows = self._read(query)
         return [{'ts': r[0], 'lane': r[1], 'agent_id': r[2], 'kind': r[3],
                  'payload': json.loads(r[4]) if r[4] else {}} for r in rows]
+
+    def load_state(self, lane, default=None):
+        row = self._read(lambda conn: conn.execute(
+            'SELECT state FROM lane_state WHERE lane = ?', (lane,)).fetchone())
+        if not row:
+            return default if default is not None else {}
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return default if default is not None else {}
+
+    def save_state(self, lane, state):
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute('PRAGMA journal_mode=WAL')
+        try:
+            conn.execute(
+                'INSERT INTO lane_state (lane, state, updated_at) VALUES (?, ?, ?) '
+                'ON CONFLICT(lane) DO UPDATE SET state = excluded.state, '
+                'updated_at = excluded.updated_at',
+                (lane, json.dumps(state, default=str), time.time()))
+            conn.commit()
+        finally:
+            conn.close()
 
 
 class FastModel:
@@ -268,22 +299,20 @@ class FastModel:
 class VpsExecutor:
     """Dispatch declared work to a dedicated VPS over SSH.
 
-    The bounty lane's work always runs here, never in a local Docker
-    container and never from the operator's home IP: the VPS is the
-    attributable, disposable workhorse. Discipline:
+    Bug-bounty work always runs here, never in a local Docker container
+    and never from the operator's home IP: the VPS is the attributable,
+    disposable workhorse. Discipline:
 
-    - Only commands declared in the lane's config `work` list ever run.
-      LLM output is analyzed, never executed; there is no code path from
-      model text to a shell command.
+    - Only commands declared in the stage's `work` list ever run. Model
+      output is analyzed, never executed; there is no code path from model
+      text to a shell command.
     - Host key pinning is mandatory (StrictHostKeyChecking=yes against an
       operator-provided known_hosts file); an unpinned host fails closed.
     - BatchMode (key auth only), bounded connect/command timeouts, and a
       bounded output capture keep a hung VPS from stalling the lane.
     """
 
-    def __init__(self, cfg, log, lane_name):
-        self.log = log
-        self.lane_name = lane_name
+    def __init__(self, cfg):
         self.host = cfg.get('host') or ''
         self.user = cfg.get('user') or ''
         self.port = str(cfg.get('port', 22))
@@ -335,103 +364,110 @@ class VpsExecutor:
                     'error': str(e)[:200]}
 
 
-class BaseLane:
-    """Common lane plumbing: the engine owns cadence; a lane only cycles."""
+class StageError(ValueError):
+    """A stage declaration the engine refuses to run."""
+
+
+class Lane:
+    """A generic pipeline lane: observe -> decide -> act -> analyze.
+
+    Built entirely from JSON. Stages run in declared order each cycle;
+    facts flow through a per-cycle dict; mutable lane state persists in
+    the lane DB (unchained) so rebuilds and reloads keep paper positions.
+    """
 
     def __init__(self, cfg, log, model):
         self.cfg = cfg or {}
         self.log = log
         self.model = model
-        self.name = self.cfg.get('name') or self.__class__.__name__
+        self.name = self.cfg.get('name') or ''
+        if not self.name:
+            raise StageError('lane needs a name')
+        self.enabled = bool(self.cfg.get('enabled', False))
         self.cadence_s = max(1.0, float(self.cfg.get('cadence_s', 60)))
+        self.pipeline = self.cfg.get('pipeline') or []
+        if not isinstance(self.pipeline, list) or not self.pipeline:
+            raise StageError(f'lane {self.name!r} needs a non-empty pipeline list')
+        self.stages = []
+        seen_kinds = []
+        for i, s in enumerate(self.pipeline):
+            kind = (s or {}).get('kind')
+            factory = STAGE_REGISTRY.get(kind)
+            if not factory:
+                raise StageError(
+                    f'lane {self.name!r} stage {i}: unknown kind {kind!r} '
+                    f'(known: {sorted(STAGE_REGISTRY)})')
+            stage = factory(s, self)
+            stage.validate(seen_kinds)
+            seen_kinds.append(kind)
+            self.stages.append(stage)
+        self.mode = 'idle'
+        self._inhibited = False
+        self.last_cycle_ts = None
 
-    def _paused_event(self):
-        self.log.emit(self.name, 'fast-path', 'paused', {'reason': 'kill switch'})
+    # -- lifecycle ------------------------------------------------------
+    def note(self, agent, kind, payload):
+        self.log.emit(self.name, agent, kind, payload)
 
+    def enter_mode(self, mode, payload):
+        """Emit only on TRANSITION. Idle and paused lanes are silent."""
+        if self.mode != mode:
+            self.mode = mode
+            self.note('fast-path', mode, payload)
 
-class HttpWatchLane(BaseLane):
-    """GET-only observation of declared targets. Recon semantics when a
-    `program` is declared; plain surface-watch otherwise. It never touches
-    a host outside `targets` and it never issues anything but GET."""
-
-    def __init__(self, cfg, log, model):
-        super().__init__(cfg, log, model)
-        self.program = self.cfg.get('program') or ''
-        self.targets = [t for t in (self.cfg.get('targets') or [])
-                        if isinstance(t, str) and t.strip()]
-        self.rate_limit_s = max(0.0, float(self.cfg.get('rate_limit_s', 2.0)))
-        self.analysis_prompt = self.cfg.get('analysis_prompt') or (
-            'You are a recon analyst. Work only within the declared scope. '
-            'Be concise: list anything unusual worth a human look, or say '
-            '"nothing notable".')
-        self._last = {}
-        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False)
-        self.work = self.cfg.get('work') or []
-        self.work_timeout_s = float(self.cfg.get('work_timeout_s', 120))
-        self.executor = None
-        exec_cfg = self.cfg.get('executor') or {}
-        if exec_cfg.get('kind') == 'vps':
-            self.executor = VpsExecutor(exec_cfg, log, self.name)
-
-    @property
-    def configured(self):
-        return bool(self.targets)
-
-    async def _vps_cycle(self):
-        """Work happens on the VPS; this machine only dispatches, observes,
-        and keeps the receipts. Every dispatch is a declared work item; the
-        lane never runs anything the config did not name."""
-        if not self.executor.configured:
-            self.log.emit(self.name, 'fast-path', 'executor_unconfigured',
-                          {'missing': self.executor.missing()})
-            return
-        if not self.work:
-            self.log.emit(self.name, 'fast-path', 'unconfigured',
-                          {'note': 'declare the work list (declared commands only); '
-                                   'the VPS runs nothing the config did not name'})
-            return
-        results = []
-        for item in self.work:
-            cmd_name = (item or {}).get('name') or ''
-            command = (item or {}).get('command') or ''
-            if not cmd_name or not command:
-                continue
-            self.log.emit(self.name, 'lane-dispatcher', 'dispatch',
-                          {'work': cmd_name, 'host': self.executor.host})
-            result = await asyncio.to_thread(self.executor.run, command,
-                                             self.work_timeout_s)
-            self.log.emit(self.name, 'lane-dispatcher', 'result',
-                          {'work': cmd_name, 'exit_code': result['exit_code'],
-                           'duration_s': result['duration_s'],
-                           'stdout_tail': result['stdout'][-3000:],
-                           'stderr_tail': result['stderr'][-1500:],
-                           **({'error': result['error']} if result.get('error') else {})})
-            results.append({'work': cmd_name, **result})
-        if results:
-            summary = await self.model.ask(
-                self.name, 'lane-analyst',
-                self.analysis_prompt + ' Never propose executing anything; '
-                'you are read-only analysis over returned output.',
-                json.dumps({'program': self.program,
-                            'results': [{'work': r['work'],
-                                         'exit': r['exit_code'],
-                                         'stdout_tail': r['stdout'][-2500:]}
-                                        for r in results]}))
-            if summary:
-                self.log.emit(self.name, 'lane-analyst', 'analysis',
-                              {'summary': summary[:2000]})
+    def inhibit(self, payload):
+        """A stage found the lane unable to work (no scope, unpinned VPS).
+        Demote to idle ONCE; stay silent on later cycles until a reload
+        rebuilds this lane object."""
+        self._inhibited = True
+        self.enter_mode('idle', payload)
 
     async def cycle(self):
         if _kill_switch_active():
-            self._paused_event()
+            self.enter_mode('paused', {'reason': 'kill switch'})
             return
-        if not self.configured:
-            self.log.emit(self.name, 'fast-path', 'unconfigured',
-                          {'note': 'declare targets in fast_lanes.json; '
-                                   'no requests run without an explicit scope'})
+        if not self.enabled:
+            self.enter_mode('idle', {'note': 'enabled=false in fast_lanes.json'})
             return
-        if self.executor is not None:
-            return await self._vps_cycle()
+        if self._inhibited:
+            return  # already announced why; silence until reload
+        self.enter_mode('running', {'cadence_s': self.cadence_s})
+        facts = {}
+        for stage in self.stages:
+            try:
+                await stage.run(facts)
+            except Exception as e:
+                self.note(stage.AGENT, 'stage_error',
+                          {'stage': stage.kind, 'error': str(e)[:300]})
+        self.last_cycle_ts = time.time()
+
+
+class HttpGetStage:
+    """GET-only observation of declared targets. Recon semantics when the
+    lane declares `program`; plain surface-watch otherwise. Never touches
+    a host outside `targets`, never issues anything but GET."""
+    KIND = 'http_get'
+    AGENT = 'lane-observer'
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.program = cfg.get('program') or ''
+        self.targets = [t for t in (cfg.get('targets') or [])
+                        if isinstance(t, str) and t.strip()]
+        self.rate_limit_s = max(0.0, float(cfg.get('rate_limit_s', 2.0)))
+        self._last = {}
+        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False)
+
+    def validate(self, seen_kinds):
+        pass
+
+    async def run(self, facts):
+        lane = self.lane
+        if not self.targets:
+            lane.inhibit({'note': 'declare targets; no requests run '
+                                  'without an explicit scope'})
+            return
         findings = []
         for target in self.targets:
             url = target if target.startswith('http') else f'https://{target}'
@@ -454,172 +490,372 @@ class HttpWatchLane(BaseLane):
                     findings.append({'type': 'error_surface', **obs})
             except Exception as e:
                 findings.append({'type': 'fetch_failed', 'url': url, 'error': str(e)[:120]})
-        self.log.emit(self.name, 'lane-observer', 'cycle',
-                      {'program': self.program, 'findings': findings,
-                       'targets': len(self.targets)})
-        summary = await self.model.ask(
-            self.name, 'lane-analyst',
-            self.analysis_prompt + ' Never act outside the declared scope.',
-            json.dumps({'program': self.program, 'observations': findings}))
-        if summary:
-            self.log.emit(self.name, 'lane-analyst', 'analysis', {'summary': summary[:2000]})
+        facts['observations'] = findings
+        lane.note(self.AGENT, 'cycle', {'program': self.program,
+                                        'findings': findings,
+                                        'targets': len(self.targets)})
 
 
-class PaperMarketsLane(BaseLane):
-    """Simulated fills against public spot prices. There is NO order-placement
-    code path in this file. Caps are structural; the kill switch pauses."""
+class VpsDispatchStage:
+    """Work happens on the VPS; this machine only dispatches, observes,
+    and keeps the receipts. Every dispatch is a declared work item."""
+    KIND = 'vps_dispatch'
+    AGENT = 'lane-dispatcher'
 
-    PRICE_SOURCES = {'coinbase_spot': 'https://api.coinbase.com/v2/prices/{symbol}/spot'}
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.work = [{'name': (w or {}).get('name') or '',
+                      'command': (w or {}).get('command') or ''}
+                     for w in (cfg.get('work') or [])
+                     if isinstance(w, dict) and (w or {}).get('command')]
+        self.work_timeout_s = float(cfg.get('work_timeout_s', 120))
+        self.executor = VpsExecutor(cfg.get('executor') or {})
 
-    def __init__(self, cfg, log, model):
-        super().__init__(cfg, log, model)
-        self.price_source = self.cfg.get('price_source', 'coinbase_spot')
-        self.symbols = [s for s in (self.cfg.get('symbols') or []) if isinstance(s, str) and s]
-        self.notional = min(float(self.cfg.get('notional', 100)), MAX_NOTIONAL_PER_TRADE)
-        self.band_pct = float(self.cfg.get('band_pct', 2.0))
-        self.analysis_prompt = self.cfg.get('analysis_prompt') or (
-            'You are a trading analyst on a PAPER trading lane. No real money. '
-            'One short paragraph on price action and positions. Never give '
-            'financial advice; this is system telemetry commentary.')
-        self.window = int(self.cfg.get('window', 30))
-        self._prices = {s: deque(maxlen=self.window) for s in self.symbols}
-        self._portfolio = {s: {'units': 0.0, 'cash': 1000.0} for s in self.symbols}
-        self._trades_today = {}
-        self._cycles = 0
-        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+    def validate(self, seen_kinds):
+        pass
 
     @property
     def configured(self):
-        return bool(self.symbols) and self.price_source in self.PRICE_SOURCES
+        return self.executor.configured
 
-    async def _spot(self, symbol):
-        r = await self._client.get(self.PRICE_SOURCES[self.price_source].format(symbol=symbol))
-        r.raise_for_status()
-        return float(r.json()['data']['amount'])
+    async def run(self, facts):
+        lane = self.lane
+        if not self.executor.configured:
+            lane.inhibit({'missing': self.executor.missing(),
+                          'note': 'executor fails closed until the VPS is '
+                                  'declared and pinned'})
+            return
+        if not self.work:
+            lane.inhibit({'note': 'declare the work list; the VPS runs '
+                                  'nothing the config did not name'})
+            return
+        results = []
+        for item in self.work:
+            lane.note(self.AGENT, 'dispatch',
+                      {'work': item['name'], 'host': self.executor.host})
+            result = await asyncio.to_thread(
+                self.executor.run, item['command'], self.work_timeout_s)
+            lane.note(self.AGENT, 'result',
+                      {'work': item['name'], 'exit_code': result['exit_code'],
+                       'duration_s': result['duration_s'],
+                       'stdout_tail': result['stdout'][-3000:],
+                       'stderr_tail': result['stderr'][-1500:],
+                       **({'error': result['error']} if result.get('error') else {})})
+            results.append({'work': item['name'], **result})
+        facts['work_results'] = results
+
+
+class PriceSpotStage:
+    """Public spot prices from a whitelisted source. No keys, no orders."""
+    KIND = 'price_spot'
+    AGENT = 'lane-markets'
+    SOURCES = {'coinbase_spot': 'https://api.coinbase.com/v2/prices/{symbol}/spot'}
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.source = cfg.get('source', 'coinbase_spot')
+        if self.source not in self.SOURCES:
+            raise StageError(f'unknown price source {self.source!r} '
+                             f'(known: {sorted(self.SOURCES)})')
+        self.symbols = [s for s in (cfg.get('symbols') or [])
+                        if isinstance(s, str) and s]
+        if not self.symbols:
+            raise StageError('price_spot needs symbols')
+        self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+
+    def validate(self, seen_kinds):
+        pass
+
+    async def run(self, facts):
+        lane = self.lane
+        ticks = {}
+        for symbol in self.symbols:
+            try:
+                r = await self._client.get(self.SOURCES[self.source].format(symbol=symbol))
+                r.raise_for_status()
+                ticks[symbol] = float(r.json()['data']['amount'])
+            except Exception as e:
+                lane.note(self.AGENT, 'price_degraded',
+                          {'symbol': symbol, 'error': str(e)[:120]})
+        facts['prices'] = ticks
+
+
+class SmaBandStage:
+    """Rule decision over price ticks: buy below the band, sell above,
+    hold inside. Needs no model; works when the model is degraded."""
+    KIND = 'sma_band'
+    AGENT = 'lane-markets'
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.window = max(2, int(cfg.get('window', 30)))
+        self.band_pct = float(cfg.get('band_pct', 2.0))
+        self._prices = {}
+
+    def validate(self, seen_kinds):
+        if 'price_spot' not in seen_kinds:
+            raise StageError('sma_band needs a price_spot stage before it')
+
+    async def run(self, facts):
+        decisions = {}
+        for symbol, price in (facts.get('prices') or {}).items():
+            win = self._prices.setdefault(symbol, deque(maxlen=self.window))
+            win.append(price)
+            if len(win) < 10:
+                decisions[symbol] = {'action': 'hold', 'why': 'warming up'}
+                continue
+            sma = sum(win) / len(win)
+            drift = (price - sma) / sma * 100
+            if drift <= -self.band_pct:
+                decisions[symbol] = {'action': 'buy',
+                                     'why': f'{drift:.2f}% below {len(win)}-tick SMA'}
+            elif drift >= self.band_pct:
+                decisions[symbol] = {'action': 'sell',
+                                     'why': f'{drift:.2f}% above {len(win)}-tick SMA'}
+            else:
+                decisions[symbol] = {'action': 'hold', 'why': 'inside band'}
+        facts['decisions'] = decisions
+        for symbol, d in decisions.items():
+            if d['action'] == 'hold':
+                self.lane.note(self.AGENT, 'tick',
+                               {'symbol': symbol,
+                                'price': facts['prices'].get(symbol),
+                                'note': d['why']})
+
+
+class PaperFillStage:
+    """Simulated fills with structural caps. State persists in the lane DB
+    (unchained) so reloads and restarts keep positions. There is NO
+    order-placement code path to any exchange anywhere in this file."""
+    KIND = 'paper_fill'
+    AGENT = 'lane-markets'
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.notional = min(float(cfg.get('notional', 100)), MAX_NOTIONAL_PER_TRADE)
+
+    def validate(self, seen_kinds):
+        if 'price_spot' not in seen_kinds:
+            raise StageError('paper_fill needs a price_spot stage before it')
+        if 'sma_band' not in seen_kinds:
+            raise StageError('paper_fill needs a decide stage (sma_band) before it')
 
     def _today(self):
         return datetime.now(timezone.utc).strftime('%Y-%m-%d')
 
-    def _decide(self, symbol, price):
-        win = self._prices[symbol]
-        win.append(price)
-        if len(win) < 10:
-            return 'hold', 'warming up'
-        sma = sum(win) / len(win)
-        drift = (price - sma) / sma * 100
-        if drift <= -self.band_pct:
-            return 'buy', f'{drift:.2f}% below {len(win)}-tick SMA'
-        if drift >= self.band_pct:
-            return 'sell', f'{drift:.2f}% above {len(win)}-tick SMA'
-        return 'hold', 'inside band'
-
-    def _paper_fill(self, symbol, action, price):
-        day = self._today()
-        if self._trades_today.get(day, 0) >= MAX_TRADES_PER_DAY:
-            return None, 'daily trade cap reached'
-        pos = self._portfolio[symbol]
-        units = self.notional / price
-        if action == 'buy':
-            if pos['cash'] < self.notional:
-                return None, 'insufficient paper cash'
-            pos['cash'] -= self.notional
-            pos['units'] += units
-        else:
-            if pos['units'] < units:
-                units = pos['units']
-                if units <= 0:
-                    return None, 'no position to sell'
-            pos['units'] -= units
-            pos['cash'] += units * price
-        self._trades_today[day] = self._trades_today.get(day, 0) + 1
-        return {'symbol': symbol, 'action': action, 'price': price,
-                'units': round(units, 8), 'notional': round(units * price, 2),
-                'portfolio': {k: round(v, 4) for k, v in pos.items()}}, None
-
-    async def cycle(self):
-        self._cycles += 1
-        if _kill_switch_active():
-            self._paused_event()
-            return
-        if not self.configured:
-            self.log.emit(self.name, 'fast-path', 'unconfigured',
-                          {'note': 'declare symbols and a supported price_source '
-                                   'in fast_lanes.json'})
-            return
-        ticks = {}
-        for symbol in self.symbols:
-            try:
-                ticks[symbol] = await self._spot(symbol)
-            except Exception as e:
-                self.log.emit(self.name, 'lane-markets', 'price_degraded',
-                              {'symbol': symbol, 'error': str(e)[:120]})
-        actions = []
-        for symbol, price in ticks.items():
-            action, why = self._decide(symbol, price)
-            if action in ('buy', 'sell'):
-                fill, blocked = self._paper_fill(symbol, action, price)
-                if fill:
-                    actions.append(fill)
-                    self.log.emit(self.name, 'lane-markets', 'paper_fill', fill)
-                elif blocked:
-                    self.log.emit(self.name, 'lane-markets', 'fill_blocked',
-                                  {'symbol': symbol, 'reason': blocked})
+    async def run(self, facts):
+        lane = self.lane
+        state = lane.log.load_state(lane.name, {}) or {}
+        portfolio = state.get('portfolio') or {}
+        for s in facts.get('prices', {}):
+            portfolio.setdefault(s, {'units': 0.0, 'cash': 1000.0})
+        trades_today = state.get('trades_today') or {}
+        if trades_today.get('day') != self._today():
+            trades_today = {'day': self._today(), 'count': 0}
+        for symbol, decision in (facts.get('decisions') or {}).items():
+            action = decision.get('action')
+            if action not in ('buy', 'sell'):
+                continue
+            price = facts['prices'][symbol]
+            if trades_today['count'] >= MAX_TRADES_PER_DAY:
+                lane.note(self.AGENT, 'fill_blocked',
+                          {'symbol': symbol, 'reason': 'daily trade cap reached'})
+                continue
+            pos = portfolio.setdefault(symbol, {'units': 0.0, 'cash': 1000.0})
+            units = self.notional / price
+            if action == 'buy':
+                if pos['cash'] < self.notional:
+                    lane.note(self.AGENT, 'fill_blocked',
+                              {'symbol': symbol, 'reason': 'insufficient paper cash'})
+                    continue
+                pos['cash'] -= self.notional
+                pos['units'] += units
             else:
-                self.log.emit(self.name, 'lane-markets', 'tick',
-                              {'symbol': symbol, 'price': price, 'note': why})
-        if self._cycles % 5 == 0 and ticks:
-            summary = await self.model.ask(
-                self.name, 'lane-analyst', self.analysis_prompt,
-                json.dumps({'prices': ticks, 'actions': actions,
-                            'portfolio': self._portfolio}))
-            if summary:
-                self.log.emit(self.name, 'lane-analyst', 'analysis', {'summary': summary[:2000]})
+                if pos['units'] < units:
+                    units = pos['units']
+                if units <= 0:
+                    lane.note(self.AGENT, 'fill_blocked',
+                              {'symbol': symbol, 'reason': 'no position to sell'})
+                    continue
+                pos['units'] -= units
+                pos['cash'] += units * price
+            trades_today['count'] += 1
+            fill = {'symbol': symbol, 'action': action, 'price': price,
+                    'units': round(units, 8), 'notional': round(units * price, 2),
+                    'portfolio': {k: round(v, 4) for k, v in pos.items()}}
+            facts.setdefault('fills', []).append(fill)
+            lane.note(self.AGENT, 'paper_fill', fill)
+        lane.log.save_state(lane.name, {'portfolio': portfolio,
+                                        'trades_today': trades_today})
 
 
-LANE_TYPES = {'http_watch': HttpWatchLane, 'paper_markets': PaperMarketsLane}
+class LlmAnalyzeStage:
+    """Read-only model commentary. Cadence-throttled (every N cycles);
+    a degraded model costs the lane nothing but one logged event. Model
+    output is recorded as text and NEVER executed."""
+    KIND = 'llm'
+    AGENT = 'lane-analyst'
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+        self.prompt = cfg.get('prompt') or (
+            'You are an analyst. Be concise: list anything unusual worth a '
+            'human look, or say "nothing notable".')
+        self.every = max(1, int(cfg.get('every', 1)))
+        self.max_input_chars = int(cfg.get('max_input_chars', 6000))
+        self._cycles = 0
+
+    def validate(self, seen_kinds):
+        pass
+
+    async def run(self, facts):
+        self._cycles += 1
+        if self._cycles % self.every != 0:
+            return
+        if not any(k in facts for k in ('observations', 'work_results', 'prices', 'fills')):
+            return
+        payload = {k: facts[k] for k in
+                   ('observations', 'work_results', 'prices', 'fills', 'decisions')
+                   if k in facts}
+        summary = await self.lane.model.ask(
+            self.lane.name, self.AGENT,
+            self.prompt + ' You are read-only analysis over returned data; '
+            'never propose executing anything.',
+            json.dumps(payload, default=str)[:self.max_input_chars])
+        if summary:
+            self.lane.note(self.AGENT, 'analysis', {'summary': summary[:2000]})
+
+
+class LogFactsStage:
+    """Record the cycle's facts as one lane event (for lanes that only
+    watch and report)."""
+    KIND = 'log'
+    AGENT = 'lane-observer'
+
+    def __init__(self, cfg, lane):
+        self.kind = self.KIND
+        self.lane = lane
+
+    def validate(self, seen_kinds):
+        pass
+
+    async def run(self, facts):
+        self.lane.note(self.AGENT, 'facts', facts)
+
+
+STAGE_REGISTRY = {
+    HttpGetStage.KIND: HttpGetStage,
+    VpsDispatchStage.KIND: VpsDispatchStage,
+    PriceSpotStage.KIND: PriceSpotStage,
+    SmaBandStage.KIND: SmaBandStage,
+    PaperFillStage.KIND: PaperFillStage,
+    LlmAnalyzeStage.KIND: LlmAnalyzeStage,
+    LogFactsStage.KIND: LogFactsStage,
+}
 
 
 def build_lanes(cfg, log, model):
-    """Instantiate every declared lane; unknown types fail visibly and are
-    skipped rather than crashing the service."""
-    lanes = []
+    """Instantiate every declared lane; bad declarations fail visibly and
+    are skipped rather than crashing the service."""
+    lanes, rejected = [], []
+    names = set()
     for i, lane_cfg in enumerate(cfg.get('lanes') or []):
-        lane_type = (lane_cfg or {}).get('type')
-        cls = LANE_TYPES.get(lane_type)
-        if not cls:
-            log.emit('system', 'fast-path', 'lane_rejected',
-                     {'index': i, 'type': lane_type,
-                      'known_types': sorted(LANE_TYPES)})
+        name = (lane_cfg or {}).get('name')
+        if name in names:
+            rejected.append({'index': i, 'name': name,
+                             'error': 'duplicate lane name'})
             continue
+        names.add(name)
         try:
-            lanes.append(cls(lane_cfg, log, model))
+            lanes.append(Lane(lane_cfg, log, model))
+        except StageError as e:
+            rejected.append({'index': i,
+                             'name': (lane_cfg or {}).get('name'),
+                             'error': str(e)})
         except Exception as e:
-            log.emit('system', 'fast-path', 'lane_error',
-                     {'index': i, 'error': str(e)[:300]})
+            rejected.append({'index': i,
+                             'name': (lane_cfg or {}).get('name'),
+                             'error': str(e)[:300]})
+    for r in rejected:
+        log.emit('system', 'fast-path', 'lane_rejected', r)
     return lanes
 
 
-app = FastAPI()
-LOG = MODEL = None
-LANES = []
+class LaneSupervisor:
+    """Owns the lane tasks; hot-reloads the config file on change. Reloads
+    rebuild lane objects (paper state survives in the lane DB) and restart
+    their loops."""
+
+    def __init__(self, log, model):
+        self.log = log
+        self.model = model
+        self.lanes = []
+        self.tasks = {}
+        self._mtime = None
+        self._stop = asyncio.Event()
+
+    def _load_config(self):
+        if not Path(CONFIG_PATH).is_file():
+            return {}
+        return json.loads(Path(CONFIG_PATH).read_text())
+
+    async def start(self):
+        await self.reload(force=True)
+        asyncio.create_task(self._reload_loop())
+
+    async def reload(self, force=False):
+        try:
+            mtime = (Path(CONFIG_PATH).stat().st_mtime
+                     if Path(CONFIG_PATH).is_file() else None)
+        except OSError:
+            mtime = None
+        if not force and mtime == self._mtime:
+            return
+        self._mtime = mtime
+        try:
+            cfg = self._load_config()
+        except Exception as e:
+            self.log.emit('system', 'fast-path', 'config_error',
+                          {'error': str(e)[:300]})
+            return
+        old = {l.name: l for l in self.lanes}
+        lanes = build_lanes(cfg, self.log, self.model)
+        # Stop loops for lanes that disappeared or changed definition.
+        new_by_name = {l.name: l for l in lanes}
+        for name, task in list(self.tasks.items()):
+            if name not in new_by_name or \
+                    json.dumps(new_by_name[name].cfg, sort_keys=True, default=str) != \
+                    json.dumps(old.get(name).cfg if old.get(name) else None,
+                               sort_keys=True, default=str):
+                task.cancel()
+                self.tasks.pop(name, None)
+        self.log.emit('system', 'fast-path', 'reload',
+                      {'lanes': [l.name for l in lanes]})
+        for lane in lanes:
+            if lane.name not in self.tasks:
+                self.tasks[lane.name] = asyncio.create_task(_lane_loop(lane))
+        self.lanes = lanes
+
+    async def _reload_loop(self):
+        while True:
+            await asyncio.sleep(RELOAD_POLL_S)
+            try:
+                await self.reload()
+            except Exception as e:
+                self.log.emit('system', 'fast-path', 'reload_error',
+                              {'error': str(e)[:200]})
 
 
-@app.on_event('startup')
-async def _startup():
-    # All construction happens at startup, never at import: importing this
-    # module (as the tests do) must not open the real lane DB, create the
-    # key file, or start threads.
-    global LOG, MODEL
-    LOG = LaneLog()
-    MODEL = FastModel(LOG)
-    cfg = json.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.is_file() else {}
-    LANES[:] = build_lanes(cfg, LOG, MODEL)
-    LOG.emit('system', 'fast-path', 'boot',
-             {'model': FAST_MODEL, 'port': FAST_PORT,
-              'kill_switch': str(KILL_SWITCH_PATH),
-              'lanes': [l.name for l in LANES]})
-    for lane in LANES:
-        asyncio.create_task(_lane_loop(lane))
+def rejected_names(cfg, lanes, log):
+    declared = {(l.get('name') if isinstance(l, dict) else None)
+                for l in (cfg.get('lanes') or [])}
+    built = {l.name for l in lanes}
+    return sorted(n for n in declared - built if n)
 
 
 async def _lane_loop(lane):
@@ -629,11 +865,29 @@ async def _lane_loop(lane):
         try:
             await asyncio.wait_for(lane.cycle(), timeout=budget)
         except asyncio.TimeoutError:
-            LOG.emit(lane.name, 'fast-path', 'cycle_overrun', {'budget_s': budget})
+            lane.note('fast-path', 'cycle_overrun', {'budget_s': budget})
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            LOG.emit(lane.name, 'fast-path', 'cycle_error', {'error': str(e)[:300]})
+            lane.note('fast-path', 'cycle_error', {'error': str(e)[:300]})
         elapsed = time.monotonic() - started
         await asyncio.sleep(max(1.0, lane.cadence_s - elapsed))
+
+
+app = FastAPI()
+LOG = MODEL = SUPERVISOR = None
+
+
+@app.on_event('startup')
+async def _startup():
+    # All construction happens at startup, never at import: importing this
+    # module (as the tests do) must not open the real lane DB, create the
+    # key file, or start threads.
+    global LOG, MODEL, SUPERVISOR
+    LOG = LaneLog()
+    MODEL = FastModel(LOG)
+    SUPERVISOR = LaneSupervisor(LOG, MODEL)
+    await SUPERVISOR.start()
 
 
 @app.get('/status')
@@ -641,16 +895,14 @@ async def status():
     return JSONResponse({
         'model': FAST_MODEL,
         'kill_switch': _kill_switch_active(),
-        'lanes': [{'name': l.name, 'type': type(l).__name__,
-                   'configured': l.configured,
-                   'cadence_s': l.cadence_s,
-                   'symbols': getattr(l, 'symbols', None),
-                   'program': getattr(l, 'program', None),
-                   'executor': (None if not getattr(l, 'executor', None)
-                                else {'kind': 'vps', 'host': l.executor.host,
-                                      'configured': l.executor.configured,
-                                      'missing': l.executor.missing()}),
-                   'portfolio': getattr(l, '_portfolio', None)} for l in LANES],
+        'config_mtime': (Path(CONFIG_PATH).stat().st_mtime
+                         if Path(CONFIG_PATH).is_file() else None),
+        'lanes': [{'name': l.name, 'enabled': l.enabled,
+                   'mode': l.mode, 'cadence_s': l.cadence_s,
+                   'stages': [s.kind for s in l.stages],
+                   'last_cycle_ts': l.last_cycle_ts,
+                   'portfolio': (l.log.load_state(l.name, {}) or {}).get('portfolio')}
+                  for l in SUPERVISOR.lanes],
         'chain_head': LOG.head(),
         'chain_problems': LOG.verify(),
         'recent': LOG.recent(limit=12),
