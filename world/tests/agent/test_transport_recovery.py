@@ -60,8 +60,40 @@ class TransportRecovery(unittest.TestCase):
         self.assertFalse(transport_recovery.queue(
             state, task, {'ok': False, 'infra': True, 'budgetExhausted': True}, 100000))
 
-    def test_non_coding_task_is_not_transport_retry(self):
+    def test_non_coding_infra_failure_is_retried_with_backoff(self):
+        # A non-coding card whose model call failed on transport must be
+        # re-queued on the SAME story (reviewOf), not auto-closed into churn.
         state, task = fixture()
         state['tasks']['p']['taskType'] = 'spike'
         task['taskType'] = 'spike'
-        self.assertFalse(transport_recovery.queue(state, task, failure(), 100000))
+        self.assertEqual(transport_recovery.queue(state, task, failure(), 100000), 'queued')
+        queued = state['workQueue']
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]['reviewOf'], 'p')
+        self.assertEqual(queued[0]['title'], task.get('title'))
+        self.assertEqual(state['tasks']['p']['status'], 'repairing')
+        self.assertFalse(state['tasks']['p']['manualAttention'])
+        # Retries follow the non-coding schedule: first is immediate, second waits.
+        self.assertEqual(queued[0]['notBefore'], 100000)
+        state['workQueue'] = []
+        self.assertEqual(transport_recovery.queue(state, task, failure(), 200000), 'queued')
+        self.assertGreaterEqual(state['workQueue'][0]['notBefore'] - 200000, 60000)
+
+    def test_non_coding_non_infra_failure_is_not_transport_retry(self):
+        state, task = fixture()
+        state['tasks']['p']['taskType'] = 'spike'
+        task['taskType'] = 'spike'
+        self.assertFalse(transport_recovery.queue(
+            state, task, {'ok': False, 'note': 'the pipeline did not pass'}, 100000))
+
+    def test_non_coding_retry_limit_blocks(self):
+        state, task = fixture()
+        state['tasks']['p']['taskType'] = 'spike'
+        task['taskType'] = 'spike'
+        for now in (100000, 200000, 400000):
+            state['workQueue'] = []
+            self.assertEqual(transport_recovery.queue(state, task, failure(), now), 'queued')
+        state['workQueue'] = []
+        self.assertEqual(transport_recovery.queue(state, task, failure(), 800000), 'blocked')
+        self.assertEqual(state['tasks']['p']['status'], 'blocked')
+        self.assertTrue(state['tasks']['p']['manualAttention'])

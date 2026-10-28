@@ -33,7 +33,9 @@ def queue(state, task, result, now_ms):
               or parent.get('taskType') in ('code', 'qa', 'bug')
               or bool(task.get('writtenPy')) or bool(parent.get('writtenPy'))
               or 'coding model request failed' in note.lower())
-    if not coding:
+    if not coding and result.get('infra') is not True:
+        # A non-coding failure with no explicit infra tag is the agent's own
+        # poor quality, not transport: let the normal failure path handle it.
         return False
     if any(q.get('reviewOf') == parent['id'] and q.get('taskType') not in ('review', 'qa')
            for q in state.get('workQueue', [])):
@@ -48,7 +50,12 @@ def queue(state, task, result, now_ms):
         return 'blocked'
     retry['attempts'] += 1
     attempt = retry['attempts']
-    delay = 0 if attempt == 1 else min(900000, 15000 * 2 ** min(attempt - 2, 6))
+    if coding:
+        delay = 0 if attempt == 1 else min(900000, 15000 * 2 ** min(attempt - 2, 6))
+    else:
+        # Non-coding retries re-run the whole request, so they cost a full
+        # model call: back off from the first attempt (60s doubling, 15m max).
+        delay = 0 if attempt == 1 else min(900000, 60000 * 2 ** min(attempt - 2, 4))
     retry.update(lastAttemptAt=now_ms, nextAttemptAt=now_ms + delay)
     retry['history'].append({'taskId': task['id'], 'at': now_ms,
                              'failure': note[:800], 'retryAt': now_ms + delay})
@@ -58,11 +65,19 @@ def queue(state, task, result, now_ms):
     parent.update(status='repairing', manualAttention=False, blockedReason=None,
                   _peerRepairPending=True, failureCategory='infrastructure',
                   deliveryState='queued',
-                  note='Model connection failed; retry queued with the existing workspace.',
-                  nextAction=('Resume the saved task immediately.' if not delay else
+                  note='Model connection failed; retry scheduled for this same story.',
+                  nextAction=('Retry the model request now.' if not delay else
                               'Retry the model request after scheduled transport backoff.'))
     parent.setdefault('_peerGate', {}).update(escalated=False, approvals=0,
                                               approvers=[], acceptanceVerified=False)
+    if coding:
+        resume_instruction = ('The previous model connection ended without a response. Resume the saved '
+                              'workspace; make small edits, preserve all acceptance criteria and rerun '
+                              'quality checks before independent review.')
+    else:
+        resume_instruction = ('The previous model connection ended without a response. Redo the original '
+                              'request from scratch; this is a transient infrastructure fault, not a '
+                              'rejection of your work.')
     import sim
     sim.queue_work(state, [{
         'title': task.get('title') or 'Retry model request',
@@ -73,8 +88,7 @@ def queue(state, task, result, now_ms):
         'reviewOf': parent['id'],
         'reviewAuthorId': parent.get('originalAssignedTo') or parent.get('assignedTo'),
         'instructions': str(task.get('instructions') or parent.get('instructions') or '')
-            + '\nThe previous model connection ended without a response. Resume the saved workspace; '
-              'make small edits, preserve all acceptance criteria and rerun quality checks before independent review.',
+            + '\n' + resume_instruction,
         'reviewContract': parent.get('reviewContract'),
         'acceptanceCriteria': parent.get('acceptanceCriteria'),
         'workOrderId': parent.get('workOrderId'),
