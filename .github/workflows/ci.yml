@@ -160,18 +160,44 @@ jobs:
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part4.exit
           exit $code
 
-      - name: Test suite -- tests/integrations (part 5)
+      - name: Test suite -- tests/integrations (part 5a)
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 35 | tail -n +29 | tr '\n' ' ')
-          echo "P5: $files $(date +%s.%N)" | tee ../part5.start
+          files="tests/integrations/test_mcp_client_edge_cases.py tests/integrations/test_mcp_client_registry.py"
+          echo "P5a: $files $(date +%s.%N)" | tee ../part5a.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
-          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5.exit
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5a.exit
+          exit $code
+      - name: Test suite -- tests/integrations (part 5b)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files="tests/integrations/test_mcp_client_stdio.py tests/integrations/test_mcp_tools.py"
+          echo "P5b: $files $(date +%s.%N)" | tee ../part5b.start
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
+          code=$?
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5b.exit
+          exit $code
+      - name: Test suite -- tests/integrations (part 5c)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files="tests/integrations/test_notify_escalations.py tests/integrations/test_notify_prefs.py tests/integrations/test_phone.py"
+          echo "P5c: $files $(date +%s.%N)" | tee ../part5c.start
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
+          code=$?
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5c.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 6)
