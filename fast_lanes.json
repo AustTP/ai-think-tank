@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Lane declarations for the fast path (world/server/fast_path.py).",
+    "Each entry under 'lanes' needs a unique 'name' and a 'type' from the",
+    "audited registry: http_watch (GET-only observation; declare program +",
+    "targets as the scope) or paper_markets (simulated fills against public",
+    "spot prices; no order-placement code path exists).",
+    "Unknown types are rejected visibly at boot and never run.",
+    "Kill switch: create the file data/fast-kill to pause every lane.",
+    "Tune or add lanes here without touching code; a new KIND of behavior",
+    "is a code change and gets reviewed like one."
+  ],
+  "lanes": [
+    {
+      "name": "bounty-recon",
+      "type": "http_watch",
+      "cadence_s": 300,
+      "program": "",
+      "targets": [],
+      "rate_limit_s": 2.0,
+      "analysis_prompt": "You are a bug bounty recon analyst. Work only within the declared scope. Be concise: list anything unusual worth a human look, or say \"nothing notable\"."
+    },
+    {
+      "name": "markets-paper",
+      "type": "paper_markets",
+      "cadence_s": 30,
+      "price_source": "coinbase_spot",
+      "symbols": ["BTC-USD", "ETH-USD"],
+      "notional": 100,
+      "band_pct": 2.0,
+      "window": 30
+    }
+  ]
+}
