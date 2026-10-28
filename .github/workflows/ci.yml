@@ -113,7 +113,31 @@ jobs:
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 13 | tr '\n' ' ')
           echo "Q1: $files"; free -m | head -2
+          set +e
+          set +e
+          set +e
+          set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
       - name: Test suite -- tests/integrations (quarter 2)
         working-directory: world
         if: always()
