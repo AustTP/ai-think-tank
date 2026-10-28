@@ -77,28 +77,28 @@ jobs:
       - name: Test suite -- tests/agent
         working-directory: world
         continue-on-error: true
-        run: python -m pytest tests/agent -v --tb=no -p no:cacheprovider
+        run: python -m pytest tests/agent -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/core
         working-directory: world
         continue-on-error: true
-        run: python -m pytest tests/core -v --tb=no -p no:cacheprovider
+        run: python -m pytest tests/core -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/integrations
         working-directory: world
         continue-on-error: true
-        run: python -m pytest tests/integrations -v --tb=no -p no:cacheprovider
+        run: python -m pytest tests/integrations -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
-        run: python -m pytest tests/server -v --tb=no -p no:cacheprovider
+        run: python -m pytest tests/server -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/tools
         working-directory: world
         continue-on-error: true
-        run: python -m pytest tests/tools -v --tb=no -p no:cacheprovider
+        run: python -m pytest tests/tools -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/village + JS harnesses
         working-directory: world
         continue-on-error: true
         run: |
-          python -m pytest tests/village -v --tb=no -p no:cacheprovider
+          python -m pytest tests/village -v --tb=line -p no:cacheprovider
           node tests/js_coverage.mjs
 
       - name: Coverage gate (world Python + JavaScript, 90% floor)
