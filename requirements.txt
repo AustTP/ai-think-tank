@@ -6,6 +6,7 @@
 # an unpinned dependency into the runtime unannounced). Bump deliberately:
 # pin the new version, run the full suite, commit.
 fastapi==0.115.11
+httpx==0.28.1  # starlette.testclient imports it; CI's suite step died on this for weeks (hidden behind the earlier gate failures)
 uvicorn==0.34.0
 websockets==15.0.1
 pydantic==2.13.4
