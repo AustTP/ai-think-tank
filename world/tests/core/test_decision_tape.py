@@ -321,3 +321,61 @@ def _call_feed(route, **params):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+class TapeConcurrencyTests(unittest.TestCase):
+    """Concurrent appends must never break the chain.
+
+    Regression for the 39 historical chain breaks (integrity alert
+    2026-10-28 10:01 EDT): _append_decision_tape read the head hash and
+    INSERTed in separate steps, so two threads under load both read head H
+    and the loser's row carried a prev_hash that was never the chain head.
+    The append path is now serialized by _TAPE_APPEND_LOCK.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='decision-tape-conc-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_concurrent_appends_keep_the_chain_intact(self):
+        import threading
+        threads_n, per_thread = 8, 25
+        errors = []
+
+        def worker(n):
+            try:
+                for i in range(per_thread):
+                    serve._append_decision_tape(
+                        'triage', f'model-{n}', f'prompt-{n}-{i}',
+                        {'q': f'{n}-{i}'}, f'choice-{n}-{i}', 0.9, 0.0001,
+                        {'answer': f'{n}-{i}'}, True)
+            except Exception as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(n,)) for n in range(threads_n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        self.assertEqual([t.is_alive() for t in threads], [False] * threads_n)
+        self.assertEqual(errors, [])
+
+        ok, problems = serve._verify_decision_tape()
+        breaks = [p for p in problems if 'chain break' in p.get('issue', '')]
+        self.assertEqual(breaks, [],
+                         f'chain breaks under concurrency: {breaks[:3]}')
+        self.assertTrue(ok, problems[:3])
+
+        # Row-count sanity: every append landed exactly once.
+        with serve._db() as conn:
+            count = conn.execute('SELECT COUNT(*) FROM decision_tape').fetchone()[0]
+        self.assertEqual(count, threads_n * per_thread)

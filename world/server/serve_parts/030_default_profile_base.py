@@ -629,6 +629,17 @@ def _verify_decision_tape(limit=100000, tail=0):
     return (not problems, problems)
 
 
+# Serializes the head-read + INSERT pair in _append_decision_tape. The tape's
+# chain integrity depends on nobody appending between "read the head hash" and
+# "insert"; two concurrent writers that both read head H interleave and the
+# loser's row carries a prev_hash that never existed in the chain. That race
+# is the root cause of the 39 historical chain breaks the integrity monitor
+# flagged on 2026-10-28 (each break = one lost interleaving under load, not
+# tampering). Every tape writer is a thread of this one server process, so a
+# process-wide lock closes the race completely.
+_TAPE_APPEND_LOCK = threading.Lock()
+
+
 def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None):
     # Best-effort, bounded record of a Jev decision call. A tape-write failure
     # must never fail the caller (the decision already happened), so swallow it.
@@ -639,7 +650,7 @@ def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cos
     # Every row is chained to the previous row's hash (HMAC-SHA256), so the
     # tape is tamper-evident end to end.
     try:
-        with _db() as conn:
+        with _TAPE_APPEND_LOCK, _db() as conn:
             if trace_id is None:
                 trace_id = secrets.token_hex(8)
             prev = conn.execute(
