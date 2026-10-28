@@ -100,24 +100,47 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/core -v --tb=line -p no:cacheprovider
-      - name: Test suite -- tests/integrations
+      # The hosted runner dies intermittently (flaky, not
+      # file-deterministic: two complete survivals, six kills at varying
+      # positions). Memory is NOT the cause (11 GB free at death). Split the
+      # directory into four SEPARATE STEPS so a death preserves the
+      # survivors' results and localizes the killer to one quarter.
+      - name: Test suite -- tests/integrations (quarter 1)
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        # The hosted runner dies intermittently mid-directory (five kills,
-        # two complete survivals -- flaky, not file-deterministic). Run the
-        # two halves as SEPARATE STEPS so a death preserves the survivor's
-        # results, echo memory around them, and keep tank_accounts ignored
-        # (it was associated with two early kills).
         run: |
-          files_a=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -26 | tr '\n' ' ')
-          files_b=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -26 | tr '\n' ' ')
-          echo "A: $files_a"; free -m | head -2
-          python -m pytest $files_a -v --tb=line -p no:cacheprovider
-          echo "B: $files_b"; free -m | head -2
-          python -m pytest $files_b -v --tb=line -p no:cacheprovider
-          free -m | head -2
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 13 | tr '\n' ' ')
+          echo "Q1: $files"; free -m | head -2
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+      - name: Test suite -- tests/integrations (quarter 2)
+        working-directory: world
+        if: always()
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 26 | tail -n +14 | tr '\n' ' ')
+          echo "Q2: $files"; free -m | head -2
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+      - name: Test suite -- tests/integrations (quarter 3)
+        working-directory: world
+        if: always()
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 39 | tail -n +27 | tr '\n' ' ')
+          echo "Q3: $files"; free -m | head -2
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+      - name: Test suite -- tests/integrations (quarter 4)
+        working-directory: world
+        if: always()
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +40 | tr '\n' ' ')
+          echo "Q4: $files"; free -m | head -2
+          python -m pytest $files -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
