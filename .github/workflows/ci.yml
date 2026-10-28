@@ -82,12 +82,9 @@ jobs:
       - name: Playwright chromium (browser tests)
         run: python -m playwright install --with-deps chromium
 
-      # The suite used to run as one step and the runner killed it ~2min in,
-      # losing all localization. Per-directory steps bound any kill to one
-      # directory and let the rest of the suite report independently.
-      # continue-on-error while the Linux-portability debt is triaged: every
-      # push reports ALL directories' failures at once instead of one per
-      # push. Remove these once the suite is green on the runner.
+      # The suite runs as per-directory steps (and integrations as parts) so
+      # any future runner-level event is bounded to one step and the rest of
+      # the suite still reports. All steps are required-green.
       - name: Test suite -- tests/agent
         working-directory: world
         env:
