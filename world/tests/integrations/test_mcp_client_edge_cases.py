@@ -201,3 +201,46 @@ def test_mcp_last_bits(tmp_path, monkeypatch):
     monkeypatch.setattr(m, 'get_server', lambda i: _spec())
     monkeypatch.setattr(m, '_get_session', lambda s, refresh=False: L())
     assert '(no tools returned)' in m.list_tools_text('s')
+
+
+def test_close_never_signals_a_resolved_group(tmp_path, monkeypatch):
+    # Regression: close() used to resolve the child's group with
+    # os.getpgid(proc.pid). On Linux getpgid(1) returns 0 and killpg(0)
+    # signals the CALLER'S OWN process group -- on a CI runner that kills
+    # the runner agent itself (six runner deaths). The group must be
+    # addressed as pgid == pid (our spawns are start_new_session=True),
+    # skipped entirely for fake pids <= 1, and fall back to child-only
+    # signals when the group kill fails.
+    import signal as _signal
+    killpg_calls = []
+    real_killpg = m.os.killpg
+    monkeypatch.setattr(m.os, 'killpg',
+                        lambda pgid, sig: killpg_calls.append((pgid, sig)))
+    monkeypatch.setattr(m.os, 'getpgid', lambda pid: 0)  # the Linux footgun
+    s = _spec(command=['x'])
+    s['request_timeout_s'] = 0.05
+    s['startup_timeout_s'] = 0.05
+    real_proc = types.SimpleNamespace(
+        pid=1,  # the mocked-Proc shape that used to reach getpgid/killpg
+        stdin=io.StringIO(), stderr=io.StringIO(), stdout=io.StringIO(''),
+        poll=lambda: 0, wait=lambda timeout=None: 0,
+        terminate=lambda: None, kill=lambda: None)
+    monkeypatch.setattr(m.subprocess, 'Popen', lambda *a, **k: real_proc)
+    sess = m.StdioSession(s)
+    sess.close()
+    # pid <= 1 must never reach killpg at all.
+    assert killpg_calls == [], f'killpg was called with {killpg_calls}'
+    assert sess.proc is None
+
+    # A REAL child pid (2+) is signaled at its own group id, never a
+    # getpgid-resolved one.
+    killpg_calls.clear()
+    real_proc = types.SimpleNamespace(
+        pid=4242, stdin=io.StringIO(), stderr=io.StringIO(),
+        stdout=io.StringIO(''), poll=lambda: None, wait=lambda timeout=None: 0,
+        terminate=lambda: None, kill=lambda: None)
+    monkeypatch.setattr(m.subprocess, 'Popen', lambda *a, **k: real_proc)
+    sess2 = m.StdioSession(s)
+    sess2.close()
+    assert all(pgid == 4242 for pgid, _sig in killpg_calls), killpg_calls
+    assert all(sig in (_signal.SIGTERM, _signal.SIGKILL) for _p, sig in killpg_calls)

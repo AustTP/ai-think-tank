@@ -488,28 +488,49 @@ class StdioSession(_BaseSession):
                 proc.stdin.close()
         except Exception:
             pass
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        except Exception:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+        # We spawn every stdio server with start_new_session=True, so the
+        # child IS its own process group and its pgid equals its pid. Signaling
+        # THAT group only ever reaches the child. Resolving the group via
+        # os.getpgid(pid) instead is a footgun: on Linux os.getpgid(1) succeeds
+        # and returns 0, and os.killpg(0) signals the CALLER'S OWN process
+        # group -- on a CI runner that is the runner agent itself (six runner
+        # deaths + one 22-minute hang, all "canceled" right after a pytest
+        # process whose tests left a mock-pid session in the atexit cache;
+        # macOS getpgid(1) raises, which is why local runs never saw it).
+        self._signal_child_group(signal.SIGTERM)
         try:
             proc.wait(timeout=2)
         except Exception:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
+            self._signal_child_group(signal.SIGKILL)
             try:
                 proc.wait(timeout=2)
             except Exception:
                 pass
         self.proc = None
+
+    def _signal_child_group(self, sig):
+        """SIGTERM/SIGKILL the child's own process group, never ours.
+
+        Guards: a real subprocess pid is > 1 (never init or the mocked
+        pid=1 test fakes), and the group is addressed as pgid == pid, which
+        holds for every child we spawn (start_new_session=True). If that
+        assumption ever fails, fall back to signaling ONLY the child
+        (proc.terminate/kill), never a resolved group."""
+        proc = self.proc
+        if not proc or not getattr(proc, 'pid', 0) or proc.pid <= 1:
+            return
+        try:
+            os.killpg(proc.pid, sig)
+            return
+        except (OSError, ProcessLookupError):
+            pass  # the group is gone or was never created -- fall through
+        try:
+            if sig == signal.SIGKILL:
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            pass
 
 
 class HttpSession(_BaseSession):
