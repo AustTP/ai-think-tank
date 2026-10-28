@@ -93,13 +93,13 @@ jobs:
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/agent -v --tb=line -p no:cacheprovider
+        run: python -m pytest tests/agent -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/core
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/core -v --tb=line -p no:cacheprovider
+        run: python -m pytest tests/core -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       # The hosted runner dies intermittently (flaky, not file-deterministic:
       # five complete survivals, six kills at varying positions, memory NOT the
       # cause). Eight SEPARATE STEPS so a death preserves the survivors'
@@ -113,7 +113,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 7 | tail -n +1 | tr '\n' ' ')
           echo "P1: $files $(date +%s.%N)" | tee ../part1.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part1.exit
           exit $code
@@ -127,7 +127,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 14 | tail -n +8 | tr '\n' ' ')
           echo "P2: $files $(date +%s.%N)" | tee ../part2.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part2.exit
           exit $code
@@ -141,7 +141,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 21 | tail -n +15 | tr '\n' ' ')
           echo "P3: $files $(date +%s.%N)" | tee ../part3.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part3.exit
           exit $code
@@ -155,7 +155,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 28 | tail -n +22 | tr '\n' ' ')
           echo "P4: $files $(date +%s.%N)" | tee ../part4.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part4.exit
           exit $code
@@ -169,7 +169,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 35 | tail -n +29 | tr '\n' ' ')
           echo "P5: $files $(date +%s.%N)" | tee ../part5.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5.exit
           exit $code
@@ -183,7 +183,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 42 | tail -n +36 | tr '\n' ' ')
           echo "P6: $files $(date +%s.%N)" | tee ../part6.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part6.exit
           exit $code
@@ -197,7 +197,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 49 | tail -n +43 | tr '\n' ' ')
           echo "P7: $files $(date +%s.%N)" | tee ../part7.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part7.exit
           exit $code
@@ -211,7 +211,7 @@ jobs:
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +50 | tr '\n' ' ')
           echo "P8: $files $(date +%s.%N)" | tee ../part8.start
           set +e
-          python -m pytest $files -v --tb=line -p no:cacheprovider
+          python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           code=$?
           echo "pytest exit: $code at $(date +%s.%N)" | tee ../part8.exit
           exit $code
@@ -229,20 +229,20 @@ jobs:
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/server -v --tb=line -p no:cacheprovider
+        run: python -m pytest tests/server -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/tools
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest tests/tools -v --tb=line -p no:cacheprovider
+        run: python -m pytest tests/tools -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/village + JS harnesses
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          python -m pytest tests/village -v --tb=line -p no:cacheprovider
+          python -m pytest tests/village -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
           node tests/js_coverage.mjs
 
       - name: Coverage gate (world Python + JavaScript, 90% floor)
