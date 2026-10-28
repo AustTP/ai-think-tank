@@ -10,6 +10,11 @@ The global switch OVERRIDES the team switch: nothing a team does can
 re-enable a globally blocked service, so an issue encountered in any of the
 three providers can be silenced tank-wide in one move while teams keep
 their own narrower, independent switches.
+
+The fourth service, 'paid', is not a pool endpoint: it switches off the LOW
+band's paid leg (the DB tier pick or a @provider:low pin) for the scope --
+the test/emergency lever that proves the free pool carries low-band work on
+its own. Mid/high/coding calls are untouched by it.
 """
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -18,7 +23,7 @@ import core.governance as governance
 
 router = APIRouter()
 
-SERVICES = ('gemini', 'groq', 'openrouter')
+SERVICES = ('gemini', 'groq', 'openrouter', 'paid')
 
 
 def _caller(request):

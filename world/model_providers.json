@@ -4,7 +4,9 @@
   "tiers": {},
   "free_pool": {
     "enabled": true,
-    "bands": ["low"],
+    "bands": [
+      "low"
+    ],
     "mode": "free-first",
     "endpoints": [
       {
@@ -14,45 +16,12 @@
         "model": "gemini-3.5-flash",
         "api_key_env": "GEMINI_API_KEY",
         "price_per_m": 0,
-        "extra": { "reasoning_effort": "none" },
+        "extra": {
+          "reasoning_effort": "none"
+        },
         "rpm": 10,
         "rpd": 250,
         "tpm": 250000
-      },
-      {
-        "name": "gemini-3.5-flash-lite",
-        "service": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-3.5-flash-lite",
-        "api_key_env": "GEMINI_API_KEY",
-        "price_per_m": 0,
-        "rpm": 15,
-        "rpd": 1000,
-        "tpm": 250000
-      },
-      {
-        "name": "groq-gpt-oss-120b",
-        "service": "groq",
-        "base_url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "openai/gpt-oss-120b",
-        "api_key_env": "GROQ_API_KEY",
-        "price_per_m": 0,
-        "pool_key": "groq",
-        "rpm": 30,
-        "rpd": 1000,
-        "tpm": 12000
-      },
-      {
-        "name": "groq-gpt-oss-20b",
-        "service": "groq",
-        "base_url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "openai/gpt-oss-20b",
-        "api_key_env": "GROQ_API_KEY",
-        "price_per_m": 0,
-        "pool_key": "groq",
-        "rpm": 30,
-        "rpd": 1000,
-        "tpm": 6000
       },
       {
         "name": "groq-qwen3.8-27b",
@@ -67,6 +36,17 @@
         "tpm": 6000
       },
       {
+        "name": "gemini-3.5-flash-lite",
+        "service": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "model": "gemini-3.5-flash-lite",
+        "api_key_env": "GEMINI_API_KEY",
+        "price_per_m": 0,
+        "rpm": 15,
+        "rpd": 1000,
+        "tpm": 250000
+      },
+      {
         "name": "openrouter-free",
         "service": "openrouter",
         "openrouter_free": true,
@@ -74,7 +54,20 @@
         "rpm": 20,
         "rpd": 1000,
         "tpm": 0
+      },
+      {
+        "name": "groq-gpt-oss-120b",
+        "service": "groq",
+        "base_url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "openai/gpt-oss-120b",
+        "api_key_env": "GROQ_API_KEY",
+        "price_per_m": 0,
+        "pool_key": "groq",
+        "rpm": 30,
+        "rpd": 1000,
+        "tpm": 12000
       }
-    ]
+    ],
+    "or_free_min_score": 20
   }
 }

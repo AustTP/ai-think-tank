@@ -767,6 +767,21 @@ def _openrouter_chat_post(body):
             raise
 
 
+def _is_low_paid_leg(model):
+    """Whether `model` IS the low band's paid leg: the DB tier pick for
+    'low', or the operator's @provider:low pin of it. Freepool slugs and
+    every other band are not. Only consulted while the paid switch is on, so
+    the DB read costs nothing in normal operation."""
+    if not isinstance(model, str) or model.startswith('@freepool:'):
+        return False
+    if model == '@provider:low':
+        return True
+    try:
+        return model == _raw_model_tier_slug('low')
+    except Exception:
+        return False
+
+
 def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
     """Where a failed call should be retried when the free pool is in play:
     a freepool slug falls through to the band's OTHER healthy free endpoints
@@ -797,7 +812,7 @@ def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
             if _freepool_ready(ep, band) and slug not in out:
                 out.append(slug)
         paid = _freepool_paid_fallback(model)
-        if paid and paid not in tried:
+        if paid and paid not in tried and not _low_paid_blocked():
             out.append(paid)
         return out
     try:
@@ -826,6 +841,14 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
+    paid_block = None if free_route else _low_paid_blocked()
+    if paid_block and _is_low_paid_leg(model):
+        # The paid switch is a test/emergency lever scoped to the LOW band's
+        # paid leg only: with it on, a low call either succeeds through the
+        # free pool or fails visibly here -- it never silently spends.
+        raise RuntimeError(f'The paid low tier is switched off by the '
+                           f'{paid_block} policy switch -- free pool could '
+                           f'not serve this call')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     # Keep reasoning for the tiers that benefit from it (coding, high, and mid --
@@ -1011,6 +1034,14 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):
         raise RuntimeError('OpenRouter API key is blocked after repeated auth failures -- swap the key in .env and reload env')
+    paid_block = None if free_route else _low_paid_blocked()
+    if paid_block and _is_low_paid_leg(model):
+        # The paid switch is a test/emergency lever scoped to the LOW band's
+        # paid leg only: with it on, a low call either succeeds through the
+        # free pool or fails visibly here -- it never silently spends.
+        raise RuntimeError(f'The paid low tier is switched off by the '
+                           f'{paid_block} policy switch -- free pool could '
+                           f'not serve this call')
     if is_model_circuit_broken(model):
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     if not _messages_pass_boundary_check(messages):

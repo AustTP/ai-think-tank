@@ -134,8 +134,14 @@ def _load_free_pool_config():
         })
     if not endpoints:
         return None
+    try:
+        min_score = pool.get('or_free_min_score')
+        min_score = None if min_score is None else float(min_score)
+    except (TypeError, ValueError):
+        min_score = None
     return {'enabled': True, 'bands': [b.strip() for b in bands],
-            'mode': mode, 'endpoints': endpoints}
+            'mode': mode, 'endpoints': endpoints,
+            'or_free_min_score': min_score}
 
 
 def _free_pool_cfg():
@@ -196,6 +202,11 @@ def _reload_free_pool_config():
 # those calls are not any team's work.
 
 FREE_POOL_SERVICES = ('gemini', 'groq', 'openrouter')
+# The paid switch rides the same policy document and the same team/global
+# scopes, but it is not a pool endpoint: it blocks the LOW band's paid leg
+# (the DB pick or a @provider:low pin) so the free pool can be tested with
+# no paid safety net underneath it. Mid/high/coding calls are untouched.
+POLICY_SERVICES = FREE_POOL_SERVICES + ('paid',)
 
 _FREE_POOL_ACTOR_TEAM: contextvars.ContextVar = contextvars.ContextVar(
     'free_pool_actor_team', default=None)
@@ -255,8 +266,8 @@ def _free_pool_policy():
         raw = {}
     policy = {
         'globalDisabled': {s: bool((raw.get('globalDisabled') or {}).get(s))
-                           for s in FREE_POOL_SERVICES},
-        'teams': {team: {s: bool((entry or {}).get(s)) for s in FREE_POOL_SERVICES}
+                           for s in POLICY_SERVICES},
+        'teams': {team: {s: bool((entry or {}).get(s)) for s in POLICY_SERVICES}
                   for team, entry in (raw.get('teams') or {}).items()
                   if isinstance(entry, dict)},
     }
@@ -287,6 +298,23 @@ def _freepool_service_blocked(ep):
     return None
 
 
+def _low_paid_blocked():
+    """'global' / 'team' / None: whether the LOW band's paid leg is switched
+    off for the current pick, by the same two-authority policy as the free
+    switches. Global overrides team; a team switch only bites calls stamped
+    with that team's actor."""
+    try:
+        policy = _free_pool_policy()
+        if policy['globalDisabled'].get('paid'):
+            return 'global'
+        team = _FREE_POOL_ACTOR_TEAM.get()
+        if team and (policy['teams'].get(team) or {}).get('paid'):
+            return 'team'
+    except Exception:
+        return None
+    return None
+
+
 def _utc_today():
     return time.strftime('%Y-%m-%d', time.gmtime())
 
@@ -304,11 +332,31 @@ def _freepool_minute_bucket(now=None):
     return int((now or time.time()) // 60)
 
 
+def _or_free_min_score():
+    """Score floor for the auto-picked OpenRouter-free model, on the band's
+    own benchmark. Data check (2026-10, artificial-analysis indexes): the
+    paid low pick (ling-3.1-flash) scores 41.1 on intelligence_index; the
+    best free candidates score 25.0-26.5 and the zero-price catalog tail
+    falls to 8.4. A floor of 20 keeps the coherent tier (aligned with the
+    weakest pool endpoint, gemini-3.5-flash-lite at 22.2, and the sublow
+    pick at 20.1) and drops models too weak for the band's 'follows basic
+    instructions' bar (gemma-4 16.7, nemotron-lightning 12.9, gpt-oss-20b
+    10.0, lfm-2.5 8.4). Overridable in model_providers.json ->
+    free_pool.or_free_min_score."""
+    try:
+        value = (_free_pool_cfg() or {}).get('or_free_min_score')
+        return 20.0 if value is None else float(value)
+    except (TypeError, ValueError):
+        return 20.0
+
+
 def _freepool_openrouter_free_model(band):
     """Best-scored zero-price catalog model for the band's benchmark, with a
     ban list for models OpenRouter refuses to serve outside agentic harnesses
     (confirmed live: some :free models 403 with 'only available on agentic
-    harnesses'). Reasoning-flavored ids are deprioritized: the tank's tight
+    harnesses') and a score floor (_or_free_min_score) so the auto-pick can
+    never serve a model weaker than the pool's weakest pinned endpoint.
+    Reasoning-flavored ids are deprioritized: the tank's tight
     max_tokens budgets starve hidden thinkers into null content, and a null
     answer routes to the paid pick anyway."""
     with _free_pool_lock:
@@ -327,8 +375,11 @@ def _freepool_openrouter_free_model(band):
         return None
     now = time.time()
     ranked = []
+    floor = _or_free_min_score()
     for model_id, score in rows:
         if not model_id or ':batch' in model_id:
+            continue
+        if score is None or score < floor:
             continue
         low = model_id.lower()
         penalty = 1000.0 if any(w in low for w in ('reason', 'think', '-r1')) else 0.0
@@ -392,14 +443,17 @@ def _freepool_route_for_band(band, force=False):
         cfg = _free_pool_cfg()
         if not cfg or band not in cfg['bands']:
             return None
+        paid_blocked = _low_paid_blocked()
         if not force:
-            if cfg['mode'] == 'paid-first':
+            if cfg['mode'] == 'paid-first' and not paid_blocked:
                 # The operator wants paid first: the picker never routes to
                 # the pool; the call layers' failure fallback does, via
-                # force=True.
+                # force=True. With the low paid leg switched off there is no
+                # paid alternative, so the pool serves.
                 return None
             if cfg['mode'] == 'budget-only':
-                if not (credits_pause_active() or _think_tank_spend_cap_exceeded()):
+                if not (credits_pause_active() or _think_tank_spend_cap_exceeded()
+                        or paid_blocked):
                     return None
         for ep in cfg['endpoints']:
             if _freepool_ready(ep, band):
@@ -564,7 +618,8 @@ def _freepool_status():
         cfg = _free_pool_cfg()
         if not cfg:
             return out
-        out.update({'enabled': True, 'mode': cfg['mode'], 'bands': list(cfg['bands'])})
+        out.update({'enabled': True, 'mode': cfg['mode'], 'bands': list(cfg['bands']),
+                    'paidBlocked': _low_paid_blocked()})
         now = time.time()
         for ep in cfg['endpoints']:
             with _free_pool_lock:

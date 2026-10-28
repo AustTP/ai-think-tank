@@ -218,7 +218,6 @@ class FreePoolPickerTests(unittest.TestCase):
         self.assertEqual(serve._freepool_openrouter_free_model('low'),
                          'goodmodel:free')
 
-
 class FreePoolPolicyTests(unittest.TestCase):
     def setUp(self):
         _reset_pool_state()
@@ -335,6 +334,31 @@ class FreePoolProviderTests(unittest.TestCase):
         self.assertNotEqual(serve._freepool_openrouter_free_model('low'), first)
 
 
+    def test_or_free_floor_drops_models_below_it(self):
+        _seed_db()
+        now = time.time()
+        with serve._db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO model_catalog (model_id, name, prompt_price, "
+                "completion_price, price_per_m, image_capable, scores, first_seen, "
+                "last_seen) VALUES ('weakmodel:free', 'Weak', 0, 0, 0, 0, NULL, ?, ?)",
+                (now, now))
+            conn.execute(
+                "INSERT OR REPLACE INTO model_benchmark_scores (model_id, benchmark, "
+                "score, evaluator, checked_at) VALUES ('weakmodel:free', "
+                "'intelligence_index', 15, 'aa', ?)", (now,))
+        # Default floor is 20: the 15-score model is skipped even though it is
+        # the only other zero-price candidate.
+        self.assertEqual(serve._freepool_openrouter_free_model('low'),
+                         'goodmodel:free')
+
+    def test_or_free_floor_config_override(self):
+        _seed_db()
+        _write_pool_config({**_POOL_CONFIG, 'or_free_min_score': 30})
+        # goodmodel:free scores 20, below a raised floor: nothing qualifies.
+        self.assertIsNone(serve._freepool_openrouter_free_model('low'))
+
+
 class FreePoolQuotaTests(unittest.TestCase):
     def setUp(self):
         _reset_pool_state()
@@ -372,7 +396,7 @@ _STARVED_RESULT = {'choices': [{'message': {'content': None}, 'finish_reason': '
                    'usage': {'cost': 0.0}}
 
 
-class CallLayerTests(unittest.TestCase):
+class _CallLayerBase(unittest.TestCase):
     def setUp(self):
         _reset_pool_state()
         _seed_db()
@@ -386,6 +410,8 @@ class CallLayerTests(unittest.TestCase):
             p.start()
         self.addCleanup(lambda: [p.stop() for p in self.patches])
 
+
+class CallLayerTests(_CallLayerBase):
     def test_free_route_allowed_during_credits_pause(self):
         with unittest.mock.patch.object(serve, 'credits_pause_active',
                                         return_value=True), \
@@ -468,6 +494,134 @@ class CallLayerTests(unittest.TestCase):
                                                       [{'role': 'user', 'content': 'hi'}],
                                                       64)
         self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+
+
+class PaidSwitchTests(_CallLayerBase):
+    """The 'paid' policy switch: blocks ONLY the low band's paid leg (the DB
+    pick or a @provider:low pin), scoped global/team like the free switches,
+    global overriding team."""
+
+    def _policy_state(self, policy):
+        return {'freePoolPolicy': policy}
+
+    def test_global_paid_block_raises_for_low_leg_only(self):
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value=self._policy_state({'globalDisabled': {'paid': True},
+                                                 'teams': {}})):
+            serve._invalidate_free_pool_policy_cache()
+            with self.assertRaisesRegex(RuntimeError,
+                                        'paid low tier is switched off by the global'):
+                serve._call_openrouter_once_sync('paid/low-model',
+                                                 [{'role': 'user', 'content': 'hi'}], 64)
+            # The mid band is untouched by the low-scoped switch.
+            with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                            return_value=_GOOD_RESULT):
+                result = serve._call_openrouter_once_sync(
+                    'paid/mid-model', [{'role': 'user', 'content': 'hi'}], 64)
+            self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+            # And the free pool itself keeps serving.
+            with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                            return_value=_GOOD_RESULT):
+                result = serve._call_openrouter_once_sync(
+                    '@freepool:low:gemini-x', [{'role': 'user', 'content': 'hi'}], 64)
+            self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+
+    def test_team_paid_block_scoped_to_actor(self):
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value=self._policy_state({'globalDisabled': {},
+                                                 'teams': {'t1': {'paid': True}}})):
+            serve._invalidate_free_pool_policy_cache()
+            serve._FREE_POOL_ACTOR_TEAM.set('t1')
+            with self.assertRaisesRegex(RuntimeError, 'team policy switch'):
+                serve._call_openrouter_once_sync('paid/low-model',
+                                                 [{'role': 'user', 'content': 'hi'}], 64)
+            # Unattributed calls (player chat, JEV quorum) are governed by the
+            # global switch only.
+            serve._FREE_POOL_ACTOR_TEAM.set(None)
+            with unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                            return_value=_GOOD_RESULT):
+                result = serve._call_openrouter_once_sync(
+                    'paid/low-model', [{'role': 'user', 'content': 'hi'}], 64)
+            self.assertEqual(result['choices'][0]['message']['content'], 'ok')
+
+    def test_global_overrides_team_for_paid(self):
+        serve._FREE_POOL_ACTOR_TEAM.set('t1')
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value=self._policy_state({'globalDisabled': {'paid': True},
+                                                 'teams': {'t1': {'paid': False}}})):
+            serve._invalidate_free_pool_policy_cache()
+            with self.assertRaisesRegex(RuntimeError, 'global policy switch'):
+                serve._call_openrouter_once_sync('paid/low-model',
+                                                 [{'role': 'user', 'content': 'hi'}], 64)
+
+    def test_provider_pin_low_leg_is_blocked_too(self):
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value=self._policy_state({'globalDisabled': {'paid': True},
+                                                 'teams': {}})), \
+             unittest.mock.patch.object(serve, 'MODEL_PROVIDER_OVERRIDES',
+                                        {'tiers': {'low': {'provider': 'custom',
+                                                           'base_url': 'https://x.example/v1',
+                                                           'model': 'pinned-low',
+                                                           'api_key_env': 'X',
+                                                           'price_per_m': 0.5}}}), \
+             unittest.mock.patch.object(serve, '_load_env', return_value={'X': 'k'}):
+            serve._invalidate_free_pool_policy_cache()
+            with self.assertRaisesRegex(RuntimeError, 'paid low tier is switched off'):
+                serve._call_openrouter_once_sync('@provider:low',
+                                                 [{'role': 'user', 'content': 'hi'}], 64)
+
+    def test_freepool_fallback_skips_paid_when_blocked(self):
+        import urllib.error
+        err = urllib.error.HTTPError('http://x', 503, 'unavailable', {}, None)
+        called = []
+
+        def fake_post(body):
+            called.append(body['model'])
+            if body['model'].startswith('@freepool:'):
+                raise err
+            return _GOOD_RESULT
+
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value=self._policy_state({'globalDisabled': {'paid': True},
+                                                 'teams': {}})), \
+             unittest.mock.patch.object(serve, '_openrouter_chat_post',
+                                        side_effect=fake_post), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            serve._invalidate_free_pool_policy_cache()
+            with self.assertRaises(urllib.error.HTTPError):
+                serve._call_openrouter_once_sync('@freepool:low:gemini-x',
+                                                 [{'role': 'user', 'content': 'hi'}], 64)
+        self.assertNotIn('paid/low-model', called)
+
+
+class PaidSwitchPickerTests(FreePoolPickerTests):
+    """With the low paid leg switched off, the pool serves regardless of the
+    configured mode -- there is no paid alternative to conserve."""
+
+    def test_budget_only_serves_free_when_paid_blocked(self):
+        _write_pool_config({**_POOL_CONFIG, 'mode': 'budget-only'})
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value={'freePoolPolicy': {'globalDisabled': {'paid': True},
+                                                 'teams': {}}}):
+            serve._invalidate_free_pool_policy_cache()
+            self.assertEqual(serve._freepool_route_for_band('low'),
+                             '@freepool:low:gemini-x')
+
+    def test_paid_first_serves_free_when_paid_blocked(self):
+        _write_pool_config({**_POOL_CONFIG, 'mode': 'paid-first'})
+        with unittest.mock.patch.object(
+                serve, 'get_state_from_db',
+                return_value={'freePoolPolicy': {'globalDisabled': {'paid': True},
+                                                 'teams': {}}}):
+            serve._invalidate_free_pool_policy_cache()
+            self.assertEqual(serve._freepool_route_for_band('low'),
+                             '@freepool:low:gemini-x')
 
 
 if __name__ == '__main__':
