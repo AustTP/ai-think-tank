@@ -56,8 +56,13 @@ def status_snapshot(limit=25):
 WINDOW_MIN_DURATION_MIN = 5
 WINDOW_MAX_DURATION_MIN = 240
 WINDOW_DEFAULT_DURATION_MIN = 15
-WINDOW_MIN_LEAD_S = 5 * 60
-WINDOW_MAX_LEAD_S = 30 * 24 * 60 * 60
+# Change-request lead time (owner rule, 2026-10-27): a change window must be
+# requested at least 24 hours ahead so the owner has a real chance to review
+# the request and use the veto link, and no more than 7 days out -- requests
+# filed further ahead go stale before the window arrives; re-request closer
+# to the work.
+WINDOW_MIN_LEAD_S = 24 * 60 * 60
+WINDOW_MAX_LEAD_S = 7 * 24 * 60 * 60
 
 # Validator turn (operator decision, 2026-10-19). The tank is dormant while a
 # change window holds for validation, so the sim tick cannot run and the
@@ -614,10 +619,12 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     if err:
         return False, {'error': err}
     if start_ts < now + WINDOW_MIN_LEAD_S:
-        return False, {'error': 'the window must start at least 5 minutes '
-                                'from now -- pick a future slot'}
+        return False, {'error': 'the window must start at least 24 hours '
+                                'from now -- change requests need a day of '
+                                'notice so the owner can review and veto'}
     if start_ts > now + WINDOW_MAX_LEAD_S:
-        return False, {'error': 'the window may not be more than 30 days out'}
+        return False, {'error': 'the window may not be more than 7 days out '
+                                '-- file the request closer to the window'}
     end_ts = start_ts + duration_min * 60
     conflicts = _window_conflicts(start_ts, end_ts)
     if conflicts:

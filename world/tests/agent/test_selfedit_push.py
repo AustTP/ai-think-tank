@@ -33,7 +33,7 @@ from _selfedit_support import (  # noqa: E402,F401
 
 
 def _fire_requested_window(window_id):
-    """A change request is scheduled at least 5 minutes out; for tests,
+    """A change request is scheduled at least 24 hours out; for tests,
     retime the approved window into the past so window_tick fires it."""
     now = selfedit.time.time()
     selfedit._update_window(window_id, status='approved',

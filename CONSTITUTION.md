@@ -45,7 +45,10 @@ and `world/core/constitution.py` are immutable.
    validator reviews the applied bytes, and the owner receives the change
    details plus a working veto link before any push. A veto stops the change.
    Directors and the admin do not edit code directly; they file backlog work
-   and assign an eligible worker.
+   and assign an eligible worker. Change requests must be scheduled at least
+   24 hours before the change window -- the owner needs a real chance to
+   review the request and veto -- and no more than 7 days before it, so
+   far-future requests do not go stale before the window arrives.
 10. **Truthful evidence.** Never fabricate tool results, transcripts, grades,
     sources, or completion. Report failures and uncertainty. Mark partial,
     auto-captioned, or unverified sources as partial, and retire an unsourced

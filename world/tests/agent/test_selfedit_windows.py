@@ -113,7 +113,7 @@ def test_schedule_window_time_and_range_validation(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     ok, payload = selfedit.request_window('worker', '2020-01-01', '03:00',
                                           15, 'why')
-    assert ok is False and 'at least 5 minutes' in payload['error']
+    assert ok is False and 'at least 24 hours' in payload['error']
     ok, payload = selfedit.request_window('worker', 'bad-day', '03:00',
                                           15, 'why')
     assert ok is False and 'YYYY-MM-DD' in payload['error']
@@ -122,7 +122,7 @@ def test_schedule_window_time_and_range_validation(fake_repo, monkeypatch):
     assert ok is False and 'HH:MM' in payload['error']
     ok, payload = selfedit.request_window('worker', _window_slot(31),
                                           '03:00', 15, 'why')
-    assert ok is False and '30 days' in payload['error']
+    assert ok is False and '7 days' in payload['error']
     ok, payload = selfedit.request_window('worker', _window_slot(), '03:00',
                                           None, '')
     assert ok is False and 'reason is required' in payload['error']

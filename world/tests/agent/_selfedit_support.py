@@ -37,7 +37,9 @@ def _approve(monkeypatch, decision='approve', confidence=0.9, cost=0.01):
     monkeypatch.setattr(serve, '_jev_quorum_choice_sync', fake)
     return seen
 
-def _window_slot(days_ahead=1):
+def _window_slot(days_ahead=2):
+    # 2 days out: safely inside the 24h..7d lead-time rule at any run time
+    # (1 day ahead can be <24h away when the suite runs after the slot time).
     import datetime
     day = datetime.date.today() + datetime.timedelta(days=days_ahead)
     return day.strftime('%Y-%m-%d')
