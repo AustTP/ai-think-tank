@@ -90,27 +90,25 @@ jobs:
       # push. Remove these once the suite is green on the runner.
       - name: Test suite -- tests/agent
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/agent -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/core
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/core -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
-      # The hosted runner dies intermittently (flaky, not file-deterministic:
-      # five complete survivals, six kills at varying positions, memory NOT the
-      # cause). Eight SEPARATE STEPS so a death preserves the survivors'
-      # results and localizes the killer to a ~6-file window.
+      # The integrations directory once lost six hosted runners to
+      # os.killpg(0) fired by the MCP client's atexit close_all (fixed in
+      # mcp_client.py; root cause, not a test problem). Keep the directory
+      # split into parts so any future runner-level event still leaves the
+      # survivors' results and a small search window.
       - name: Test suite -- tests/integrations (part 1)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 7 | tail -n +1 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 7 | tail -n +1 | tr '\n' ' ')
           echo "P1: $files $(date +%s.%N)" | tee ../part1.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -120,11 +118,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 2)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 14 | tail -n +8 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 14 | tail -n +8 | tr '\n' ' ')
           echo "P2: $files $(date +%s.%N)" | tee ../part2.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -134,11 +131,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 3)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 21 | tail -n +15 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 21 | tail -n +15 | tr '\n' ' ')
           echo "P3: $files $(date +%s.%N)" | tee ../part3.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -148,11 +144,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 4)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 28 | tail -n +22 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 28 | tail -n +22 | tr '\n' ' ')
           echo "P4: $files $(date +%s.%N)" | tee ../part4.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -162,7 +157,6 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 5a)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -175,7 +169,6 @@ jobs:
           exit $code
       - name: Test suite -- tests/integrations (part 5b)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -188,7 +181,6 @@ jobs:
           exit $code
       - name: Test suite -- tests/integrations (part 5c)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -202,11 +194,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 6)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 42 | tail -n +36 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 42 | tail -n +36 | tr '\n' ' ')
           echo "P6: $files $(date +%s.%N)" | tee ../part6.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -216,11 +207,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 7)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 49 | tail -n +43 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | head -n 49 | tail -n +43 | tr '\n' ' ')
           echo "P7: $files $(date +%s.%N)" | tee ../part7.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -230,11 +220,10 @@ jobs:
 
       - name: Test suite -- tests/integrations (part 8)
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +50 | tr '\n' ' ')
+          files=$(ls tests/integrations/test_*.py | tail -n +50 | tr '\n' ' ')
           echo "P8: $files $(date +%s.%N)" | tee ../part8.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
@@ -252,19 +241,16 @@ jobs:
           echo "--- memory ---"; free -m | head -2
       - name: Test suite -- tests/server
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/server -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/tools
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/tools -v --tb=line -p no:cacheprovider --timeout=120 --timeout-method=thread
       - name: Test suite -- tests/village + JS harnesses
         working-directory: world
-        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
