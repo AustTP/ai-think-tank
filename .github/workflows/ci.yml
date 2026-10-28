@@ -100,22 +100,18 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m pytest tests/core -v --tb=line -p no:cacheprovider
-      # The hosted runner dies intermittently (flaky, not
-      # file-deterministic: two complete survivals, six kills at varying
-      # positions). Memory is NOT the cause (11 GB free at death). Split the
-      # directory into four SEPARATE STEPS so a death preserves the
-      # survivors' results and localizes the killer to one quarter.
-      - name: Test suite -- tests/integrations (quarter 1)
+      # The hosted runner dies intermittently (flaky, not file-deterministic:
+      # five complete survivals, six kills at varying positions, memory NOT the
+      # cause). Eight SEPARATE STEPS so a death preserves the survivors'
+      # results and localizes the killer to a ~6-file window.
+      - name: Test suite -- tests/integrations (part 1)
         working-directory: world
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 13 | tr '\n' ' ')
-          echo "Q1: $files"; free -m | head -2
-          set +e
-          set +e
-          set +e
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 7 | tail -n +1 | tr '\n' ' ')
+          echo "P1: $files"; free -m | head -2
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
@@ -123,48 +119,118 @@ jobs:
           echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
           free -m | head -2
           exit $code
-          code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
-          exit $code
-          code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
-          exit $code
-          code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
-          exit $code
-      - name: Test suite -- tests/integrations (quarter 2)
+
+      - name: Test suite -- tests/integrations (part 2)
         working-directory: world
-        if: always()
+        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 26 | tail -n +14 | tr '\n' ' ')
-          echo "Q2: $files"; free -m | head -2
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 14 | tail -n +8 | tr '\n' ' ')
+          echo "P2: $files"; free -m | head -2
+          set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
-      - name: Test suite -- tests/integrations (quarter 3)
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 3)
         working-directory: world
-        if: always()
+        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 39 | tail -n +27 | tr '\n' ' ')
-          echo "Q3: $files"; free -m | head -2
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 21 | tail -n +15 | tr '\n' ' ')
+          echo "P3: $files"; free -m | head -2
+          set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
-      - name: Test suite -- tests/integrations (quarter 4)
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 4)
         working-directory: world
-        if: always()
+        continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
-          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +40 | tr '\n' ' ')
-          echo "Q4: $files"; free -m | head -2
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 28 | tail -n +22 | tr '\n' ' ')
+          echo "P4: $files"; free -m | head -2
+          set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 5)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 35 | tail -n +29 | tr '\n' ' ')
+          echo "P5: $files"; free -m | head -2
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 6)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 42 | tail -n +36 | tr '\n' ' ')
+          echo "P6: $files"; free -m | head -2
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 7)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 49 | tail -n +43 | tr '\n' ' ')
+          echo "P7: $files"; free -m | head -2
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
+
+      - name: Test suite -- tests/integrations (part 8)
+        working-directory: world
+        continue-on-error: true
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +50 | tr '\n' ' ')
+          echo "P8: $files"; free -m | head -2
+          set +e
+          python -m pytest $files -v --tb=line -p no:cacheprovider
+          code=$?
+          echo "pytest exit code: $code"
+          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
+          free -m | head -2
+          exit $code
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
