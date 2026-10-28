@@ -8,7 +8,14 @@
     "Unknown types are rejected visibly at boot and never run.",
     "Kill switch: create the file data/fast-kill to pause every lane.",
     "Tune or add lanes here without touching code; a new KIND of behavior",
-    "is a code change and gets reviewed like one."
+    "is a code change and gets reviewed like one.",
+    "",
+    "BUG BOUNTY LANES RUN THEIR WORK ON A VPS, NEVER IN DOCKER AND NEVER",
+    "FROM THE HOME IP. Declare executor.kind=vps plus host/user/key_path/",
+    "known_hosts. Pin the host key first:",
+    "  ssh-keyscan -H <host> >> .secret_keys/fast_vps_known_hosts",
+    "The 'work' list is the ONLY thing the VPS will ever run; LLM output is",
+    "analyzed, never executed. Missing/empty executor = lane idles loudly."
   ],
   "lanes": [
     {
@@ -18,14 +25,27 @@
       "program": "",
       "targets": [],
       "rate_limit_s": 2.0,
-      "analysis_prompt": "You are a bug bounty recon analyst. Work only within the declared scope. Be concise: list anything unusual worth a human look, or say \"nothing notable\"."
+      "analysis_prompt": "You are a bug bounty recon analyst. Work only within the declared scope. Be concise: list anything unusual worth a human look, or say \"nothing notable\".",
+      "executor": {
+        "kind": "vps",
+        "host": "",
+        "user": "",
+        "port": 22,
+        "key_path": "",
+        "known_hosts": ".secret_keys/fast_vps_known_hosts",
+        "command_timeout_s": 120
+      },
+      "work": []
     },
     {
       "name": "markets-paper",
       "type": "paper_markets",
       "cadence_s": 30,
       "price_source": "coinbase_spot",
-      "symbols": ["BTC-USD", "ETH-USD"],
+      "symbols": [
+        "BTC-USD",
+        "ETH-USD"
+      ],
       "notional": 100,
       "band_pct": 2.0,
       "window": 30

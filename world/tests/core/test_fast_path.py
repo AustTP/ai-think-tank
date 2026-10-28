@@ -243,3 +243,116 @@ class LaneEngineTests(FastPathBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VpsDispatchTests(FastPathBase):
+    """The bounty invariant: work runs on the VPS, never locally, never in
+    Docker, and never from undeclared commands. LLM output is analysis
+    input, never a command."""
+
+    def _lane(self, work=None, executor=None):
+        cfg = {'name': 'bounty-recon', 'program': 'h1-acme',
+               'targets': ['example.com'],
+               'executor': executor if executor is not None else {
+                   'kind': 'vps', 'host': 'vps.example.net', 'user': 'hunter',
+                   'port': 22, 'key_path': os.path.join(self.tmp, 'id_ed25519'),
+                   'known_hosts': os.path.join(self.tmp, 'known_hosts'),
+                   'command_timeout_s': 30},
+               'work_timeout_s': 30,
+               'work': work if work is not None else [
+                   {'name': 'subfinder', 'command': 'subfinder -d example.com -silent'},
+                   {'name': 'nuclei', 'command': 'nuclei -l targets.txt -severity medium,high'}]}
+        lane = fast_path.HttpWatchLane(cfg, self.log, self.model)
+        return lane
+
+    def _pin(self, lane):
+        open(lane.executor.key_path, 'w').write('KEY')
+        open(lane.executor.known_hosts, 'w').write('vps.example.net ssh-ed25519 AAAA')
+
+    def test_unpinned_host_fails_closed(self):
+        lane = self._lane()
+        self.assertFalse(lane.executor.configured)
+        calls = []
+        lane.executor.run = lambda cmd, t=None: calls.append(cmd) or {}
+        asyncio.run(lane._vps_cycle())
+        self.assertEqual(calls, [])
+        self._drain()
+        kinds = [e['kind'] for e in self.log.recent(lane='bounty-recon')]
+        self.assertIn('executor_unconfigured', kinds)
+
+    def test_dispatch_runs_only_declared_work_and_returns_receipts(self):
+        lane = self._lane()
+        self._pin(lane)
+        ran = []
+
+        def fake_run(command, timeout_s=None):
+            ran.append((command, timeout_s))
+            return {'exit_code': 0, 'stdout': 'sub.example.com\nsub2.example.com',
+                    'stderr': '', 'duration_s': 1.5}
+        lane.executor.run = fake_run
+        asyncio.run(lane._vps_cycle())
+        self.assertEqual([c for c, _ in ran],
+                         ['subfinder -d example.com -silent',
+                          'nuclei -l targets.txt -severity medium,high'])
+        self.assertEqual(ran[0][1], 30)
+        self._drain()
+        kinds = [e['kind'] for e in self.log.recent(lane='bounty-recon')]
+        self.assertEqual(kinds.count('dispatch'), 2)
+        self.assertEqual(kinds.count('result'), 2)
+        result = [e for e in self.log.recent(lane='bounty-recon') if e['kind'] == 'result'][0]
+        self.assertEqual(result['payload']['exit_code'], 0)
+        self.assertIn('sub.example.com', result['payload']['stdout_tail'])
+
+    def test_ssh_argv_pins_the_host_key_and_never_gives_a_shell(self):
+        lane = self._lane()
+        self._pin(lane)
+        argv = lane.executor.argv('subfinder -d example.com')
+        self.assertIn('-o', argv)
+        self.assertIn('StrictHostKeyChecking=yes', argv)
+        self.assertIn('UserKnownHostsFile=' + lane.executor.known_hosts, argv)
+        self.assertIn('BatchMode=yes', argv)
+        self.assertEqual(argv[-1], 'subfinder -d example.com')
+        self.assertTrue(argv[-1].endswith('example.com'))  # the command, unmodified
+
+    def test_no_vps_declared_means_local_recon_only(self):
+        # A lane without an executor keeps the plain http_watch behavior
+        # (local GET surface watch) -- the VPS is an explicit declaration.
+        fetched = []
+
+        class FakeClient:
+            async def get(self, url):
+                fetched.append(url)
+
+                class R:
+                    status_code = 200
+                    headers = {}
+                return R()
+        lane = fast_path.HttpWatchLane(
+            {'name': 'watch-plain', 'program': '', 'targets': ['example.com'],
+             'rate_limit_s': 0}, self.log, self.model)
+        lane._client = FakeClient()
+        asyncio.run(lane.cycle())
+        self.assertEqual(fetched, ['https://example.com'])
+
+    def test_empty_work_list_runs_nothing_on_the_vps(self):
+        lane = self._lane(work=[])
+        self._pin(lane)
+        calls = []
+        lane.executor.run = lambda cmd, t=None: calls.append(cmd) or {}
+        asyncio.run(lane._vps_cycle())
+        self.assertEqual(calls, [])
+        self._drain()
+        kinds = [e['kind'] for e in self.log.recent(lane='bounty-recon')]
+        self.assertIn('unconfigured', kinds)
+
+    def test_kill_switch_blocks_dispatch(self):
+        lane = self._lane()
+        self._pin(lane)
+        calls = []
+        lane.executor.run = lambda cmd, t=None: calls.append(cmd) or {}
+        open(fast_path.KILL_SWITCH_PATH, 'w').write('stop')
+        asyncio.run(lane.cycle())  # the real path, guard included
+        self.assertEqual(calls, [])
+        self._drain()
+        kinds = [e['kind'] for e in self.log.recent(lane='bounty-recon')]
+        self.assertEqual(kinds, ['paused'])

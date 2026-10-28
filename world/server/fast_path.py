@@ -53,6 +53,7 @@ import hmac
 import json
 import os
 import queue
+import subprocess
 import sqlite3
 import threading
 import time
@@ -264,6 +265,76 @@ class FastModel:
             return None
 
 
+class VpsExecutor:
+    """Dispatch declared work to a dedicated VPS over SSH.
+
+    The bounty lane's work always runs here, never in a local Docker
+    container and never from the operator's home IP: the VPS is the
+    attributable, disposable workhorse. Discipline:
+
+    - Only commands declared in the lane's config `work` list ever run.
+      LLM output is analyzed, never executed; there is no code path from
+      model text to a shell command.
+    - Host key pinning is mandatory (StrictHostKeyChecking=yes against an
+      operator-provided known_hosts file); an unpinned host fails closed.
+    - BatchMode (key auth only), bounded connect/command timeouts, and a
+      bounded output capture keep a hung VPS from stalling the lane.
+    """
+
+    def __init__(self, cfg, log, lane_name):
+        self.log = log
+        self.lane_name = lane_name
+        self.host = cfg.get('host') or ''
+        self.user = cfg.get('user') or ''
+        self.port = str(cfg.get('port', 22))
+        self.key_path = cfg.get('key_path') or ''
+        self.known_hosts = cfg.get('known_hosts') or ''
+        self.command_timeout_s = float(cfg.get('command_timeout_s', 120))
+
+    @property
+    def configured(self):
+        return bool(self.host and self.user and self.key_path and self.known_hosts
+                    and Path(self.key_path).is_file()
+                    and Path(self.known_hosts).is_file())
+
+    def missing(self):
+        need = []
+        if not (self.host and self.user):
+            need.append('host/user')
+        if not self.key_path or not Path(self.key_path).is_file():
+            need.append('key_path (must exist on this machine)')
+        if not self.known_hosts or not Path(self.known_hosts).is_file():
+            need.append('known_hosts (pin it: ssh-keyscan -H <host> >> <file>)')
+        return need
+
+    def argv(self, command):
+        return ['ssh', '-i', self.key_path, '-p', self.port,
+                '-o', 'BatchMode=yes',
+                '-o', 'ConnectTimeout=8',
+                '-o', 'StrictHostKeyChecking=yes',
+                '-o', 'UserKnownHostsFile=' + self.known_hosts,
+                f'{self.user}@{self.host}', command]
+
+    def run(self, command, timeout_s=None):
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                self.argv(command), capture_output=True, text=True,
+                timeout=timeout_s or self.command_timeout_s)
+            return {'exit_code': proc.returncode,
+                    'stdout': proc.stdout[:20000],
+                    'stderr': proc.stderr[:8000],
+                    'duration_s': round(time.monotonic() - started, 2)}
+        except subprocess.TimeoutExpired:
+            return {'exit_code': None, 'stdout': '', 'stderr': '',
+                    'duration_s': round(time.monotonic() - started, 2),
+                    'error': f'timeout after {timeout_s or self.command_timeout_s}s'}
+        except Exception as e:
+            return {'exit_code': None, 'stdout': '', 'stderr': '',
+                    'duration_s': round(time.monotonic() - started, 2),
+                    'error': str(e)[:200]}
+
+
 class BaseLane:
     """Common lane plumbing: the engine owns cadence; a lane only cycles."""
 
@@ -295,10 +366,60 @@ class HttpWatchLane(BaseLane):
             '"nothing notable".')
         self._last = {}
         self._client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, follow_redirects=False)
+        self.work = self.cfg.get('work') or []
+        self.work_timeout_s = float(self.cfg.get('work_timeout_s', 120))
+        self.executor = None
+        exec_cfg = self.cfg.get('executor') or {}
+        if exec_cfg.get('kind') == 'vps':
+            self.executor = VpsExecutor(exec_cfg, log, self.name)
 
     @property
     def configured(self):
         return bool(self.targets)
+
+    async def _vps_cycle(self):
+        """Work happens on the VPS; this machine only dispatches, observes,
+        and keeps the receipts. Every dispatch is a declared work item; the
+        lane never runs anything the config did not name."""
+        if not self.executor.configured:
+            self.log.emit(self.name, 'fast-path', 'executor_unconfigured',
+                          {'missing': self.executor.missing()})
+            return
+        if not self.work:
+            self.log.emit(self.name, 'fast-path', 'unconfigured',
+                          {'note': 'declare the work list (declared commands only); '
+                                   'the VPS runs nothing the config did not name'})
+            return
+        results = []
+        for item in self.work:
+            cmd_name = (item or {}).get('name') or ''
+            command = (item or {}).get('command') or ''
+            if not cmd_name or not command:
+                continue
+            self.log.emit(self.name, 'lane-dispatcher', 'dispatch',
+                          {'work': cmd_name, 'host': self.executor.host})
+            result = await asyncio.to_thread(self.executor.run, command,
+                                             self.work_timeout_s)
+            self.log.emit(self.name, 'lane-dispatcher', 'result',
+                          {'work': cmd_name, 'exit_code': result['exit_code'],
+                           'duration_s': result['duration_s'],
+                           'stdout_tail': result['stdout'][-3000:],
+                           'stderr_tail': result['stderr'][-1500:],
+                           **({'error': result['error']} if result.get('error') else {})})
+            results.append({'work': cmd_name, **result})
+        if results:
+            summary = await self.model.ask(
+                self.name, 'lane-analyst',
+                self.analysis_prompt + ' Never propose executing anything; '
+                'you are read-only analysis over returned output.',
+                json.dumps({'program': self.program,
+                            'results': [{'work': r['work'],
+                                         'exit': r['exit_code'],
+                                         'stdout_tail': r['stdout'][-2500:]}
+                                        for r in results]}))
+            if summary:
+                self.log.emit(self.name, 'lane-analyst', 'analysis',
+                              {'summary': summary[:2000]})
 
     async def cycle(self):
         if _kill_switch_active():
@@ -309,6 +430,8 @@ class HttpWatchLane(BaseLane):
                           {'note': 'declare targets in fast_lanes.json; '
                                    'no requests run without an explicit scope'})
             return
+        if self.executor is not None:
+            return await self._vps_cycle()
         findings = []
         for target in self.targets:
             url = target if target.startswith('http') else f'https://{target}'
@@ -523,6 +646,10 @@ async def status():
                    'cadence_s': l.cadence_s,
                    'symbols': getattr(l, 'symbols', None),
                    'program': getattr(l, 'program', None),
+                   'executor': (None if not getattr(l, 'executor', None)
+                                else {'kind': 'vps', 'host': l.executor.host,
+                                      'configured': l.executor.configured,
+                                      'missing': l.executor.missing()}),
                    'portfolio': getattr(l, '_portfolio', None)} for l in LANES],
         'chain_head': LOG.head(),
         'chain_problems': LOG.verify(),
