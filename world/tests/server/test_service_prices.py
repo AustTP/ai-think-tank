@@ -1,4 +1,8 @@
 """The agent-facing price report: quote, budget, and the model-visible line."""
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import unittest
 import unittest.mock
 

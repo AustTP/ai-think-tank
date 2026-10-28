@@ -1,4 +1,8 @@
 """Coverage-gap tests for serve_parts 050, 080, 090 and 100."""
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import asyncio
 import os
 import shutil

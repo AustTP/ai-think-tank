@@ -1,4 +1,8 @@
 """Coverage-gap tests for serve_parts 110, 120 and 130."""
+
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import os
 import shutil
 import struct
