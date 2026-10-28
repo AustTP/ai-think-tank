@@ -60,9 +60,37 @@ jobs:
         working-directory: world
         run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py selfedit.py
 
-      - name: Full test suite (Python unittest files + JS harnesses)
+      - name: Git identity for sandbox tests
+        run: |
+          git config --global user.email "ci@aithinktank.local"
+          git config --global user.name "CI"
+
+      - name: Playwright chromium (browser tests)
+        run: python -m playwright install --with-deps chromium
+
+      # The suite used to run as one step and the runner killed it ~2min in,
+      # losing all localization. Per-directory steps bound any kill to one
+      # directory and let the rest of the suite report independently.
+      - name: Test suite -- tests/agent
         working-directory: world
-        run: bash tests/run_all.sh
+        run: python -m pytest tests/agent -v --tb=no -p no:cacheprovider
+      - name: Test suite -- tests/core
+        working-directory: world
+        run: python -m pytest tests/core -v --tb=no -p no:cacheprovider
+      - name: Test suite -- tests/integrations
+        working-directory: world
+        run: python -m pytest tests/integrations -v --tb=no -p no:cacheprovider
+      - name: Test suite -- tests/server
+        working-directory: world
+        run: python -m pytest tests/server -v --tb=no -p no:cacheprovider
+      - name: Test suite -- tests/tools
+        working-directory: world
+        run: python -m pytest tests/tools -v --tb=no -p no:cacheprovider
+      - name: Test suite -- tests/village + JS harnesses
+        working-directory: world
+        run: |
+          python -m pytest tests/village -v --tb=no -p no:cacheprovider
+          node tests/js_coverage.mjs
 
       - name: Coverage gate (world Python + JavaScript, 90% floor)
         run: |
