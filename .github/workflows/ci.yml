@@ -65,6 +65,16 @@ jobs:
           git config --global user.email "ci@aithinktank.local"
           git config --global user.name "CI"
 
+      # The credential vault's master key auto-generates on first use on a
+      # live server; tests that exercise the vault path on a fresh runner
+      # hit the read side first and die with FileNotFoundError x67. A
+      # throwaway key is correct here: CI holds no vault data.
+      - name: Throwaway credential-vault key for tests
+        run: |
+          mkdir -p .secret_keys
+          python -c "from cryptography.fernet import Fernet; open('.secret_keys/edek.key', 'w').write(Fernet.generate_key().decode())"
+          chmod 600 .secret_keys/edek.key
+
       - name: Playwright chromium (browser tests)
         run: python -m playwright install --with-deps chromium
 
