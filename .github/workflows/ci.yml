@@ -8,6 +8,10 @@ on:
 jobs:
   gate:
     runs-on: ubuntu-latest
+    # The hosted-runner deaths and now a hang both argue for a hard cap:
+    # default is 360 minutes, which would burn the whole Actions budget on
+    # one hung test. 30 minutes is ~10x the healthy runtime.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
