@@ -101,11 +101,16 @@ jobs:
         continue-on-error: true
         env:
           PYTHONPATH: ${{ github.workspace }}
-        # test_tank_accounts kills the hosted runner outright (twice
-        # reproduced: the step dies right after its grant-rotation test,
-        # taking server/tools/village with it). Ignored while the kill is
-        # root-caused; the file passes on macOS (8208 green locally).
-        run: python -m pytest tests/integrations -v --tb=line -p no:cacheprovider --ignore=tests/integrations/test_tank_accounts.py
+        # The hosted runner dies ~15s into this directory (killed three
+        # runs; not test_tank_accounts -- ignored and still died). A/B split
+        # of the file list localizes the killer; rejoin the steps once found.
+        run: |
+          files_a=$(ls tests/integrations/test_*.py | head -26 | tr '\n' ' ')
+          files_b=$(ls tests/integrations/test_*.py | tail -26 | tr '\n' ' ')
+          echo "A: $files_a"
+          python -m pytest $files_a -v --tb=line -p no:cacheprovider
+          echo "B: $files_b"
+          python -m pytest $files_b -v --tb=line -p no:cacheprovider
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
