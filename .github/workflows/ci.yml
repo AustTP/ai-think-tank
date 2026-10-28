@@ -111,13 +111,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 7 | tail -n +1 | tr '\n' ' ')
-          echo "P1: $files"; free -m | head -2
+          echo "P1: $files $(date +%s.%N)" | tee ../part1.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part1.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 2)
@@ -127,13 +125,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 14 | tail -n +8 | tr '\n' ' ')
-          echo "P2: $files"; free -m | head -2
+          echo "P2: $files $(date +%s.%N)" | tee ../part2.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part2.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 3)
@@ -143,13 +139,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 21 | tail -n +15 | tr '\n' ' ')
-          echo "P3: $files"; free -m | head -2
+          echo "P3: $files $(date +%s.%N)" | tee ../part3.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part3.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 4)
@@ -159,13 +153,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 28 | tail -n +22 | tr '\n' ' ')
-          echo "P4: $files"; free -m | head -2
+          echo "P4: $files $(date +%s.%N)" | tee ../part4.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part4.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 5)
@@ -175,13 +167,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 35 | tail -n +29 | tr '\n' ' ')
-          echo "P5: $files"; free -m | head -2
+          echo "P5: $files $(date +%s.%N)" | tee ../part5.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part5.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 6)
@@ -191,13 +181,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 42 | tail -n +36 | tr '\n' ' ')
-          echo "P6: $files"; free -m | head -2
+          echo "P6: $files $(date +%s.%N)" | tee ../part6.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part6.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 7)
@@ -207,13 +195,11 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | head -n 49 | tail -n +43 | tr '\n' ' ')
-          echo "P7: $files"; free -m | head -2
+          echo "P7: $files $(date +%s.%N)" | tee ../part7.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part7.exit
           exit $code
 
       - name: Test suite -- tests/integrations (part 8)
@@ -223,14 +209,21 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           files=$(ls tests/integrations/test_*.py | grep -v test_tank_accounts.py | tail -n +50 | tr '\n' ' ')
-          echo "P8: $files"; free -m | head -2
+          echo "P8: $files $(date +%s.%N)" | tee ../part8.start
           set +e
           python -m pytest $files -v --tb=line -p no:cacheprovider
           code=$?
-          echo "pytest exit code: $code"
-          echo "--- dmesg tail ---"; sudo dmesg 2>/dev/null | tail -15 || true
-          free -m | head -2
+          echo "pytest exit: $code at $(date +%s.%N)" | tee ../part8.exit
           exit $code
+      - name: Forensics -- runner death evidence
+        working-directory: world
+        if: always()
+        run: |
+          echo "--- part markers ---"
+          for f in ../part*.start ../part*.exit; do [ -f "$f" ] && cat "$f"; done
+          echo "--- dmesg tail (oom/segfault evidence) ---"
+          sudo dmesg 2>/dev/null | tail -25 || true
+          echo "--- memory ---"; free -m | head -2
       - name: Test suite -- tests/server
         working-directory: world
         continue-on-error: true
