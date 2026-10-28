@@ -93,7 +93,7 @@ CODING_STANDARDS_PROMPT = (
 )
 
 
-def _quality_pipeline_steps(scope_files=None):
+def _quality_pipeline_steps(scope_files=None, style_lenient=False):
     """Build the standard quality pipeline steps. When `scope_files` is a
     non-empty list of .py paths, flake8/mypy/bandit AND pytest-cov are scoped
     to exactly those files instead of running on the whole sandbox -- a
@@ -115,6 +115,14 @@ def _quality_pipeline_steps(scope_files=None):
         '--isolated --max-line-length=100 '
         '--extend-ignore=E501,E203,E128,E127,E221,E302,E303,E305,E306,E741,E731,E702,W292,W605'
     )
+    if style_lenient:
+        # Recovery cards ("Help:"/"Fix:" titles) repair legacy code that
+        # already violates style; blocking the REPAIR on style nits creates
+        # a fail -> help -> fail loop (consultant finding 2026-10-27: E231
+        # rejections on Help cards). Style-class prefixes only -- the
+        # semantic E7xx codes (bare except, ambiguous names, chained
+        # assignment), E9xx, and every F code stay enforced.
+        _flake8_flags += ',E1,E2,E3,E4,E5,W1,W2,W3,W4,W5,W6'
     if scope_files:
         _scoped = ' '.join(scope_files)
         # Coverage is scoped to the same files as lint when scope_files is
@@ -239,7 +247,8 @@ def _poll_pipeline_job(base, key, job_id, deadline_s=_QUALITY_PIPELINE_TIMEOUT_S
     return {'error': 'pipeline job timed out'}
 
 
-def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=None):
+def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=None,
+                         style_lenient=False):
     """Run the standard quality pipeline in the sandbox via /api/pipeline, which
     stops at the first failing step and returns per-step {name, exitCode, stdout,
     stderr} + failedStep (None on a full pass). Always returns a plain dict; never
@@ -248,7 +257,7 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
     _quality_pipeline_steps). Passing checks are content-addressed and reused
     until the workspace or the step set changes; long runs are polled as a
     background job instead of holding one 300s HTTP request open."""
-    steps = _quality_pipeline_steps(scope_files)
+    steps = _quality_pipeline_steps(scope_files, style_lenient)
     resolved_sandbox = _serve._village_sandbox_id(agent_id, sandbox_id)
     sandbox_dir = _serve._sandbox_dir_for(resolved_sandbox)
     cache_key = (None if os.environ.get('PYTEST_CURRENT_TEST')
@@ -709,7 +718,13 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         elif exec_data.get('timedOut'):
             _block_reason = 'the command timed out before the execution service returned'
         else:
-            _block_reason = exec_data.get('reason') or 'the execution service refused the command without a reason'
+            _block_reason = exec_data.get('reason') or exec_data.get('detail') or (
+                # Consultant finding 2026-10-27: an empty refusal reason
+                # failed Help cards with no actionable detail. Surface what
+                # the wrapper does know -- the refused command -- instead of
+                # the bare boilerplate.
+                f'the execution service refused the command without a reason '
+                f'(command: {str(command)[:200]})')
         store_result(task.get('id'),
                                           {'note': f"blocked: {_block_reason}",
                                            'command': command, 'ok': False, 'tier': tier_slug,
@@ -817,7 +832,8 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                     return False
             qp = _run_quality_pipeline(base, key, agent_id, sandbox_id,
                                        f'Quality gate for coding task: {backlog_item}',
-                                       scope_files=written_py or None)
+                                       scope_files=written_py or None,
+                                       style_lenient=str(backlog_item or '').startswith(('Help:', 'Fix:')))
     else:
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
     # writtenPy rides the result channel so _apply_content_result can persist

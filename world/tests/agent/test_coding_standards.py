@@ -607,5 +607,21 @@ def _step_names():
     return [s['name'] for s in serve._quality_pipeline_steps()]
 
 
+class StyleLenientPipelineTests(unittest.TestCase):
+    """Consultant finding 2026-10-27: Help:/Fix: recovery cards were dying
+    on style-only flake8 codes (E231) while repairing legacy code. Lenient
+    mode ignores the style classes but keeps semantic E7xx/E9xx and F."""
+
+    def test_style_lenient_adds_style_classes_only(self):
+        strict = [s for s in content._quality_pipeline_steps() if s['name'] == 'flake8'][0]
+        lenient = [s for s in content._quality_pipeline_steps(style_lenient=True) if s['name'] == 'flake8'][0]
+        self.assertIn(',E1,E2,E3,E4,E5,W1,W2,W3,W4,W5,W6', lenient['command'])
+        self.assertNotIn(',E1,E2,E3,E4,E5,W1,W2,W3,W4,W5,W6', strict['command'])
+        # The semantic codes stay enforced in both modes (not in extend-ignore).
+        for cmd in (strict['command'], lenient['command']):
+            self.assertNotIn('E722', cmd)
+            self.assertNotIn('E9', cmd)
+
+
 if __name__ == '__main__':
     unittest.main()

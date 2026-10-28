@@ -387,6 +387,12 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
 # that was built specifically to catch them before caching a pick.
 CIRCUIT_BREAKER_THRESHOLD = 3
 CIRCUIT_BREAKER_COOLDOWN_S = 300
+# Free-pool endpoints need a longer open window: their failures are mostly
+# provider-side quota/demand (429/503) that outlast a 5-minute cooldown, and a
+# fast re-probe just burns the probe slot and re-opens the circuit
+# (consultant finding 2026-10-27: 4 free-pool breakers tripped within 90s and
+# 13 fallback hops in 24h). 15 minutes matches typical free-tier recovery.
+FREE_POOL_CIRCUIT_COOLDOWN_S = 900
 # Half-open probe. The old breaker was OPEN-or-CLOSED: after the cooldown
 # expired, the very next call went straight through, and if it happened to
 # fail (a transient blip right at recovery) it re-tripped immediately. That
@@ -445,8 +451,12 @@ def record_model_result(model_slug, success):
             # can't grow unboundedly across repeated probe failures (the circuit is
             # already OPEN; only "< threshold" vs ">= threshold" matters).
             state['consecutive_failures'] = CIRCUIT_BREAKER_THRESHOLD
-            state['open_until'] = time.time() + CIRCUIT_BREAKER_COOLDOWN_S
-            log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': CIRCUIT_BREAKER_COOLDOWN_S})
+            cooldown = (FREE_POOL_CIRCUIT_COOLDOWN_S
+                        if isinstance(model_slug, str)
+                        and model_slug.startswith('@freepool:')
+                        else CIRCUIT_BREAKER_COOLDOWN_S)
+            state['open_until'] = time.time() + cooldown
+            log_action(None, 'model_circuit_broken', {'model': model_slug, 'cooldown_s': cooldown})
 
 
 # API-key auth-health tracker: per-service consecutive auth failures, with

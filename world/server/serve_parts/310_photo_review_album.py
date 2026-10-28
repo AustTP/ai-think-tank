@@ -468,7 +468,18 @@ def _taste_is_expired(taste):
 # rule (a one-pattern drift between them would be a silent hole).
 _INPUT_GUARD_PATTERNS = (
     r'(?i)(ignore|forget|override|disregard|skip)\s+(all\s+)?(previous|prior|the\s+above)',
-    r'(?i)(you\s+are\s+now|from\s+now\s+on|your\s+new\s+role|act\s+as)',
+    # v2 (consultant finding 2026-10-27): the bare phrases matched 6
+    # legitimate messages in 24h -- procedural language ("you are now at
+    # step X") and planning language ("from now on, distills will...").
+    # Each alternative now requires the jailbreak CONTEXT that follows it:
+    # a persona being assigned, an instruction being overridden, or the
+    # model being told it is unbounded.
+    r'(?i)(you\s+(are|must|will)\s+now\s+'
+    r'\b(a|an|the|my|acting|pretending|role[\s-]*playing|free\s+of|'
+    r'uncensored|unfiltered|unrestricted|no\s+longer\s+bound|dan)\b'
+    r'|from\s+now\s+on,?\s*(you\s+(are|will|must|should)|ignore|disregard|forget)'
+    r'|your\s+new\s+role\s+(is|will\s+be)'
+    r'|act\s+as\s+\b(if|my|your|an?\s+(uncensored|unfiltered|unrestricted)|dan)\b)',
     r'(?i)system\s+(prompt|instruction|message|override)\s*(:|is|:)',
     r'(?i)(reveal|show|print|output|leak|display)\s+(your|the)\s+(prompt|system|instructions)',
 )

@@ -1,5 +1,6 @@
 """Review-only sandbox execution for a pending escalation."""
 import base64
+import time
 import json
 import os
 import sys
@@ -68,3 +69,32 @@ class ReviewExecute(unittest.TestCase):
             r = self._post({'escalationId': self.esc_id, 'command': self.code})
         self.assertEqual(r.status_code, 400)
         run.assert_not_called()
+
+
+class EscalationExpiryPushTests(unittest.TestCase):
+    """Consultant finding 2026-10-27: 5 escalations expired in 24h with zero
+    owner notification. Expiry must push a warning to the player channels."""
+
+    def test_expiry_pushes_warning_alert(self):
+        pushed = []
+        esc = {'kind': 'owner safety decision', 'agentId': 'clara',
+               'ts': time.time() - (serve.ESCALATION_STALE_TTL_S + 60)}
+        with unittest.mock.patch.object(serve, '_push_new_health_alerts',
+                                        side_effect=lambda alerts: pushed.extend(alerts)):
+            self.assertTrue(serve._expire_stale_escalation('esc-test', esc, time.time()))
+        self.assertEqual(esc['status'], 'denied')
+        self.assertEqual(len(pushed), 1)
+        self.assertEqual(pushed[0]['severity'], 'warning')
+        self.assertIn('esc-test', pushed[0]['message'])
+        self.assertIn('clara', pushed[0]['message'])
+
+    def test_non_stale_kind_does_not_push(self):
+        esc = {'kind': 'some other kind', 'agentId': 'clara',
+               'ts': time.time() - (serve.ESCALATION_STALE_TTL_S + 60)}
+        with unittest.mock.patch.object(serve, '_push_new_health_alerts') as push:
+            self.assertFalse(serve._expire_stale_escalation('esc-y', esc, time.time()))
+        push.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

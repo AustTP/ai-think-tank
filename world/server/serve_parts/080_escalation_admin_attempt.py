@@ -130,6 +130,19 @@ def _expire_stale_escalation(esc_id, esc, now):
         'escalationId': esc_id, 'kind': esc.get('kind'),
         'ageS': round(now - created, 1),
         'reason': 'no decision within 6 hours'}, authorized=False)
+    # Consultant finding 2026-10-27: expirations were silent -- 5 in 24h with
+    # zero owner notification. Push each expiry to the player channels
+    # (best-effort, the same no-op-when-unconfigured pusher the health loop
+    # uses; expirations are rare enough that per-event push beats the dedup
+    # window collapsing them into one standing row).
+    try:
+        _push_new_health_alerts([{
+            'category': 'coordination', 'severity': 'warning',
+            'message': (f'Escalation {esc_id} ({esc.get("kind")}) expired: no '
+                        f'decision within 6 hours. Requester: '
+                        f'{esc.get("agentId") or "unknown"}.')}])
+    except Exception:
+        pass
     return True
 
 

@@ -85,6 +85,11 @@ def _reset_pool_state():
         serve._free_pool_state['cooldown'].clear()
         serve._free_pool_state['or_free_banned'].clear()
         serve._free_pool_state['or_free_chosen'] = None
+    # Model circuit state is module-global and survives between tests; the
+    # breaker tests open circuits ON PURPOSE, so every suite must start with
+    # closed circuits or leaked OPEN state poisons the next test's picks.
+    with serve._model_circuit_lock:
+        serve._model_circuit_state.clear()
     serve._FREE_POOL_ACTOR_TEAM.set(None)
     serve._invalidate_free_pool_policy_cache()
 
@@ -622,6 +627,25 @@ class PaidSwitchPickerTests(FreePoolPickerTests):
             serve._invalidate_free_pool_policy_cache()
             self.assertEqual(serve._freepool_route_for_band('low'),
                              '@freepool:low:gemini-x')
+
+
+class FreePoolBreakerTests(_CallLayerBase):
+    """Consultant finding 2026-10-27: free-pool breakers tripping on
+    provider-side 429/503 storms re-probed after only 5 minutes and burned
+    the probe, so free endpoints flap. Freepool slugs now open for 15 min;
+    paid slugs keep the 5-minute window."""
+
+    def test_freepool_breaker_cooldown_is_longer(self):
+        import time as _time
+        for slug in ('@freepool:low:gemini-x', 'paid/low-model'):
+            for _ in range(serve.CIRCUIT_BREAKER_THRESHOLD):
+                serve.record_model_result(slug, False)
+        self.assertTrue(serve.is_model_circuit_broken('@freepool:low:gemini-x'))
+        self.assertTrue(serve.is_model_circuit_broken('paid/low-model'))
+        free_left = serve._model_circuit_state['@freepool:low:gemini-x']['open_until'] - _time.time()
+        paid_left = serve._model_circuit_state['paid/low-model']['open_until'] - _time.time()
+        self.assertAlmostEqual(free_left, serve.FREE_POOL_CIRCUIT_COOLDOWN_S, delta=5)
+        self.assertAlmostEqual(paid_left, serve.CIRCUIT_BREAKER_COOLDOWN_S, delta=5)
 
 
 if __name__ == '__main__':
