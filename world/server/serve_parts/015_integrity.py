@@ -28,12 +28,28 @@ def _state_checksum_for(blob_text):
 
 
 def _state_checksum_write(conn, blob_text):
-    """Update the singleton checksum row inside the writer's transaction."""
-    conn.execute(
-        'INSERT INTO state_checksum (singleton, sha256, updated_at) VALUES (1, ?, ?) '
-        'ON CONFLICT(singleton) DO UPDATE SET sha256 = excluded.sha256, updated_at = excluded.updated_at',
-        (_state_checksum_for(blob_text), time.time()),
-    )
+    """Update the singleton checksum row inside the writer's transaction.
+    Self-healing: a database built before this feature (or a hand-built test
+    schema, or a standalone tool run) has no state_checksum table -- create
+    it on demand so the integrity write never breaks a state save."""
+    try:
+        conn.execute(
+            'INSERT INTO state_checksum (singleton, sha256, updated_at) VALUES (1, ?, ?) '
+            'ON CONFLICT(singleton) DO UPDATE SET sha256 = excluded.sha256, updated_at = excluded.updated_at',
+            (_state_checksum_for(blob_text), time.time()),
+        )
+    except sqlite3.OperationalError as e:
+        if 'no such table' not in str(e):
+            raise
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS state_checksum ('
+            'singleton INTEGER PRIMARY KEY CHECK(singleton = 1), '
+            'sha256 TEXT NOT NULL, updated_at REAL NOT NULL)')
+        conn.execute(
+            'INSERT INTO state_checksum (singleton, sha256, updated_at) VALUES (1, ?, ?) '
+            'ON CONFLICT(singleton) DO UPDATE SET sha256 = excluded.sha256, updated_at = excluded.updated_at',
+            (_state_checksum_for(blob_text), time.time()),
+        )
 
 
 def _verify_state_checksum_at_boot():

@@ -97,7 +97,8 @@ def test_poll_pipeline_job_paths(monkeypatch):
 
 
 def test_run_quality_pipeline_cache_and_job(monkeypatch):
-    monkeypatch.setattr(content, '_quality_pipeline_steps', lambda s: [])
+    monkeypatch.setattr(content, '_quality_pipeline_steps',
+                        lambda s, style_lenient=False: [])
     monkeypatch.setattr(content._serve, '_village_sandbox_id', lambda a, b: 'sb')
     monkeypatch.setattr(content._serve, '_sandbox_dir_for', lambda s: '/tmp')
     monkeypatch.delenv('PYTEST_CURRENT_TEST', raising=False)

@@ -65,7 +65,12 @@ def main():
         conn.execute(
             'REPLACE INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?)',
             (blob, now_ms))
-        # keep the integrity checksum row (kv_state id=2) in step -- same
+        # self-heal: a DB built before the integrity feature has no table
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS state_checksum ('
+            'singleton INTEGER PRIMARY KEY CHECK(singleton = 1), '
+            'sha256 TEXT NOT NULL, updated_at REAL NOT NULL)')
+        # keep the integrity checksum row in step -- same
         # scheme as server 015_integrity (_state_checksum_write)
         conn.execute(
             'INSERT INTO state_checksum (singleton, sha256, updated_at) VALUES (1, ?, ?) '

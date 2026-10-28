@@ -71,7 +71,7 @@ _free_pool_state = {
     'rpd': {},            # endpoint name -> {'date': 'YYYY-MM-DD', 'count': int}
     'tpm': {},            # pool_key -> {'minute': int, 'tokens': int}
     'cooldown': {},       # endpoint name -> ts until which the endpoint is skipped
-    'or_free_banned': {}, # catalog model_id -> ts until which the pick skips it
+    'or_free_banned': {},  # catalog model_id -> ts until which the pick skips it
     'or_free_chosen': None,
 }
 

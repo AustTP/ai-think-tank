@@ -60,6 +60,11 @@ def test_feedback_endpoints(monkeypatch):
 
 def test_webhook_pure(tmp_path, monkeypatch):
     import serve
+    # Scope to the x-mention channel: the github channel is gated on its
+    # producer's env (GITHUB_WATCH_REPO) and has its own tests.
+    x_only = {k: v for k, v in webhooks.CHANNELS.items() if k == 'x-mention'}
+    monkeypatch.setattr(webhooks, 'CHANNELS', x_only)
+    monkeypatch.setattr(webhooks, 'WEBHOOK_CHANNELS', tuple(x_only))
     monkeypatch.setattr(serve, 'X_HANDLE', '')
     assert webhooks._webhook_channel_enabled('nope') is False
     assert webhooks._webhook_channel_enabled('x-mention') is False

@@ -15,6 +15,10 @@ _ACCESS_RANK = {name: i for i, name in enumerate(_ACCESS_LEVELS)}
 _ACCESS_MIN_LEVEL = {
     # exec: the registry/review-execute gate. Matches today's _operator_gate
     # rule exactly: a player session, or any agent with direct reports.
+    # The pre-lattice operator gate admitted player, director/admin, and any
+    # agent with direct reports (the canonical director predicate) -- the
+    # supervisor floor preserves exactly that. The lattice structures
+    # authority; it does not silently widen or narrow it.
     ('exec', 'run'): 'supervisor',
     ('exec', 'manage'): 'chief',          # registry mutations, key management
     ('spend', 'view'): 'assistant',
@@ -25,7 +29,7 @@ _ACCESS_MIN_LEVEL = {
     ('allowlist', 'request'): 'assistant',
     ('allowlist', 'approve'): 'chief',
     ('policy', 'write_global'): 'chief',  # e.g. the free-pool global switches
-    ('policy', 'write_team'): 'director', # a director may govern their own team
+    ('policy', 'write_team'): 'director',  # a director may govern their own team
     ('state_write', 'full'): 'player',    # the whole-blob autosave: player-only
 }
 
@@ -48,10 +52,12 @@ def _access_level_of(actor, state=None):
         role = (entry.get('role') or '').lower()
         if 'chief' in role:
             return 'chief'
-        if 'director' in role or not entry.get('director'):
+        if 'director' in role:
             return 'director'
     # The tank's own canonical director predicate ("has direct reports") is
-    # the supervisor floor -- one definition, injectable in tests.
+    # the supervisor floor -- one definition, injectable in tests. Only an
+    # agent the canonical predicate vouches for rises above assistant; a
+    # plain worker never does.
     if _is_director_or_admin(state, actor):
         return 'supervisor'
     return 'assistant' if entry else 'external'

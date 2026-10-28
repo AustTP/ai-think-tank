@@ -34,7 +34,7 @@ redis==8.1.0
 # Quality gates. Pinned to the exact versions baked into the Work Room
 # sandbox (world/sandbox/Dockerfile) and expected by the CI workflow
 # (.github/workflows/ci.yml), so local and CI agree.
-flake8==6.0.0
+flake8==7.1.1  # 6.0.0 + Python 3.12 misparses PEP-701 f-strings (E713 false positives inside string text)
 mypy==1.8.0
 bandit==1.9.4
 pytest==7.4.0
