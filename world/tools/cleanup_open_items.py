@@ -55,10 +55,17 @@ def main():
                              'task-ID collision bug, now fixed in sim.py.')
             print('wrq-8 -> done')
 
+    blob = json.dumps(state)
     with sqlite3.connect(DB) as conn:
         conn.execute(
             'REPLACE INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?)',
-            (json.dumps(state), now_s))
+            (blob, now_s))
+        # keep the integrity checksum row (kv_state id=2) in step -- same
+        # scheme as server 015_integrity (_state_checksum_write)
+        conn.execute(
+            'INSERT INTO state_checksum (singleton, sha256, updated_at) VALUES (1, ?, ?) '
+            'ON CONFLICT(singleton) DO UPDATE SET sha256 = excluded.sha256, updated_at = excluded.updated_at',
+            (__import__('hashlib').sha256(blob.encode('utf-8')).hexdigest(), now_s))
         conn.commit()
     print('state saved')
 

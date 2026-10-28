@@ -21,6 +21,7 @@ Imported back into serve.py as `from notify import ...`; no call site changes.
 """
 
 import email.mime.text
+import hashlib
 import json
 import os
 
@@ -52,7 +53,9 @@ def _load_escalations():
         if os.path.exists(_serve.ESCALATIONS_PATH):
             try:
                 with open(_serve.ESCALATIONS_PATH) as f:
-                    return json.load(f)
+                    data = json.load(f)
+                _verify_escalation_checksum(_serve)
+                return data
             except (OSError, ValueError) as e:
                 print(f'[escalation] could not read {_serve.ESCALATIONS_PATH}: {e}')
                 return {}
@@ -87,6 +90,18 @@ def _save_escalations(data, replace_missing=False):
                 f.flush()
                 os.fsync(f.fileno())
             os.replace(tmp, path)
+            # Integrity pair: a sibling checksum file over the exact bytes
+            # written, so a load can detect truncation or out-of-band edits
+            # (the store holds safety decisions).
+            try:
+                with open(path, 'rb') as f:
+                    digest = hashlib.sha256(f.read()).hexdigest()
+                ctmp = f'{path}.sha256.{os.getpid()}.{threading.get_ident()}.tmp'
+                with open(ctmp, 'w') as f:
+                    f.write(digest)
+                os.replace(ctmp, f'{path}.sha256')
+            except OSError:
+                pass
         finally:
             try:
                 if os.path.exists(tmp):
@@ -380,3 +395,46 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     if _serve._escalation_floor(kind) >= 1.0:
         notify_human_of_escalation(esc_id, escalations[esc_id])
     return esc_id
+
+def _verify_escalation_checksum(serve_mod):
+    """Best-effort integrity check of the escalation store (called with the
+    read lock held, right after a successful parse). A missing checksum file
+    is seeded (first boot after this feature); a mismatch is LOUD -- logged
+    and pushed to the player channels -- but never blocks the read."""
+    import hashlib
+    import os
+    path = serve_mod.ESCALATIONS_PATH
+    chk = path + '.sha256'
+    try:
+        with open(path, 'rb') as f:
+            got = hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return
+    try:
+        with open(chk) as f:
+            want = f.read().strip()
+    except OSError:
+        want = None
+    if not want:
+        try:
+            with open(chk + '.tmp', 'w') as f:
+                f.write(got)
+            os.replace(chk + '.tmp', chk)
+        except OSError:
+            pass
+        return
+    if got == want:
+        return
+    try:
+        serve_mod.log_action(None, 'escalation_checksum_mismatch',
+                             {'expected': want[:16], 'actual': got[:16]})
+    except Exception:
+        pass
+    try:
+        if hasattr(serve_mod, '_push_new_health_alerts'):
+            serve_mod._push_new_health_alerts([{
+                'category': 'integrity', 'severity': 'warning',
+                'message': ('Escalation store checksum mismatch -- the safety-decision '
+                            'ledger may be truncated or edited outside the server.')}])
+    except Exception:
+        pass

@@ -34,7 +34,7 @@ def _fire_decision(state, reviewers, candidate_def, now_ms, decider=None):
         {'id': 'keep', 'description': f"Keep {candidate.get('name')} on -- performance is acceptable, improving, or the evidence or the people who work with them don't support firing."},
     ]
     decision = (decider(state, instructions, candidates) if decider
-                else _governance_decider(state, instructions, candidates))
+                else _fire_parity_decider(state, instructions, candidates))
     if not decision:
         # Jev-outage fallback re-keyed off the firing signal, not
         # the raw morale score. Firing requires a real corroborated problem:

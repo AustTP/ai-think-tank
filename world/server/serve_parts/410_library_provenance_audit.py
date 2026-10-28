@@ -434,6 +434,19 @@ def _health_alerts_for_signals(signals):
                   f'agent "{agent_id}" made {count} browse/execute/curl/chat calls in the last '
                   f'{ANOMALY_WINDOW_S // 60} min -- possible runaway loop or tool churn')
 
+    # Integrity gates: the decision tape's hash chain and the action-log
+    # parity windows must hold -- a failed one means the audit trail itself
+    # (spend + safety decisions) cannot be trusted, which outranks every
+    # operational warning on this page.
+    if signals.get('tape_integrity') is False:
+        alert('integrity', 'critical',
+              'decision tape hash chain FAILED verification -- decision record untrustworthy: '
+              + '; '.join(str(p.get('issue')) for p in signals.get('tape_integrity_problems', [])[:3]))
+    if signals.get('action_log_parity') is False:
+        alert('integrity', 'critical',
+              'action-log parity window(s) FAILED verification -- audit log truncated or edited: '
+              + '; '.join(str(p.get('issue')) for p in signals.get('action_log_parity_problems', [])[:3]))
+
     if signals['missing_model_tier_bands']:
         alert('model_tiers', 'warning',
               f'no chosen model for band(s): {", ".join(signals["missing_model_tier_bands"])} -- '

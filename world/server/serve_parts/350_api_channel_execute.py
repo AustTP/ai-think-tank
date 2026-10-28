@@ -409,9 +409,10 @@ def _operator_gate(request):
     if actor:
         try:
             state = get_state_from_db() or {}
-        except Exception:  # noqa: BLE001 -- state unavailable -> not a director
+        except Exception:  # noqa: BLE001 -- state unavailable -> not authorized
             state = {}
-        if _is_director_or_admin(state, actor):
+        ok, _lvl, _need = _access_authorize(actor, 'exec', 'run', state)
+        if ok:
             return True, actor
     return False, None
 

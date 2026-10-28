@@ -726,6 +726,33 @@ def _decision_model_chain():
     return chain
 
 
+def _provider_key_of(slug):
+    """Coarse provider identity of a model slug: the org prefix of a plain
+    'org/model' id, or the synthetic-pool token for '@...' slugs. Used only to
+    keep the two-model agreement check honest (two different providers)."""
+    s = (slug or '').strip()
+    if s.startswith('@'):
+        parts = s.split(':')
+        return parts[1] if len(parts) > 1 else s
+    return s.split('/', 1)[0] if '/' in s else s
+
+
+def _parity_second_model():
+    """A fire/keep second-opinion model from a provider DIFFERENT from the Jev
+    primary. Preference order: the coding band, then the high band. None when
+    every candidate shares the primary's provider -- the check then degrades
+    to a single verdict rather than comparing a model with itself."""
+    primary = _jev_model()
+    for band in ('coding', 'high'):
+        try:
+            slug = _raw_model_tier_slug(band)
+        except Exception:
+            slug = None
+        if slug and slug != primary and _provider_key_of(slug) != _provider_key_of(primary):
+            return slug
+    return None
+
+
 def _jev_model():
     """The PRIMARY decisions model this think tank actually runs on, resolved
     fresh at call time like before: DB `settings` row (which may now be a

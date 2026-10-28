@@ -215,6 +215,13 @@ def init_db():
     # SQLite instance for both activity and state, not files that only
     # cover whichever feature happened to add one.
     with _db() as conn:
+        # Integrity pair for the whole-state blob (015): a singleton checksum
+        # row in its own table, committed atomically with every blob write.
+        conn.execute('''CREATE TABLE IF NOT EXISTS state_checksum (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            sha256 TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         conn.execute('''CREATE TABLE IF NOT EXISTS kv_state (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             blob TEXT NOT NULL,

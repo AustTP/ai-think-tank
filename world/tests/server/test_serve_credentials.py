@@ -21,6 +21,12 @@ import serve  # noqa: E402
 from test_cov_gap_serve_helpers import (  # noqa: E402
     _NO_GRANT, _SENTINEL, req_with, decision_cache_report_defaults)
 
+# Hermetic isolation (shared helper): this suite used to run against the LIVE
+# think_tank.db -- its external-write dedupe store read/wrote the real DB with
+# a 24h TTL, so one suite run poisoned the next day's runs with replay
+# markers. With the helper, init_db() builds a fresh temp DB per suite run.
+from test_serve_helpers import setUpModule, tearDownModule
+
 
 class CredentialLoginActionTest(unittest.TestCase):
     def _call(self, body, rate=True, key=True, grant=_NO_GRANT, safe=None,

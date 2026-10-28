@@ -30,6 +30,12 @@ async def _lifespan(app):
     # think_tank.db gets its initial copy of _SEED_PROFILES here. Idempotent: only
     # fills roles that are missing and never overwrites a director's edits.
     try:
+        # Integrity gate before the first read: flag a torn or edited
+        # whole-state blob (see 015) instead of booting half a village.
+        try:
+            _verify_state_checksum_at_boot()
+        except Exception:
+            pass
         startup_state = get_state_from_db()
         if startup_state is not None and _init_templates_in_db(startup_state):
             save_state_to_db(startup_state)

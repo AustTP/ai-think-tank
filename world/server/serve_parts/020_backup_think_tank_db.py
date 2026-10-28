@@ -648,6 +648,9 @@ def save_state_to_db(data):
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
                 (json.dumps(blob), time.time()),
             )
+            # Integrity pair (015): the checksum row must commit atomically
+            # with the blob it covers.
+            _state_checksum_write(conn, json.dumps(blob))
         try:
             sync_agent_directories(data, throttle=True)
         except Exception as e:

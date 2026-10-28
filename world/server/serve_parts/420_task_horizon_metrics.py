@@ -450,6 +450,20 @@ def compute_health_snapshot():
         'openrouter_monthly_budget_usd': OPENROUTER_MONTHLY_BUDGET_USD,
         'openrouter_api_key_set': bool(OPENROUTER_API_KEY),
     }
+    # Integrity gates (015): tape hash chain + action-log parity windows.
+    # None means the check could not run; False means it ran and FAILED.
+    try:
+        tape_ok, tape_problems = _verify_decision_tape(limit=4000)
+    except Exception:
+        tape_ok, tape_problems = None, []
+    try:
+        parity_ok, parity_problems = _verify_action_log_parity()
+    except Exception:
+        parity_ok, parity_problems = None, []
+    signals['tape_integrity'] = tape_ok
+    signals['action_log_parity'] = parity_ok
+    signals['tape_integrity_problems'] = (tape_problems or [])[:5]
+    signals['action_log_parity_problems'] = (parity_problems or [])[:5]
     return {'checked_at': now, 'db_ok': True, 'alerts': _health_alerts_for_signals(signals), **signals}
 
 

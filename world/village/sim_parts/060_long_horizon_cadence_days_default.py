@@ -687,6 +687,55 @@ def _governance_decider_default(state, instructions, candidates):
         return None
 
 
+def _fire_parity_decider(state, instructions, candidates):
+    """Two-provider agreement (the parity-bit analog) on the fire/keep
+    verdict: the primary governance decider plus one independent call on a
+    DIFFERENT provider's model. Agreement decides; disagreement files an
+    owner-safety escalation carrying both verdicts and acts on neither; a
+    failed second call degrades to the single verdict (availability over
+    strictness, with a logged marker). Firing decisions are rare, so the
+    extra call costs nothing measurable and buys a second opinion on an
+    irreversible action."""
+    import serve as _serve
+    first = _governance_decider(state, instructions, candidates)
+    if first is None:
+        return None
+    try:
+        second_model = _serve._parity_second_model()
+        if not second_model:
+            return first
+        data = _serve._call_openrouter_decision_sync(
+            second_model, {'messages': [], 'signals': {}},
+            {'choice': {'type': 'choice', 'instructions': instructions,
+                        'criteria': {c['id']: c['description'] for c in candidates}}})
+        second, _, _ = _serve._jev_choice(data)
+    except Exception as e:
+        try:
+            _serve.log_action(None, 'fire_parity_second_unavailable', {'error': str(e)[:200]})
+        except Exception:
+            pass
+        return first
+    if second not in {c['id'] for c in candidates}:
+        try:
+            _serve.log_action(None, 'fire_parity_second_unparsed',
+                              {'model': second_model, 'choice': second})
+        except Exception:
+            pass
+        return first
+    if second == first:
+        return first
+    try:
+        _serve.log_action(None, 'fire_parity_disagreement', {'first': first, 'second': second})
+        _serve.create_escalation(
+            'owner safety decision',
+            f'Fire/keep parity check DISAGREED: primary verdict "{first}", independent '
+            f'second opinion "{second}". No action was taken; a human decides. '
+            f'Review context: {instructions[:600]}')
+    except Exception:
+        pass
+    return None
+
+
 # Injectable so tests substitute a deterministic decider; the live loop uses
 # the default. Mirrors how _content_executor is injected.
 _governance_decider = _governance_decider_default

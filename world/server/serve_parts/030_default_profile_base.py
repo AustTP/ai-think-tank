@@ -507,6 +507,10 @@ def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
             (agent_id, action, json.dumps(details) if details is not None else None, authorized, time.time(), trace_id),
         )
     try:
+        _action_log_parity_maybe()
+    except Exception:
+        pass
+    try:
         _maybe_notify_failure(agent_id, action, details)
     except Exception:
         # A notification can never break the action log itself.
