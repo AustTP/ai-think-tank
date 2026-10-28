@@ -122,6 +122,52 @@ class TaskArchive(_StateCase):
         self.assertLess(blob_len, 5000)
         self.assertEqual(len(serve.get_state_from_db()['tasks']), 201)
 
+    def test_failed_quarantined_and_abandoned_tasks_archive_out(self):
+        # DEV-31 probe finding F-C (2026-10-28): only done/cancelled were
+        # swept, so 267 failed/quarantined cards accumulated in the live blob.
+        state = self._state()
+        state['tasks']['t-fail'] = {'id': 't-fail', 'status': 'failed',
+                                    'note': 'boom'}
+        state['tasks']['t-quar'] = {'id': 't-quar', 'status': 'quarantined'}
+        state['tasks']['t-aband'] = {'id': 't-aband', 'status': 'abandoned'}
+        serve.save_state_to_db(state)
+        self.assertEqual(set(self._blob_tasks()), {'t-active'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived),
+                         {'t-done', 't-fail', 't-quar', 't-aband'})
+
+    def test_recovering_failed_task_stays_in_the_blob(self):
+        # A failed task mid-recovery must stay live: the watchdog flips it
+        # back to 'repairing' and the retry child looks its parent up in the
+        # blob. Archiving it would orphan the repair chain.
+        state = self._state()
+        state['tasks']['t-recover'] = {'id': 't-recover', 'status': 'failed',
+                                       '_peerRepairPending': True}
+        state['tasks']['t-manual'] = {'id': 't-manual', 'status': 'failed',
+                                      'manualAttention': True}
+        serve.save_state_to_db(state)
+        self.assertEqual(set(self._blob_tasks()),
+                         {'t-active', 't-recover', 't-manual'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived), {'t-done'})
+
+    def test_terminal_task_referenced_by_a_live_task_stays_in_the_blob(self):
+        # A repair child mid-flight references its failed parent; archiving
+        # the parent would break the child's completion lookup.
+        state = self._state()
+        state['tasks']['t-parent'] = {'id': 't-parent', 'status': 'failed',
+                                      'note': 'transport flap'}
+        state['tasks']['t-child'] = {'id': 't-child', 'status': 'working',
+                                     'reviewOf': 't-parent'}
+        serve.save_state_to_db(state)
+        self.assertEqual(set(self._blob_tasks()),
+                         {'t-active', 't-parent', 't-child'})
+        with serve._db() as conn:
+            archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
+        self.assertEqual(set(archived), {'t-done'})
+
 
 class SyncThrottle(_StateCase):
     def test_throttled_sync_skips_within_the_interval(self):

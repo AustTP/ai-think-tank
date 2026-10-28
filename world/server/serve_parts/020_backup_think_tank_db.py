@@ -530,13 +530,25 @@ def get_state_from_db():
 # kv_state and merged back in on read, so state['tasks'] keeps its exact shape
 # for every existing reader while the per-tick serialize shrinks from MBs to
 # the handful of live tasks.
-TASK_ARCHIVE_STATUSES = frozenset({'done', 'cancelled'})
+TASK_ARCHIVE_STATUSES = frozenset(
+    {'done', 'cancelled', 'failed', 'quarantined', 'abandoned'})
 _TASK_ARCHIVE_LOCK = threading.Lock()
 _TASK_ARCHIVE_CACHE: dict[str, object] = {'db': None, 'loaded': False, 'tasks': {}}
 
 
 def _is_archived_task(task):
-    return bool(task) and task.get('status') in TASK_ARCHIVE_STATUSES
+    if not task or task.get('status') not in TASK_ARCHIVE_STATUSES:
+        return False
+    # A failed task mid-recovery must stay in the blob: the completion
+    # watchdog flips it back to 'repairing' and the retry child's completion
+    # looks the parent up in the live blob -- an archived recovering parent
+    # would orphan its own repair chain. Same for anything the operator has
+    # flagged for manual attention. (DEV-31 probe finding F-C, 2026-10-28:
+    # failed/quarantined cards were the only terminal statuses never swept,
+    # so 267 dead tasks accumulated in the live blob.)
+    if task.get('_peerRepairPending') or task.get('manualAttention'):
+        return False
+    return True
 
 
 def _task_archive_load_locked():
@@ -635,9 +647,28 @@ def save_state_to_db(data):
         # view for the write, not a mutation of the caller's state.
         tasks = data.get('tasks') or {}
         done = {tid: t for tid, t in tasks.items() if _is_archived_task(t)}
+        # A surviving task may still point at a terminal one -- a repair child
+        # mid-flight references its failed parent. Never archive a task a
+        # surviving task references, or the child's completion lookup loses
+        # its parent and the chain dead-ends. The blob filter below must use
+        # this SAME final set, or a guarded task would be dropped from the
+        # blob without ever having been archived (silent data loss).
+        live = {tid: t for tid, t in tasks.items() if tid not in done}
+        referenced = set()
+        for t in live.values():
+            for field in ('reviewOf', 'rootStoryId', 'investigationOf',
+                          'dependsOn', 'adversarialTaskId'):
+                value = t.get(field)
+                if isinstance(value, str) and value:
+                    referenced.add(value)
+                elif isinstance(value, (list, tuple)):
+                    referenced.update(v for v in value if isinstance(v, str))
+        if referenced:
+            done = {tid: t for tid, t in done.items() if tid not in referenced}
         archived_ok = _reconcile_task_archive(done) if done else True
         if done and archived_ok:
-            blob = {**data, 'tasks': {tid: t for tid, t in tasks.items() if not _is_archived_task(t)}}
+            keep = (set(tasks) - set(done))
+            blob = {**data, 'tasks': {tid: tasks[tid] for tid in keep}}
         else:
             # Nothing to archive, or the archive table is unavailable -- keep
             # every task in the blob so nothing is ever lost.

@@ -23,6 +23,38 @@ def seed(status='working'):
     }
 
 
+class StaleRepairFlagSweep(unittest.TestCase):
+    def test_stale_flag_is_popped_when_no_repair_is_live(self):
+        # A dead failed card kept _peerRepairPending forever: nothing ever
+        # cleared it, and the archive split refuses to drop a recovering
+        # parent, so the card sat in the live blob indefinitely (F-C).
+        state = seed('failed')
+        state['tasks']['p']['_peerRepairPending'] = True
+        watchdog.step(state, 100000, observe_only=False)
+        self.assertNotIn('_peerRepairPending', state['tasks']['p'])
+
+    def test_flag_survives_while_a_repair_child_is_live(self):
+        state = seed('failed')
+        state['tasks']['p']['_peerRepairPending'] = True
+        state['tasks']['r1'] = {'id': 'r1', 'status': 'working',
+                                'reviewOf': 'p', 'taskType': 'code'}
+        watchdog.step(state, 100000, observe_only=False)
+        self.assertTrue(state['tasks']['p'].get('_peerRepairPending'))
+
+    def test_flag_survives_while_a_repair_is_queued(self):
+        state = seed('failed')
+        state['tasks']['p']['_peerRepairPending'] = True
+        state['workQueue'].append({'reviewOf': 'p', 'taskType': 'code'})
+        watchdog.step(state, 100000, observe_only=False)
+        self.assertTrue(state['tasks']['p'].get('_peerRepairPending'))
+
+    def test_observe_pass_never_sweeps(self):
+        state = seed('failed')
+        state['tasks']['p']['_peerRepairPending'] = True
+        watchdog.observe(state, 100000)
+        self.assertTrue(state['tasks']['p'].get('_peerRepairPending'))
+
+
 class ObserveOnly(unittest.TestCase):
     def test_failed_task_is_not_blocked_or_requeued(self):
         state = seed('failed')

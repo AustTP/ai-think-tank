@@ -40,10 +40,44 @@ def terminalize(task, reason, now_ms):
     task.pop('_peerGate', None)
 
 
+def sweep_stale_repair_flags(state):
+    """A terminal task keeps _peerRepairPending only while a repair or
+    investigation child is actually live. The flag gates the
+    failed->repairing flip, which already requires a running or queued child,
+    so a flag with nothing in flight is stale: nothing ever clears it, and
+    the archive split must not drop a recovering parent, so the dead card
+    sits in the live blob forever (probe finding F-C, 2026-10-28: 156 dead
+    tasks carried the flag from recoveries that ended days earlier). Popping
+    it changes no live behavior: a NEW repair re-sets the flag when queued."""
+    tasks = state.get('tasks') or {}
+    live_parents = set()
+    for child in tasks.values():
+        if not isinstance(child, dict) or child.get('status') not in ('walking', 'working', 'needs_review'):
+            continue
+        for field in ('reviewOf', 'investigationOf'):
+            parent = child.get(field)
+            if parent:
+                live_parents.add(parent)
+    for item in state.get('workQueue') or []:
+        if not isinstance(item, dict) or item.get('taskType') in ('review', 'qa'):
+            continue
+        for field in ('reviewOf', 'investigationOf'):
+            parent = item.get(field)
+            if parent:
+                live_parents.add(parent)
+    for task in tasks.values():
+        if (isinstance(task, dict) and task.get('_peerRepairPending')
+                and task.get('status') in ('failed', 'cancelled', 'quarantined', 'abandoned', 'done')
+                and task.get('id') not in live_parents):
+            task.pop('_peerRepairPending', None)
+
+
 def step(state, now_ms=None, observe_only=True):
     import sim
     if not any(t.get('status') not in TERMINAL for t in (state.get('tasks') or {}).values()):
         return
+    if not observe_only:
+        sweep_stale_repair_flags(state)
     now = int(time.time() * 1000) if now_ms is None else now_ms
     control = state.setdefault('completionControl', {})
     control.setdefault('enabled', False if observe_only else True)

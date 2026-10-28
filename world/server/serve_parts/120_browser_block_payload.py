@@ -55,6 +55,13 @@ def _compact_command_output(text, limit=COMMAND_CONTEXT_MAX):
     reserved first, then the remaining budget fills head and tail.
     """
     text = text or ''
+    if isinstance(text, (bytes, bytearray)):
+        # subprocess.TimeoutExpired.stdout is ALWAYS bytes even when the
+        # successful path decodes with text=True, so a timed-out command's
+        # output flowed straight into JSONResponse and crashed the endpoint
+        # with "Object of type bytes is not JSON serializable" (52 logged
+        # occurrences from the captcha part's execute before this fix).
+        text = bytes(text).decode('utf-8', errors='replace')
     if len(text) <= limit:
         return text
     if '\n' not in text:

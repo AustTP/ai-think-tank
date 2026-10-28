@@ -22,6 +22,17 @@ class CommandCompactionTest(unittest.TestCase):
         self.assertTrue(out.endswith('TAIL'))
         self.assertIn('chars omitted', out)
 
+    def test_bytes_output_is_decoded_not_crashed(self):
+        # subprocess.TimeoutExpired.stdout is always bytes even when the
+        # successful path uses text=True; the old code passed it straight
+        # into JSONResponse and crashed the execute endpoint (52 logged
+        # "Object of type bytes is not JSON serializable" occurrences).
+        raw = 'connection timed out'.encode('utf-8')
+        self.assertEqual(serve._compact_command_output(raw),
+                         'connection timed out')
+        self.assertEqual(serve._compact_command_output(bytearray(b'ok')), 'ok')
+        self.assertIsInstance(serve._compact_command_output(b'\xff\xfe'), str)
+
 
 class HttpCacheTest(unittest.TestCase):
     def setUp(self):
