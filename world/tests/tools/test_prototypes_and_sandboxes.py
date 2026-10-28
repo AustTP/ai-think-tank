@@ -36,6 +36,8 @@ class _NullCtx:
 
 
 class PrototypeApp(unittest.TestCase):
+    @unittest.skipUnless(os.path.isdir(PROTO),
+                         'agents/ is untracked operator state -- absent on a fresh checkout')
     def test_every_agents_app_py_runs(self):
         for d in sorted(os.listdir(PROTO)):
             app = os.path.join(PROTO, d, 'prototypes', 'app.py')
@@ -64,6 +66,8 @@ class PrototypeApp(unittest.TestCase):
 
 
 class PrototypeLuhn(unittest.TestCase):
+    @unittest.skipUnless(os.path.isdir(PROTO),
+                         'agents/ is untracked operator state -- absent on a fresh checkout')
     def test_every_agents_luhn_validates(self):
         for d in sorted(os.listdir(PROTO)):
             path = os.path.join(PROTO, d, 'prototypes', 'luhn.py')
@@ -85,6 +89,8 @@ class PrototypeLuhn(unittest.TestCase):
 
 
 class PrototypeTempFix(unittest.TestCase):
+    @unittest.skipUnless(os.path.isdir(PROTO),
+                         'agents/ is untracked operator state -- absent on a fresh checkout')
     def test_every_agents_temp_fix_runs(self):
         for d in sorted(os.listdir(PROTO)):
             path = os.path.join(PROTO, d, 'prototypes', 'temp_fix.py')
@@ -182,6 +188,8 @@ class SbP1Checkout(unittest.TestCase):
 
 
 class TinyProbeTestDir(unittest.TestCase):
+    @unittest.skipUnless(os.path.isdir(os.path.join(REPO_ROOT, 'tinyprobe_test')),
+                         'tinyprobe_test/ is untracked scratch -- absent on a fresh checkout')
     def test_tp_and_probe2copy(self):
         tp = _load('tiny_tp', os.path.join(REPO_ROOT, 'tinyprobe_test', 'tp.py'))
         self.assertEqual(tp.t(), 3)

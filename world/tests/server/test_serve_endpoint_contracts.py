@@ -803,7 +803,12 @@ class SmallEndpointsTest(unittest.TestCase):
         with mock.patch.object(serve, '_village_sandbox_id',
                                side_effect=lambda a, s: s), \
              mock.patch.object(serve, '_SANDBOX_ID_RE',
-                               mock.MagicMock(match=lambda s: None)):
+                               mock.MagicMock(match=lambda s: None)), \
+             mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
+             mock.patch.object(serve, 'BROWSING_ENABLED', True):
+            # OPENROUTER_API_KEY gates the handler before the sandboxId
+            # check; machines without the operator's .env otherwise see the
+            # key-missing 500 instead of the 400 under test.
             self.assertEqual(asyncio.run(serve.sandbox_save_page(
                 req)).status_code, 400)
 

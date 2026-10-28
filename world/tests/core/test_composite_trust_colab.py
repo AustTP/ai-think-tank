@@ -106,7 +106,10 @@ class ColabStandbyTests(unittest.TestCase):
         serve._set_setting('jev_model', 'primary-x')
         self.assertTrue(serve.COLAB_STANDBY_URL.startswith('http://127.0.0.1:'),
                         'the standby is loopback-only by construction')
-        with unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+        # _colab_standby_enabled() also requires the colab CLI to be present
+        # (machine state) -- pin it so the chain under test is deterministic.
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
             self.assertEqual(serve._decision_model_chain(),
                              ['primary-x', serve.COLAB_STANDBY_URL + serve.COLAB_STANDBY_DECISION_PATH],
                              'the standby trails the chain as the LAST fallback')
@@ -340,7 +343,8 @@ class ColabComputeTests(unittest.TestCase):
 
     def test_provisions_gpu_session_with_t4_on_demand(self):
         calls = []
-        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=False), \
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_session_exists', return_value=False), \
              unittest.mock.patch.object(serve, '_colab_cli', side_effect=lambda *a, **k: calls.append((a, k)) or (0, '')):
             ok, msg = serve._colab_compute_provision()
         self.assertTrue(ok)
@@ -349,7 +353,10 @@ class ColabComputeTests(unittest.TestCase):
                          'the dedicated session is a T4 created on demand')
 
     def test_reuses_existing_session(self):
-        with unittest.mock.patch.object(serve, '_colab_session_exists', return_value=True), \
+        # The CLI's mere presence is machine state (shutil.which); the
+        # provision FLOW is what this suite tests.
+        with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+             unittest.mock.patch.object(serve, '_colab_session_exists', return_value=True), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
             ok, msg = serve._colab_compute_provision()
         self.assertTrue(ok)

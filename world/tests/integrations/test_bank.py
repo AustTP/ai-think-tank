@@ -513,7 +513,8 @@ class ApifyBudget(unittest.TestCase):
         # The cap is real (enforced by the plan), so it belongs in the Bank
         # before the first actor run accrues anything -- same "visible from
         # day one" rule as product caps.
-        with unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
+        with unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
+             unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
              unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}):
             view = serve._bank_budget_view(_snapshot())
         self.assertIn('__apify__', view)
@@ -611,7 +612,10 @@ class ApifyBudget(unittest.TestCase):
         self.addCleanup(patcher.stop)
         task = {'id': 't-apify', 'room': 'bank', 'title': 'check the budget'}
         usage = {'usedUsd': 1.2500, 'capUsd': 5.0, 'remainingUsd': 3.75}
+        # The Apify line gates on the account key being configured at all
+        # (operator .env); pin it so the reconcile flow under test runs.
         with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
              unittest.mock.patch.object(serve, '_openrouter_account_credits', return_value=None), \
              unittest.mock.patch.object(serve, '_apify_account_usage', return_value=usage):
@@ -629,6 +633,7 @@ class ApifyBudget(unittest.TestCase):
         self.addCleanup(patcher.stop)
         task = {'id': 't-apify-2', 'room': 'bank', 'title': 'check the budget'}
         with unittest.mock.patch.object(serve, '_spend_ledger_read', return_value={}), \
+             unittest.mock.patch.object(serve, 'APIFY_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, 'APIFY_MONTHLY_BUDGET_USD', 5.0), \
              unittest.mock.patch.object(serve, '_openrouter_account_credits', return_value=None), \
              unittest.mock.patch.object(serve, '_apify_account_usage', return_value=None):

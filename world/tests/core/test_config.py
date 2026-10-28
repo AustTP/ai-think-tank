@@ -763,6 +763,11 @@ class ToolDescriptionOverridesTest(unittest.TestCase):
 
     def test_override_reaches_the_served_tool_and_removal_restores_it(self):
         import serve
+        # Normalize first: the served text is baked at import from the shipped
+        # descriptions file, while a reload rebuilds it from the live env --
+        # on a machine without the operator's .env the two differ (VPN exit
+        # metadata). One reload pins both sides to the same rebuild path.
+        config.reload_policy_config()
         original = self._served('browse_page')
         self._write({'browse_page': 'Use this to read one exact page.'})
         config.reload_policy_config()
@@ -789,6 +794,9 @@ class ToolDescriptionOverridesTest(unittest.TestCase):
 
     def test_missing_file_leaves_inline_text_untouched(self):
         import serve
+        # Same normalization as the override test: compare reload-to-reload,
+        # not shipped-file text against a reload rebuild.
+        config.reload_policy_config()
         original = self._served('browse_page')
         config.reload_policy_config()
         self.assertEqual(self._served('browse_page'), original)

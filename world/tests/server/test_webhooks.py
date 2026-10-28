@@ -61,8 +61,12 @@ class DedupeTest(unittest.TestCase):
 
     def test_github_channel_is_enabled_without_a_handle_gate(self):
         # github has no own_handle_attr: the tank never posts AS the repo,
-        # so nothing can be self-activity.
-        self.assertTrue(serve._webhook_channel_enabled('github'))
+        # so nothing can be self-activity. Its requires_env gate (the watch
+        # repo) must be satisfied here -- machines without the operator's
+        # .env would otherwise see the channel disabled.
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={'GITHUB_WATCH_REPO': 'AustTP/ai-think-tank'}):
+            self.assertTrue(serve._webhook_channel_enabled('github'))
         self.assertFalse(serve._webhook_self_mention(
             {'author': 'ai-think-tank[bot]', 'text': 'x'}, channel='github'))
 

@@ -332,10 +332,13 @@ class RevokeAllowlist(unittest.TestCase):
         # A host that exists ONLY in the code-reviewed baseline must come back
         # as 'not_granted' -- the caller must never mistake it for a removal,
         # and the baseline itself must stay untouched.
+        # Both assertions stay inside the patch: BROWSE_ALLOWLIST_DOMAINS is
+        # env-seeded (_load_env), so a machine without the operator's .env
+        # has an empty baseline and only this patch can supply the host.
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}):
             result = serve._revoke_allowlist('Dreyx.COM')
-        self.assertEqual(result, 'not_granted')
-        self.assertTrue(serve._is_allowlisted_host('dreyx.com'))
+            self.assertEqual(result, 'not_granted')
+            self.assertTrue(serve._is_allowlisted_host('dreyx.com'))
 
     def test_runtime_grant_is_removed_persists_and_refreshes_proxy(self):
         # Seed the runtime list directly (no _grant_allowlist -- that would

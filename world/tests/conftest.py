@@ -120,14 +120,17 @@ def _ensure_test_db_schema():
         db_path = str(serve.DB_PATH)
     except Exception:
         db_path = None
-    if db_path and not os.path.exists(db_path):
-        parent = os.path.dirname(db_path)
-        if parent and not os.path.isdir(parent):
-            return  # a missing parent dir is the test's own scenario
-        try:
-            serve.init_db()
-        except Exception:
-            pass
+    try:
+        if db_path and os.path.isdir(os.path.dirname(db_path)):
+            if not os.path.exists(db_path):
+                serve.init_db()
+            elif os.path.getsize(db_path) == 0:
+                # An existing-but-empty file (NamedTemporaryFile): still no
+                # schema. Tests that need a virgin DB build their scenario
+                # explicitly (they drop or patch tables themselves).
+                serve.init_db()
+    except Exception:
+        pass
     yield
 
 
