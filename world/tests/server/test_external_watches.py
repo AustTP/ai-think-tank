@@ -2,9 +2,11 @@
 discovery, OSV dependency audit, GitHub CI/issue watcher, owner-calendar ICS
 sync + the selfedit calendar-conflict integration. Every test is offline:
 network seams are patched, side-car files are pointed at temp dirs."""
+import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 import time
@@ -49,6 +51,90 @@ class TempWatchFiles(unittest.TestCase):
         for p in self._patches:
             p.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+
+class UrlValidatorTests(unittest.TestCase):
+    def test_public_https_allowed(self):
+        self.assertEqual(serve._validate_external_url('https://hc-ping.com/abc'),
+                         'https://hc-ping.com/abc')
+
+    def test_loopback_rejected(self):
+        for url in ('http://localhost:8936/x', 'http://127.0.0.1:8936/x',
+                    'http://0.0.0.0/x', 'http://api.localhost/x'):
+            with self.assertRaises(ValueError):
+                serve._validate_external_url(url)
+
+    def test_metadata_and_scheme_rejected(self):
+        with self.assertRaises(ValueError):
+            serve._validate_external_url('http://169.254.169.254/latest/meta-data/')
+        with self.assertRaises(ValueError):
+            serve._validate_external_url('ftp://example.com/cal.ics')
+
+    def test_owner_lan_calendar_still_allowed(self):
+        # A self-hosted LAN calendar (Nextcloud etc.) is a legitimate owner
+        # setup -- RFC1918 stays allowed, loopback does not.
+        self.assertTrue(serve._validate_external_url('https://192.168.1.10/dav'))
+
+
+class DeadmanConfigGuardTests(unittest.TestCase):
+    def test_invalid_deadman_url_is_reported_and_never_pinged(self):
+        calls = []
+
+        def record(url):
+            calls.append(url)
+            return None  # disabled, not a ping
+
+        class StopAfterFirst(Exception):
+            pass
+
+        async def sleep_once(_s):
+            raise StopAfterFirst  # one loop cycle, then stop
+
+        with mock.patch.object(serve, '_watch_env', lambda k: 'http://localhost:9/x'), \
+             mock.patch.object(serve, '_deadman_ping_once', record), \
+             mock.patch.object(serve.asyncio, 'sleep', sleep_once):
+            with self.assertRaises(StopAfterFirst):
+                asyncio.run(serve._deadman_ping_loop())
+        # The hostile URL never reaches the wire: the guard blanks it, and
+        # _deadman_ping_once('') is the disabled no-op, not a ping attempt.
+        self.assertEqual(calls, [''])
+        rows = sqlite3.connect(serve.DB_PATH).execute(
+            "SELECT COUNT(*) FROM action_log WHERE action = 'deadman_config_invalid'"
+        ).fetchone()[0]
+        self.assertEqual(rows, 1)
+
+
+
+class IcsCapTests(unittest.TestCase):
+    def test_parse_stops_at_max_events(self):
+        raw = ''.join(
+            f'BEGIN:VEVENT\nUID:e{i}\nDTSTART:20261101T100000Z\n'
+            f'DTEND:20261101T110000Z\nSUMMARY:ev {i}\nEND:VEVENT\n'
+            for i in range(300))
+        events = serve._parse_ics_events(raw, max_events=200)
+        self.assertEqual(len(events), 200)
+
+    def test_unbounded_parse_still_returns_all(self):
+        raw = ''.join(
+            f'BEGIN:VEVENT\nUID:e{i}\nDTSTART:20261101T100000Z\n'
+            f'SUMMARY:ev {i}\nEND:VEVENT\n' for i in range(5))
+        self.assertEqual(len(serve._parse_ics_events(raw)), 5)
+
+
+class OsvSeverityTests(unittest.TestCase):
+    def test_numeric_database_specific_score_wins(self):
+        with mock.patch.object(serve, '_http_get_json',
+                               lambda u: {'database_specific': {'cvss_score': 9.8}}):
+            self.assertEqual(serve._osv_advisory_severity('GHSA-x'), 9.8)
+
+    def test_qualitative_level_maps(self):
+        with mock.patch.object(serve, '_http_get_json',
+                               lambda u: {'database_specific': {'severity': 'HIGH'}}):
+            self.assertEqual(serve._osv_advisory_severity('GHSA-y'), 7.5)
+
+    def test_failure_returns_none(self):
+        with mock.patch.object(serve, '_http_get_json', lambda u: None):
+            self.assertIsNone(serve._osv_advisory_severity('GHSA-z'))
 
 
 class DeadmanTests(TempWatchFiles):

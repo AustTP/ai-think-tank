@@ -92,6 +92,29 @@ def _http_get_json(url, headers=None, timeout=WATCH_HTTP_TIMEOUT_S):
 # STOP, the monitor pages the owner. The tank itself does nothing on ping
 # failure except log the transition -- the monitor is the alarm.
 
+def _validate_external_url(url):
+    """Guard the owner-configured outbound URLs. The threat model is weak
+    (only the owner can write .env), but a mistyped or hostile URL must not
+    turn a watch loop into an internal port scanner: loopback and the
+    link-local cloud-metadata range are never legitimate targets, and a
+    dead-man ping to localhost would be useless anyway (it dies with the
+    tank -- the whole point is a monitor that outlives it). Private LAN
+    ranges stay allowed: a self-hosted LAN calendar is a legitimate owner
+    setup."""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ('http', 'https'):
+        raise ValueError(f'unsupported scheme: {parsed.scheme or "(none)"}')
+    host = (parsed.hostname or '').lower()
+    if host in ('localhost', '0.0.0.0', '::1') or host.endswith('.localhost'):
+        raise ValueError(f'loopback host not allowed: {host}')
+    if host.startswith('127.'):
+        raise ValueError(f'loopback host not allowed: {host}')
+    if host.startswith('169.254.'):
+        raise ValueError(f'link-local/metadata host not allowed: {host}')
+    return url
+
+
 def _deadman_ping_once(url):
     """One ping. Returns True/False for the outcome, or None when no URL is
     configured (watch disabled -- not a failure)."""
@@ -109,7 +132,14 @@ def _deadman_ping_once(url):
 async def _deadman_ping_loop():
     last_ok = None
     while True:
-        ok = _deadman_ping_once((_watch_env('DEADMAN_PING_URL') or '').strip())
+        url = (_watch_env('DEADMAN_PING_URL') or '').strip()
+        try:
+            url = _validate_external_url(url) if url else url
+        except ValueError as e:
+            log_action(None, 'deadman_config_invalid', {'error': str(e)},
+                       authorized=False)
+            url = ''
+        ok = _deadman_ping_once(url)
         if ok is False and last_ok is not False:
             log_action(None, 'deadman_ping_failed',
                        {'note': 'the tank could not reach its dead-man '
@@ -241,6 +271,31 @@ async def _osv_dependency_audit_loop():
         await asyncio.sleep(WATCH_OSV_INTERVAL_S)
 
 
+OSV_CRITICAL_SCORE = 7.0
+
+
+def _osv_advisory_severity(advisory_id):
+    """Best-effort severity score for one advisory id via the OSV API.
+    Returns a float or None on any failure -- severity enrichment must
+    never break the audit. OSV's severity array carries CVSS VECTORS
+    (no numeric base score), so the practical source is the advisory's
+    database_specific block: a numeric score when present, else the
+    qualitative level mapped conservatively upward."""
+    try:
+        data = _http_get_json(f'https://api.osv.dev/v1/vulns/{advisory_id}')
+        spec = (data or {}).get('database_specific') or {}
+        for key in ('cvss_score', 'severity'):
+            try:
+                return float(spec.get(key))  # a numeric severity/score
+            except (TypeError, ValueError):
+                pass
+        level = str(spec.get('severity') or '').lower()
+        return {'critical': 9.0, 'high': 7.5, 'moderate': 4.5,
+                'medium': 4.5, 'low': 2.0}.get(level)
+    except Exception:
+        return None
+
+
 def _osv_dependency_audit_once(requirements_path=None):
     # THINK_TANK_DIR is the repo root (think_tank.db, requirements.txt,
     # webhooks.jsonl all live there). Parts exec into serve's namespace, so
@@ -248,13 +303,30 @@ def _osv_dependency_audit_once(requirements_path=None):
     path = requirements_path or os.path.join(THINK_TANK_DIR, 'requirements.txt')
     pins = _parse_requirements_pins(path)
     hits = _osv_query_sync(pins)
+    critical = []
+    for pkg, advs in (hits or {}).items():
+        for adv in advs:
+            score = _osv_advisory_severity(adv.get('id'))
+            if score is not None:
+                adv['score'] = score
+                if score >= OSV_CRITICAL_SCORE:
+                    critical.append({'package': pkg, 'id': adv.get('id'),
+                                     'score': score})
     _save_watch_file(WATCH_OSV_PATH, {
-        'lastRun': time.time(), 'scanned': len(pins), 'hits': hits})
+        'lastRun': time.time(), 'scanned': len(pins), 'hits': hits,
+        'critical': critical})
     log_action(None, 'osv_dependency_audit',
                {'scanned': len(pins), 'packagesWithAdvisories': len(hits),
                 'note': ('known advisories found -- review watches_osv.json'
                          if hits else 'no known advisories in pinned deps')},
                authorized=False)
+    if critical:
+        log_action(None, 'osv_critical_advisory',
+                   {'critical': critical,
+                    'note': 'CVSS 7.0+ advisories in pinned dependencies -- '
+                            'the emergency change lane exists for exactly '
+                            'this'},
+                   authorized=False)
     return hits
 
 
@@ -279,8 +351,11 @@ def _github_watch_once(repo):
     data = _load_watch_file(WATCH_GITHUB_PATH, {'runs': [], 'issues': []})
     runs_seen = set(data.get('runs') or [])
     issues_seen = set(data.get('issues') or [])
-    runs, _err = _github_call(
+    runs, err = _github_call(
         'GET', f'https://api.github.com/repos/{repo}/actions/runs?per_page=10')
+    if err and 'rate limit' in str(err).lower():
+        log_action(None, 'github_watch_rate_limited', {'error': str(err)[:200]},
+                   authorized=False)
     if runs:
         for run in (runs.get('workflow_runs') or []):
             rid = run.get('id')
@@ -366,10 +441,11 @@ def _ics_dt_to_ts(value, tzid):
         return None
 
 
-def _parse_ics_events(raw):
+def _parse_ics_events(raw, max_events=None):
     """Parse the needed subset of an ICS calendar into
     [{uid, summary, start_ts, end_ts}]. Returns a list; unparseable entries
-    are skipped, not fatal."""
+    are skipped, not fatal. max_events stops parsing once reached -- a
+    hostile feed cannot make the tank allocate past the cap."""
     lines = []
     for line in (raw or '').replace('\r\n', '\n').replace('\r', '\n').split('\n'):
         if line[:1] in (' ', '\t') and lines:
@@ -392,6 +468,8 @@ def _parse_ics_events(raw):
                                'start_ts': cur['start_ts'],
                                'end_ts': end})
             cur = None
+            if max_events is not None and len(events) >= max_events:
+                break
         elif cur is not None:
             params = name.split(';', 1)[1] if ';' in name else ''
             if key == 'DTSTART':
@@ -435,13 +513,22 @@ async def _owner_calendar_loop():
         await asyncio.sleep(WATCH_CALENDAR_INTERVAL_S)
 
 
+MAX_ICS_BYTES = 1024 * 1024  # a calendar feed is small; 1 MiB is generous
+
+
 def _owner_calendar_fetch_once(url):
+    url = _validate_external_url(url)
     req = urllib.request.Request(
         url, headers={'User-Agent': 'AIThinkTankAgent/1.0'})
-    with urllib.request.urlopen(req, timeout=WATCH_HTTP_TIMEOUT_S) as resp:  # nosec B310 -- owner-configured URL
-        raw = resp.read().decode('utf-8', errors='replace')
+    with urllib.request.urlopen(req, timeout=WATCH_HTTP_TIMEOUT_S) as resp:  # nosec B310 -- owner-configured URL, validated above
+        declared = int(resp.headers.get('Content-Length') or 0)
+        if declared > MAX_ICS_BYTES:
+            raise ValueError(f'calendar feed too large: {declared} bytes')
+        raw = resp.read(MAX_ICS_BYTES + 1).decode('utf-8', errors='replace')
+        if len(raw.encode('utf-8')) > MAX_ICS_BYTES:
+            raise ValueError('calendar feed exceeds 1 MiB read cap')
     now = time.time()
-    events = [e for e in _parse_ics_events(raw)
+    events = [e for e in _parse_ics_events(raw, max_events=_CALENDAR_EVENTS_MAX)
               if e['end_ts'] > now - _CALENDAR_KEEP_DAYS * 86400]
     events.sort(key=lambda e: e['start_ts'])
     _save_watch_file(CALENDAR_BLACKOUTS_PATH, {
