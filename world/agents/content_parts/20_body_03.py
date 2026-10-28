@@ -464,9 +464,11 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                 # Boot-gated like the base sync: unit tests stub the executor
                 # and write nothing, so they must not be judged on a real tree.
                 problem = None
+                before_manifest = after_manifest = None
                 if getattr(_serve.config, 'ALLOW_WORKSPACE_SYNC', False):
-                    problem = _deliverable_problem(_tree_manifest(str(stage.original)),
-                                                   _tree_manifest(str(stage.directory)))
+                    before_manifest = _tree_manifest(str(stage.original))
+                    after_manifest = _tree_manifest(str(stage.directory))
+                    problem = _deliverable_problem(before_manifest, after_manifest)
                 if problem:
                     stage.checkpoint()
                     result['ok'] = False
@@ -478,6 +480,19 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                     _commit_story_workspace(workspace, task.get('id'))
                     result['sourceDigest'] = work_reuse.tree_digest(str(stage.original))
                     result['note'] = str(result.get('note') or '') + ' | validated staged changes published'
+                    if after_manifest is not None:
+                        # The reviewer must be able to see what this turn changed
+                        # without re-walking the workspace: the DEV-31 probe
+                        # (2026-10-28) published its artifact but the completion
+                        # carried no file list, so the reviewer could not verify
+                        # the deliverable and sent the story back.
+                        changed = sorted(
+                            p for p in set(before_manifest) | set(after_manifest)
+                            if before_manifest.get(p) != after_manifest.get(p))
+                        if changed:
+                            result['changedPaths'] = changed[:60]
+                            more = '' if len(changed) <= 8 else f' (+{len(changed) - 8} more)'
+                            result['note'] += ' | changed: ' + ', '.join(changed[:8]) + more
                     _save_code_library_report(agent_id, task, result)
             else:
                 stage.checkpoint()

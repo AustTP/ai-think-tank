@@ -565,6 +565,65 @@ class CodingExecutorQualityGate(unittest.TestCase):
         self.assertFalse(result.get('ok'))
         self.assertIn('flake8', result['note'])
 
+    def _write_into_stage_fake(self):
+        """Like _fake_http, but the /api/execute write really lands in the staged
+        workspace so the publish-time tree manifests see a real changed file."""
+        def fake(method, base, path, body=None, header=None, timeout=None):
+            self.http_log.append((method, path))
+            if path == '/api/chat':
+                return {'reply': "cat > report.md << 'EOF'\nwatch health\nEOF"}
+            if path == '/api/library/search':
+                return {'matches': []}
+            if path == '/api/library/file' and method == 'GET':
+                return {'error': 'not found'}
+            if path == '/api/library/file' and method == 'POST':
+                return '_raw = saved'
+            if path == '/api/pipeline':
+                return {'sandboxId': 'x', 'failedStep': None,
+                        'results': [{'name': n, 'exitCode': 0} for n in _step_names()]}
+            if path == '/api/execute':
+                body = body or {}
+                command = (body.get('command') or '')
+                if command.startswith('budget=15000'):
+                    return {'allowed': True, 'stdout': '--- index.html ---\n<html></html>\n', 'exitCode': 0}
+                if command == 'ls -la':
+                    return {'allowed': True, 'stdout': 'report.md\n', 'exitCode': 0}
+                if command.startswith('grep -q'):
+                    return {'allowed': True, 'stdout': 'LINKED:app.js', 'exitCode': 0}
+                if 'PHANTOM:' in command and 'EXISTS:' in command:
+                    return {'allowed': True, 'stdout': '', 'exitCode': 0}
+                if command.startswith('for f in *.html *.js'):
+                    return {'allowed': True, 'stdout': '', 'exitCode': 0}
+                stage_dir = os.path.join(serve.SANDBOXES_DIR, body.get('sandboxId') or '')
+                os.makedirs(stage_dir, exist_ok=True)
+                with open(os.path.join(stage_dir, 'report.md'), 'w') as stream:
+                    stream.write('watch health\n')
+                return {'allowed': True, 'exitCode': 0, 'timedOut': False, 'stdout': '', 'reason': None}
+            return {'error': f'unexpected {method} {path}'}
+        return fake
+
+    def test_publish_note_lists_changed_files(self):
+        # The publish-time completion must tell the reviewer WHICH files the
+        # turn changed (DEV-31 probe, 2026-10-28): the artifact was published
+        # but the completion carried no file list, so the reviewer could not
+        # verify the deliverable and sent the story back.
+        import sim as _sim
+        real_store = _sim._store_content_result
+        _sim._store_content_result = self._record
+        try:
+            with unittest.mock.patch.object(serve.config, 'ALLOW_WORKSPACE_SYNC', True, create=True), \
+                 unittest.mock.patch.object(serve, '_http_json', self._write_into_stage_fake(), create=False):
+                ok = serve._run_coding_content(
+                    {'agents': {'ada': {'name': 'Ada'}}}, 'ada',
+                    {'id': 'c3', 'room': 'pressoffice', 'title': 'watch report', 'projectLabel': 'Snake'},
+                    'Current files:\nindex.html\n')
+        finally:
+            _sim._store_content_result = real_store
+        self.assertTrue(ok)
+        result = self.stored['c3']
+        self.assertEqual(['report.md'], result.get('changedPaths'))
+        self.assertIn('validated staged changes published | changed: report.md', result['note'])
+
 
 # ---------------------------------------------------------------------------
 # Instruction + toolchain wiring
