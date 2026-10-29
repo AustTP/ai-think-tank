@@ -159,6 +159,21 @@ class Reconcile(unittest.TestCase):
         _seed_grade(None, prompt_extra='no task id here', meta=False)
         self.assertEqual(serve._judge_outcome_reconcile(30), 0)
 
+    def test_review_decisions_do_not_rate_the_deliverable_judge(self):
+        # kind='grade' also tapes peer-review decisions ('actionable',
+        # 'allow', 'file_bug'); only the 0-10 score buckets feed the ledger,
+        # and rows ledgered before the filter existed are purged.
+        prompt = 'Review nora task-811 the report reads well, actionable items clear'
+        serve._append_decision_tape('grade', 'test-model', prompt,
+                                    '{"allow": "ok"}', 'allow', 0.95, 0.0,
+                                    '{}', True)
+        _seed_grade('task-812')
+        serve._judge_outcome_reconcile(30)
+        with serve._db() as conn:
+            refs = [r[0] for r in conn.execute(
+                'SELECT task_ref FROM grade_outcomes').fetchall()]
+        self.assertEqual(refs, ['task-812'])
+
 
 class Export(unittest.TestCase):
     def setUp(self):

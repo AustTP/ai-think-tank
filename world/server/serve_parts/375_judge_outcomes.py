@@ -42,6 +42,11 @@ _TASK_REF_RE = re.compile(r'(?:task|spike-task)-\d+')
 # `details LIKE '%ref%'` is only a prefilter: task-123 must not match
 # task-1234. The boundary check rejects digit-adjacent collisions.
 _ADVERSE_ACTIONS = ('quality_gate_reject', 'task_review_requeued')
+# The deliverable-grade family: `kind='grade'` also tapes peer-REVIEW
+# decisions ('actionable', 'allow', 'file_bug'), which judge a REVIEW, not a
+# deliverable, and whose prompts mention task ids for other reasons. Only
+# the 0-10 score buckets feed the judge-calibration ledger.
+_SCORE_BUCKETS = frozenset({'0', '2', '4', '6', '8', '10'})
 
 
 def _ensure_grade_outcomes():
@@ -92,6 +97,8 @@ def _judge_outcome_reconcile(days=30):
             'SELECT id, ts, prompt, choice, confidence, meta FROM decision_tape '
             "WHERE kind = 'grade' AND ok = 1 AND ts >= ?", (cutoff,)).fetchall()
         for tape_id, ts, prompt, choice, confidence, meta_raw in rows:
+            if str(choice) not in _SCORE_BUCKETS:
+                continue
             ref = _grade_task_ref(prompt, meta_raw)
             if not ref:
                 continue
@@ -119,6 +126,11 @@ def _judge_outcome_reconcile(days=30):
                 'evidence = excluded.evidence, computed_at = excluded.computed_at',
                 (tape_id, ref, ts, choice, confidence, outcome, evidence,
                  time.time()))
+        # Self-healing: rows ledgered before the score-bucket filter existed
+        # (review decisions mis-joined by regex) must not rate the judge.
+        conn.execute(
+            'DELETE FROM grade_outcomes WHERE grade IS NULL OR grade NOT IN '
+            "('0', '2', '4', '6', '8', '10')")
     return scanned
 
 
