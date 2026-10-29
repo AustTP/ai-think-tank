@@ -656,7 +656,14 @@ def save_state_to_db(data):
             # save cannot resurrect a completed task as live work.
             archived = _archived_tasks()
             if archived:
-                current = copy.deepcopy(current)
+                # No deepcopy: `current` is a freshly-parsed json.loads
+                # result with no shared references to protect, and
+                # preserve_guidance copies whatever it lifts out of
+                # `current` rather than mutating it. The deepcopy of the
+                # whole live blob (412k copy calls, ~1.2s measured) ran on
+                # EVERY save and was the largest GIL hog in the tick
+                # thread -- the merged archived dicts alias the archive
+                # cache, but this path only reads them.
                 current['tasks'] = {**archived, **(current.get('tasks') or {})}
             data = state_updates.preserve_guidance(current, data)
     # Training capture (opt-in): link task outcomes to recorded
