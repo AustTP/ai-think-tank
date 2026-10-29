@@ -20,58 +20,20 @@ through `_serve.X` at call time (the same lazy pattern auth.py documents), so:
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import threading
 import time
 import urllib.parse
 
-WS_FEED_SEED = {
-    'kraken': {
-        'name': 'Kraken public crypto ticker',
-        'credential': {'type': 'none'},
-        'ws': {
-            'url': 'wss://ws.kraken.com',
-            'subscribe': {'event': 'subscribe', 'pair': ['$PAIRS'],
-                          'subscription': {'name': 'ticker'}},
-            'vars': {'$PAIRS': ['XBT/USD', 'ETH/USD', 'XRP/USD', 'SOL/USD', 'XDG/USD']},
-            'open_timeout_s': 15,
-            'stall_timeout_s': 90,
-            'reconnect_backoff_s': 15,
-            'frame_filter': {
-                'data_kind': 'list',
-                'data_index': 1,
-                # Ticker frames are [channelID, data, channelName, pair].
-                'topic_path': '[3]',
-                'fields': {'price': 'c[0]', 'bid': 'b[0]', 'ask': 'a[0]', 'volume': 'v[0]'},
-            },
-            'buffer': {'kind': 'latest_per_topic', 'max_topics': 100, 'history': 200},
-        },
-    },
-    'aisstream': {
-        'name': 'AISStream live maritime positions',
-        'credential': {'type': 'env', 'key': 'AISSTREAM_API_KEY'},
-        'ws': {
-            'url': 'wss://stream.aisstream.io/v0/stream',
-            'subscribe': {'APIKey': '$CRED',
-                          'BoundingBoxes': [[[36.9, -76.3], [33.3, -74.8]]],
-                          'FilterMessageTypes': ['PositionReport']},
-            'vars': {},
-            'open_timeout_s': 20,
-            'stall_timeout_s': 120,
-            'reconnect_backoff_s': 15,
-            'frame_filter': {
-                'data_kind': 'dict',
-                'topic_path': 'MetaData.ShipName',
-                'skip_on_key': 'MessageType',
-                'skip_values': ['SubscriptionConfirmation'],
-                'fields': {'lat': 'MetaData.latitude', 'lon': 'MetaData.longitude',
-                           'time': 'MetaData.time_utc', 'mmsi': 'MetaData.MMSI_String'},
-            },
-            'buffer': {'kind': 'ring', 'history': 300},
-        },
-    },
-}
+# The seed now lives in ws_feeds.json (same shape as api_services.json):
+# config-not-code for a fresh install; runtime edits stay in the DB registry.
+WS_FEEDS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             'ws_feeds.json')
+with open(WS_FEEDS_PATH, encoding='utf-8') as _ws_seed_file:
+    _ws_seed_data = json.load(_ws_seed_file)
+WS_FEED_SEED = {sid: dict(spec) for sid, spec in (_ws_seed_data.get('feeds') or {}).items()}
 
 # Public aliases used by serve.py's routes and lifespan wiring. The underscore
 # names below are the originals the tests and the rest of serve.py already use.

@@ -21,78 +21,21 @@ through `_serve.X` at call time (the same lazy pattern auth.py documents), so:
   - serve.py re-imports these names unchanged, so no call site moved.
 """
 
+import json
+import os
 import sqlite3
 import threading
 import time
 import urllib.parse
 import urllib.request
 
-FEED_SEED = {
-    'bbc_world': {
-        'name': 'BBC World',
-        'url': 'https://feeds.bbci.co.uk/news/world/rss.xml',
-        'interval_s': 600,
-    },
-    'nasa_breaking': {
-        'name': 'NASA Breaking News',
-        'url': 'https://www.nasa.gov/rss/breaking_news.rss',
-        'interval_s': 1800,
-    },
-    'usgs_quakes': {
-        'name': 'USGS Earthquakes (M2.5+)',
-        'url': 'https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.atom',
-        'interval_s': 600,
-    },
-    'arxiv_cs_lg': {
-        'name': 'arXiv cs.LG',
-        'url': 'https://rss.arxiv.org/rss/cs.LG',
-        'interval_s': 1800,
-    },
-    'arxiv_cs_cl': {
-        'name': 'arXiv cs.CL',
-        'url': 'https://rss.arxiv.org/rss/cs.CL',
-        'interval_s': 1800,
-    },
-    # Owner expansion (2026-10-27): research + operational awareness. The two
-    # provider_status feeds are scanned by the health snapshot (410) for live
-    # incident keywords so the tank learns about provider degradation before
-    # the circuit breakers find it the hard way.
-    'hn_frontpage': {
-        'name': 'Hacker News front page',
-        'url': 'https://hnrss.org/frontpage',
-        'interval_s': 600,
-    },
-    'arxiv_cs_se': {
-        'name': 'arXiv cs.SE (software engineering)',
-        'url': 'https://rss.arxiv.org/rss/cs.SE',
-        'interval_s': 1800,
-    },
-    'arxiv_cs_ai': {
-        'name': 'arXiv cs.AI',
-        'url': 'https://rss.arxiv.org/rss/cs.AI',
-        'interval_s': 1800,
-    },
-    'openai_blog': {
-        'name': 'OpenAI news',
-        'url': 'https://openai.com/news/rss.xml',
-        'interval_s': 3600,
-    },
-    'deepmind_blog': {
-        'name': 'Google DeepMind blog',
-        'url': 'https://deepmind.google/blog/rss.xml',
-        'interval_s': 3600,
-    },
-    'provider_status_openai': {
-        'name': 'OpenAI status incidents',
-        'url': 'https://status.openai.com/history.rss',
-        'interval_s': 600,
-    },
-    'provider_status_anthropic': {
-        'name': 'Anthropic status incidents',
-        'url': 'https://status.anthropic.com/feed.rss',
-        'interval_s': 600,
-    },
-}
+# The seed now lives in rss_feeds.json (same shape as api_services.json):
+# config-not-code for a fresh install; runtime edits stay in the DB registry.
+RSS_FEEDS_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              'rss_feeds.json')
+with open(RSS_FEEDS_PATH, encoding='utf-8') as _rss_seed_file:
+    _rss_seed_data = json.load(_rss_seed_file)
+FEED_SEED = {sid: dict(spec) for sid, spec in (_rss_seed_data.get('feeds') or {}).items()}
 
 # Public aliases used by serve.py's routes and lifespan wiring. The underscore
 # names below are the originals the tests and the rest of serve.py already use.

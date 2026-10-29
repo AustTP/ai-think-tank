@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "comment": "Seed for the DB-backed RSS feed registry (feeds table). Runtime edits happen in the registry; a fresh install seeds from this file.",
+  "feeds": {
+    "bbc_world": {
+      "name": "BBC World",
+      "url": "https://feeds.bbci.co.uk/news/world/rss.xml",
+      "interval_s": 600
+    },
+    "nasa_breaking": {
+      "name": "NASA Breaking News",
+      "url": "https://www.nasa.gov/rss/breaking_news.rss",
+      "interval_s": 1800
+    },
+    "usgs_quakes": {
+      "name": "USGS Earthquakes (M2.5+)",
+      "url": "https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/2.5_day.atom",
+      "interval_s": 600
+    },
+    "arxiv_cs_lg": {
+      "name": "arXiv cs.LG",
+      "url": "https://rss.arxiv.org/rss/cs.LG",
+      "interval_s": 1800
+    },
+    "arxiv_cs_cl": {
+      "name": "arXiv cs.CL",
+      "url": "https://rss.arxiv.org/rss/cs.CL",
+      "interval_s": 1800
+    },
+    "hn_frontpage": {
+      "name": "Hacker News front page",
+      "url": "https://hnrss.org/frontpage",
+      "interval_s": 600
+    },
+    "arxiv_cs_se": {
+      "name": "arXiv cs.SE (software engineering)",
+      "url": "https://rss.arxiv.org/rss/cs.SE",
+      "interval_s": 1800
+    },
+    "arxiv_cs_ai": {
+      "name": "arXiv cs.AI",
+      "url": "https://rss.arxiv.org/rss/cs.AI",
+      "interval_s": 1800
+    },
+    "openai_blog": {
+      "name": "OpenAI news",
+      "url": "https://openai.com/news/rss.xml",
+      "interval_s": 3600
+    },
+    "deepmind_blog": {
+      "name": "Google DeepMind blog",
+      "url": "https://deepmind.google/blog/rss.xml",
+      "interval_s": 3600
+    },
+    "provider_status_openai": {
+      "name": "OpenAI status incidents",
+      "url": "https://status.openai.com/history.rss",
+      "interval_s": 600
+    },
+    "provider_status_anthropic": {
+      "name": "Anthropic status incidents",
+      "url": "https://status.anthropic.com/feed.rss",
+      "interval_s": 600
+    }
+  }
+}

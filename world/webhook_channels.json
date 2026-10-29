@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "comment": "Inbound webhook channels: how each channel payload becomes an ask. Adding a channel is adding an entry here plus a producer that POSTs to /api/webhook/<channel>. The consumer stays channel-agnostic.",
+  "channels": {
+    "github": {
+      "label": "GitHub event",
+      "goal": {
+        "author_template": "GitHub {author}",
+        "body_fields": [
+          "text",
+          "subject"
+        ],
+        "include_url": true,
+        "empty": "GitHub event (no text captured)"
+      },
+      "requires_env": "GITHUB_WATCH_REPO"
+    },
+    "x-mention": {
+      "label": "X mention",
+      "goal": {
+        "author_template": "X mention from {author}",
+        "body_fields": [
+          "text",
+          "subject"
+        ],
+        "include_url": true,
+        "empty": "X mention (no text captured)"
+      },
+      "own_handle_attr": "X_HANDLE",
+      "own_handle_fields": [
+        "author",
+        "subject",
+        "url"
+      ]
+    }
+  }
+}

@@ -25,45 +25,18 @@ call site moved.
 
 import asyncio
 import json
+import os
 
-# The channels a webhook can write to, and how each one is turned into an ask.
-#   goal.author_template  -- str.format template for the payload author ('' to skip)
-#   goal.body_fields      -- first present payload key supplies the body text
-#   goal.include_url      -- append the payload url in brackets
-#   goal.empty            -- fallback goal text when nothing else is present
-#   own_handle_attr       -- serve attribute holding our own account handle; when
-#                            it appears in own_handle_fields the entry is our own
-#                            activity and must not be delegated (unset -> skip all)
-CHANNELS = {
-    'github': {
-        'label': 'GitHub event',
-        # Producer: the tank's own watch loop (195_external_watches) polls
-        # the registered GitHub API for CI runs and new issues on the
-        # watched repo and appends normalized entries to webhooks.jsonl --
-        # no external relay needed. Payload shape: {author, text, url}.
-        'goal': {
-            'author_template': 'GitHub {author}',
-            'body_fields': ('text', 'subject'),
-            'include_url': True,
-            'empty': 'GitHub event (no text captured)',
-        },
-        # The producer is the tank's own watch loop; without a repo to watch
-        # it has nothing to relay, so the channel stays off.
-        'requires_env': 'GITHUB_WATCH_REPO',
-    },
-    'x-mention': {
-        'label': 'X mention',
-        'goal': {
-            'author_template': 'X mention from {author}',
-            'body_fields': ('text', 'subject'),
-            'include_url': True,
-            'empty': 'X mention (no text captured)',
-        },
-        'own_handle_attr': 'X_HANDLE',
-        'own_handle_fields': ('author', 'subject', 'url'),
-    },
-}
-
+# The channels a webhook can write to now live in webhook_channels.json
+# (same config-not-code pattern as api_services.json): the goal text, the
+# self-activity gate, and the env var that switches a channel on are data.
+# The consumer below stays channel-agnostic.
+WEBHOOK_CHANNELS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'webhook_channels.json')
+with open(WEBHOOK_CHANNELS_PATH, encoding='utf-8') as _wh_channels_file:
+    _wh_channels_data = json.load(_wh_channels_file)
+CHANNELS = {cid: dict(spec) for cid, spec in (_wh_channels_data.get('channels') or {}).items()}
 # Public tuple of valid channel names; serve.py's endpoint validates against it.
 WEBHOOK_CHANNELS = tuple(CHANNELS)
 

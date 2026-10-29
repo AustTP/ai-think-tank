@@ -1,0 +1,102 @@
+{
+  "version": 1,
+  "comment": "Seed for the DB-backed websocket feed registry (ws_feeds table). Runtime edits happen in the registry; a fresh install seeds from this file.",
+  "feeds": {
+    "kraken": {
+      "name": "Kraken public crypto ticker",
+      "credential": {
+        "type": "none"
+      },
+      "ws": {
+        "url": "wss://ws.kraken.com",
+        "subscribe": {
+          "event": "subscribe",
+          "pair": [
+            "$PAIRS"
+          ],
+          "subscription": {
+            "name": "ticker"
+          }
+        },
+        "vars": {
+          "$PAIRS": [
+            "XBT/USD",
+            "ETH/USD",
+            "XRP/USD",
+            "SOL/USD",
+            "XDG/USD"
+          ]
+        },
+        "open_timeout_s": 15,
+        "stall_timeout_s": 90,
+        "reconnect_backoff_s": 15,
+        "frame_filter": {
+          "data_kind": "list",
+          "data_index": 1,
+          "topic_path": "[3]",
+          "fields": {
+            "price": "c[0]",
+            "bid": "b[0]",
+            "ask": "a[0]",
+            "volume": "v[0]"
+          }
+        },
+        "buffer": {
+          "kind": "latest_per_topic",
+          "max_topics": 100,
+          "history": 200
+        }
+      }
+    },
+    "aisstream": {
+      "name": "AISStream live maritime positions",
+      "credential": {
+        "type": "env",
+        "key": "AISSTREAM_API_KEY"
+      },
+      "ws": {
+        "url": "wss://stream.aisstream.io/v0/stream",
+        "subscribe": {
+          "APIKey": "$CRED",
+          "BoundingBoxes": [
+            [
+              [
+                36.9,
+                -76.3
+              ],
+              [
+                33.3,
+                -74.8
+              ]
+            ]
+          ],
+          "FilterMessageTypes": [
+            "PositionReport"
+          ]
+        },
+        "vars": {},
+        "open_timeout_s": 20,
+        "stall_timeout_s": 120,
+        "reconnect_backoff_s": 15,
+        "frame_filter": {
+          "data_kind": "dict",
+          "topic_path": "MetaData.ShipName",
+          "skip_on_key": "MessageType",
+          "skip_values": [
+            "SubscriptionConfirmation"
+          ],
+          "fields": {
+            "lat": "MetaData.latitude",
+            "lon": "MetaData.longitude",
+            "time": "MetaData.time_utc",
+            "mmsi": "MetaData.MMSI_String"
+          }
+        },
+        "buffer": {
+          "kind": "ring",
+          "history": 300
+        }
+      }
+    }
+  }
+}
