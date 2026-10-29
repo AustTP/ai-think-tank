@@ -432,6 +432,13 @@ def init_db():
                 conn.execute(f'ALTER TABLE decision_tape ADD COLUMN {_col} TEXT')
             except Exception:
                 pass
+        # Structured call-site metadata (JSON): `_taskRef` on grade decisions,
+        # so the judge-calibration ledger can join a decision to its task's
+        # downstream outcome without parsing the prompt text.
+        try:
+            conn.execute('ALTER TABLE decision_tape ADD COLUMN meta TEXT')
+        except Exception:
+            pass
         _backfill_decision_tape_hashes(conn)
         # The permanent decision ARCHIVE. _prune_logs distills old decision_tape
         # rows (prompt/raw are the expensive part) into this append-only table

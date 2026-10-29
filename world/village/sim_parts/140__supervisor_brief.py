@@ -388,7 +388,7 @@ def _deliverable_evidence_lines(task):
     return lines
 
 
-def _grading_decider_default(state, instructions, task_title, room):
+def _grading_decider_default(state, instructions, task_title, room, task_id=None):
     """Default Jev resolver for grading a landed deliverable (0-10 score).
     Returns a float score or None on a Jev outage (-> deterministic fallback).
 
@@ -403,17 +403,24 @@ def _grading_decider_default(state, instructions, task_title, room):
     every deliverable graded exactly 5.0. Fixed by actually
     giving Jev several real, named score buckets to choose among (matching
     every other working choice call in this file), which restores real
-    variance instead of a permanent, invisible fallback."""
+    variance instead of a permanent, invisible fallback.
+
+    `task_id` rides the tape as structured metadata (`_taskRef`, stripped
+    before the wire payload like every underscore key) so the judge-
+    calibration ledger can join this decision to the task's downstream
+    outcome without parsing it out of the prompt text."""
     try:
         import serve
     except Exception:
         return None
+    questions = {'choice': {'type': 'choice', 'instructions': instructions,
+                            'criteria': dict(_GRADE_BUCKETS)},
+                 '_kind': 'grade'}
+    if task_id:
+        questions['_taskRef'] = str(task_id)
     try:
         data = serve._call_openrouter_decision_sync(
-            serve._jev_model(), {'messages': [], 'signals': {}},
-            {'choice': {'type': 'choice', 'instructions': instructions,
-                        'criteria': dict(_GRADE_BUCKETS)},
-             '_kind': 'grade'})
+            serve._jev_model(), {'messages': [], 'signals': {}}, questions)
         choice, _, _ = serve._jev_choice(data)
         if choice in _GRADE_BUCKETS:
             return float(choice)
@@ -623,7 +630,13 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         instructions += ('\n\nThe task record carries no deliverable content beyond '
                          'the title itself: no deliverable text, no completion note, '
                          'no written files, no artifact path. Grade what is actually here.')
-    real_grade = _grading_decider(state, instructions, title, room)
+    real_grade = None
+    try:
+        real_grade = _grading_decider(state, instructions, title, room, task.get('id'))
+    except TypeError:
+        # Older injected stubs keep their 3-arg signature; the task ref only
+        # enriches the decision tape, so a stub without it grades normally.
+        real_grade = _grading_decider(state, instructions, title, room)
     grade_is_real = real_grade is not None
     if real_grade is None:
         real_grade = _room_trailing_grade(state, room)

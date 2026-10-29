@@ -364,7 +364,7 @@ def _decision_request(model, state, questions):
     )
 
 
-def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None, kind=None):
+def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None, kind=None, meta=None):
     choice, confidence, cost = _jev_choice(data)
     # Gap: every OTHER real model call accrues
     # into the spend ledger at its own chokepoint, but Jev's cost was only
@@ -376,7 +376,7 @@ def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None,
     _append_decision_tape(
         kind or _decision_kind(prompt), model, prompt, criteria,
         choice, confidence, cost, data, True,
-        trace_id=trace_id,
+        trace_id=trace_id, meta=meta,
     )
     data['trace_id'] = trace_id
     return data
@@ -446,7 +446,7 @@ def _decision_cache_put(model, state, questions, data, chain=None):
         pass
 
 
-def _finalize_cached_decision(data, prompt, criteria, trace_id, model, village_id=None, kind=None):
+def _finalize_cached_decision(data, prompt, criteria, trace_id, model, village_id=None, kind=None, meta=None):
     """Serve a cached Jev decision: tape it (marked cached) so the audit trail
     stays complete, but accrue no spend and hit no network. A fresh trace_id
     keeps this decision event distinct in action_log like any other."""
@@ -454,7 +454,7 @@ def _finalize_cached_decision(data, prompt, criteria, trace_id, model, village_i
     _append_decision_tape(
         kind or _decision_kind(prompt), model, prompt, criteria,
         choice, confidence, 0.0, data, True,
-        trace_id=trace_id,
+        trace_id=trace_id, meta=meta,
     )
     out = dict(data)
     out['trace_id'] = trace_id
@@ -581,6 +581,14 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     # the per-kind success rates were lies. The tag is stripped from the wire
     # payload by _normalize_decision_questions below.
     explicit_kind = (questions or {}).get('_kind') if isinstance(questions, dict) else None
+    # Structured tape metadata: any other underscore key (`_taskRef`,
+    # `_agentId`, ...) is call-site context for the judge-calibration ledger,
+    # stripped from the wire payload like `_kind` but persisted alongside the
+    # row so a grade decision can be joined to its task's downstream outcome
+    # without parsing the prompt text.
+    tape_meta = {k: v for k, v in (questions or {}).items()
+                 if isinstance(k, str) and k.startswith('_') and k != '_kind'} \
+        if isinstance(questions, dict) else None
     questions = _normalize_decision_questions(questions)
     _record_decision_keys(model, state, questions)
     prompt = (questions or {}).get('choice', {}).get('instructions') if isinstance(questions, dict) else None
@@ -601,7 +609,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     cache_chain = chain
     cached = _decision_cache_get(model, state, questions, cache_chain)
     if cached is not None:
-        return _finalize_cached_decision(cached, prompt, criteria, trace_id, model, village_id=village_id, kind=kind)
+        return _finalize_cached_decision(cached, prompt, criteria, trace_id, model, village_id=village_id, kind=kind, meta=tape_meta)
     if _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     armed = len(chain) > 1  # the breaker only arms once a real fallback exists
@@ -615,7 +623,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
             _append_decision_tape(
                 kind, ','.join(chain), prompt, criteria,
                 None, None, None, {'error': 'all decision models circuit-broken', 'tried': chain}, False,
-                trace_id=trace_id,
+                trace_id=trace_id, meta=tape_meta,
             )
             raise RuntimeError('all configured decision models are circuit-broken')
         chain = probe_chain
@@ -633,7 +641,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
         if armed:
             record_model_result(slug, True)
         _decision_cache_put(model, state, questions, data, cache_chain)
-        return _finalize_decision(data, prompt, criteria, trace_id, slug, village_id=village_id, kind=kind)
+        return _finalize_decision(data, prompt, criteria, trace_id, slug, village_id=village_id, kind=kind, meta=tape_meta)
     # All candidates failed (or were already open). Tape the failure -- an ok=0
     # row marks the decision as having been attempted and lost, so a gap in the
     # tape is distinguishable from a decision that never happened. Then re-raise;
@@ -651,7 +659,7 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
             'kind': type(last_error).__name__ if last_error is not None else None,
             'status': getattr(last_error, 'code', None), 'exc': exc,
         }, False,
-        trace_id=trace_id,
+        trace_id=trace_id, meta=tape_meta,
     )
     if last_error is not None:
         raise last_error

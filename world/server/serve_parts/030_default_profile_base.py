@@ -551,12 +551,14 @@ def _decision_kind(instructions):
     return 'other'
 
 
-def _tape_row_hash(prev_hash, ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id):
+def _tape_row_hash(prev_hash, *fields):
     # HMAC-SHA256 over prev_hash + the canonical row, keyed by the server's
     # boundary secret (the same trust root the external-data markers use). A
     # row edit, a reorder, or a truncation inside the chain changes this.
-    blob = json.dumps([ts, kind, model, prompt, criteria, choice, confidence,
-                       cost, raw, ok, trace_id], sort_keys=True, default=str)
+    # Variadic: legacy rows hash 11 content fields (ts..trace_id); rows
+    # written with structured `meta` hash 12. The verifier reconstructs the
+    # same field list from the row's own NULL-ness of meta.
+    blob = json.dumps(list(fields), sort_keys=True, default=str)
     return hmac.new(_BOUNDARY_SECRET.encode(),
                     f'{prev_hash or ""}|{blob}'.encode('utf-8', errors='replace'),
                     hashlib.sha256).hexdigest()
@@ -602,13 +604,13 @@ def _verify_decision_tape(limit=100000, tail=0):
             if tail and tail > 0:
                 rows = conn.execute(
                     'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
-                    'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
+                    'choice, confidence, cost, raw, ok, trace_id, meta FROM decision_tape '
                     'WHERE id > (SELECT COALESCE(MAX(id), 0) FROM decision_tape) - ? '
                     'ORDER BY id ASC', (tail,)).fetchall()
             else:
                 rows = conn.execute(
                     'SELECT id, prev_hash, hash, ts, kind, model, prompt, criteria, '
-                    'choice, confidence, cost, raw, ok, trace_id FROM decision_tape '
+                    'choice, confidence, cost, raw, ok, trace_id, meta FROM decision_tape '
                     'ORDER BY id ASC LIMIT ?', (limit,)).fetchall()
     except Exception as e:
         return False, [{'id': None, 'issue': f'verify unavailable: {e}'}]
@@ -621,8 +623,13 @@ def _verify_decision_tape(limit=100000, tail=0):
             continue
         if idx > 0 and row_prev != prev_hash:
             problems.append({'id': rid, 'issue': 'chain break (prev_hash mismatch)'})
-        expected = _tape_row_hash(row_prev, r[3], r[4], r[5], r[6], r[7], r[8],
-                                  r[9], r[10], r[11], r[12], r[13])
+        # Legacy rows (meta NULL) hash 11 fields; rows written with structured
+        # meta hash 12. _tape_row_hash is variadic and the writer hashed the
+        # same list it inserted, so the reconstruction here must match it.
+        fields = list(r[3:14])
+        if r[14] is not None:
+            fields.append(r[14])
+        expected = _tape_row_hash(row_prev, *fields)
         if expected != row_hash:
             problems.append({'id': rid, 'issue': 'hash mismatch (content tampered)'})
         prev_hash = row_hash
@@ -640,13 +647,17 @@ def _verify_decision_tape(limit=100000, tail=0):
 _TAPE_APPEND_LOCK = threading.Lock()
 
 
-def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None):
+def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id=None, meta=None):
     # Best-effort, bounded record of a Jev decision call. A tape-write failure
     # must never fail the caller (the decision already happened), so swallow it.
     # `trace_id`: correlates this decision with the resulting
     # action_log entry(s) for the same execution chain. Auto-generated here if
     # the caller didn't supply one; the caller should pass it through to
     # log_action so actions are traceable back to this decision.
+    # `meta`: structured call-site context (`_taskRef` for grades, ...) that
+    # the underscore-stripping removed from the wire payload -- persisted so
+    # the judge-calibration ledger can join a decision to its subject without
+    # parsing the prompt. Hashed into the row like every other column.
     # Every row is chained to the previous row's hash (HMAC-SHA256), so the
     # tape is tamper-evident end to end.
     try:
@@ -668,11 +679,17 @@ def _append_decision_tape(kind, model, prompt, criteria, choice, confidence, cos
                 raw if isinstance(raw, str) else json.dumps(raw),
                 int(bool(ok)),
                 trace_id,
+                json.dumps(meta) if meta else None,
             )
-            row_hash = _tape_row_hash(prev_hash, *values)
+            # NULL meta hashes as the 11-field legacy row (the verifier
+            # reconstructs the same list from the stored column).
+            hash_fields = list(values[:11])
+            if values[11] is not None:
+                hash_fields.append(values[11])
+            row_hash = _tape_row_hash(prev_hash, *hash_fields)
             conn.execute(
-                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id, prev_hash, hash) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                'INSERT INTO decision_tape (ts, kind, model, prompt, criteria, choice, confidence, cost, raw, ok, trace_id, meta, prev_hash, hash) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (*values, prev_hash, row_hash),
             )
     except Exception:
