@@ -157,6 +157,22 @@ def _escalation_context_lines(esc):
                 f'Prior internal votes on this same escalation: {bits}. '
                 'Weigh them, but decide independently -- persistent disagreement '
                 'across rungs is itself a reason to leave this for the owner.')
+    # Institutional memory (385_rag_institutional): similar past escalations'
+    # resolutions and related library/wiki work, retrieved semantically. The
+    # rung-vote block above shows what THIS chain thought; these lines show
+    # what the TANK already learned about this kind of problem. DB-only and
+    # failure-swallowed: a retrieval gap must never block an escalation.
+    probe = ' '.join(str(esc.get(k) or '') for k in ('note', 'whatChecked', 'lookFirst'))
+    if probe.strip():
+        try:
+            for hit in _rag_search(probe, k=2, min_score=0.2,
+                                   sources=('library', 'deliverable')):
+                label = ('prior deliverable' if hit['source'] == 'deliverable'
+                         else 'library')
+                lines.append(f'Related {label}: "{hit["title"] or hit["ref"]}" -- '
+                             f'{hit["snippet"][:180]}')
+        except Exception:
+            pass
     return lines
 
 

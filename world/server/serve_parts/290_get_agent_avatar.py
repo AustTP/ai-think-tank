@@ -100,6 +100,34 @@ async def search_library(q: str, request: Request):
     requester = _resolve_requester(request)
     allowed = _requester_villages(requester)
     matches = _library_search_matches(query, allowed=allowed)
+    # Semantic layer over the same query (385_rag_institutional): the
+    # substring scan misses related work that does not share vocabulary.
+    # Retrieved hits are merged BELOW the keyword matches -- keyword hits
+    # earned their rank; semantic hits are a bonus surface, capped at three,
+    # village-scoped exactly like the keyword ones so one village's knowledge
+    # never surfaces in another's search. A lazy, bounded index refresh rides
+    # along so the index stays warm without a dedicated hot-path pass.
+    try:
+        _rag_index_pass(budget=12)
+        state = get_state_from_db()
+        seen = {m.get('path') for m in matches}
+        for hit in _rag_search(query, k=6, sources=('library', 'deliverable')):
+            if hit['source'] == 'library':
+                if hit['ref'] in seen:
+                    continue
+                if not _scope_allows(allowed, _library_path_village(hit['ref'], state)):
+                    continue
+                matches.append({'path': hit['ref'],
+                                'snippet': '[semantic match] ' + hit['snippet'],
+                                'via': 'semantic'})
+            else:
+                matches.append({'path': 'task-archive/' + hit['ref'],
+                                'snippet': '[prior deliverable] ' + hit['snippet'],
+                                'via': 'semantic'})
+            if sum(1 for m in matches if m.get('via') == 'semantic') >= 3:
+                break
+    except Exception:
+        pass  # retrieval is a bonus layer; a failure never blocks the search
     return JSONResponse({'query': query, 'matches': matches[:50]})
 
 

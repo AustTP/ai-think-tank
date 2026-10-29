@@ -623,6 +623,18 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     evidence = _deliverable_evidence_lines(task)
     if evidence:
         instructions += '\n\n' + '\n\n'.join(evidence)
+    # Room anchors (serve's institutional-memory retrieval): what comparable
+    # deliverables in this room were graded, and whether they held up. A
+    # judge with real anchors grades against the room's demonstrated bar
+    # instead of its own reflex. Bounded and failure-swallowed -- anchors
+    # enrich the judgment, they are never a precondition for it.
+    try:
+        import serve as _serve_mod
+        anchors = _serve_mod._rag_room_anchors(room, exclude_ref=task.get('id'))
+        if anchors:
+            instructions += '\n\n' + '\n\n'.join(anchors)
+    except Exception:
+        pass
     else:
         # Honest absence: a task record with no deliverable content beyond the
         # title is a legitimate 0 -- but Jev should know it is judging an empty

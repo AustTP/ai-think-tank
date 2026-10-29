@@ -269,6 +269,7 @@ async def _calibration_loop():
         try:
             await asyncio.to_thread(_calibration_adjust_pass)
             await asyncio.to_thread(_review_grade_calibration_pass)
+            await asyncio.to_thread(_rag_index_pass, 60)
         except Exception as e:
             print(f'[calibration] loop error: {e}', flush=True)
         await asyncio.sleep(CALIBRATION_ADJUST_INTERVAL_S)
@@ -823,3 +824,11 @@ def _unfinished_task_causes(task_ids):
         else:
             out['in_flight'] += 1
     return out
+
+
+@app.get('/api/rag/status')
+async def rag_status():
+    # Operator visibility for the institutional-memory index (385): what is
+    # indexed, how fresh each source is, and whether the bounded background
+    # pass is keeping up. DB-only, no model calls.
+    return JSONResponse(_rag_status())
