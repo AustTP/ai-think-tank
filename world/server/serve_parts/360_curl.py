@@ -442,11 +442,16 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     # mounts the task directory at /workspace and has its own ephemeral /tmp;
     # a host home path is never ordinary work. This also keeps the read path
     # consistent with the write path, which previously allowed a /tmp scratch
-    # write and then blocked reading the same file (task-389).
+    # write and then blocked reading the same file (task-389). The refusal
+    # names the sanctioned alternative so a high-ranking agent (the chief of
+    # staff reaching for the production database for a supervision report) is
+    # pointed at the real tool instead of just a wall.
     _host_home = os.path.expanduser('~')
     if _host_home and _host_home != '/' and _host_home in reviewed['text']:
         return False, ('blocked: the command references a host filesystem path outside the sandbox. '
-                       'Use /workspace, or the sandbox\'s own /tmp.')
+                       'Use /workspace, or the sandbox\'s own /tmp. The sandbox cannot see the '
+                       'host filesystem at all -- for org-level stats (task counts, spend) use '
+                       'the state_records tool with op=stats instead.')
     instructions = (f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\n'
                     f'Stated reason: {purpose or "not given"}\n'
                     'The sandbox is a container: /workspace is the task directory and its /tmp is '

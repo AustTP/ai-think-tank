@@ -363,20 +363,100 @@ STATE_RECORDS_TOP_LEVEL = frozenset({
 STATE_RECORDS_MAX_VALUE_CHARS = 200_000
 
 
+def _state_records_stats(state, agent_id, args):
+    """The rank-scoped aggregate read behind state_records op='stats'.
+
+    Rank discipline (the reason this op exists): the chief of staff tried to
+    satisfy a cross-team supervision report by running sqlite3 against the
+    HOST database path from inside his sandbox -- deterministic-blocked, and
+    unrunnable even if allowed, because the sandbox has no host filesystem.
+    The sanctioned aggregate now lives here, server-side under the state
+    lock, with the rank boundary built in:
+
+    - chief of staff: org-wide, or one team via args.teamId.
+    - director: forced to their own team -- the aggregate is how a director
+      sees their team's tasks/spend without paging through records; other
+      teams' numbers stay invisible.
+    - worker: refused -- org-level counts are not worker-scope data."""
+    from_start = args if args is not None else {}
+    scope = (from_start or {}).get('teamId')
+    if _is_admin(state, agent_id):
+        scope_kind = 'org' if not scope else 'team'
+    else:
+        team = supervisor_team_for(state, agent_id)
+        if not team:
+            return {'error': 'stats is chief-of-staff (org-wide) or director '
+                             '(own team) scope; workers have no aggregate read'}
+        scope, scope_kind = team.get('id'), 'team'  # forced: own team only
+    tasks = state.get('tasks') or {}
+    teams = state.get('teams') or []
+    by_team = {}
+    by_status = {}
+    total_spend = 0.0
+    total_budget = 0.0
+    for task in tasks.values():
+        if not isinstance(task, dict) or task.get('shadow'):
+            continue
+        status = str(task.get('status') or 'unknown')
+        team_id = task.get('teamId')
+        if scope_kind == 'team' and team_id != scope:
+            continue
+        by_status[status] = by_status.get(status, 0) + 1
+        if not team_id:
+            continue
+        row = by_team.setdefault(team_id, {'teamId': team_id, 'tasksByStatus': {},
+                                           'spendUsd': 0.0, 'budgetUsd': 0.0})
+        row['tasksByStatus'][status] = row['tasksByStatus'].get(status, 0) + 1
+        try:
+            row['spendUsd'] += float(task.get('ownSpendUsd') or 0.0)
+            total_spend += float(task.get('ownSpendUsd') or 0.0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            row['budgetUsd'] += float(task.get('budgetUsd') or 0.0)
+            total_budget += float(task.get('budgetUsd') or 0.0)
+        except (TypeError, ValueError):
+            pass
+    names = {t.get('id'): (t.get('name') or '') for t in teams}
+    team_rows = []
+    for team_id, row in sorted(by_team.items()):
+        row['teamName'] = names.get(team_id) or ''
+        team_rows.append(row)
+    return {
+        'ok': True, 'op': 'stats', 'scope': scope_kind,
+        'teamId': scope if scope_kind == 'team' else None,
+        'tasksByStatus': by_status,
+        'totalTasks': sum(by_status.values()),
+        'totalSpendUsd': round(total_spend, 4),
+        'totalBudgetUsd': round(total_budget, 4),
+        'teams': team_rows,
+    }
+
+
 def supervisor_state_records(agent_id, args):
-    """Chief of staff only: read or modify live business records in the state
-    blob (tasks, backlog requests, issues, teams, sprints, products, features,
-    backlog, schedules, retrospectives, governance). A path-based set/get/delete
-    under the state lock, so the sim's single writer stays authoritative. The
-    roster, agent runtime state, settings, and every underscore-prefixed
-    internal key are refused; the SQL tables have their own db_records tool."""
+    """Rank-scoped access to live business records in the state blob (tasks,
+    backlog requests, issues, teams, sprints, products, features, backlog,
+    schedules, retrospectives, governance). op='stats' is the aggregate read:
+    chief of staff gets org-wide (or one team via teamId), a director is
+    forced to their own team, workers are refused. Everything else
+    (path-based get/set/delete) stays chief-of-staff-only, under the state
+    lock, so the sim's single writer stays authoritative. The roster, agent
+    runtime state, settings, and every underscore-prefixed internal key are
+    refused; the SQL tables have their own db_records tool."""
     state = _state_begin()
     try:
         if not state:
             return {'error': 'state unavailable'}
+        op = str((args or {}).get('op') or 'collections').strip().lower()
+        if op == 'stats':
+            # Rank-scoped aggregate read, checked BEFORE the chief-of-staff
+            # gate because directors get their own-team view: chief of staff
+            # org-wide (or one team via teamId), a director forced to their
+            # own team, everyone else refused. _state_records_stats enforces
+            # the boundary; this branch never leaks for other ops.
+            return _state_records_stats(state, agent_id, args)
         if not _is_admin(state, agent_id):
             return {'error': 'only the chief of staff may read or modify state records'}
-        op = str((args or {}).get('op') or 'collections').strip().lower()
         if op == 'collections':
             out = []
             for key in sorted(STATE_RECORDS_TOP_LEVEL):

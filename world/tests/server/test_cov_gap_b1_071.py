@@ -661,3 +661,64 @@ def test_live_find_artifact_limits_and_errors(monkeypatch, tmp_path):
     assert len(out['files']) == 25
     assert len(out['archivedTasks']) == 15
     assert out['archivedTasks'][0]['title'] is None
+
+
+# ---------------------------------------------------------------------------
+# state records: rank-scoped aggregate stats
+# ---------------------------------------------------------------------------
+
+_STATS_TASKS = {
+    't1': {'status': 'done', 'teamId': 'nora', 'ownSpendUsd': 0.5, 'budgetUsd': 1.0},
+    't2': {'status': 'blocked', 'teamId': 'nora', 'ownSpendUsd': 0.25},
+    't3': {'status': 'running', 'teamId': 'ben', 'ownSpendUsd': 2.0, 'budgetUsd': 3.0},
+    't4': {'status': 'done', 'teamId': 'ben', 'shadow': True, 'ownSpendUsd': 99.0},
+}
+
+
+def test_state_records_stats_org_and_single_team(monkeypatch):
+    state = _state(tasks=dict(_STATS_TASKS))
+    _state_env(monkeypatch, state)
+    monkeypatch.setattr(serve, '_is_admin', lambda s, a: a == 'theo')
+
+    org = serve.supervisor_state_records('theo', {'op': 'stats'})
+    assert org['ok'] and org['scope'] == 'org' and org['teamId'] is None
+    assert org['tasksByStatus'] == {'done': 1, 'blocked': 1, 'running': 1}
+    assert org['totalTasks'] == 3
+    assert org['totalSpendUsd'] == 2.75
+    rows = {r['teamId']: r for r in org['teams']}
+    assert rows['nora']['tasksByStatus'] == {'done': 1, 'blocked': 1}
+    assert rows['ben']['tasksByStatus'] == {'running': 1}
+    assert rows['ben']['spendUsd'] == 2.0
+
+    one = serve.supervisor_state_records('theo', {'op': 'stats', 'teamId': 'ben'})
+    assert one['scope'] == 'team' and one['teamId'] == 'ben'
+    assert one['tasksByStatus'] == {'running': 1}
+
+
+def test_state_records_stats_director_forced_to_own_team(monkeypatch):
+    state = _state(tasks=dict(_STATS_TASKS))
+    _state_env(monkeypatch, state)
+    monkeypatch.setattr(serve, '_is_admin', lambda s, a: a == 'theo')
+
+    own = serve.supervisor_state_records('nora', {'op': 'stats'})
+    assert own['ok'] and own['scope'] == 'team' and own['teamId'] == 'nora'
+    assert own['tasksByStatus'] == {'done': 1, 'blocked': 1}
+
+    # A director asking for another team is silently re-scoped, never refused:
+    # the aggregate is her legitimate tool, the boundary is what is fixed.
+    forced = serve.supervisor_state_records('nora', {'op': 'stats', 'teamId': 'ben'})
+    assert forced['teamId'] == 'nora'
+    assert forced['tasksByStatus'] == {'done': 1, 'blocked': 1}
+
+
+def test_state_records_stats_worker_refused_writes_still_admin_only(monkeypatch):
+    state = _state(tasks=dict(_STATS_TASKS))
+    _state_env(monkeypatch, state)
+    monkeypatch.setattr(serve, '_is_admin', lambda s, a: a == 'theo')
+
+    refused = serve.supervisor_state_records('ruth', {'op': 'stats'})
+    assert 'workers have no aggregate read' in refused['error']
+
+    writes = serve.supervisor_state_records(
+        'nora', {'op': 'get', 'path': 'tasks/t1/status'})
+    assert 'only the chief of staff' in writes['error']

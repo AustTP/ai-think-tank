@@ -718,6 +718,10 @@ class ClassifyCommand(unittest.TestCase):
                 'cat ' + os.path.expanduser('~') + '/secret.txt', 'read a file', 'ada'))
         self.assertFalse(allowed)
         self.assertIn('host filesystem', reason)
+        # The refusal names the sanctioned alternative so a high-ranking
+        # agent (the chief of staff reaching for the production database for
+        # a supervision report) is pointed at the real tool, not just a wall.
+        self.assertIn('state_records tool with op=stats', reason)
 
 
 

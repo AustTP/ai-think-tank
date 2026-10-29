@@ -491,12 +491,20 @@ _SUPERVISOR_STATE_TOOL = {
     'function': {
         'name': 'state_records',
         'description': (
-            'CHIEF OF STAFF ONLY: read or modify live business records in the '
-            'think tank state (tasks, workQueue, backlogRequests, issues, teams, '
+            'RANK-SCOPED read/write over live business records in the think '
+            'tank state (tasks, workQueue, backlogRequests, issues, teams, '
             'sprints, products, features, backlog, researchTopics, retrospectives, '
             'governance, directorSupervision, completionControl). Path-based: '
             '{"op":"get","path":"tasks/task-1/status"} or '
             '{"op":"set","path":"tasks/task-1/status","value":"failed"}. '
+            'Writes (set/delete) are CHIEF OF STAFF ONLY. '
+            'op="stats" is the aggregate read: task counts by status plus '
+            'per-team spend/budget totals -- the chief of staff gets org-wide '
+            '(or one team via teamId), a director is always forced to their '
+            'OWN team, and workers are refused. Use stats for cross-team or '
+            'whole-fleet reporting instead of trying to query files or a '
+            'database path from the sandbox (host paths are unreachable and '
+            'always refused). '
             'collections lists every collection with its count. The roster, agent '
             'runtime state, settings, and underscore-prefixed internals are '
             'refused. Every set/delete runs under the state lock and is audited.'
@@ -505,9 +513,11 @@ _SUPERVISOR_STATE_TOOL = {
             'type': 'object',
             'properties': {
                 'op': {'type': 'string',
-                       'enum': ['collections', 'get', 'set', 'delete']},
+                       'enum': ['collections', 'stats', 'get', 'set', 'delete']},
                 'path': {'type': 'string',
                          'description': 'Slash path, e.g. tasks/task-1/status or backlogRequests/0/priority.'},
+                'teamId': {'type': 'string',
+                           'description': 'Optional team scope for op=stats (chief of staff only; directors are always forced to their own team).'},
                 'value': {'description': 'JSON value for set.'},
             },
             'required': ['op'],
