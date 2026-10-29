@@ -173,12 +173,17 @@ class AutoHire(unittest.TestCase):
         # Was 8 ticks @ SIM_TICK_S=2.0 (=16s wall); with the finer
         # 1.0s tick, 8 ticks is only 8s -- not enough to cross the hire/ceremony
         # wall-time intervals. Doubled so the same wall-time elapses.
+        # The tick cadence is pinned here rather than read live: these tests
+        # assert WALL-TIME behavior (cooldowns, ceremony windows), so a
+        # production cadence change (e.g. the 2026-10-29 1.0 -> 5.0
+        # event-loop stopgap) must not silently stretch the scenario.
         now = 1000.0
         grid, doors = sim._load_outdoor_geometry()
         # A hire that completes names its employee via the default
         # _hire_name_chooser -- a REAL model call. Stub it deterministic (like
         # the injected `decider`) so these tests stay offline and hermetic.
-        with unittest.mock.patch('sim._hire_name_chooser', return_value='Rowan'):
+        with unittest.mock.patch('sim._hire_name_chooser', return_value='Rowan'), \
+                unittest.mock.patch.object(sim, 'SIM_TICK_S', 1.0):
             for _ in range(ticks):
                 now += sim.SIM_TICK_S
                 sim._governance_pass(state, now=now, now_ms=int(now * 1000), grid=grid,
