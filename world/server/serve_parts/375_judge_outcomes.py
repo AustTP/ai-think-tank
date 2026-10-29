@@ -38,7 +38,6 @@ _GRADE_MATURITY_S = 7 * 86400
 # metadata (added with this ledger) is authoritative, the regex is the
 # historical fallback. The last match wins: later refs in a prompt are the
 # deliverable's own id, earlier ones tend to be cross-references.
-_TASK_REF_RE = re.compile(r'(?:task|spike-task)-\d+')
 # `details LIKE '%ref%'` is only a prefilter: task-123 must not match
 # task-1234. The boundary check rejects digit-adjacent collisions.
 _ADVERSE_ACTIONS = ('quality_gate_reject', 'task_review_requeued')
@@ -76,12 +75,14 @@ def _grade_task_ref(prompt, meta_raw):
         ref = meta.get('taskRef') or meta.get('_taskRef')
         if ref:
             return str(ref)
-    hits = _TASK_REF_RE.findall(prompt or '')
-    return hits[-1] if hits else None
+    # Shared extractor (380_entity_links): same grammar, boundary guards
+    # tested once, so task-123 is never condemned by task-1234's reject.
+    refs = _extract_task_refs(prompt or '')
+    return refs[-1] if refs else None
 
 
 def _ref_in_details(ref, details):
-    return bool(re.search(r'(?<!\d)' + re.escape(ref) + r'(?!\d)', details or ''))
+    return _entity_ref_present(ref, details)
 
 
 def _judge_outcome_reconcile(days=30):
