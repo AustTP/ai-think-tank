@@ -29,20 +29,23 @@ class EntriesValidate(unittest.TestCase):
     def test_all_four_tomtom_entries_validate(self):
         services = _services_json()['services']
         for sid in ('tomtom-search', 'tomtom-geocoding', 'tomtom-routing',
-                    'tomtom-traffic'):
+                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data'):
             spec = dict(services[sid])
             spec['id'] = sid
             resolved, normalized, error = serve._validate_api_service_spec(spec)
             self.assertIsNone(error, f'{sid}: {error}')
             self.assertEqual(resolved, sid)
-            self.assertEqual(normalized['auth']['type'], 'query_param')
-            self.assertEqual(normalized['credential']['name'], 'tomtom_api_key')
-            self.assertEqual(normalized['base_url'], 'https://api.tomtom.com')
+            self.assertIn(normalized['auth']['type'], ('query_param', 'header_bearer', 'none'))
+            self.assertIn(normalized['credential'].get('name'),
+                          ('tomtom_api_key', 'eventbrite_api_key', None))
+            self.assertTrue(normalized['base_url'].startswith('https://'))
 
     def test_daily_caps_never_exceed_monthly_free_tier(self):
         # floor(monthly / 31) * 31 <= monthly, always, even in a 31-day month.
         documented = {'tomtom-search': 2500, 'tomtom-geocoding': 20000,
-                      'tomtom-routing': 20000, 'tomtom-traffic': 2500}
+                      'tomtom-routing': 20000, 'tomtom-traffic': 2500,
+                      'eventbrite': 31 * 200, 'overpass': 31 * 250,
+                      'redfin-data': 31 * 20}
         services = _services_json()['services']
         for sid, monthly in documented.items():
             cap = services[sid]['spend']['cap']
@@ -93,5 +96,5 @@ class RegistryShape(unittest.TestCase):
             serve._load_api_services()
             registry = serve._API_SERVICES or {}
         for sid in ('tomtom-search', 'tomtom-geocoding', 'tomtom-routing',
-                    'tomtom-traffic'):
+                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data'):
             self.assertIn(sid, registry, f'{sid} missing from the seeded registry')

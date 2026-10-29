@@ -1020,6 +1020,99 @@
     "kind": "free",
     "note": "Free tier 2,500 requests/month. traffic/services/5/incidentDetails?bbox=minLon,minLat,maxLon,maxLat&timeValidityFilter=present returns live incidents (iconCategory, delay, roadNumbers, events). bbox max area 10,000 km^2."
    }
+  },
+  "eventbrite": {
+   "name": "Eventbrite v3 (event/venue lookups)",
+   "base_url": "https://www.eventbriteapi.com",
+   "credential": {
+    "type": "vault",
+    "name": "eventbrite_api_key"
+   },
+   "auth": {
+    "type": "header_bearer"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/v3/",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 200,
+    "note": "Eventbrite v3 with the vault key (header Bearer). NOTE: the public event-search (Discovery) endpoint is RETIRED (404); what works is object fetches by id -- /v3/events/{id}/, /v3/venues/{id}/, /v3/users/me/. Event DISCOVERY needs Ticketmaster Discovery API (free key, to be registered) or an events scraper."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free with the operator key; read-only GET only."
+   }
+  },
+  "overpass": {
+   "name": "Overpass API (OpenStreetMap)",
+   "base_url": "https://overpass-api.de",
+   "credential": {
+    "type": "none"
+   },
+   "auth": {
+    "type": "none"
+   },
+   "methods": [
+    "GET",
+    "POST"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/api/interpreter",
+     "methods": [
+      "GET",
+      "POST"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 250,
+    "note": "Keyless and free (public OpenStreetMap infrastructure). POI/business density: GET /api/interpreter?data=<QL> or POST with data=<QL>. Rate-limit etiquette applies (~1-2 req/s, no hammering); cap is politeness, not billing. Pairs with tomtom-search: Overpass has category density, TomTom has named businesses."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free, no account. Keep queries bounded (bounding box + timeout) or the server rejects them."
+   }
+  },
+  "redfin-data": {
+   "name": "Redfin Data Center (housing TSVs)",
+   "base_url": "https://redfin-public-data.s3.us-west-2.amazonaws.com",
+   "credential": {
+    "type": "none"
+   },
+   "auth": {
+    "type": "none"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 20,
+    "note": "Free public downloads of Redfin housing data (gzipped TSVs, multi-MB, refreshed monthly). Browse https://www.redfin.com/us-data-center for the current file paths, then fetch here. Cap is bandwidth politeness."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free download; cite Redfin per their data terms."
+   }
   }
  },
  "channels": {
