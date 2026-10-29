@@ -79,9 +79,15 @@ _STANDING_SCHEDULER = schedule.StandingScheduler()
 # cooldowns, stuck-gate + skill-review sweeps) all key off wall-time deltas
 # (now_ms - lastX >= interval), so they still fire at the same REAL rhythm --
 # they're just checked on a finer heartbeat.
-SIM_TICK_S = 1.0
-
-# Movement sub-step for the server loop: SIM_TICK_S (now 1s) is far too coarse
+# 2026-10-29: 1.0 -> 5.0. Measured on the live-size state (10.2MB blob,
+# 1672 archived tasks): save_state_to_db alone costs ~2.5s per call (Pass 1
+# re-reads the blob, deep-copies the whole state, and loads every archived
+# task to protect recovery decisions), so a 1s cadence put the tick thread
+# at ~2.5x over budget -- its GIL-held json work starved the HTTP event
+# loop and the server went dark under agent traffic. 5s restores headroom;
+# the proper fix is slimming Pass 1 to read only intervention fields, not
+# whole archived blobs. Agents pace slower; the tank stays alive.
+SIM_TICK_S = 5.0
 # to advance a 60px/s walker in one step (60px >> the 16px grid cell), which
 # overshoots waypoints and oscillates. The browser moves per-frame (tiny dt);
 # the server chunks each tick into small fixed steps so arrival/sliding resolve

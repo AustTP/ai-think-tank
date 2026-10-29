@@ -99,16 +99,21 @@ async def search_library(q: str, request: Request):
         return JSONResponse({'error': 'q is required'}, status_code=400)
     requester = _resolve_requester(request)
     allowed = _requester_villages(requester)
-    matches = _library_search_matches(query, allowed=allowed)
+    # ONE state read per request, shared by the keyword path and the
+    # semantic merge below (the blob is very large; two reads per search
+    # doubled an already-heavy request).
+    state = get_state_from_db()
+    matches = _library_search_matches(query, allowed=allowed, state=state)
     # Semantic layer over the same query (385_rag_institutional): the
     # substring scan misses related work that does not share vocabulary.
     # Retrieved hits are merged BELOW the keyword matches -- keyword hits
     # earned their rank; semantic hits are a bonus surface, capped at three,
     # village-scoped exactly like the keyword ones so one village's knowledge
-    # never surfaces in another's search. A lazy, bounded index refresh rides
-    # along so the index stays warm without a dedicated hot-path pass.
+    # never surfaces in another's search. Deliberately READ-ONLY against the
+    # index: indexing is the calibration loop's job, never the request
+    # path's -- a walk of the whole library inside a hot endpoint starves
+    # the event loop under agent traffic.
     try:
-        _rag_index_pass(budget=12)
         state = get_state_from_db()
         seen = {m.get('path') for m in matches}
         for hit in _rag_search(query, k=6, sources=('library', 'deliverable')):
@@ -189,12 +194,19 @@ def _library_trail_score(path, usage, now=None):
     return entry.get('count', 0) * decay
 
 
-def _library_search_matches(query, allowed=None):
+def _library_search_matches(query, allowed=None, state=None):
     """Pure KB search over real Library file contents: a case-insensitive
     substring match on content or path, with a context snippet either side of
     the first hit. Shares one implementation with /api/library/search so the
     clarify router's KNOWLEDGE-BASE-FIRST lookup is literally the same search
     the agents themselves use -- no second, divergent indexing to drift.
+
+    `state` is an OPTIONAL preloaded roster/village map: the hot endpoint
+    path loads the (very large) state blob ONCE per request and shares it
+    with every consumer instead of each helper re-reading the DB. None
+    keeps the old load-it-yourself behavior for cold callers.
+
+    `allowed` is the caller's village scope (see _requester_villages): None =
 
     `allowed` is the caller's village scope (see _requester_villages): None =
     every village (player/admin), a set = only that set. Filters each match by
@@ -214,7 +226,8 @@ def _library_search_matches(query, allowed=None):
     query_lower = (query or '').strip().lower()
     if not query_lower:
         return []
-    state = get_state_from_db()
+    if state is None:
+        state = get_state_from_db()
     matches = []
     for root, _dirs, filenames in os.walk(LIBRARY_DIR):
         for fn in filenames:
