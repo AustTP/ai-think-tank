@@ -20,7 +20,8 @@ import content  # noqa: E402
 import serve  # noqa: E402
 import sim  # noqa: E402
 
-from _content_sim_helpers import _Base, _completion, _snapshot
+from _content_sim_helpers import (_Base, _completion, _snapshot,
+                                  _hermetic_db)
 
 
 class DeepSimTest(_Base):
@@ -462,7 +463,8 @@ class SimResidualTest(_Base):
                  'backlogRequests': [req], 'tasks': {}, 'workQueue': []}
         pending = {'scrumMasterId': 'sm', 'reqIds': ['r1'], 'teamId': 't1'}
         seen = {}
-        with unittest.mock.patch.object(sim.comprehension,
+        with _hermetic_db(), \
+             unittest.mock.patch.object(sim.comprehension,
                                         'comprehend_batch',
                                         return_value={}), \
              unittest.mock.patch.object(sim, '_overrun_factor_for',
@@ -500,7 +502,8 @@ class SimResidualTest(_Base):
             seen['instructions'] = instructions
             seen['criteria'] = criteria
             return 'accept'
-        with unittest.mock.patch.object(sim.comprehension,
+        with _hermetic_db(), \
+             unittest.mock.patch.object(sim.comprehension,
                                         'comprehend_batch',
                                         return_value={}), \
              unittest.mock.patch.object(sim, '_overrun_factor_for',

@@ -462,11 +462,26 @@ async def write_library_file(request: Request):
     with open(target, 'w') as f:
         f.write(content[:200_000])
     log_action(agent_id, 'library_write', {'path': write_rel, 'bytes': len(content), 'source': source}, authorized=authorized)
+    # Injection scan on the untrusted door (386_injection_flags): the
+    # pending_review path quarantine is where untrusted content SITS; this
+    # is the detector that says WHY a reviewer should look carefully. Flags
+    # ride the action_log, the passport entry, and the response.
+    injection = ({'flags': [], 'score': 0} if source != 'external'
+                 else _log_library_injection_flags(agent_id, write_rel,
+                                                   content, authorized))
     # Every time an agent writes or modifies a file, it's chained into the
     # passport -- so the immutable ledger records not
     # just promotes but the actual act of writing, and any later tampering
     # with a written file is detectable against it.
-    _append_passport_decision('library_write', agent_id, {'path': write_rel, 'source': source})
+    _append_passport_decision('library_write', agent_id,
+                              {'path': write_rel, 'source': source,
+                               **({'injectionFlags': injection['flags'],
+                                   'injectionScore': injection['score']}
+                                  if injection['score'] else {})})
+    if injection['score']:
+        return JSONResponse({'saved': True, 'path': write_rel,
+                             'injectionFlags': injection['flags'],
+                             'injectionScore': injection['score']})
     return PlainTextResponse('saved')
 
 

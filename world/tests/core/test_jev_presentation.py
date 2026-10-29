@@ -201,7 +201,11 @@ class WorkerPickSignals(unittest.TestCase):
         self.assertIn('Open tasks right now: 0', out[0]['description'])
 
 
-class GroomContract(unittest.TestCase):
+class GroomContract(_ServeIsolated):
+    # Hermetic on purpose: this asserts the DECIDER CONTRACT, and the live
+    # DB copy (conftest) now legitimately carries an armed groom cascade --
+    # the decider would be correctly bypassed by the classifier instead of
+    # reached. A tmp DB keeps the contract observable.
     def _state(self, req):
         return {
             'agentRoster': [

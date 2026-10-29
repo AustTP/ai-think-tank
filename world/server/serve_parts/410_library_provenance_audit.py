@@ -166,6 +166,7 @@ def _build_weekly_review(now=None):
             'unvetted_pending_n': len(provenance['unvetted_pending']),
             'unvetted_pending': provenance['unvetted_pending'][:20],
         },
+        'judge_economics': _grade_outcome_spend(since),
     }
 
     if not actions and not decisions and provenance['writes'] == 0 \
@@ -221,6 +222,23 @@ def _build_weekly_review(now=None):
                          f'({len(provenance["unvetted_pending"])} file(s)):')
             for p in provenance['unvetted_pending'][:20]:
                 lines.append(f'  - `{p}`')
+    # Judge economics: what the grading spend bought this window. Rework
+    # spend is the price of judgments the work then failed anyway -- the
+    # number that decides how much grading is worth at all.
+    je = digest['judge_economics']
+    if je.get('held') or je.get('rework'):
+        held = je.get('held', {})
+        rework = je.get('rework', {})
+        lines += ['', '## Judge economics', '']
+        labeled_n = held.get('n', 0) + rework.get('n', 0)
+        rate = (f"{held.get('n', 0) / labeled_n:.0%}" if labeled_n else 'n/a')
+        lines.append(f"- Labeled grades: held **{held.get('n', 0)}**, "
+                     f"rework **{rework.get('n', 0)}** (hold-up rate {rate})")
+        lines.append(f"- Grading spend on held work: **${held.get('spend', 0):.4f}**; "
+                     f"on rework: **${rework.get('spend', 0):.4f}**")
+        if 'reworkSpendShare' in je:
+            lines.append(f"- Share of grading spend that bought rework: "
+                         f"**{je['reworkSpendShare']:.0%}**")
     return {'digest': digest, 'markdown': '\n'.join(lines) + '\n'}
 
 
@@ -275,6 +293,12 @@ async def _calibration_loop():
             # the opportunity window -- it no-ops 47 times a day.
             import sim as _sim
             await asyncio.to_thread(_sim._triage_nightly_retrain)
+            # Grade-outcome bookkeeping keeps itself current: the temporal
+            # backfill recovers task refs for historical grades (idempotent,
+            # cheap once caught up), then the reconcile re-classifies with
+            # whatever new evidence the last half hour brought.
+            await asyncio.to_thread(_grade_temporal_backfill, 120)
+            await asyncio.to_thread(_judge_outcome_reconcile, 30)
         except Exception as e:
             print(f'[calibration] loop error: {e}', flush=True)
         await asyncio.sleep(CALIBRATION_ADJUST_INTERVAL_S)

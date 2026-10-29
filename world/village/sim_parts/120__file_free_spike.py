@@ -609,6 +609,29 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
         if read_back:
             instructions += (f" Read-back: \"{read_back['summary']}\" "
                              f"(readiness: {read_back['readiness']}).")
+        # Near-duplicate surfacing (serve's institutional-memory retrieval):
+        # the archive of delivered work often already contains this request.
+        # A retrieved match is a HINT for the groomer, not a verdict --
+        # reject as a duplicate when it is the same work, accept when it is
+        # genuinely new. (The cascade trains on these prompts too: the line
+        # appearing is itself correlated with duplicates, which biases its
+        # prior in the correct direction.)
+        try:
+            import serve as _serve_mod
+            probe = ' '.join(str(req.get(k) or '')
+                             for k in ('title', 'reason', 'body', 'appeal'))
+            if probe.strip():
+                dup_hits = _serve_mod._rag_search(
+                    probe, k=1, min_score=0.5, sources=('deliverable',))
+                if dup_hits:
+                    hit = dup_hits[0]
+                    instructions += (
+                        ' NEAR-DUPLICATE CHECK: this closely resembles a prior '
+                        f'deliverable "{hit["title"]}" ({hit["ref"]}, room '
+                        f'{hit["room"] or "n/a"}). Reject it as a duplicate if it '
+                        'is the same work; accept only if it is genuinely new.')
+        except Exception:
+            pass  # retrieval is a hint; a failure never blocks grooming
         instructions += (" Turn it into a real card (the card type says story, spike, or research) "
                          "or groom it back to the requester because it's not ready / not needed / "
                          "doesn't fit the roadmap (reject). "

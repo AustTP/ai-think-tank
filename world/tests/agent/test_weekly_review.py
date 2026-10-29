@@ -313,3 +313,71 @@ class WeeklyReviewEndpoint(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
+
+
+class JudgeEconomics(unittest.TestCase):
+    """The judge's spend report in the weekly review: what grading bought,
+    and how much of it bought rework."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='think tank-weekly-review-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+            AGENTS_DIR=os.path.join(self.tmp, 'agents'),
+            LIBRARY_DIR=os.path.join(self.tmp, 'library'),
+            PASSPORT_PATH=os.path.join(self.tmp, 'library', '.passport.json'),
+        )
+        self._cm.start()
+        serve.init_db()
+        serve._ensure_grade_outcomes()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_digest_and_markdown_carry_the_judge_economics(self):
+        now = 2000000.0
+        since = now - WEEK
+        # Two held grades (0.01 each) + one rework (0.04), all in-window.
+        for i, (outcome, cost) in enumerate([('held', 0.01), ('held', 0.01),
+                                             ('rework', 0.04)]):
+            with serve._db() as conn:
+                conn.execute(
+                    'INSERT INTO decision_tape '
+                    '(ts, kind, model, prompt, criteria, choice, confidence, '
+                    'cost, raw, ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (since + 1000 + i, 'grade', 'test-model', 'p', 'c', '8',
+                     0.9, cost, '{}', 1))
+                tape_id = conn.execute(
+                    'SELECT id FROM decision_tape ORDER BY id DESC LIMIT 1'
+                ).fetchone()[0]
+                conn.execute(
+                    'INSERT INTO grade_outcomes (tape_id, task_ref, grade_ts, '
+                    'grade, confidence, outcome, evidence, computed_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    (tape_id, f'task-{i}', since + 2000 + i, '8', 0.9,
+                     outcome, '[]', since + 3000 + i))
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        je = review['digest']['judge_economics']
+        self.assertEqual(je['held']['n'], 2)
+        self.assertAlmostEqual(je['held']['spend'], 0.02)
+        self.assertEqual(je['rework']['n'], 1)
+        self.assertAlmostEqual(je['spendPerHeld'], 0.01)
+        self.assertAlmostEqual(je['reworkSpendShare'], 2 / 3, places=3)
+        self.assertIn('## Judge economics', review['markdown'])
+        self.assertIn('bought rework', review['markdown'])
+
+    def test_quiet_judge_leaves_no_section(self):
+        now = 2000000.0
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO action_log (agent_id, action, details, authorized, ts) '
+                'VALUES (?, ?, ?, ?, ?)',
+                ('ada', 'task_completed', None, 1, now - 1000))
+        review = serve._build_weekly_review(now=now)
+        self.assertIsNotNone(review)
+        self.assertEqual(review['digest']['judge_economics'], {})
+        self.assertNotIn('Judge economics', review['markdown'])

@@ -288,3 +288,43 @@ class TapeMeta(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class JudgeSpend(unittest.TestCase):
+    """The judge's economics: what grading spend bought. Rework spend is
+    the price of judgments the work then failed anyway."""
+
+    def setUp(self):
+        _wipe()
+
+    def _seed_priced_grade(self, task_ref, cost, outcome_action=None):
+        tape_id = _seed_grade(task_ref=task_ref, age_s=10 * 86400)
+        with serve._db() as conn:
+            conn.execute('UPDATE decision_tape SET cost = ? WHERE id = ?',
+                         (cost, tape_id))
+        if outcome_action:
+            _seed_action(outcome_action, {'taskId': task_ref})
+        return tape_id
+
+    def test_spend_split_across_outcomes(self):
+        self._seed_priced_grade('task-10', 0.01)
+        self._seed_priced_grade('task-11', 0.01)
+        self._seed_priced_grade('task-12', 0.04, 'quality_gate_reject')
+        report = serve._judge_calibration_report(30)
+        spend = report['spend']
+        self.assertEqual(spend['held']['n'], 2)
+        self.assertAlmostEqual(spend['held']['spend'], 0.02)
+        self.assertEqual(spend['rework']['n'], 1)
+        self.assertAlmostEqual(spend['rework']['spend'], 0.04)
+        self.assertAlmostEqual(spend['spendPerHeld'], 0.01)
+        self.assertAlmostEqual(spend['reworkSpendShare'], 2 / 3, places=3)
+
+    def test_no_labeled_grades_empty_spend(self):
+        report = serve._judge_calibration_report(30)
+        self.assertEqual(report['spend'], {})
+
+    def test_spend_failure_is_empty_not_fatal(self):
+        self._seed_priced_grade('task-20', 0.01)
+        with unittest.mock.patch.object(serve, '_db',
+                                        side_effect=RuntimeError('down')):
+            self.assertEqual(serve._grade_outcome_spend(0), {})

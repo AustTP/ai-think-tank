@@ -85,6 +85,145 @@ def _ref_in_details(ref, details):
     return _entity_ref_present(ref, details)
 
 
+def _grade_temporal_backfill(days=120, now=None):
+    """Recover task refs for historical grade rows the structured channel
+    can't join. Going forward every grade carries meta._taskRef; the
+    historical corpus doesn't, and a grade prompt only names its task when
+    the completion prose happened to. But a grade fires in the same tick as
+    its task's completion, and action_log records that completion with the
+    task id -- so title + agent + a tight time window resolves most of the
+    rest. Deliberately conservative: a match must agree on normalized
+    title, resolve the prompt's agent name to the acting agent, land inside
+    a +/-300s window, and survive a room cross-check against the archived
+    task when the archive has it. Anything ambiguous stays unresolved --
+    a false join would rate the judge on someone else's outcome.
+
+    Idempotent (PK on tape_id, existing matches never recomputed); safe to
+    call every calibration tick. Returns counts."""
+    now = time.time() if now is None else now
+    cutoff = now - days * 86400
+    with _db() as conn:
+        conn.execute('''CREATE TABLE IF NOT EXISTS grade_backfill (
+            tape_id INTEGER PRIMARY KEY,
+            task_ref TEXT NOT NULL,
+            method TEXT NOT NULL,
+            evidence TEXT,
+            created_at REAL NOT NULL
+        )''')
+    # Unjoined, mature-window grade rows: meta regex fails AND no backfill row.
+    joined = set()
+    try:
+        with _db() as conn:
+            joined = {r[0] for r in conn.execute('SELECT tape_id FROM grade_backfill')}
+    except Exception:
+        joined = set()
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                "SELECT id, ts, prompt, choice FROM decision_tape "
+                "WHERE kind = 'grade' AND ok = 1 AND ts >= ? "
+                'ORDER BY id ASC', (cutoff,)).fetchall()
+    except Exception:
+        return {'matched': 0, 'unresolved': 0, 'error': 'tape unavailable'}
+    unjoined = []
+    for tape_id, ts, prompt, choice in rows:
+        if tape_id in joined or str(choice) not in _SCORE_BUCKETS:
+            continue
+        ref = _grade_task_ref(prompt, None)
+        if ref:
+            continue  # structured/regex channel already owns this row
+        parsed = _grade_prompt_fields(prompt)
+        if parsed:
+            unjoined.append((tape_id, ts) + parsed)
+    if not unjoined:
+        return {'matched': 0, 'unresolved': 0}
+    # One bounded load of the completion records for the whole window --
+    # indexed by (action, ts), so this is two index range scans, not table
+    # walks.
+    roster = _agent_name_to_id()
+    completions = []
+    try:
+        with _db() as conn:
+            for ts, agent_id, details_raw in conn.execute(
+                    "SELECT ts, agent_id, details FROM action_log "
+                    "WHERE action = 'task_completed' AND ts >= ? AND ts <= ?",
+                    (cutoff, now + 60)).fetchall():
+                try:
+                    details = json.loads(details_raw) if details_raw else {}
+                except Exception:
+                    continue
+                if isinstance(details, dict) and details.get('taskId'):
+                    completions.append((ts, agent_id, details))
+    except Exception:
+        return {'matched': 0, 'unresolved': len(unjoined),
+                'error': 'action_log unavailable'}
+    matched = 0
+    for tape_id, ts, title, room, name in unjoined:
+        window = [c for c in completions
+                  if abs(c[0] - ts) <= 300
+                  and str(c[2].get('title') or '').strip().lower() == title
+                  and (not name or not roster or roster.get(name) in (None, c[1]))]
+        task_ids = {str(c[2].get('taskId')) for c in window}
+        if len(task_ids) != 1:
+            continue
+        ref = task_ids.pop()
+        if room and not _backfill_room_agrees(ref, room):
+            continue
+        with _db() as conn:
+            conn.execute(
+                'INSERT OR IGNORE INTO grade_backfill '
+                '(tape_id, task_ref, method, evidence, created_at) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (tape_id, ref, 'temporal',
+                 json.dumps({'title': title, 'room': room, 'name': name,
+                             'windowRows': len(window)}), time.time()))
+        matched += 1
+    return {'matched': matched, 'unresolved': len(unjoined) - matched}
+
+
+_GRADE_PROMPT_RE = re.compile(
+    r"Grade the deliverable '(.+?)' landed in the ([a-z]+) room by ([^.(]+?) \(")
+
+
+def _grade_prompt_fields(prompt):
+    """(title, room, agent-name) out of the standard grade prompt; None when
+    the prompt is not the standard shape (custom graders, test stubs)."""
+    m = _GRADE_PROMPT_RE.search(prompt or '')
+    if not m:
+        return None
+    # Name normalized here once: the roster map is lowercased, and a case
+    # mismatch would silently skip the agent leg of the match.
+    return (m.group(1).strip().lower(), m.group(2), m.group(3).strip().lower())
+
+
+def _agent_name_to_id():
+    """Display-name -> agent-id map from the roster. Best-effort: an empty
+    map just means the agent leg of the match is skipped."""
+    try:
+        state = get_state_from_db() or {}
+        return {str((a or {}).get('name') or '').strip().lower(): agent_id
+                for agent_id, a in (state.get('agents') or {}).items()
+                if (a or {}).get('name')}
+    except Exception:
+        return {}
+
+
+def _backfill_room_agrees(task_ref, room):
+    """Cross-check a candidate match against the archived task's own room
+    field. True when the archive is missing (recent completion not yet
+    archived -- the title+agent+window evidence stands alone) or agrees."""
+    try:
+        with _db() as conn:
+            row = conn.execute('SELECT blob FROM task_archive WHERE id = ?',
+                               (task_ref,)).fetchone()
+        if not row:
+            return True
+        task = json.loads(row[0])
+        return str(task.get('room') or '').lower() == str(room).lower()
+    except Exception:
+        return False
+
+
 def _judge_outcome_reconcile(days=30):
     """Classify grade decisions in the window against downstream outcomes.
     Idempotent per tape row: UPSERT, because outcomes mature over time (a
@@ -101,6 +240,20 @@ def _judge_outcome_reconcile(days=30):
             if str(choice) not in _SCORE_BUCKETS:
                 continue
             ref = _grade_task_ref(prompt, meta_raw)
+            if not ref:
+                # The temporal backfill's recovered ref (if any) counts --
+                # it passed title + agent + window + room evidence before
+                # it was allowed to speak for this row. NB: a DISTINCT
+                # connection variable -- shadowing the loop's `conn` here
+                # would leave the rest of the iteration on a closed db.
+                try:
+                    with _db() as backfill_conn:
+                        row = backfill_conn.execute(
+                            'SELECT task_ref FROM grade_backfill '
+                            'WHERE tape_id = ?', (tape_id,)).fetchone()
+                    ref = row[0] if row else None
+                except Exception:
+                    ref = None
             if not ref:
                 continue
             scanned += 1
@@ -197,10 +350,41 @@ def _judge_calibration_report(days=30, now=None):
         'byGrade': choices,
         'overconfident': overconfident,
         'datasetRows': len(rows),
+        'spend': _grade_outcome_spend(cutoff),
         'note': ('holdRate is the owner-accepted-without-rework north star; '
                  'pending rows are grades too recent to classify '
                  f'(< {_GRADE_MATURITY_S // 86400}d maturity).'),
     }
+
+
+def _grade_outcome_spend(cutoff):
+    """The judge's economics: what grading spend bought. Rework spend is
+    money spent producing a judgment the task then failed anyway -- the
+    denominator of every future decision about how much grading is worth.
+    DB-only; {} on any failure."""
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT g.outcome, SUM(t.cost), COUNT(*) FROM grade_outcomes g '
+                'JOIN decision_tape t ON t.id = g.tape_id '
+                "WHERE t.kind = 'grade' AND t.ok = 1 AND g.grade_ts >= ? "
+                "AND g.outcome IN ('held', 'rework') GROUP BY g.outcome",
+                (cutoff,)).fetchall()
+    except Exception:
+        return {}
+    out = {}
+    for outcome, spend, n in rows:
+        out[outcome] = {'spend': round(float(spend or 0.0), 6), 'n': n}
+    if 'held' in out and out['held']['n']:
+        out['spendPerHeld'] = round(out['held']['spend'] / out['held']['n'], 6)
+    if 'rework' in out and out['rework']['n']:
+        out['spendPerRework'] = round(
+            out['rework']['spend'] / out['rework']['n'], 6)
+    total = sum(v['spend'] for v in out.values() if isinstance(v, dict))
+    rework = out.get('rework', {}).get('spend', 0.0)
+    if total:
+        out['reworkSpendShare'] = round(rework / total, 4)
+    return out
 
 
 def _judge_calibration_export(days=30, cap=5000):

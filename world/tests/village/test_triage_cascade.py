@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -287,6 +288,107 @@ class NightlyRetrain(unittest.TestCase):
         out = sim._triage_cascade_report()
         self.assertIn('lastRetrain', out)
         self.assertTrue(out['lastRetrain']['adopted'])
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class NearDuplicateSurfacing(unittest.TestCase):
+    """The groom instructions gain a NEAR-DUPLICATE CHECK line when the
+    archive of delivered work contains something semantically close -- a
+    hint for the groomer, not a verdict."""
+
+    def _groom(self, req):
+        state = {
+            'agentRoster': [
+                {'id': 'd1', 'name': 'Dana', 'director': None},
+                {'id': 'sm1', 'name': 'Sam', 'director': 'd1'},
+                {'id': 'm1', 'name': 'Mia', 'director': 'd1'},
+            ],
+            'agents': {
+                'd1': {'id': 'd1', 'busy': False, 'offDuty': False},
+                'sm1': {'id': 'sm1', 'name': 'Sam', 'busy': False, 'offDuty': False},
+                'm1': {'id': 'm1', 'busy': False, 'offDuty': False},
+            },
+            'teams': [{'id': 't1', 'directorId': 'd1'}],
+            'backlogRequests': [req], 'issues': {}, 'tasks': {}, 'workQueue': [],
+        }
+        captured = {}
+
+        def decider(instructions, criteria, kind=None):
+            captured['instructions'] = instructions
+            return 'accept'
+
+        pending = {'scrumMasterId': 'sm1', 'teamId': 't1', 'reqIds': ['r1'],
+                   'people': {}}
+        gov = unittest.mock.patch.object(sim, '_log_governance',
+                                         lambda *a, **k: None)
+        digest = unittest.mock.patch.object(serve, 'log_refinement_digest',
+                                            lambda *a, **k: None)
+        with gov, digest:
+            sim._resolve_refinement(state, pending, 1_000_000, decider=decider)
+        return captured['instructions']
+
+    def setUp(self):
+        _reset_cache()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+            conn.execute("DELETE FROM settings WHERE key LIKE 'triage_%'")
+        serve._rag_ensure_table()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM rag_index')
+            conn.execute('DELETE FROM task_archive')
+        shutil.rmtree(serve.LIBRARY_DIR, ignore_errors=True)
+        os.makedirs(serve.LIBRARY_DIR, exist_ok=True)
+
+    def _seed_deliverable(self, task_id, room, title, body):
+        blob = json.dumps({'id': task_id, 'room': room, 'title': title,
+                           'deliverableText': body})
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?)',
+                (task_id, blob, time.time()))
+        serve._rag_index_pass(60)
+
+    def test_near_duplicate_line_names_the_prior_work(self):
+        self._seed_deliverable(
+            'task-77', 'observatory', 'Weather widget',
+            'Weather widget for the observatory: shows the current '
+            'conditions and forecast on the wall display.')
+        instructions = self._groom({
+            'id': 'r1', 'status': 'pending', 'filedBy': 'm1',
+            'title': '[STORY] Add a weather widget', 'room': 'observatory',
+            'reason': 'The observatory cannot show the current weather.',
+            'issueType': 'story', 'deliverable': 'code',
+            'acceptanceCriteria': 'Given a load, when the page opens, then '
+                                  'the widget shows conditions.',
+            'never': 'NEVER: Never call paid APIs',
+        })
+        self.assertIn('NEAR-DUPLICATE CHECK', instructions)
+        self.assertIn('task-77', instructions)
+        self.assertIn('Reject it as a duplicate', instructions)
+
+    def test_no_match_no_line(self):
+        instructions = self._groom({
+            'id': 'r1', 'status': 'pending', 'filedBy': 'm1',
+            'title': '[STORY] Add a weather widget', 'room': 'observatory',
+            'reason': 'The observatory cannot show the current weather.',
+        })
+        self.assertNotIn('NEAR-DUPLICATE CHECK', instructions)
+
+    def test_retrieval_failure_never_blocks_grooming(self):
+        with unittest.mock.patch.object(serve, '_rag_search',
+                                        side_effect=RuntimeError('down')):
+            instructions = self._groom({
+                'id': 'r1', 'status': 'pending', 'filedBy': 'm1',
+                'title': '[STORY] Add a weather widget', 'room': 'observatory',
+                'reason': 'weather',
+            })
+        # Grooming survived: the instructions were built and handed to the
+        # decider even though retrieval blew up.
+        self.assertIn('Turn it into a real card', instructions)
+        self.assertNotIn('NEAR-DUPLICATE CHECK', instructions)
 
 
 if __name__ == '__main__':
