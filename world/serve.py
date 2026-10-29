@@ -21,9 +21,15 @@ if __name__ == '__main__':
     # The enforced form of "kill the server when idle"; 0 = disabled.
     _idle_arg = [a for a in sys.argv if a.startswith('--max-idle-minutes')]
     if _idle_arg:
+        _idle_raw = _idle_arg[0].split('=', 1)[1] if '=' in _idle_arg[0] else None
+        if _idle_raw is None:
+            # Space form: --max-idle-minutes 5 (the value is the next argv).
+            _idx = sys.argv.index(_idle_arg[0])
+            if _idx + 1 < len(sys.argv):
+                _idle_raw = sys.argv[_idx + 1]
         try:
-            _MAX_IDLE_MINUTES = float(_idle_arg[0].split('=')[1])
-        except (IndexError, ValueError):
+            _MAX_IDLE_MINUTES = float(_idle_raw)
+        except (TypeError, ValueError):
             print('[args] --max-idle-minutes=<minutes> expected (0 disables); ignoring', flush=True)
     # --host=<ip>: bind somewhere other than localhost, e.g. a Tailscale
     # address so the real (already-login-gated) UI is reachable from other

@@ -447,3 +447,105 @@ class CredentialAndDeviceHelpers(unittest.TestCase):
             self.assertEqual(serve._get_or_create_device_key(), ('existing', None))
 
 
+
+
+class DormancyWiring(unittest.TestCase):
+    """The dormancy loops must actually be scheduled by the lifespan.
+
+    Found 2026-10-29: _idle_shutdown_loop and _dormancy_window_loop were
+    defined but never created -- no create_task referenced either, so
+    idle auto-sleep and the dormant-only self-edit window could never
+    engage no matter what flags were passed."""
+
+    def _run_with_spied_loops(self):
+        calls = []
+
+        async def _spy_loop(*a, **k):
+            calls.append('loop')
+            await asyncio.sleep(0)
+
+        async def _run():
+            async with serve._lifespan(serve.app):
+                await asyncio.sleep(0)
+
+        with contextlib.ExitStack() as stack:
+            for p in Lifespan._patches(self, sim_ok=True):
+                stack.enter_context(p)
+            idle_spy = unittest.mock.patch.object(serve, '_idle_shutdown_loop', _spy_loop)
+            dorm_spy = unittest.mock.patch.object(serve, '_dormancy_window_loop', _spy_loop)
+            stack.enter_context(idle_spy)
+            stack.enter_context(dorm_spy)
+            stack.enter_context(unittest.mock.patch.object(serve, '_MAX_IDLE_MINUTES', 5.0))
+            asyncio.run(_run())
+        return calls
+
+    def test_dormancy_window_loop_is_always_scheduled(self):
+        self.assertIn('loop', self._run_with_spied_loops())
+
+    def test_idle_loop_is_scheduled_when_armed(self):
+        self.assertIn('loop', self._run_with_spied_loops())
+
+    def test_idle_loop_is_not_scheduled_when_disarmed(self):
+        calls = []
+
+        async def _dormancy_spy(*a, **k):
+            calls.append('dormancy')
+            await asyncio.sleep(0)
+
+        async def _idle_spy(*a, **k):
+            calls.append('idle')
+            await asyncio.sleep(0)
+
+        async def _run():
+            async with serve._lifespan(serve.app):
+                await asyncio.sleep(0)
+        with contextlib.ExitStack() as stack:
+            for p in Lifespan._patches(self, sim_ok=True):
+                stack.enter_context(p)
+            stack.enter_context(unittest.mock.patch.object(serve, '_dormancy_window_loop', _dormancy_spy))
+            stack.enter_context(unittest.mock.patch.object(serve, '_idle_shutdown_loop', _idle_spy))
+            stack.enter_context(unittest.mock.patch.object(serve, '_MAX_IDLE_MINUTES', 0.0))
+            asyncio.run(_run())
+        self.assertIn('dormancy', calls)
+        self.assertNotIn('idle', calls,
+                         'idle loop must not run when --max-idle-minutes is unset')
+
+
+class IdleShouldSleep(unittest.TestCase):
+    def _patched(self, minutes, last, dormant, now):
+        return unittest.mock.patch.multiple(
+            serve, _MAX_IDLE_MINUTES=minutes, _LAST_REQUEST_TIME=last,
+            _dormant=lambda: dormant), now
+
+    def test_arms_only_when_flag_set(self):
+        with unittest.mock.patch.multiple(serve, _MAX_IDLE_MINUTES=0.0,
+                                          _LAST_REQUEST_TIME=time.time() - 3600,
+                                          _dormant=lambda: False):
+            self.assertFalse(serve._idle_should_sleep())
+
+    def test_no_request_ever_seen_never_sleeps(self):
+        with unittest.mock.patch.multiple(serve, _MAX_IDLE_MINUTES=0.5,
+                                          _LAST_REQUEST_TIME=None,
+                                          _dormant=lambda: False):
+            self.assertFalse(serve._idle_should_sleep())
+
+    def test_idle_beyond_threshold_sleeps(self):
+        now = time.time()
+        with unittest.mock.patch.multiple(serve, _MAX_IDLE_MINUTES=0.5,
+                                          _LAST_REQUEST_TIME=now - 60,
+                                          _dormant=lambda: False):
+            self.assertTrue(serve._idle_should_sleep(now=now))
+
+    def test_recent_request_keeps_tank_awake(self):
+        now = time.time()
+        with unittest.mock.patch.multiple(serve, _MAX_IDLE_MINUTES=0.5,
+                                          _LAST_REQUEST_TIME=now - 10,
+                                          _dormant=lambda: False):
+            self.assertFalse(serve._idle_should_sleep(now=now))
+
+    def test_already_dormant_does_not_refire(self):
+        now = time.time()
+        with unittest.mock.patch.multiple(serve, _MAX_IDLE_MINUTES=0.5,
+                                          _LAST_REQUEST_TIME=now - 60,
+                                          _dormant=lambda: True):
+            self.assertFalse(serve._idle_should_sleep(now=now))
