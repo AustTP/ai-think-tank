@@ -626,14 +626,20 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             # copy only repeats the failure.
             choice = 'reject'
         else:
-            # Thread the tape kind tag when the decider accepts it (the real
-            # default does; older 2-arg test stubs fall back positionally).
-            # The real decider swallows its own exceptions, so a TypeError here
-            # can only be the stub's arity -- safe to retry 2-arg.
-            try:
-                choice = decider(instructions, criteria, kind='groom')
-            except TypeError:
-                choice = decider(instructions, criteria)
+            # Cascade triage first (145_triage_cascade): when the tape's own
+            # groom history predicts this verdict with a high posterior, the
+            # expensive judge is spared and the auto-decision is taped. None
+            # means not armed / not confident / stood down -- JEV decides.
+            choice = _triage_cascade_choice(instructions, criteria)
+            if choice is None:
+                # Thread the tape kind tag when the decider accepts it (the real
+                # default does; older 2-arg test stubs fall back positionally).
+                # The real decider swallows its own exceptions, so a TypeError here
+                # can only be the stub's arity -- safe to retry 2-arg.
+                try:
+                    choice = decider(instructions, criteria, kind='groom')
+                except TypeError:
+                    choice = decider(instructions, criteria)
             if choice is None:
                 # Outage fallback: accept only a request that names a real
                 # delegatable-room gap (same determinism as the governance fallback --
