@@ -626,9 +626,12 @@ def _verify_decision_tape(limit=100000, tail=0):
         # Legacy rows (meta NULL) hash 11 fields; rows written with structured
         # meta hash 12. _tape_row_hash is variadic and the writer hashed the
         # same list it inserted, so the reconstruction here must match it.
+        # Length-tolerant: mocked/legacy row tuples may predate the meta
+        # column entirely (CI's VerifyDecisionTapeTest does exactly that).
+        meta = r[14] if len(r) > 14 else None
         fields = list(r[3:14])
-        if r[14] is not None:
-            fields.append(r[14])
+        if meta is not None:
+            fields.append(meta)
         expected = _tape_row_hash(row_prev, *fields)
         if expected != row_hash:
             problems.append({'id': rid, 'issue': 'hash mismatch (content tampered)'})
