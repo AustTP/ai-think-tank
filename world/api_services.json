@@ -892,6 +892,134 @@
     "kind": "free",
     "note": "Free, no key; courtesy rate limits (keep the User-Agent honest)."
    }
+  },
+  "tomtom-search": {
+   "name": "TomTom Search (POI/business)",
+   "base_url": "https://api.tomtom.com",
+   "credential": {
+    "type": "vault",
+    "name": "tomtom_api_key"
+   },
+   "auth": {
+    "type": "query_param",
+    "field": "key"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/search/2/poiSearch",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 80,
+    "note": "TomTom free plan: MONTHLY allowances per product (developer.tomtom.com/pricing); the daily cap below is floor(monthly/31) so 31 running days can never exceed the month. Key is the vault credential tomtom_api_key, injected as ?key= automatically -- agents never handle the key. Search API free tier: 2,500 calls/month -> 80/day."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free tier 2,500 requests/month. Use poiSearch for businesses/POIs near a lat/lon (params: lat, lon, radius in meters 50-50000, limit)."
+   }
+  },
+  "tomtom-geocoding": {
+   "name": "TomTom Geocoding",
+   "base_url": "https://api.tomtom.com",
+   "credential": {
+    "type": "vault",
+    "name": "tomtom_api_key"
+   },
+   "auth": {
+    "type": "query_param",
+    "field": "key"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/search/2/geocode",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 645,
+    "note": "TomTom free plan: MONTHLY allowances per product (developer.tomtom.com/pricing); the daily cap below is floor(monthly/31) so 31 running days can never exceed the month. Key is the vault credential tomtom_api_key, injected as ?key= automatically -- agents never handle the key. Geocoding API free tier: 20,000/month -> 645/day."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free tier 20,000 requests/month. geocode/{address}.json turns an address or place name into lat/lon."
+   }
+  },
+  "tomtom-routing": {
+   "name": "TomTom Routing",
+   "base_url": "https://api.tomtom.com",
+   "credential": {
+    "type": "vault",
+    "name": "tomtom_api_key"
+   },
+   "auth": {
+    "type": "query_param",
+    "field": "key"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/routing/1/calculateRoute",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 645,
+    "note": "TomTom free plan: MONTHLY allowances per product (developer.tomtom.com/pricing); the daily cap below is floor(monthly/31) so 31 running days can never exceed the month. Key is the vault credential tomtom_api_key, injected as ?key= automatically -- agents never handle the key. Routing API free tier: 20,000/month -> 645/day."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free tier 20,000 requests/month. calculateRoute/{lat1},{lon1}:{lat2},{lon2}/json?travelMode=car&routeType=fastest returns route summaries (travelTimeInSeconds, trafficDelayInSeconds, lengthInMeters). Summaries only; omit instructionsType (value \"none\" is rejected)."
+   }
+  },
+  "tomtom-traffic": {
+   "name": "TomTom Traffic Incidents",
+   "base_url": "https://api.tomtom.com",
+   "credential": {
+    "type": "vault",
+    "name": "tomtom_api_key"
+   },
+   "auth": {
+    "type": "query_param",
+    "field": "key"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/traffic/services/5/incidentDetails",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 80,
+    "note": "TomTom free plan: MONTHLY allowances per product (developer.tomtom.com/pricing); the daily cap below is floor(monthly/31) so 31 running days can never exceed the month. Key is the vault credential tomtom_api_key, injected as ?key= automatically -- agents never handle the key. Traffic Incidents free tier: 2,500/month -> 80/day."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free tier 2,500 requests/month. traffic/services/5/incidentDetails?bbox=minLon,minLat,maxLon,maxLat&timeValidityFilter=present returns live incidents (iconCategory, delay, roadNumbers, events). bbox max area 10,000 km^2."
+   }
   }
  },
  "channels": {

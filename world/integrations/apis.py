@@ -339,8 +339,18 @@ def _validate_api_service_spec(spec):
         return None, None, 'credential.type must be "none", "env", or "vault"'
     auth = spec.get('auth') or {}
     auth_type = auth.get('type')
-    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'mullvad', 'oauth2_client_credentials'):
-        return None, None, 'auth.type must be none, header_bearer, header_key, body_field, mullvad, or oauth2_client_credentials'
+    if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'mullvad',
+                         'oauth2_client_credentials', 'query_param'):
+        return None, None, ('auth.type must be none, header_bearer, header_key, body_field, '
+                            'mullvad, oauth2_client_credentials, or query_param')
+    if auth_type == 'query_param':
+        # Key-in-URL services (TomTom's ?key=... pattern). The credential is
+        # appended to the URL query under auth.field (default 'key') at
+        # request time and never logged or echoed. Requires a single-part
+        # credential like the other static-key types.
+        field = str(auth.get('field') or 'key').strip()
+        if not field or '=' in field or '&' in field:
+            return None, None, 'query_param requires a simple auth.field parameter name'
     if auth_type == 'mullvad':
         # Mullvad mints a bearer from the account number via its JSON token
         # endpoint -- requires a public https auth.token_url and a single-part
@@ -495,7 +505,14 @@ def _api_apply_auth(spec, token, token2, method, url, headers, body):
     import serve as _serve
     auth = (spec or {}).get('auth') or {}
     atype = auth.get('type')
-    if atype == 'header_bearer':
+    if atype == 'query_param':
+        # Key-in-URL auth: append the credential to the URL query string
+        # (TomTom-style ?key=...). Applied here so agents can never forget it
+        # and the key never appears in any agent-visible surface.
+        field = auth.get('field') or 'key'
+        sep = '&' if '?' in url else '?'
+        url = f'{url}{sep}{urllib.parse.urlencode({field: token or ""})}'
+    elif atype == 'header_bearer':
         headers['Authorization'] = f'Bearer {token}'
     elif atype == 'header_key':
         fmt = auth.get('value_format') or 'Key {key}'
