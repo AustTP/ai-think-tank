@@ -1113,6 +1113,38 @@
     "kind": "free",
     "note": "Free download; cite Redfin per their data terms."
    }
+  },
+  "ticketmaster-discovery": {
+   "name": "Ticketmaster Discovery (events search)",
+   "base_url": "https://app.ticketmaster.com",
+   "credential": {
+    "type": "vault",
+    "name": "ticketmaster_api_key"
+   },
+   "auth": {
+    "type": "query_param",
+    "field": "apikey"
+   },
+   "methods": [
+    "GET"
+   ],
+   "path_rules": [
+    {
+     "prefix": "/discovery/v2/",
+     "methods": [
+      "GET"
+     ]
+    }
+   ],
+   "spend": {
+    "kind": "daily_calls",
+    "cap": 4500,
+    "note": "The event-DISCOVERY endpoint Eventbrite retired. Free tier: 5,000 calls/day documented, 5 calls/second -- cap sits at 90% of the documented daily allowance. Key is the vault credential ticketmaster_api_key, injected as ?apikey= automatically. Endpoints: /discovery/v2/events.json (keyword, latlong or city/stateCode/countryCode, radius, unit, startDateTime/endDateTime, size, page, sort), attractions.json, venues.json, classifications.json. Pace requests >= 200ms apart."
+   },
+   "pricing": {
+    "kind": "free",
+    "note": "Free tier 5,000 calls/day; overage needs a paid contract. Attribution \"Powered by Ticketmaster\" is required on public surfaces per their terms."
+   }
   }
  },
  "channels": {

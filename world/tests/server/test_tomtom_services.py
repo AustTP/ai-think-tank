@@ -29,7 +29,8 @@ class EntriesValidate(unittest.TestCase):
     def test_all_four_tomtom_entries_validate(self):
         services = _services_json()['services']
         for sid in ('tomtom-search', 'tomtom-geocoding', 'tomtom-routing',
-                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data'):
+                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data',
+                    'ticketmaster-discovery'):
             spec = dict(services[sid])
             spec['id'] = sid
             resolved, normalized, error = serve._validate_api_service_spec(spec)
@@ -37,21 +38,27 @@ class EntriesValidate(unittest.TestCase):
             self.assertEqual(resolved, sid)
             self.assertIn(normalized['auth']['type'], ('query_param', 'header_bearer', 'none'))
             self.assertIn(normalized['credential'].get('name'),
-                          ('tomtom_api_key', 'eventbrite_api_key', None))
+                          ('tomtom_api_key', 'eventbrite_api_key',
+                           'ticketmaster_api_key', None))
             self.assertTrue(normalized['base_url'].startswith('https://'))
 
     def test_daily_caps_never_exceed_monthly_free_tier(self):
         # floor(monthly / 31) * 31 <= monthly, always, even in a 31-day month.
-        documented = {'tomtom-search': 2500, 'tomtom-geocoding': 20000,
-                      'tomtom-routing': 20000, 'tomtom-traffic': 2500,
-                      'eventbrite': 31 * 200, 'overpass': 31 * 250,
-                      'redfin-data': 31 * 20}
+        monthly = {'tomtom-search': 2500, 'tomtom-geocoding': 20000,
+                   'tomtom-routing': 20000, 'tomtom-traffic': 2500,
+                   'eventbrite': 31 * 200, 'overpass': 31 * 250,
+                   'redfin-data': 31 * 20}
         services = _services_json()['services']
-        for sid, monthly in documented.items():
+        for sid, allowance in monthly.items():
             cap = services[sid]['spend']['cap']
-            self.assertLessEqual(cap * 31, monthly,
-                                 f'{sid}: {cap}/day can exceed {monthly}/month')
+            self.assertLessEqual(cap * 31, allowance,
+                                 f'{sid}: {cap}/day can exceed {allowance}/month')
             self.assertGreater(cap, 0)
+        # Ticketmaster documents a DAILY allowance (5,000/day, 5/s); the cap
+        # sits at 90% of it.
+        tm_cap = services['ticketmaster-discovery']['spend']['cap']
+        self.assertLessEqual(tm_cap, int(5000 * 0.9))
+        self.assertGreater(tm_cap, 0)
 
 
 class QueryParamAuth(unittest.TestCase):
@@ -96,5 +103,6 @@ class RegistryShape(unittest.TestCase):
             serve._load_api_services()
             registry = serve._API_SERVICES or {}
         for sid in ('tomtom-search', 'tomtom-geocoding', 'tomtom-routing',
-                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data'):
+                    'tomtom-traffic', 'eventbrite', 'overpass', 'redfin-data',
+                    'ticketmaster-discovery'):
             self.assertIn(sid, registry, f'{sid} missing from the seeded registry')
