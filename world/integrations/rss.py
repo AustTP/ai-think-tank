@@ -106,6 +106,10 @@ _RSS_HTTP_HEADERS = {'User-Agent': 'AIThinkTankAgent/1.0 (think-tank current-eve
 
 _RSS_BUFFER: dict = {}  # feed_id -> list of {'ts', 'title', 'link', 'summary', 'matchedTopics'}
 _RSS_BUFFER_LOCK = threading.Lock()
+# feed_id -> {link: True}, FIFO-trimmed at 1000: the ring buffer forgets links
+# past _RSS_BUFFER_MAX_PER_FEED, so without this a feed returning more items
+# than the buffer re-ingests its evicted links every cycle forever.
+_RSS_SEEN_LINKS: dict = {}
 _RSS_STATUS: dict = {}  # feed_id -> {'last_fetch_at', 'last_error', 'ok'}
 
 # RSS and Atom feeds are untrusted input. Parse them only with defusedxml,
@@ -164,15 +168,23 @@ def _parse_rss_atom_xml(raw, feed_id):  # noqa: ARG001 -- feed_id kept for signa
     return items
 
 
-def _rss_match_topics(title):
+def _rss_match_topics(title, topics=None):
     """Tag a title with any current watchlist research topics it mentions
-    (word-boundary match on topic words, not the full topic string)."""
+    (word-boundary match on topic words, not the full topic string).
+
+    `topics` is an OPTIONAL preloaded list of topic strings: `_rss_ingest`
+    loads the state ONCE per batch and shares it across every item, because
+    get_state_from_db re-reads the whole (very large) state blob -- and
+    deep-copies the entire task archive -- on EVERY call. Per-item loads
+    inside one ingest were the event-loop spin that took the live server
+    dark under an item-heavy feed cycle."""
     import serve as _serve
-    try:
-        state = _serve.get_state_from_db()
-    except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
-        state = None
-    topics = [(t.get('topic') or '') for t in ((state or {}).get('researchTopics') or [])]
+    if topics is None:
+        try:
+            state = _serve.get_state_from_db()
+        except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
+            state = None
+        topics = [(t.get('topic') or '') for t in ((state or {}).get('researchTopics') or [])]
     title_l = f' {title.lower()} '
     matched = []
     for topic in topics:
@@ -187,17 +199,38 @@ def _rss_match_topics(title):
 def _rss_ingest(feed_id, items):
     import serve as _serve
     now = int(time.time() * 1000)
+    # Load the watchlist topics ONCE for the whole batch: a per-item
+    # get_state_from_db re-reads the entire state blob (and deep-copies the
+    # whole task archive) for every headline, which under an item-heavy feed
+    # was enough CPU on the event loop to starve every other coroutine.
+    try:
+        _state = _serve.get_state_from_db()
+    except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
+        _state = None
+    topics = [(t.get('topic') or '') for t in ((_state or {}).get('researchTopics') or [])]
     with _serve._RSS_BUFFER_LOCK:
+        # `seen` must survive buffer eviction: the ring buffer keeps only the
+        # last _RSS_BUFFER_MAX_PER_FEED links, so a feed that returns more
+        # items than that re-presented its evicted links as "fresh" on every
+        # cycle -- a permanent re-ingest loop that multiplied the cost above.
+        # A bounded per-feed seen-set (FIFO-trimmed well past the buffer size)
+        # remembers links across cycles without growing unbounded.
+        seen_links = _RSS_SEEN_LINKS.setdefault(feed_id, {})
         seen = {it.get('link') for it in _serve._RSS_BUFFER.get(feed_id, [])}
+        seen.update(seen_links)
         fresh = []
         for it in items:
             link = it.get('link') or ''
             if link and link in seen:
                 continue
             seen.add(link)
+            seen_links[link] = True
+            if len(seen_links) > 1000:
+                for stale in list(seen_links)[:len(seen_links) - 1000]:
+                    seen_links.pop(stale, None)
             fresh.append({'ts': now, 'title': it.get('title') or '',
                           'link': link, 'summary': it.get('summary') or '',
-                          'matchedTopics': _serve._rss_match_topics(it.get('title') or '')})
+                          'matchedTopics': _serve._rss_match_topics(it.get('title') or '', topics)})
         buf = _serve._RSS_BUFFER.setdefault(feed_id, [])
         buf.extend(fresh)
         if len(buf) > _serve._RSS_BUFFER_MAX_PER_FEED:
