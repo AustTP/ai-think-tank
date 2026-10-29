@@ -185,6 +185,91 @@ def _triage_cascade_choice(instructions, criteria):
         return None
 
 
+_TRIAGE_NIGHT_WINDOW = (2, 5)      # local hours 02:00-04:59
+_TRIAGE_HOLDOUT_MIN = 8            # smallest evaluable holdout
+_TRIAGE_HOLDOUT_FRAC = 0.25        # newest quarter is the exam
+_TRIAGE_HOLDOUT_MAX = 100
+_TRIAGE_ADOPT_ACCURACY = 0.7       # below this the fit is not trusted
+_TRIAGE_COLD_CORPUS = 16           # 2x holdout min: nothing to evaluate on
+
+
+def _triage_nightly_retrain(now=None, _hour=None):
+    """The nightly, eval-gated retrain. Between nightly runs the 10-minute
+    TTL refit keeps the model fresh; this pass is the quality gate: fit on
+    everything but the newest quarter, examine on that quarter (the day's
+    own decisions), and adopt the full-data fit ONLY when the holdout
+    accuracy clears 0.7 AND beats the majority-class baseline. A classifier
+    that cannot beat 'always say the common thing' must not silently
+    replace a working one.
+
+    Runs at most once per local night (02:00-04:59), tracked via the
+    settings table so restarts and multiple loop ticks cannot double-run.
+    Every outcome -- adopted, rejected, cold corpus -- lands in action_log
+    under agent 'system' so the operator can read the classifier's report
+    card each morning. Returns a stats dict; never raises (the calling
+    loop swallows, but a silent failure here would be invisible)."""
+    try:
+        import serve as _serve_mod
+        now = time.time() if now is None else now
+        lt = time.localtime(now)
+        hour = lt.tm_hour if _hour is None else _hour
+        if not (_TRIAGE_NIGHT_WINDOW[0] <= hour < _TRIAGE_NIGHT_WINDOW[1]):
+            return {'ran': False, 'reason': 'not-night'}
+        today = time.strftime('%Y-%m-%d', lt)
+        try:
+            last = json.loads(_serve_mod._get_setting(
+                'triage_last_retrain', '{}') or '{}')
+        except Exception:
+            last = {}
+        if last.get('date') == today:
+            return {'ran': False, 'reason': 'already-retrained',
+                    'date': today}
+        rows = _triage_train_rows()
+        if len(rows) < _TRIAGE_COLD_CORPUS:
+            _serve_mod.log_action('system', 'triage_nightly_retrain', {
+                'date': today, 'adopted': False, 'reason': 'cold-corpus',
+                'rows': len(rows), 'needed': _TRIAGE_COLD_CORPUS})
+            return {'ran': True, 'adopted': False, 'reason': 'cold-corpus',
+                    'rows': len(rows), 'date': today}
+        holdout_n = max(_TRIAGE_HOLDOUT_MIN,
+                        min(_TRIAGE_HOLDOUT_MAX,
+                            int(len(rows) * _TRIAGE_HOLDOUT_FRAC)))
+        train_rows, holdout = rows[:-holdout_n], rows[-holdout_n:]
+        eval_model = _triage_fit(train_rows)
+        correct = 0
+        for prompt, truth in holdout:
+            choice, _post = _triage_classify(
+                eval_model, _triage_tokens(prompt))
+            correct += 1 if choice == truth else 0
+        accuracy = correct / len(holdout)
+        counts = {}
+        for _p, truth in holdout:
+            counts[truth] = counts.get(truth, 0) + 1
+        baseline = max(counts.values()) / len(holdout)
+        degenerate = baseline >= 0.999
+        adopted = (not degenerate and accuracy >= _TRIAGE_ADOPT_ACCURACY
+                   and accuracy > baseline)
+        stats = {'date': today, 'adopted': adopted, 'accuracy': round(accuracy, 4),
+                 'baseline': round(baseline, 4), 'rows': len(rows),
+                 'holdout': len(holdout), 'reason': 'eval' if not degenerate else 'degenerate-holdout'}
+        if adopted:
+            # Publish the full-data fit (holdout included -- it is now
+            # labeled data, not exam material).
+            full = _triage_fit(rows)
+            _TRIAGE_CACHE.update(model=full, fitted_at=now, rows=len(rows))
+        _serve_mod._set_setting('triage_last_retrain', json.dumps(stats))
+        _serve_mod.log_action('system', 'triage_nightly_retrain', stats)
+        return dict(stats, ran=True)
+    except Exception as e:  # noqa: BLE001 -- the retrain must never break its loop
+        try:
+            import serve as _serve_mod
+            _serve_mod.log_action('system', 'triage_nightly_retrain', {
+                'error': f'{type(e).__name__}: {str(e)[:160]}'})
+        except Exception:
+            pass
+        return {'ran': False, 'reason': 'error'}
+
+
 def _triage_cascade_report():
     """Operator visibility: is the cascade armed, on what, how often has it
     decided, and what has it chosen. DB-only."""
@@ -192,6 +277,12 @@ def _triage_cascade_report():
     model, trained = _triage_resolve_model()
     out = {'armed': bool(model) and trained >= _TRIAGE_MIN_TRAIN,
            'trainedRows': trained, 'minTrain': _TRIAGE_MIN_TRAIN}
+    try:
+        last = json.loads(_serve_mod._get_setting('triage_last_retrain', '{}') or '{}')
+        if isinstance(last, dict) and last:
+            out['lastRetrain'] = last
+    except Exception:
+        pass
     try:
         out['enabled'] = str(_serve_mod._get_setting(
             'triage_cascade_enabled', 'on')).strip().lower() == 'on'

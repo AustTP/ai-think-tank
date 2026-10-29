@@ -204,5 +204,90 @@ class Cascade(unittest.TestCase):
         self.assertGreaterEqual(out['trainedRows'], sim._TRIAGE_MIN_TRAIN)
 
 
+def _seed_interleaved(n=60):
+    """Interleaved so the newest-quarter holdout mixes classes -- a
+    block-ordered corpus makes the holdout degenerate (one class only)."""
+    fill = ('Add a small decorative mascot to the footer of the press '
+            'office page. Purely cosmetic, no data, no integration, tiny.')
+    for i in range(n):
+        _seed_groom('accept' if i % 2 == 0 else 'reject',
+                    BUGGY if i % 2 == 0 else fill)
+
+
+class NightlyRetrain(unittest.TestCase):
+    def setUp(self):
+        _reset_cache()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM decision_tape')
+            conn.execute("DELETE FROM settings WHERE key LIKE 'triage_%'")
+            conn.execute("DELETE FROM action_log WHERE action = "
+                         "'triage_nightly_retrain'")
+
+    def test_only_runs_at_night(self):
+        out = sim._triage_nightly_retrain(_hour=14)
+        self.assertEqual(out, {'ran': False, 'reason': 'not-night'})
+
+    def test_adopts_a_validated_fit_and_logs_it(self):
+        _seed_interleaved(60)
+        out = sim._triage_nightly_retrain(_hour=3)
+        self.assertTrue(out['ran'])
+        self.assertTrue(out['adopted'])
+        self.assertGreaterEqual(out['accuracy'], sim._TRIAGE_ADOPT_ACCURACY)
+        with serve._db() as conn:
+            logged = conn.execute(
+                "SELECT details FROM action_log WHERE action = "
+                "'triage_nightly_retrain'").fetchall()
+            stored = conn.execute(
+                "SELECT value FROM settings WHERE key = 'triage_last_retrain'"
+            ).fetchone()
+        self.assertEqual(len(logged), 1)
+        self.assertTrue(json.loads(stored[0])['adopted'])
+        # The published fit is the full-data fit, primed in the cache.
+        self.assertIsNotNone(sim._TRIAGE_CACHE['model'])
+
+    def test_rejects_a_fit_that_cannot_beat_majority(self):
+        # Same text, alternating labels: the best possible classifier is a
+        # coin flip, so accuracy cannot beat the baseline.
+        for i in range(40):
+            _seed_groom('accept' if i % 2 == 0 else 'reject', BUGGY)
+        out = sim._triage_nightly_retrain(_hour=3)
+        self.assertTrue(out['ran'])
+        self.assertFalse(out['adopted'])
+        with serve._db() as conn:
+            details = json.loads(conn.execute(
+                "SELECT details FROM action_log WHERE action = "
+                "'triage_nightly_retrain'").fetchone()[0])
+        self.assertFalse(details['adopted'])
+
+    def test_once_per_night(self):
+        _seed_interleaved(60)
+        first = sim._triage_nightly_retrain(_hour=3)
+        self.assertTrue(first['ran'])
+        second = sim._triage_nightly_retrain(_hour=4)
+        self.assertEqual(second['reason'], 'already-retrained')
+        with serve._db() as conn:
+            logged = conn.execute(
+                "SELECT COUNT(*) FROM action_log WHERE action = "
+                "'triage_nightly_retrain'").fetchone()[0]
+        self.assertEqual(logged, 1)
+
+    def test_cold_corpus_reports_without_marking_the_night_done(self):
+        _seed_groom('accept', BUGGY)
+        out = sim._triage_nightly_retrain(_hour=3)
+        self.assertEqual(out['reason'], 'cold-corpus')
+        with serve._db() as conn:
+            stored = conn.execute(
+                "SELECT value FROM settings WHERE key = 'triage_last_retrain'"
+            ).fetchone()
+        self.assertIsNone(stored)  # retried on the next tick until data exists
+
+    def test_report_carries_the_last_retrain(self):
+        _seed_interleaved(60)
+        sim._triage_nightly_retrain(_hour=3)
+        out = sim._triage_cascade_report()
+        self.assertIn('lastRetrain', out)
+        self.assertTrue(out['lastRetrain']['adopted'])
+
+
 if __name__ == '__main__':
     unittest.main()

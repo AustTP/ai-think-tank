@@ -270,6 +270,11 @@ async def _calibration_loop():
             await asyncio.to_thread(_calibration_adjust_pass)
             await asyncio.to_thread(_review_grade_calibration_pass)
             await asyncio.to_thread(_rag_index_pass, 60)
+            # The groom cascade's nightly, eval-gated retrain (sim 145):
+            # itself once-per-night gated, so this 30-minute tick is just
+            # the opportunity window -- it no-ops 47 times a day.
+            import sim as _sim
+            await asyncio.to_thread(_sim._triage_nightly_retrain)
         except Exception as e:
             print(f'[calibration] loop error: {e}', flush=True)
         await asyncio.sleep(CALIBRATION_ADJUST_INTERVAL_S)
