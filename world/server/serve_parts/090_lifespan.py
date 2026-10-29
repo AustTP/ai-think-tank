@@ -114,6 +114,16 @@ async def _lifespan(app):
     avatar_task = asyncio.create_task(_avatar_task_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
     ws_supervisor_task = asyncio.create_task(_ws_supervisor_loop())
+    # The ALWAYS-RUNNING owner of approved one-shot dormancy windows and of
+    # apply_pass for armed self-edits (dormant-only by contract). Must NOT be
+    # gated on --max-idle-minutes: an armed edit has to land at its dormancy
+    # path even when the idle watcher itself is disabled. Fully guarded; with
+    # no windows and no armed edits it is a 30s no-op poll.
+    dormancy_window_task = asyncio.create_task(_dormancy_window_loop())
+    # The mechanical idle auto-sleep, armed ONLY when --max-idle-minutes is
+    # passed (0 = disabled) so default behavior never silently changes.
+    idle_shutdown_task = (asyncio.create_task(_idle_shutdown_loop())
+                          if _MAX_IDLE_MINUTES > 0 else None)
     # Sim task + watchdog. sim_holder is shared with _sim_watchdog_loop so a
     # dead or frozen loop can be recreated mid-run (2026-10-13 freeze: the
     # task died silently and nothing restarted it). shutting_down stops the
@@ -176,6 +186,10 @@ async def _lifespan(app):
         avatar_task.cancel()
     rss_task.cancel()
     ws_supervisor_task.cancel()
+    if dormancy_window_task is not None:
+        dormancy_window_task.cancel()
+    if idle_shutdown_task is not None:
+        idle_shutdown_task.cancel()
     for _fp, task in list(_WS_TASKS.values()):
         task.cancel()
     # Stop the sim watchdog's recycle loop FIRST, then cancel the final sim
@@ -398,7 +412,9 @@ def _require_player_or_admin(request):
         return False
     if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return False
-    return _is_admin(get_state_from_db() or {}, requester)
+    # Read-only single-key check: the alias merge skips the whole-archive
+    # deepcopy this per-request path would otherwise pay.
+    return _is_admin(get_state_from_db(archive_merge='alias') or {}, requester)
 
 
 def _direct_reports(state, agent_id):

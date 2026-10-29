@@ -886,9 +886,10 @@ async def get_state(request: Request):
     # seeded here (see _seed_default_roster) so the client never has to
     # generate or hardcode a single agent name -- cold start and warm
     # start both read names from the DB.
-    if get_state_from_db() is None:
+    data = get_state_from_db(archive_merge='alias')
+    if data is None:
         _seed_default_roster()
-    data = get_state_from_db()
+        data = get_state_from_db(archive_merge='alias')
     if data is None:
         return JSONResponse(None)
     # Close the race a per-tick-only heal leaves open: a stale client tab's

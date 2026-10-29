@@ -440,6 +440,21 @@ async def _auto_failover_jev_if_gone(fresh, actor):
     print(f'[model-tiers] Jev decision model {current} unavailable; auto-fell-back to {replacement["id"]}', flush=True)
 
 
+def _idle_should_sleep(now=None):
+    """One poll of the idle watcher, factored out so tests can drive the
+    decision without awaiting the real loop. True exactly when the idle
+    auto-sleep is armed (--max-idle-minutes > 0), a request has been seen
+    (_LAST_REQUEST_TIME is not None), the idle streak has crossed the
+    threshold, and the tank is not already dormant."""
+    if _MAX_IDLE_MINUTES <= 0:
+        return False
+    last = _LAST_REQUEST_TIME
+    if last is None:
+        return False
+    idle_s = (time.time() if now is None else now) - last
+    return idle_s >= _MAX_IDLE_MINUTES * 60 and not _dormant()
+
+
 async def _idle_shutdown_loop(poll_s=30):
     # The mechanical enforcement of the "pause the think tank when idle" rule.
     # Watches for a live-but-unwatched server (no HTTP request for
@@ -448,17 +463,14 @@ async def _idle_shutdown_loop(poll_s=30):
     # it, but the simulation loop stops spending and stops churning. Any
     # request flips it awake instantly (see no_store middleware). Only armed
     # when --max-idle-minutes is passed, so behavior never silently changes.
-    global _LAST_REQUEST_TIME
     while True:
         await asyncio.sleep(poll_s)
-        last = _LAST_REQUEST_TIME
-        if last is None:
-            continue
-        idle_s = time.time() - last
-        if idle_s >= _MAX_IDLE_MINUTES * 60 and not _dormant():
+        idle_s = (time.time() - _LAST_REQUEST_TIME) if _LAST_REQUEST_TIME is not None else 0
+        if _idle_should_sleep():
             # Transition awake -> dormant exactly once per idle streak (gate
-            # on not _dormant so an already-dormant server doesn't re-log every
-            # poll). The process stays up and port-bound; only the sim pauses.
+            # inside _idle_should_sleep on not _dormant so an already-dormant
+            # server doesn't re-log every poll). The process stays up and
+            # port-bound; only the sim pauses.
             _set_dormant(True)
             print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- think tank dormant; waking on next request', flush=True)
 
@@ -514,13 +526,26 @@ async def _dormancy_window_loop(poll_s=30):
                           f'{window_id}: {exc}', flush=True)
 
 
-def get_state_from_db():
+def get_state_from_db(archive_merge='copy'):
+    """Read the whole state blob and merge the task archive back in.
+
+    archive_merge:
+      'copy'  (default) -- every archived task is deep-copied before merge,
+              so callers may mutate the returned state freely without
+              corrupting the archive cache. Costs ~1.2s at a 1.6k-task
+              archive; every state WRITER must use this.
+      'alias' -- archived entries are shared with the archive cache. Only
+              for callers that provably never mutate any task object
+              (serialize-and-return handlers, single-key readers). Cuts the
+              merge to a dict spread; a mutating caller would silently
+              corrupt the archive cache and lose changes on restart.
+    """
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if not row:
             return None
         data = json.loads(row[0])
-    _merge_archived_tasks(data)
+    _merge_archived_tasks(data, mode=archive_merge)
     return data
 
 
@@ -601,18 +626,24 @@ def _archived_tasks():
         return dict(_task_archive_load_locked())
 
 
-def _merge_archived_tasks(data):
+def _merge_archived_tasks(data, mode='copy'):
     # state['tasks'] = archived done tasks, with the live blob winning on any
     # id overlap (an un-done task's active copy must override its stale
     # archived copy).
     archived = _archived_tasks()
     if not archived:
         return
-    # Copy the archived task dicts before merging. The tick mutates the state
-    # in place; if it mutated the cache's own dicts, _reconcile_task_archive
-    # would see cached == task and skip the DB write, silently losing the
-    # change on the next restart.
-    merged = {tid: copy.deepcopy(task) for tid, task in archived.items()}
+    if mode == 'alias':
+        # Caller contract (see get_state_from_db): never mutate any task
+        # object. Aliasing the archive cache makes the merge a dict spread
+        # instead of a 1.2s whole-archive deepcopy on every read.
+        merged = dict(archived)
+    else:
+        # Copy the archived task dicts before merging. The tick mutates the
+        # state in place; if it mutated the cache's own dicts,
+        # _reconcile_task_archive would see cached == task and skip the DB
+        # write, silently losing the change on the next restart.
+        merged = {tid: copy.deepcopy(task) for tid, task in archived.items()}
     merged.update(data.get('tasks') or {})
     data['tasks'] = merged
 

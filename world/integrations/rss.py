@@ -181,7 +181,9 @@ def _rss_match_topics(title, topics=None):
     import serve as _serve
     if topics is None:
         try:
-            state = _serve.get_state_from_db()
+            # Alias merge: this reads one key and mutates nothing, so it
+            # must not pay the whole-archive deepcopy per call.
+            state = _serve.get_state_from_db(archive_merge='alias')
         except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
             state = None
         topics = [(t.get('topic') or '') for t in ((state or {}).get('researchTopics') or [])]
@@ -203,8 +205,9 @@ def _rss_ingest(feed_id, items):
     # get_state_from_db re-reads the entire state blob (and deep-copies the
     # whole task archive) for every headline, which under an item-heavy feed
     # was enough CPU on the event loop to starve every other coroutine.
+    # Alias merge: single-key read, mutates nothing.
     try:
-        _state = _serve.get_state_from_db()
+        _state = _serve.get_state_from_db(archive_merge='alias')
     except Exception:  # noqa: BLE001 -- never let topic tagging break the poller
         _state = None
     topics = [(t.get('topic') or '') for t in ((_state or {}).get('researchTopics') or [])]

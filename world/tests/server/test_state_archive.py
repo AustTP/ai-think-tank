@@ -102,6 +102,23 @@ class TaskArchive(_StateCase):
         loaded = serve.get_state_from_db()
         self.assertEqual(loaded['tasks']['t-done']['note'], 'edited after done')
 
+    def test_alias_merge_shares_archive_objects(self):
+        serve.save_state_to_db(self._state())
+        st = serve.get_state_from_db(archive_merge='alias')
+        with serve._TASK_ARCHIVE_LOCK:
+            cached = serve._task_archive_load_locked()
+        self.assertIs(st['tasks']['t-done'], cached['t-done'],
+                      "alias merge must hand out the cache's own object")
+
+    def test_copy_merge_shields_the_archive_cache(self):
+        serve.save_state_to_db(self._state())
+        st = serve.get_state_from_db()
+        st['tasks']['t-done']['title'] = 'MUTATED'
+        with serve._TASK_ARCHIVE_LOCK:
+            cached = serve._task_archive_load_locked()
+        self.assertEqual(cached['t-done']['title'], 'finished',
+                         'the copy merge must never let a caller mutation reach the cache')
+
     def test_un_done_task_overrides_the_archived_copy(self):
         serve.save_state_to_db(self._state())
         state = serve.get_state_from_db()
