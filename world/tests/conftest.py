@@ -135,6 +135,25 @@ def _ensure_test_db_schema():
 
 
 @pytest.fixture(autouse=True)
+def _pin_sim_tick_cadence():
+    """Pin the tick cadence for every test.
+
+    Tests advance scenario wall-time by sim.SIM_TICK_S per tick (governance
+    ceremonies, onboarding, lifecycles), so their cooldown/ceremony windows
+    are calibrated to the 1.0s design cadence. Production cadence is an
+    operational knob (the 2026-10-29 1.0 -> 5.0 event-loop stopgap), not a
+    behavioral contract -- pin it so cadence changes never stretch or
+    compress test scenarios."""
+    import sim
+    saved = sim.SIM_TICK_S
+    sim.SIM_TICK_S = 1.0
+    try:
+        yield
+    finally:
+        sim.SIM_TICK_S = saved
+
+
+@pytest.fixture(autouse=True)
 def _reset_credit_pause():
     """Keep one test's simulated OpenRouter credit exhaustion from leaking.
 
