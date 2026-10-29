@@ -486,7 +486,13 @@ def _api_credential_value(spec):
         return token, token2, None
     if ctype == 'vault':
         name = cred.get('name') or ''
-        token = _serve._open_secret(_serve._credential_token(name) or '')
+        # _credential_payload normalizes both storage shapes (legacy raw
+        # token strings and {'kind': 'token', 'token': ...} payloads) into
+        # the usable token; decrypting the blob directly would hand back the
+        # payload JSON for newer rows instead of the key itself.
+        payload = _serve._credential_payload(name) or {}
+        token = payload.get('token') if isinstance(payload, dict) else None
+        token = str(token or '').strip() or None
         if not token and name == 'pixellab':
             # Existing DBs still carry the historical vault row. PixelLab's
             # shipped credential is PIXELLAB_API_KEY in .env now, so fall back
