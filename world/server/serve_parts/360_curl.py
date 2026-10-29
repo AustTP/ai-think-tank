@@ -451,6 +451,10 @@ async def _classify_command(command, purpose, agent_id='unknown'):
                     f'Stated reason: {purpose or "not given"}\n'
                     'The sandbox is a container: /workspace is the task directory and its /tmp is '
                     'ephemeral and internal, not the host filesystem. Decide allow or block.')
+    try:
+        instructions += '\n' + _jev_actor_framing(get_state_from_db() or {}, agent_id)
+    except Exception:
+        pass  # framing is presentation, never a gate
     if reviewed['decoded']:
         instructions += ('\n(The command above was decoded from a base64 wrapper for review. '
                          'The original wrapper is what would run.)')

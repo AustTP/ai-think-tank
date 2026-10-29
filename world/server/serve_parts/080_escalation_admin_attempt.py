@@ -3,6 +3,124 @@
 from core.review_decode import review_target
 
 
+def _roster_row_for(state, agent_id):
+    if not agent_id:
+        return None
+    for d in ((state or {}).get('agentRoster') or []):
+        if d.get('id') == agent_id:
+            return d
+    return None
+
+
+def _jev_actor_role(state, agent_id):
+    """The actor's authority rank for JEV presentation: 'chief_of_staff',
+    'director', 'worker', or 'unknown'. The roster carries the truth:
+    isAdmin marks the chief of staff, isDirector marks every director
+    (supervisors and the senior director alike), everyone else is a worker."""
+    row = _roster_row_for(state, agent_id)
+    if not row:
+        return 'unknown'
+    if row.get('isAdmin'):
+        return 'chief_of_staff'
+    if row.get('isDirector'):
+        return 'director'
+    return 'worker'
+
+
+def _jev_actor_framing(state, agent_id):
+    """One prompt paragraph telling JEV WHOSE request it is judging and what
+    "in scope" means for that rank. Before this, every gate prompt described
+    the requester as a generic "in-game agent", so JEV weighed a worker's
+    command and the chief of staff's allowlist grant with the same standard
+    even though their authority (and the cost of a wrong approval) differs
+    by orders of magnitude. Three ranks, three stances:
+
+    - worker: task scope -- ordinary work serving the current assignment is
+      routine; org-wide effects are not theirs to request.
+    - director: team stewardship -- judge against their team's assigned work
+      within a director's authority; cross-team/org-wide is not theirs.
+    - chief of staff: org-wide authority -- strictest bar, because an
+      approval here takes effect tank-wide and is the hardest to undo."""
+    row = _roster_row_for(state, agent_id)
+    role = _jev_actor_role(state, agent_id)
+    if role == 'chief_of_staff':
+        name = (row or {}).get('name') or agent_id
+        return (f'{name} is the chief of staff, the owner\'s standing delegate '
+                'with org-wide authority (spend, allowlists, cross-team coordination). '
+                'Hold the strictest bar: an approval here takes effect tank-wide and '
+                'is the hardest to undo; when genuinely unsure, leave it for the owner.')
+    if role == 'director':
+        name = (row or {}).get('name') or agent_id
+        role_label = (row or {}).get('role') or 'director'
+        return (f'{name} is a director ({role_label}) deciding for their own team. '
+                'Judge team stewardship: whether this serves their team\'s assigned '
+                'work within a director\'s authority; cross-team or org-wide effects '
+                'are not theirs to grant.')
+    if role == 'worker':
+        name = (row or {}).get('name') or agent_id
+        role_label = (row or {}).get('role') or 'worker'
+        return (f'{name} is a worker ({role_label}) executing an assigned task. '
+                'Judge task scope: ordinary work serving their current assignment is '
+                'routine; requests beyond one task\'s needs (org-wide settings, other '
+                'teams\' work, spending) are not theirs to make.')
+    return ('The requester is an agent not on the roster; treat them with '
+            'worker-level task scope: ordinary work serving a current assignment '
+            'is routine, anything org-wide is not theirs to request.')
+
+
+def _escalation_rung_instructions(rung, reviewer_name, question, state=None,
+                                  esc=None, esc_kind=None):
+    """The delegated-approval prompt for ONE rung of the escalation chain.
+
+    The old chain asked every rung the same question with the same standard
+    ('You are X, the senior-most director ... standing in for the owner'),
+    swapping only the reviewer's name and model tier -- so three similar-
+    strength models kept re-deriving the same uncertainty in isolation. Each
+    rung now judges from its own vantage point:
+
+    - immediate (the requester's own director): richest context, task-scoped
+      standard, unsure means HAND UP, not deny.
+    - senior: judges the authority boundary and whether the immediate
+      director's hesitation was over-caution.
+    - admin (chief of staff): org-wide authority, strictest bar, unsure
+      means LEAVE IT FOR THE OWNER.
+
+    `esc` may be a real escalation record (queued chain) or a lightweight
+    dict carrying agentId + rungVotes (in-flight chain); `state` enables the
+    requester's role framing."""
+    if rung == 'admin':
+        framing = (
+            f'You are {reviewer_name}, the chief of staff -- the owner\'s standing '
+            'delegate and the last internal check before the owner. Your approval '
+            'grants org-wide effect (spend, allowlists, cross-team access) without '
+            'the owner seeing it first, so hold the strictest bar: approve only what '
+            'is unambiguously safe, in-scope, and justified, and leave anything '
+            'genuinely uncertain for the owner.'
+        )
+    elif rung == 'senior':
+        framing = (
+            f'You are {reviewer_name}, the senior director -- the second opinion '
+            'between the team\'s own director and the chief of staff. A director '
+            'below you already passed on this. Judge whether this needs more '
+            'authority than a director has, or whether the hesitation was mere '
+            'over-caution; hand up only what you genuinely cannot judge.'
+        )
+    else:
+        framing = (
+            f'You are {reviewer_name}, the requester\'s own director. You know '
+            'their assignment better than anyone else in this chain, so use that '
+            'context: approve what plainly serves their assigned work and is safe; '
+            'deny what does not; hand up only what you genuinely cannot judge.'
+        )
+    parts = [framing, f'Decide the following escalation. Kind: {esc_kind or "unspecified"}.',
+             f'Question: {question}']
+    if state and (esc or {}).get('agentId'):
+        parts.append(_jev_actor_framing(state, esc['agentId']))
+    if esc:
+        parts.extend(_escalation_context_lines(esc))
+    return ' '.join(p.strip() for p in parts if p)
+
+
 def _review_question(esc):
     q = (esc or {}).get('reviewQuestion')
     if q:
@@ -56,18 +174,9 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
         return False
     esc['adminAskedAt'] = time.time()
     admin_name = (roster.get(admin_id) or {}).get('name', admin_id)
-    instr = (
-        f'You are {admin_name}, the chief of staff/admin of the AI think tank. '
-        f'The senior director already tried {esc.get("askCount") or 0} time(s) '
-        f'and could not decide this escalation. This is the admin pass before '
-        f'the owner is asked. Kind: {esc.get("kind")}. '
-        f'Question: {_review_question(esc)}. Approve only if clearly legitimate, '
-        'in-scope, and safe. Deny if out of scope, unsafe, or clearly no. '
-        'When genuinely unsure, leave it for the owner.'
-    )
-    _ctx = _escalation_context_lines(esc)
-    if _ctx:
-        instr += ' ' + ' '.join(_ctx)
+    instr = _escalation_rung_instructions(
+        'admin', admin_name, _review_question(esc),
+        state=state, esc=esc, esc_kind=esc_kind)
     criteria = {
         'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
         'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',
@@ -342,18 +451,9 @@ def _resolve_pending_escalations_sync():
         esc['lastAskedAt'] = now
         esc['askCount'] = (esc.get('askCount') or 0) + 1
         dirty = True
-        instr = (
-            f'You are {director_name}, the senior-most director of the AI think tank, '
-            f'standing in for the owner on this request. The chief of staff has delegated '
-            f'routine approval/denial to you. Decide the following escalation. '
-            f'Kind: {esc.get("kind")}. Question: {_review_question(esc)}.\n'
-            f'Approve if the request is clearly legitimate, in-scope, and safe for the think tank. '
-            f'Deny if it is out of scope, unsafe, or the answer is clearly no. Favor denying '
-            f'when genuinely unsure -- an unconvincing approval is the real risk.'
-        )
-        _ctx = _escalation_context_lines(esc)
-        if _ctx:
-            instr += ' ' + ' '.join(_ctx)
+        instr = _escalation_rung_instructions(
+            rung, director_name, _review_question(esc),
+            state=state, esc=esc, esc_kind=esc_kind)
         criteria = {
             'approve': 'An ordinary, legitimate, in-scope request that should go ahead.',
             'deny': 'Out of scope, unsafe, insufficiently justified, or clearly should not happen.',

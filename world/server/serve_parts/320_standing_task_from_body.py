@@ -653,6 +653,10 @@ async def browse(request: Request):
         if work_context:
             instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
         instructions += 'Decide allow or block based on the URL/domain, the stated purpose, and the work the URL serves (the page has not been fetched yet). If the URL falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
+        try:
+            instructions += '\n' + _jev_actor_framing(get_state_from_db() or {}, agent_id)
+        except Exception:
+            pass  # framing is presentation, never a gate
         decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria, kind='browse')
 
         if not _jev_safety_gate(agent_id, 'browse', 'This page', url, purpose, decision, confidence, cost, authorized, trace_id):

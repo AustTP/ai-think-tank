@@ -12,6 +12,7 @@ mis-bucketed whole decision families so the per-kind success rates lied.
 These tests pin the presentation fixes.
 """
 
+import asyncio
 import json
 import os
 import shutil
@@ -354,6 +355,111 @@ class TierGatePrompt(unittest.TestCase):
         finally:
             serve._tier_gate_decider = old
         self.assertEqual(calls, [1])
+
+
+class RoleFraming(unittest.TestCase):
+    """JEV judges a worker's command, a director's request, and the chief of
+    staff's grant with rank-specific framing instead of one generic
+    "in-game agent" description."""
+
+    ROSTER = [
+        {'id': 'theo', 'name': 'Theo', 'role': 'Chief of Staff', 'isAdmin': True,
+         'isDirector': True},
+        {'id': 'nora', 'name': 'Nora', 'role': 'Supporting Director',
+         'isDirector': True},
+        {'id': 'ben', 'name': 'Ben', 'role': 'Supervisor', 'isDirector': True,
+         'director': 'theo'},
+        {'id': 'ruth', 'name': 'Ruth', 'role': 'Assistant to Nora',
+         'director': 'nora'},
+    ]
+
+    def _state(self):
+        return {'agentRoster': self.ROSTER}
+
+    def test_role_classification(self):
+        state = self._state()
+        self.assertEqual(serve._jev_actor_role(state, 'theo'), 'chief_of_staff')
+        self.assertEqual(serve._jev_actor_role(state, 'nora'), 'director')
+        self.assertEqual(serve._jev_actor_role(state, 'ben'), 'director')
+        self.assertEqual(serve._jev_actor_role(state, 'ruth'), 'worker')
+        self.assertEqual(serve._jev_actor_role(state, 'ghost'), 'unknown')
+        self.assertEqual(serve._jev_actor_role({}, 'ruth'), 'unknown')
+
+    def test_framing_differs_by_rank(self):
+        state = self._state()
+        chief = serve._jev_actor_framing(state, 'theo')
+        director = serve._jev_actor_framing(state, 'nora')
+        worker = serve._jev_actor_framing(state, 'ruth')
+        self.assertIn('chief of staff', chief)
+        self.assertIn('strictest bar', chief)
+        self.assertIn('org-wide authority', chief)
+        self.assertIn('director (Supporting Director)', director)
+        self.assertIn('team stewardship', director)
+        self.assertIn('worker (Assistant to Nora)', worker)
+        self.assertIn('task scope', worker)
+        self.assertNotEqual(chief, director)
+        self.assertNotEqual(director, worker)
+
+    def test_unknown_actor_gets_worker_level_framing(self):
+        framing = serve._jev_actor_framing(self._state(), 'ghost')
+        self.assertIn('not on the roster', framing)
+        self.assertIn('worker-level task scope', framing)
+
+    def test_rung_instructions_differ(self):
+        esc = {'kind': 'owner safety decision', 'agentId': 'ruth'}
+        q = 'Question text here.'
+        imm = serve._escalation_rung_instructions(
+            'immediate', 'Nora', q, state=self._state(), esc=esc, esc_kind='x')
+        sen = serve._escalation_rung_instructions(
+            'senior', 'Nora', q, state=self._state(), esc=esc, esc_kind='x')
+        adm = serve._escalation_rung_instructions(
+            'admin', 'Theo', q, state=self._state(), esc=esc, esc_kind='x')
+        self.assertIn("requester's own director", imm)
+        self.assertIn('use that context', imm)
+        self.assertIn('second opinion', sen)
+        self.assertIn('authority than a director has', sen)
+        self.assertIn('chief of staff', adm)
+        self.assertIn('strictest bar', adm)
+        # The requester's rank framing rides every rung.
+        for text in (imm, sen, adm):
+            self.assertIn('worker (Assistant to Nora)', text)
+
+    def test_rung_instructions_render_prior_votes(self):
+        esc = {'kind': 'owner safety decision', 'agentId': 'ruth',
+               'rungVotes': [{'rung': 'immediate', 'decision': 'deny',
+                              'confidence': 0.44}]}
+        sen = serve._escalation_rung_instructions(
+            'senior', 'Nora', 'q', state=self._state(), esc=esc, esc_kind='x')
+        self.assertIn('immediate leaned deny (confidence 0.44)', sen)
+
+    def test_classify_command_carries_worker_framing(self):
+        captured = {}
+
+        def fake_call(model, state, questions):
+            captured.update(questions)
+            return _jev_response(choice='allow')
+
+        async def drive():
+            return await serve._classify_command('ls /workspace', 'list the task dir', 'ruth')
+
+        with unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value={'agentRoster': self.ROSTER}), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        side_effect=fake_call), \
+             unittest.mock.patch.object(serve, '_jev_choice',
+                                        return_value=('allow', 0.95, 0.01)), \
+             unittest.mock.patch.object(serve, 'is_model_circuit_broken',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'):
+            # is_model_circuit_broken is patched because earlier tests in the
+            # full suite trip the process-global breaker; in isolation it
+            # would be closed either way.
+            allowed, reason = asyncio.run(drive())
+        self.assertTrue(allowed, f'blocked with reason: {reason}')
+        instructions = captured['choice']['instructions']
+        self.assertIn('worker (Assistant to Nora)', instructions)
+        self.assertIn('task scope', instructions)
+        self.assertEqual(captured.get('_kind'), 'cmd_allow')
 
 
 if __name__ == '__main__':

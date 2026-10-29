@@ -41,6 +41,11 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
     threshold = _effective_safety_confidence()
     reviewed = review_target(target)
     target_for_review = reviewed['text']
+    # Votes cast by earlier rungs of THIS chain pass, threaded into the next
+    # rung's prompt (see _escalation_context_lines) so the chain converges on
+    # -- or visibly disagrees about -- a decision instead of each rung
+    # re-deriving the same uncertainty in isolation.
+    votes = []
     criteria = {
         'approve': 'Ordinary, legitimate, in-scope work; the low JEV confidence was caution, not a concrete risk.',
         'deny': 'Unsafe, destructive, credential/secret access or exfiltration, out of scope, or not justified.',
@@ -48,18 +53,25 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
     for level, reviewer_id in enumerate(chain):
         reviewer = roster.get(reviewer_id) or {}
         name = reviewer.get('name') or reviewer_id
-        role = ('chief of staff' if reviewer_id == admin_id else
-                'senior director' if reviewer_id == senior_id else 'director')
-        instr = (
-            f'You are {name}, the {role} of the AI think tank. '
+        rung = ('admin' if reviewer_id == admin_id else
+                'senior' if reviewer_id == senior_id else 'immediate')
+        # Role-differentiated rung framing (see _escalation_rung_instructions):
+        # the requester's own director judges task scope with team context, the
+        # senior director judges the authority boundary, and the chief of staff
+        # holds the strictest org-wide bar. The synthetic esc dict carries the
+        # requester id + the votes earlier rungs already cast, so each rung
+        # sees who is asking and what the chain below it thought.
+        question = (
             f'An agent asked to run this {noun}: {target_for_review}\n'
             f'Stated purpose: {purpose or "not given"}\n'
             f'JEV returned allow at low confidence ({confidence:.2f}, below '
             f'the {threshold:.2f} safety threshold). Decide whether the action '
-            'should go ahead. Approve only if it is ordinary, in-scope work and '
-            'the low confidence was caution rather than a real risk. Deny if it '
-            'is unsafe, destructive, exfiltrating, out of scope, or unjustified.'
+            'should go ahead.'
         )
+        instr = _escalation_rung_instructions(
+            rung, name, question, state=state,
+            esc={'agentId': agent_id, 'rungVotes': votes},
+            esc_kind='owner safety decision')
         review_model = _escalation_review_model(reviewer_id, admin_id)
         decision, reviewer_conf, _cost = _jev_quorum_choice_sync(
             instr, criteria, model=review_model)
@@ -68,6 +80,13 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
         # chain (Nora -> Theo), exactly like a low-confidence approve. Before
         # this, a hesitant Nora ended the chain and the chief of staff never
         # saw the request.
+        # Record this rung's vote before the gate decides what to do with it,
+        # mirroring the queued-escalation loop: a real binary vote is the
+        # rung's opinion and the next rung (and the owner record, if it comes
+        # to that) should see it.
+        if decision in ('approve', 'deny'):
+            votes.append({'rung': rung, 'decision': decision,
+                          'confidence': round(float(reviewer_conf or 0.0), 3)})
         if decision == 'deny' and reviewer_conf >= threshold:
             log_action(reviewer_id, 'jev_chain_denied',
                        {'agent': agent_id, 'action': action, 'target': target,
@@ -102,7 +121,18 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
             'safety threshold, and the director, senior director, and chief '
             'of staff all declined or could not decide.',
             what_checked='JEV plus the full director -> senior director -> chief of staff chain',
-            look_first=target_for_review)
+            look_first=target_for_review,
+            agent_id=agent_id)
+        # The rung votes survive onto the record so the owner (and any later
+        # tooling reading escalations.json) sees exactly how the internal
+        # chain split, not just that it failed to decide.
+        try:
+            escalations = _load_escalations() or {}
+            if escalations.get(esc_id):
+                escalations[esc_id].setdefault('rungVotes', []).extend(votes)
+                _save_escalations(escalations)
+        except Exception:
+            pass
         log_action('player', 'jev_chain_owner_escalation',
                    {'escalationId': esc_id, 'agent': agent_id,
                     'action': action, 'target': target,
@@ -186,6 +216,10 @@ async def _jev_re_gate_redirect_final(agent_id, action, noun, approved_url, fina
     if work_context:
         instructions += f'The agent is currently working on this assigned task: {work_context[:600]}\n'
     instructions += 'Decide allow or block based on the FINAL URL/domain (the redirect destination), the stated purpose, and the work it serves. If the URL falls into any blocked category, you MUST block it regardless of work relevance or stated purpose.'
+    try:
+        instructions += '\n' + _jev_actor_framing(get_state_from_db() or {}, agent_id)
+    except Exception:
+        pass  # framing is presentation, never a gate
     decision, confidence, cost, redirect_trace_id = await _jev_quorum_decision(instructions, criteria)
     if not _jev_safety_gate(agent_id, action, noun, final_url, purpose, decision, confidence, cost, authorized, redirect_trace_id):
         return False, 'The site this URL redirected to was not approved for a think tank agent to visit.'
