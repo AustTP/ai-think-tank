@@ -699,6 +699,40 @@ FAILURE_TYPE_LABELS = {
     'style': 'style, tone, or wording',
 }
 DB_PATH = os.environ.get('THINK_TANK_DB') or os.path.join(THINK_TANK_DIR, 'think_tank.db')
+
+
+def _refuse_production_db_from_tests():
+    """Fail loudly when a TEST process is about to open the production DB.
+
+    The pytest suite is isolated by world/tests/conftest.py, which points
+    THINK_TANK_DB at a per-session copy before serve is ever imported. But
+    conftest only runs under pytest: a test module executed directly
+    (`python world/tests/core/test_x.py`, `python -m unittest ...`) imports
+    serve with the operator's real environment, and every _db() writer --
+    decision tape, action_log, escalation saves -- then lands in the live
+    database. That exact pollution happened before conftest existed (fixture
+    titles in the live action_log). This guard makes the bypass impossible
+    instead of merely unlikely: an import from a test-looking entrypoint that
+    resolves to the production think_tank.db raises here, before any write.
+
+    The live server, operator scripts, and ad-hoc operator tooling pass:
+    their argv[0] is serve.py or a scripts/ path, not a tests/ path."""
+    argv0 = (sys.argv[0] or '') if sys.argv else ''
+    base = os.path.basename(argv0)
+    test_entry = (os.sep + 'tests' + os.sep) in argv0 or base.startswith(('pytest', 'py.test'))
+    if not test_entry:
+        return
+    production = os.path.realpath(os.path.join(THINK_TANK_DIR, 'think_tank.db'))
+    if os.path.realpath(DB_PATH) != production:
+        return  # already redirected (conftest / explicit THINK_TANK_DB)
+    raise RuntimeError(
+        'serve.py refuses to open the production think_tank.db from a test '
+        f'process (entrypoint {argv0!r}). Run tests through pytest '
+        '(world/tests/conftest.py redirects THINK_TANK_DB to a session copy), '
+        'or set THINK_TANK_DB explicitly.')
+
+
+_refuse_production_db_from_tests()
 # The Library's real capability -- a shared file directory
 # any agent can read from or write to (code, notes, completed-task
 # records), with archive/ specifically for completed tasks. Same
