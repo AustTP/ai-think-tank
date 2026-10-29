@@ -1,11 +1,11 @@
 # parts: server/serve_parts
 """Ordered source parts for :mod:`serve`."""
-import faulthandler as _fh
-import signal as _sig
+import faulthandler
+import signal
 import os as _os
 # kill -USR1 <pid> dumps all python thread stacks to stderr (found the RSS
 # spin tonight; keep it as standing incident tooling).
-_fh.register(_sig.SIGUSR1)
+faulthandler.register(signal.SIGUSR1)
 _here = globals().get('__file__') or __file__
 _parts = _os.path.join(_os.path.dirname(_os.path.abspath(_here)), 'server', 'serve_parts')
 for _fn in sorted(f for f in _os.listdir(_parts) if f.endswith('.py')):
