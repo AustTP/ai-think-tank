@@ -453,6 +453,46 @@ class SimResidualTest(_Base):
                 reader=lambda r: None)
         self.assertEqual(req['status'], 'rejected')
 
+    def test_player_filed_request_skips_the_cascade(self):
+        """2026-10-30 Tier-2: the groom NB learned a player/pressoffice
+        reject-bias and killed four operator filings at posterior 1.0.
+        Player-authored requests must go to the real judge, never the
+        cascade shortcut."""
+        req = {'id': 'r1', 'status': 'pending', 'filedBy': 'player',
+               'room': 'pressoffice', 'title': 'Arrival brief', 'reason': 'why'}
+        state = {'agents': {'sm': {'name': 'SM'}},
+                 'agentRoster': [{'id': 'sm', 'name': 'SM'}],
+                 'backlogRequests': [req], 'tasks': {}, 'workQueue': []}
+        pending = {'scrumMasterId': 'sm', 'reqIds': ['r1'], 'teamId': 't1'}
+        cascade_calls = []
+
+        def fake_cascade(instructions, criteria):
+            cascade_calls.append(1)
+            return 'reject'
+
+        with unittest.mock.patch.object(sim.comprehension,
+                                        'comprehend_batch',
+                                        return_value={}), \
+             unittest.mock.patch.object(sim, '_overrun_factor_for',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, 'budget_usd_for_task',
+                                        return_value=1.0), \
+             unittest.mock.patch.object(sim, '_refinement_context_for_room',
+                                        return_value=''), \
+             unittest.mock.patch.object(sim, '_reassign_rolled_over_cards'), \
+             unittest.mock.patch.object(sim, '_restore_refinement_agent'), \
+             unittest.mock.patch.object(sim, '_triage_cascade_choice',
+                                        side_effect=fake_cascade), \
+             unittest.mock.patch('serve.log_action'), \
+             unittest.mock.patch('serve.log_refinement_digest'):
+            sim._resolve_refinement(
+                state, pending, 1000,
+                decider=lambda instructions, criteria: 'accept',
+                reader=lambda r: None)
+        self.assertEqual(cascade_calls, [],
+                         'player-authored requests must never hit the cascade')
+        self.assertEqual(req['status'], 'accepted')
+
     def test_resolve_refinement_appeal_rides_instructions(self):
         req = {'id': 'r1', 'status': 'pending', 'filedBy': 'cora',
                'room': 'pressoffice', 'title': 'Do X', 'reason': 'why',

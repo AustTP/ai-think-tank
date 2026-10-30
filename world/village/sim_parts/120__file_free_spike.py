@@ -653,7 +653,14 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             # groom history predicts this verdict with a high posterior, the
             # expensive judge is spared and the auto-decision is taped. None
             # means not armed / not confident / stood down -- JEV decides.
-            choice = _triage_cascade_choice(instructions, criteria)
+            # 2026-10-30 Tier-2: player-authored (operator-directed) requests
+            # NEVER ride the cascade -- the NB learned a player/pressoffice
+            # reject-bias from history and killed four operator filings at
+            # posterior 1.0 with zero judgment. Operator-directed work gets
+            # the real judge (one JEV call costs pennies).
+            player_authored = filed_by == 'player'
+            choice = (None if player_authored
+                      else _triage_cascade_choice(instructions, criteria))
             if choice is None:
                 # Thread the tape kind tag when the decider accepts it (the real
                 # default does; older 2-arg test stubs fall back positionally).
