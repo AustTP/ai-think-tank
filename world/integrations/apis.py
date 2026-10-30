@@ -489,7 +489,9 @@ def _api_credential_value(spec):
         # _credential_payload normalizes both storage shapes (legacy raw
         # token strings and {'kind': 'token', 'token': ...} payloads) into
         # the usable token; decrypting the blob directly would hand back the
-        # payload JSON for newer rows instead of the key itself.
+        # payload JSON for newer rows instead of the key itself. It is
+        # active-gated: a removed/proposed credential resolves to None, so
+        # revocation stops api_calls here rather than only at handle minting.
         payload = _serve._credential_payload(name) or {}
         token = payload.get('token') if isinstance(payload, dict) else None
         token = str(token or '').strip() or None
@@ -499,7 +501,12 @@ def _api_credential_value(spec):
             # to it instead of forcing a row migration just to use the key.
             token = _serve._pixellab_token()
         if not token:
-            return None, None, f'credential {name} is not in the vault'
+            status = _serve._credential_status(name)
+            if status is None:
+                return None, None, f'credential {name} is not in the vault'
+            if status != 'active':
+                return None, None, f'credential {name} is not active (status: {status})'
+            return None, None, f'credential {name} is active but undecryptable'
         return token, None, None
     return None, None, 'registry entry has no credential configured'
 

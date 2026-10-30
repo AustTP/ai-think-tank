@@ -92,3 +92,39 @@ def test_theo_more(tmp_path, monkeypatch):
     monkeypatch.setattr(theo_policy.os.path, 'exists', lambda p: True)
     monkeypatch.setattr(theo_policy.os, 'remove', lambda p: (_ for _ in ()).throw(OSError('x')))
     policy._persist()
+
+
+def test_send_player_email_sync_gated_on_credential_status(monkeypatch, tmp_path):
+    """A removed/proposed gmail credential must stop the email channel the
+    same way it stops handle minting -- no send, no SMTP, honest log line."""
+    import serve
+    sent = []
+    monkeypatch.setattr(serve, 'PLAYER_EMAIL_ENABLED', True)
+    monkeypatch.setattr(serve, '_open_secret', lambda raw: 'app-password')
+
+    def fake_smtp(host, port, user, pw, to, subject, body, label):
+        sent.append((subject, pw))
+        return True
+
+    monkeypatch.setattr(notify, '_smtp_send', fake_smtp)
+    # Active credential: gate passes, send proceeds with the decrypted secret.
+    monkeypatch.setattr(serve, '_credential_status', lambda name: 'active')
+    monkeypatch.setattr(serve, '_credential_token', lambda name: 'raw-blob')
+    assert notify._send_player_email_sync('hi', 'body') is True
+    assert sent == [('hi', 'app-password')]
+    # Removed credential: gate stops the send before SMTP, without even
+    # touching the encrypted blob.
+    sent.clear()
+    monkeypatch.setattr(serve, '_credential_status', lambda name: 'removed')
+    token_calls = []
+    monkeypatch.setattr(serve, '_credential_token',
+                        lambda name: token_calls.append(name) or 'raw-blob')
+    assert notify._send_player_email_sync('leak?', 'body') is False
+    assert sent == [] and token_calls == []
+    # Absent credential (status None): falls through to the existing
+    # no-credential path -- also no send.
+    sent.clear()
+    monkeypatch.setattr(serve, '_credential_status', lambda name: None)
+    monkeypatch.setattr(serve, '_credential_token', lambda name: None)
+    assert notify._send_player_email_sync('hi', 'body') is False
+    assert sent == []

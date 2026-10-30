@@ -340,5 +340,65 @@ class LoginAdapter(_CredentialCase):
         self.assertEqual(scrubbed['data']['user'], 'x')
 
 
+class RevocationBitesEverywhere(_CredentialCase):
+    """Revocation must stop every read chokepoint, not just handle minting:
+    _credential_payload (default gate), _credential_status, and the registry
+    credential resolver's three-way errors."""
+
+    def test_removed_credential_payload_is_gated(self):
+        from starlette.testclient import TestClient
+        serve._store_credential('acct', 'ExampleCo',
+                                {'kind': 'token', 'token': 'sk-live-1'}, status='active')
+        self.assertEqual(serve._credential_payload('acct')['token'], 'sk-live-1')
+        # A proposed row is also gated: payload reads refuse it.
+        serve._store_credential('acct2', 'ExampleCo',
+                                {'kind': 'token', 'token': 'sk-live-2'}, status='proposed')
+        self.assertIsNone(serve._credential_payload('acct2'))
+        # Removal flips status; the default gate now refuses even the blob
+        # that would decrypt fine, but require_active=False still decrypts
+        # (the approval flow and admin preview rely on that).
+        c = TestClient(serve.app)
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=True):
+            r = c.post('/api/credentials/remove', json={'name': 'acct'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(serve._credential_status('acct'), 'removed')
+        self.assertIsNone(serve._credential_payload('acct'))
+        self.assertEqual(serve._credential_payload('acct', require_active=False)['token'],
+                         'sk-live-1')
+        # _credential_status distinguishes 'removed' from 'never stored'.
+        self.assertIsNone(serve._credential_status('never-stored'))
+
+    def test_api_credential_value_status_errors(self):
+        import integrations.apis as apis
+        spec = {'credential': {'type': 'vault', 'name': 'vaultacme'}}
+        # Absent row: not-in-the-vault error.
+        token, token2, err = apis._api_credential_value(spec)
+        self.assertIsNone(token)
+        self.assertIsNone(token2)
+        self.assertEqual(err, 'credential vaultacme is not in the vault')
+        # Non-active row: precise revocation error, still no token.
+        serve._store_credential('vaultacme', 'Acme',
+                                {'kind': 'token', 'token': 'sk-acme'}, status='active')
+        with unittest.mock.patch.object(serve, '_require_player_session', return_value=True), \
+             unittest.mock.patch.object(serve, '_pixellab_token', return_value=None):
+            from starlette.testclient import TestClient
+            TestClient(serve.app).post('/api/credentials/remove', json={'name': 'vaultacme'})
+        token, token2, err = apis._api_credential_value(spec)
+        self.assertIsNone(token)
+        self.assertIsNone(token2)
+        self.assertEqual(err, 'credential vaultacme is not active (status: removed)')
+        # Active-but-undecryptable row: the third way, distinct from both.
+        serve._store_credential('vaultacme', 'Acme',
+                                {'kind': 'token', 'token': 'sk-acme'}, status='active')
+        with unittest.mock.patch.object(serve, '_credential_payload',
+                                        return_value=None):
+            token, token2, err = apis._api_credential_value(spec)
+        self.assertEqual(err, 'credential vaultacme is active but undecryptable')
+        # Happy path still returns the token from the active row.
+        token, token2, err = apis._api_credential_value(spec)
+        self.assertEqual(token, 'sk-acme')
+        self.assertIsNone(err)
+
+
 if __name__ == '__main__':
     unittest.main()

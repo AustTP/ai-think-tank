@@ -867,25 +867,43 @@ class ReloadGoogleLimitsTest(unittest.TestCase):
 
 class CredentialPayloadTest(unittest.TestCase):
     def test_branches(self):
-        with mock.patch.object(serve, '_credential_token',
-                               return_value=None):
+        active = mock.patch.object(serve, '_credential_status',
+                                   return_value='active')
+        removed = mock.patch.object(serve, '_credential_status',
+                                    return_value='removed')
+        absent = mock.patch.object(serve, '_credential_status',
+                                   return_value=None)
+        with active, mock.patch.object(serve, '_credential_token',
+                                       return_value=None):
             self.assertIsNone(serve._credential_payload('c'))
-        with mock.patch.object(serve, '_credential_token',
-                               return_value='raw'), \
+        with active, mock.patch.object(serve, '_credential_token',
+                                       return_value='raw'), \
              mock.patch.object(serve, '_open_secret', return_value=None):
             self.assertIsNone(serve._credential_payload('c'))
-        with mock.patch.object(serve, '_credential_token',
-                               return_value='raw'), \
+        with active, mock.patch.object(serve, '_credential_token',
+                                       return_value='raw'), \
              mock.patch.object(serve, '_open_secret',
                                return_value='notjson'):
             self.assertEqual(serve._credential_payload('c'),
                              {'kind': 'token', 'token': 'notjson'})
-        with mock.patch.object(serve, '_credential_token',
-                               return_value='raw'), \
+        with active, mock.patch.object(serve, '_credential_token',
+                                       return_value='raw'), \
              mock.patch.object(serve, '_open_secret',
                                return_value='{"kind": "login"}'):
             self.assertEqual(serve._credential_payload('c'),
                              {'kind': 'login'})
+        # Active gate: a non-active row resolves to None even when the blob
+        # would decrypt fine, and require_active=False bypasses the gate.
+        with removed, mock.patch.object(serve, '_credential_token',
+                                        return_value='raw'), \
+             mock.patch.object(serve, '_open_secret',
+                               return_value='notjson'):
+            self.assertIsNone(serve._credential_payload('c'))
+            self.assertEqual(serve._credential_payload('c', require_active=False),
+                             {'kind': 'token', 'token': 'notjson'})
+        with absent:
+            self.assertIsNone(serve._credential_payload('c'))
+            self.assertIsNone(serve._credential_payload('c', require_active=False))
 
 
 class AllowlistWaitSamplesTest(unittest.TestCase):

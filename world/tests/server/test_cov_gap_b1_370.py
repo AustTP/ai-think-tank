@@ -344,8 +344,9 @@ def test_credential_list_endpoint(monkeypatch):
     monkeypatch.setattr(serve, '_list_credentials',
                         lambda: [{'name': 'a', 'service': 's', 'kind': 'token',
                                   'status': 'active', 'proposedBy': 'player'}])
-    monkeypatch.setattr(serve, '_credential_payload', lambda name: {'kind': 'token',
-                                                                    'token': 'secret'})
+    monkeypatch.setattr(serve, '_credential_payload',
+                        lambda name, require_active=False: {'kind': 'token',
+                                                            'token': 'secret'})
     monkeypatch.setattr(serve, '_mask_credential_preview',
                         lambda payload: {'masked': True})
     resp = asyncio.run(serve.credential_list(_req({})))

@@ -276,7 +276,7 @@ async def credential_list(request: Request):
     entries = []
     for cred in _list_credentials():
         entry = dict(cred)
-        entry['preview'] = _mask_credential_preview(_credential_payload(cred['name']) or {})
+        entry['preview'] = _mask_credential_preview(_credential_payload(cred['name'], require_active=False) or {})
         entries.append(entry)
     return JSONResponse({'credentials': entries})
 
@@ -333,7 +333,7 @@ async def credential_approve(request: Request):
         return JSONResponse({'error': f'no credential row "{name}"'}, status_code=404)
     if existing == 'active':
         return JSONResponse({'error': f'credential "{name}" is already active'}, status_code=409)
-    payload = _credential_payload(name)
+    payload = _credential_payload(name, require_active=False)
     if payload is None:
         return JSONResponse({'error': 'stored credential is unreadable'}, status_code=400)
     with _db() as conn:

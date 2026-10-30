@@ -160,6 +160,13 @@ def _send_player_email_sync(subject, body_text):
         return False
     token = None
     try:
+        # Active-gated: a removed credential must stop the channel too, the
+        # same way the handle mint gate refuses non-active rows.
+        cred_status = _serve._credential_status(_serve._GMAIL_CRED_NAME)
+        if cred_status is not None and cred_status != 'active':
+            print(f'[email] {_serve._GMAIL_CRED_NAME} credential is not active '
+                  f'(status: {cred_status}) -- not sending: {subject}')
+            return False
         token = _serve._credential_token(_serve._GMAIL_CRED_NAME)
     except Exception as e:
         print(f'[email] credential lookup failed: {e}')

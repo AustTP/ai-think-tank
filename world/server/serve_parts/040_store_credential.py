@@ -32,12 +32,32 @@ def _list_credentials():
                     'SELECT name, service, kind, status, proposed_by FROM external_credentials ORDER BY name')]
 
 
-def _credential_payload(name):
+def _credential_status(name):
+    """Current status of one credential row, or None when the name is absent.
+    Lets callers distinguish 'revoked' from 'never stored' without touching
+    the encrypted blob."""
+    with _db() as conn:
+        row = conn.execute('SELECT status FROM external_credentials WHERE name = ?',
+                           (name,)).fetchone()
+        return row[0] if row else None
+
+
+def _credential_payload(name, require_active=True):
     """Decrypt one credential's stored value into its structured payload, or
     None when absent/unreadable. Legacy rows that stored a raw token string
     decrypt to {'kind': 'token', 'token': <raw>}. This is the single chokepoint
     that turns an encrypted blob back into something usable -- everything that
-    USES a credential goes through here (or through resolve_capability_handle)."""
+    USES a credential goes through here (or through resolve_capability_handle).
+
+    require_active defaults to True: a credential whose status is not 'active'
+    (removed / proposed / denied) resolves to None, so revocation bites at the
+    read chokepoint and not only at handle minting. Callers that legitimately
+    need to read a non-active row -- the approval flow, which must decrypt a
+    'proposed' credential to re-validate it, and the admin preview -- pass
+    require_active=False explicitly."""
+    if require_active:
+        if _credential_status(name) != 'active':
+            return None
     raw = _credential_token(name)
     if raw is None:
         return None
