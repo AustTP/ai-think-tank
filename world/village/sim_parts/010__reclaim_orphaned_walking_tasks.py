@@ -318,6 +318,43 @@ def _sim_loop_pass():
     # Returns the updated state after one tick, or None if nothing to do.
     # Runs on a worker thread (the loop calls us via asyncio.to_thread).
     import serve
+    # Pile-up guard (2026-10-30 Tier-0 starvation profile): the watchdog
+    # recycles the sim TASK when a pass exceeds _SIM_WATCHDOG_STALE_S, but
+    # asyncio.to_thread CANNOT cancel the running pass thread -- every
+    # recycle started a second pass reading the same base state while the
+    # first kept running. Overlapping passes duplicated lane work and model
+    # spend and GIL-saturated the process until operator HTTP starved
+    # (>15s GET) and the tick went stale 200-320s repeatedly (378 historical
+    # recycles). One pass at a time: a late arrival skips (no double work,
+    # no pile-up); a pass stuck past _PASS_FORCE_AFTER_S is taken over.
+    global _PASS_HELD_SINCE, _PASS_SKIP_LOGGED
+    if not _PASS_LOCK.acquire(blocking=False):
+        held = time.time() - _PASS_HELD_SINCE
+        if held < _PASS_FORCE_AFTER_S:
+            if not _PASS_SKIP_LOGGED:
+                _PASS_SKIP_LOGGED = True
+                print(f'[sim] pass skipped: previous pass still running ({held:.0f}s); pile-up guard', flush=True)
+            return None
+        try:
+            _PASS_LOCK.release()
+        except RuntimeError:
+            pass
+        _PASS_LOCK.acquire()
+        print(f'[sim] pass guard: previous pass held {held:.0f}s (>= {_PASS_FORCE_AFTER_S}s); forcing takeover', flush=True)
+    _PASS_HELD_SINCE = time.time()
+    _PASS_SKIP_LOGGED = False
+    try:
+        return _sim_loop_pass_inner()
+    finally:
+        try:
+            _PASS_LOCK.release()
+        except RuntimeError:
+            pass
+
+
+def _sim_loop_pass_inner():
+    # The actual tick body, split out so the pile-up guard wraps it.
+    import serve
     # Cheap housekeeping: drop expired external-capability handles and
     # sublow/JEV experiment grants on each tick so a stale nonce can never be
     # presented. All idempotent; no-op when empty.
@@ -336,10 +373,18 @@ def _sim_loop_pass():
         state = serve._state_begin()
         if not state:
             return None
+        # Progress heartbeat (2026-10-30): the watchdog recycles on a stale
+        # stamp, so a pass must be able to PROVE it is advancing. Stamp at
+        # each milestone instead of only after the final save -- a slow
+        # heavy pass keeps its stamp fresh, a frozen pass goes silent and
+        # earns its recycle.
+        global _LAST_TICK_WALL_EPOCH
+        _LAST_TICK_WALL_EPOCH = time.time()
         # Record dormancy/downtime as paused time BEFORE the tick advances
         # sim.lastTickEpochS, so stale-work aging excludes it.
         _record_tick_gap(state, int(time.time() * 1000))
         state = _engine.tick(state)
+        _LAST_TICK_WALL_EPOCH = time.time()
         try:
             governance.supervisor_tick(state)
         except Exception as e:
@@ -406,10 +451,9 @@ def _sim_loop_pass():
         except Exception as e:
             print(f'[sim] completion recovery error: {e}', flush=True)
         serve.save_state_to_db(state)
-        # Stamp the watchdog heartbeat only after a fully successful pass
-        # (tick + save). A pass that dies mid-way leaves the old stamp so the
-        # watchdog can notice repeated failures.
-        global _LAST_TICK_WALL_EPOCH
+        # Final heartbeat after a fully successful pass (tick + save); the
+        # milestone stamps above already keep a heavy pass fresh, so this
+        # closing stamp only matters for the sub-second tail.
         _LAST_TICK_WALL_EPOCH = time.time()
         return state
     finally:

@@ -102,10 +102,26 @@ SIM_SUBSTEP_S = 0.1
 # patch; _sim_loop must re-raise it so lifespan shutdown still works.
 _SimCancelledError = asyncio.CancelledError
 
-# Wall-clock of the last SUCCESSFUL _sim_loop_pass (set after save_state_to_db).
-# The serve.py sim watchdog reads this cheap module global to detect a frozen
-# tick without touching the DB. 0.0 = no tick has completed yet this process.
+# Wall-clock of the last SUCCESSFUL _sim_loop_pass milestone (state load,
+# engine tick, or the final save -- whichever landed last). The serve.py sim
+# watchdog reads this cheap module global to detect a frozen tick without
+# touching the DB. 0.0 = no tick has completed yet this process. Since
+# 2026-10-30 the pass stamps PROGRESS milestones, not just completions, so
+# a slow heavy pass keeps its stamp fresh and only a genuinely frozen pass
+# goes stale.
 _LAST_TICK_WALL_EPOCH = 0.0
+
+# Pile-up guard (2026-10-30 Tier-0 starvation profile): the watchdog's
+# task.cancel() cannot stop a pass thread that asyncio.to_thread already
+# started, so every stale-recycle used to pile ANOTHER pass on top of the
+# old one -- overlapping passes duplicated lane work and model spend and
+# GIL-saturated the process until operator HTTP starved. One pass at a
+# time: _PASS_LOCK is held for the whole pass; a late arrival skips its
+# tick; a pass stuck past _PASS_FORCE_AFTER_S is force-taken-over.
+_PASS_LOCK = threading.Lock()
+_PASS_HELD_SINCE = 0.0
+_PASS_SKIP_LOGGED = False
+_PASS_FORCE_AFTER_S = 600
 
 # Sim-loop failure event (R6 escalation ladder), stamped by serve's watchdog
 # thread and consumed ONCE by the next non-dormant _sim_loop_pass (clear-on-read,

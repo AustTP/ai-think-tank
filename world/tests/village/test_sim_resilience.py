@@ -774,3 +774,74 @@ def test_apply_content_result_dedupes_gate_fix_cards():
             {'ok': True, 'note': 'rejected', 'queueFix': dict(qf)}, 1000)
     fixes = [q for q in state['workQueue'] if q.get('reviewOf') == 'p']
     assert len(fixes) == 1
+
+
+def test_pass_guard_skips_while_previous_pass_in_flight(monkeypatch):
+    """2026-10-30 Tier-0: the watchdog's task.cancel() cannot stop a pass
+    thread; every recycle used to pile another pass on top. One pass at a
+    time: a late arrival must SKIP, not double-execute."""
+    ran = []
+    monkeypatch.setattr(sim, '_sim_loop_pass_inner',
+                        lambda: ran.append(1) or 'ran')
+    assert sim._PASS_LOCK.acquire(blocking=False)
+    try:
+        assert sim._sim_loop_pass() is None
+        assert ran == []
+        assert sim._PASS_SKIP_LOGGED is True
+    finally:
+        sim._PASS_LOCK.release()
+    sim._PASS_SKIP_LOGGED = False
+
+
+def test_pass_guard_force_takeover_after_stuck_window(monkeypatch):
+    ran = []
+    monkeypatch.setattr(sim, '_sim_loop_pass_inner',
+                        lambda: ran.append(1) or 'ran')
+    monkeypatch.setattr(sim, '_PASS_FORCE_AFTER_S', 0)
+    assert sim._PASS_LOCK.acquire(blocking=False)
+    try:
+        sim._PASS_HELD_SINCE = time.time() - 700
+        assert sim._sim_loop_pass() == 'ran'
+        assert ran == [1], 'stuck pass must be taken over past the window'
+    finally:
+        if sim._PASS_LOCK.locked():
+            sim._PASS_LOCK.release()
+
+
+def test_pass_guard_releases_lock_after_normal_pass(monkeypatch):
+    calls = []
+    monkeypatch.setattr(sim, '_sim_loop_pass_inner', lambda: calls.append(1))
+    assert sim._sim_loop_pass() is None
+    assert sim._sim_loop_pass() is None
+    assert len(calls) == 2, 'lock must release so the next tick runs'
+    assert sim._PASS_LOCK.acquire(blocking=False)
+    sim._PASS_LOCK.release()
+
+
+def test_pass_heartbeat_stamps_progress_mid_tick(monkeypatch):
+    stamps = {}
+
+    def fake_tick(state):
+        stamps['during_tick'] = sim._LAST_TICK_WALL_EPOCH
+        return state
+
+    monkeypatch.setattr(sim._engine, 'tick', fake_tick)
+    monkeypatch.setattr(serve, '_expire_handles', lambda: None)
+    monkeypatch.setattr(serve, 'expire_sublow_grants', lambda: None)
+    monkeypatch.setattr(serve, 'expire_jev_grants', lambda: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: False)
+    monkeypatch.setattr(serve, '_state_begin', lambda: {'sim': {}})
+    monkeypatch.setattr(serve, '_state_abort', lambda: None)
+    monkeypatch.setattr(serve, 'save_state_to_db', lambda s: None)
+    monkeypatch.setattr(serve, '_apply_pending_ask_results', lambda s: None)
+    monkeypatch.setattr(serve, '_peer_review_tick', lambda s: None)
+    monkeypatch.setattr(serve, '_adversarial_village_tick', lambda s: None)
+    monkeypatch.setattr(serve, '_spend_ledger_read', lambda: [])
+    monkeypatch.setattr(sim.governance, 'supervisor_tick', lambda s: None)
+    before = time.time()
+    out = sim._sim_loop_pass()
+    assert isinstance(out, dict)
+    assert stamps['during_tick'] >= before - 1, (
+        'the post-load heartbeat must be visible to the engine tick')
+    assert sim._LAST_TICK_WALL_EPOCH >= stamps['during_tick']
+    assert not sim._PASS_LOCK.locked(), 'lock must be released after the pass'
