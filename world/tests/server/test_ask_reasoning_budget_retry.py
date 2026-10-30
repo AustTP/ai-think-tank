@@ -76,3 +76,47 @@ def test_retry_that_yields_tool_calls_falls_through_to_execution():
             max_tokens=200, max_iterations=2)
     assert executed == [('probe_tool', {'x': 1})]
     assert out == 'final answer after the tool ran'
+
+
+def test_breaker_open_primary_rotates_to_healthy_pool_sibling():
+    """2026-10-30 Tier-1: a breaker-open free-pool primary used to fail the
+    whole ask even though a healthy sibling could serve. The call must
+    rotate instead of refusing."""
+    posts = []
+
+    def fake_post(body):
+        posts.append(body.get('model'))
+        if body.get('model') == '@freepool:low:primary':
+            raise AssertionError('the breaker-open primary must never reach the network')
+        return _resp('served by the sibling')
+
+    with unittest.mock.patch.object(serve, 'is_model_circuit_broken',
+                                    side_effect=lambda m: m == '@freepool:low:primary'), \
+         unittest.mock.patch.object(serve, '_model_provider_for',
+                                    return_value={'free': True}), \
+         unittest.mock.patch.object(serve, '_free_pool_fallback_slugs',
+                                    return_value=['@freepool:low:sibling']), \
+         unittest.mock.patch.object(serve, '_openrouter_chat_post', side_effect=fake_post), \
+         unittest.mock.patch.object(serve, 'record_model_result', lambda *a, **k: None), \
+         unittest.mock.patch.object(serve, '_accrue_spend', lambda *a, **k: None), \
+         unittest.mock.patch.object(serve, 'log_action', lambda *a, **k: None):
+        out = serve._post_openrouter_raw('@freepool:low:primary',
+                                         [{'role': 'user', 'content': 'q'}])
+    assert ((out.get('choices') or [{}])[0].get('message') or {}).get('content') == \
+        'served by the sibling'
+    assert posts == ['@freepool:low:sibling'], posts
+
+
+def test_breaker_open_primary_with_no_healthy_sibling_still_raises():
+    with unittest.mock.patch.object(serve, 'is_model_circuit_broken',
+                                    return_value=True), \
+         unittest.mock.patch.object(serve, '_free_pool_fallback_slugs',
+                                    return_value=['@freepool:low:sibling']), \
+         unittest.mock.patch.object(serve, 'log_action', lambda *a, **k: None):
+        try:
+            serve._post_openrouter_raw('@freepool:low:primary',
+                                       [{'role': 'user', 'content': 'q'}])
+            raised = False
+        except RuntimeError as e:
+            raised = 'circuit-broken' in str(e)
+        assert raised, 'all pool members broken -> the raise must stand'

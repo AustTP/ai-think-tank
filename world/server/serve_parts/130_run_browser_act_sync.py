@@ -1053,6 +1053,29 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
                            f'{paid_block} policy switch -- free pool could '
                            f'not serve this call')
     if is_model_circuit_broken(model):
+        if free_route and _fallback_depth < TIER_FALLBACK_MAX_DEPTH:
+            # 2026-10-30 Tier-1: a breaker-open PRIMARY used to refuse the
+            # whole call even though the free pool has healthy siblings --
+            # the ask lane then failed outright ("temporarily circuit-
+            # broken") while another endpoint could have served. Rotate the
+            # pool exactly like the HTTPError fallback below; the breaker
+            # still protects each individual endpoint.
+            for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
+                if is_model_circuit_broken(slug):
+                    continue
+                try:
+                    result = _post_openrouter_raw(
+                        slug, messages, tools, max_tokens, tool_choice,
+                        _fallback_depth=_fallback_depth + 1,
+                        _tried=(_tried or ()) + (model,))
+                except Exception:
+                    continue
+                print(f'[free-pool] {model} breaker-open; served the call with '
+                      f'{slug}', flush=True)
+                log_action(None, 'free_pool_fallback',
+                           {'from': model, 'to': slug, 'reason': 'circuit_broken',
+                            'depth': _fallback_depth}, authorized=False)
+                return result
         raise RuntimeError(f'{model} is temporarily circuit-broken after repeated failures')
     if not _messages_pass_boundary_check(messages):
         raise RuntimeError('external data boundary failed verification -- refusing model call')
