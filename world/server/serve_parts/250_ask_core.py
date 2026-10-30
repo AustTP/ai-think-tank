@@ -1,5 +1,27 @@
 
 
+_LIVE_DATA_TIME = (
+    r'\b(?:live|right[_\s-]?now|current(?:ly)?|as[_\s-]?of[_\s-]?(?:now|today)|'
+    r"today(?:'s)?|at[_\s-]?this[_\s-]?moment|this[_\s-]?(?:morning|afternoon|evening))\b")
+_LIVE_DATA_NOUN = (
+    r'\b(?:data|count|how[_\s-]?many|number|price|prices|events?|incidents?|'
+    r'traffic|cafes?|weather|open(?:ings|ed)?|status)\b')
+_LIVE_DATA_RE = re.compile(
+    _LIVE_DATA_TIME + r'.{0,80}?' + _LIVE_DATA_NOUN
+    + '|' + _LIVE_DATA_NOUN + r'.{0,80}?' + _LIVE_DATA_TIME
+    + r'|\b(?:overpass|tomtom|ticketmaster|eventbrite|redfin|api[_\s-]?service|'
+    r'registry[_\s-]?service|api[_\s-]?call)\b', re.I)
+
+
+def _ask_wants_live_registry_data(question):
+    """True when a question asks for LIVE external data the registry services
+    can answer (or names a registered service outright). Used to force the
+    list_services tool on turn 1 -- prompt-only guidance to use registry
+    tools was ignored live (2026-10-30 probe: the model answered a live-data
+    ask with a fabricated policy excuse and zero tool calls)."""
+    return bool(_LIVE_DATA_RE.search(str(question or '')))
+
+
 async def _ask_core(state, question, agent_id_hint=None, location=None, max_tokens=300, allow_admin_pin=False, allow_park=True, session_id=None, approved_tools=None, best_effort=False):
     """The real logic behind /api/intent/ask, pulled out so a non-HTTP caller
     (the Telegram bridge) can invoke it directly -- no fake Request object,
@@ -147,6 +169,12 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
            "those tools genuinely returned, never a guess at what they might return. "
            if is_security_test_role else "")
         + "Do not fabricate numbers or tool results you did not actually get from a tool."
+        + "Registered API services (list_services, then api_call) are YOURS to call for "
+          "live external data: the registry injects credentials server-side, enforces "
+          "read-only paths, and the Bank meters the spend. There is no approval gate on "
+          "registry GETs -- if a live-data question arrives, actually call the tools and "
+          "report what they returned. NEVER claim a tool is 'restricted by policy' or "
+          "'requires approval' without having attempted the call and seen the refusal."
     )
     # Conversation memory: the player's long-term memories and the rolling
     # summary of the earlier conversation are folded into the system prompt so
@@ -215,7 +243,16 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     # actually honors tool_choice. Plain questions keep their JEV-resolved low tier
     # (cost unchanged); tool-forced calls pay a fraction more to never hallucinate.
     ask_force_first_tool = None
-    if _spike_wants_x_trending(question, None):
+    if _ask_wants_live_registry_data(question):
+        # 2026-10-30 Tier-1 probe finding: asked for live Overpass/TomTom/
+        # Ticketmaster numbers, the ask model NEVER called the api_call tool
+        # it was offered (zero registry spend since boot) and answered with a
+        # fabricated "restricted by policy approvals" excuse instead. Same
+        # disease as the spike detectors above; same cure: force the registry
+        # discovery tool on turn 1 so the model sees real service ids and the
+        # follow-up api_call happens against reality, not imagination.
+        ask_force_first_tool = 'list_services'
+    elif _spike_wants_x_trending(question, None):
         ask_force_first_tool = 'x_trending_topics'
     elif _spike_wants_linkedin_search(question, None):
         ask_force_first_tool = 'search_linkedin_posts'
