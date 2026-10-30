@@ -77,6 +77,43 @@ def _awake_idle_count(state):
     return n
 
 
+def _awake_eligible_count(state, pick):
+    """Idle, on-duty, non-admin agents who could actually TAKE this item:
+    the plain awake-idle count with the item's own eligibility filters
+    previewed -- the code-capability filter for code-type items (directors
+    delegate code by design; governance.may_work_code) and the sprint worker
+    pool for sprint cards.
+
+    2026-10-30 Tier-2 stall this fixes: two due operator cards (taskType
+    code, no sprintId) sat unassigned for over an hour while three idle
+    directors were awake -- the raw _awake_idle_count()==0 wake trigger never
+    fired because directors count as awake supply even though they are
+    forbidden from taking code work. A due card whose capable supply is zero
+    must be allowed to wake its pool, whatever idle bystanders are awake."""
+    awake = _awake_idle_count(state)
+    if awake == 0:
+        return 0
+    is_code = pick.get('taskType') in governance.CODE_TASK_TYPES
+    sprint_pool = _sprint_worker_pool(state, pick.get('sprintId'))
+    if not is_code and sprint_pool is None:
+        return awake
+    roster = state.get('agentRoster') or []
+    agents = state.get('agents') or {}
+    n = 0
+    for d in roster:
+        if d.get('isAdmin'):
+            continue
+        a = agents.get(d.get('id'))
+        if not a or a.get('busy') or a.get('task') or a.get('pairWith') or a.get('offDuty'):
+            continue
+        if is_code and not governance.may_work_code(state, d.get('id')):
+            continue
+        if sprint_pool is not None and d.get('id') not in sprint_pool:
+            continue
+        n += 1
+    return n
+
+
 def _any_available_including_off_duty(state):
     """Port of tasks.js runTaskCycleBody._anyAvailableIncludingOffDuty: a non-admin
     agent not busy/task/pairWith; if off-duty, only counts when the active ceiling

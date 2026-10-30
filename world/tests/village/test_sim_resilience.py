@@ -865,3 +865,49 @@ def test_pass_heartbeat_stamps_progress_mid_tick(monkeypatch):
         'the post-load heartbeat must be visible to the engine tick')
     assert sim._LAST_TICK_WALL_EPOCH >= stamps['during_tick']
     assert not sim._PASS_LOCK.locked(), 'lock must be released after the pass'
+
+
+def test_awake_eligible_count_filters_by_code_capability():
+    # 2026-10-30 Tier-2 stall: two due operator code-cards waited while three
+    # idle directors were awake -- raw awake-idle supply suppressed the wake
+    # trigger even though directors are forbidden from taking code work.
+    roster = [
+        {'id': 'theo', 'isAdmin': True},
+        {'id': 'harold', 'role': 'Supervisor'},
+        {'id': 'june', 'role': 'Supervisor'},
+        {'id': 'iris', 'role': 'Supervisor'},
+        {'id': 'casey', 'director': 'harold'},
+        {'id': 'piper', 'director': 'june'},
+        {'id': 'quinn', 'director': 'iris'},
+    ]
+    agents = {
+        'theo': {'inRoom': 'townsquare'},
+        'harold': {'inRoom': 'observatory'},
+        'june': {'inRoom': 'pressoffice'},
+        'iris': {'inRoom': 'townsquare'},
+        'casey': {'offDuty': True},
+        'piper': {'offDuty': True},
+        'quinn': {'offDuty': True},
+    }
+    state = {'agentRoster': roster, 'agents': agents}
+    code_pick = {'taskType': 'code'}
+    research_pick = {'taskType': 'research'}
+    # directors are awake supply for non-code work, NOT for code work
+    assert sim._awake_eligible_count(state, research_pick) == 3
+    assert sim._awake_eligible_count(state, code_pick) == 0
+    # waking one code-capable worker makes the supply real
+    agents['casey'] = {'inRoom': 'workroom'}
+    assert sim._awake_eligible_count(state, code_pick) == 1
+
+
+def test_awake_eligible_count_respects_sprint_pool():
+    roster = [{'id': 'harold'}, {'id': 'casey'}, {'id': 'piper'}]
+    agents = {'harold': {'inRoom': 'townsquare'},
+              'casey': {'inRoom': 'workroom'},
+              'piper': {'inRoom': 'workroom'}}
+    state = {'agentRoster': roster, 'agents': agents,
+             'sprints': {'sp1': {'teamIds': ['t1'], 'workerCount': 1}}}
+    state['teams'] = [{'id': 't1', 'memberIds': ['casey', 'piper']}]
+    pick = {'taskType': 'research', 'sprintId': 'sp1'}
+    assert sim._awake_eligible_count(state, pick) == 1, \
+        'only the sprint-pooled worker counts, not every awake agent'

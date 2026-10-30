@@ -828,14 +828,18 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         # must be woken to staff the sprint even when the generic wake rule
         # would otherwise keep the think tank thin.
         _pinned_review = bool(pick.get('reviewOf') or pick.get('sprintId'))
-        can_wake_off_duty = (_pinned_review or bool(pick.get('notBefore')) or _awake_idle_count(state) == 0) \
+        # The wake trigger measures CAPABLE supply, not raw supply: idle
+        # directors awake must not suppress waking a resting worker pool for
+        # a card they are forbidden to take (2026-10-30 operator-card stall).
+        awake_supply = _awake_eligible_count(state, pick)
+        can_wake_off_duty = (_pinned_review or bool(pick.get('notBefore')) or awake_supply == 0) \
             and can_activate_another(state)
         # A PLAYER card needs no awake agent at all -- the assign step delivers
         # it into the player's inbox. Only the agent-work guard below can stop
         # it, so the wake-guard break must never fire for one.
         preempted_for_scheduled = None
         if not (pick.get('assignedTo') or '') == 'player' \
-                and _awake_idle_count(state) == 0 \
+                and awake_supply == 0 \
                 and not (can_wake_off_duty and _any_available_including_off_duty(state)):
             # Interrupt a busy agent so this due item can land. A SCHEDULED item
             # (queue_once notBefore) must still fire at its specified time even
