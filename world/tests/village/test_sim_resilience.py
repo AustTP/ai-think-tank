@@ -120,7 +120,27 @@ def test_mail_card_update_unknown_kind():
     agent = {}
     state = {'agents': {'ben': agent}}
     assert sim._mail_card_update(state, 'ben', 'bogus', 'K', 'T', 'team') is False
-    assert sim._mail_card_update(state, 'player', 'issue_done', 'K', 'T', '') is False
+
+
+def test_mail_card_update_player_note_lands_in_inbox():
+    # 2026-10-30 Tier-2: player-addressed card notes used to be dropped, so
+    # the operator's ADA-28/ADA-31 filings were groomed OUT with zero
+    # feedback. Player notes now land in the player inbox.
+    state = {}
+    assert sim._mail_card_update(state, 'player', 'request_declined',
+                                 'ADA-31', 'arrival brief', 'Supervisor',
+                                 extra='judged duplicate, trivial, out of scope') is True
+    note = state['playerInbox'][-1]
+    assert note['status'] == 'note'
+    assert '[card]' in note['question']
+    assert 'ADA-31' in note['answer']
+    assert 'sharper scope' in note['answer']
+    # carded notes follow the same surface
+    state2 = {}
+    assert sim._mail_card_update(state2, 'player', 'request_carded',
+                                 'ADA-32', 'next card', 'Supervisor') is True
+    note2 = state2['playerInbox'][-1]
+    assert 'queued' in note2['answer']
 
 
 def test_ceremony_facilitator_ladders(monkeypatch):

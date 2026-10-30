@@ -185,8 +185,39 @@ def _mail_card_update(state, to_id, kind, key, title, team_name, extra=''):
     """One no-wake mailbox note from the owning side of a card to its
     reporter. kind: request_carded | request_declined | issue_started |
     issue_done | issue_closed. Returns True when a note landed. Pure."""
-    if not isinstance(to_id, str) or not to_id or to_id == 'player':
+    if not isinstance(to_id, str) or not to_id:
         return False
+    # 2026-10-30 Tier-2: notes addressed to the PLAYER were silently dropped
+    # -- the operator filed ADA-28/ADA-31, the team groomed both OUT, and the
+    # decline never reached anyone (dead-assisted-work, zero feedback). Player
+    # notes now land in the player inbox as [card] notes, which the operator
+    # actually reads.
+    if to_id == 'player':
+        label = f'{key} ' if key else ''
+        title_bit = (title or '')[:120]
+        if kind == 'request_carded':
+            text = (f'Your card {label}"{title_bit}" was groomed into the '
+                    f'sprint by {team_name or "the team"} -- it is queued and '
+                    'starts when a worker picks it up.')
+        elif kind == 'request_declined':
+            text = (f'Your card {label}"{title_bit}" was groomed out during '
+                    f'backlog refinement by {team_name or "the team"}'
+                    + (f': {extra}' if extra else '.')
+                    + ' File a follow-up with sharper scope if it still matters.')
+        else:
+            text = f'{label}{title_bit}: {kind}' + (f' -- {extra}' if extra else '')
+        now_ms = int(time.time() * 1000)
+        state.setdefault('playerInbox', []).append({
+            'id': f'card-{now_ms}',
+            'agentId': 'system',
+            'question': f'[card] {label}{kind}',
+            'answer': text,
+            'status': 'note',
+            'answeredAt': now_ms,
+            'createdAt': now_ms,
+            'queued': False,
+        })
+        return True
     agent = (state.get('agents') or {}).get(to_id)
     if not isinstance(agent, dict) or not agent:
         return False
