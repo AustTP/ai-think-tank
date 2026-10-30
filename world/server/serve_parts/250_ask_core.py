@@ -148,8 +148,13 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     if is_security_test_role and profile.get('instructions'):
         checklist = '\n' + '\n'.join(f'{i}. {line}' for i, line in enumerate(profile['instructions'], 1))
     has_context = bool(mctx) and bool(mctx.get('history') or mctx.get('summary'))
+    # The ask model must never guess the date: the 2026-10-30 Tier-1 probe
+    # saw answers stamped "checked as of March 2025" because no clock was in
+    # context. Inject the real date/time every time.
     system = (
         f"You are {name}, working as {role} in a small think tank. "
+        f"Today's date is {time.strftime('%A, %B %d, %Y')} and the current UTC time is "
+        f"{time.strftime('%H:%M')} UTC -- any 'as of' stamp in your answer must use this. "
         f"Your mission: {mission}{checklist} "
         + ("The player asks you a fresh question that has nothing to do with the think tank's "
            "own products or backlog. Answer it directly, in character. Match the shape of the "
