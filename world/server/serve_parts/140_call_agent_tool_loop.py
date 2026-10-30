@@ -215,9 +215,48 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
         if not tool_calls:
             content = sanitize_text((message.get('content') or '').strip())
             if not content:
-                print(f'[ask-debug] empty content for model={model} raw={json.dumps(data)[:2000]}', flush=True)
-            current_messages.append(message)
-            return (content, current_messages) if return_transcript else content
+                # Reasoning-budget exhaustion (2026-10-30 Tier-1 finding):
+                # reasoning models (anthropic/claude-haiku-5.5 observed live)
+                # can spend the ENTIRE max_tokens on their reasoning field
+                # and return content=null with finish_reason="length". The
+                # empty reply then counts as a failure upstream and repeated
+                # failures open the model's circuit breaker. Retry ONCE with
+                # a raised budget before giving up; other empty shapes (e.g.
+                # a provider returning a vacuous stop) stay failures.
+                _finish_reason = ((data or {}).get('choices') or [{}])[0].get('finish_reason')
+                _reasoning_text = str(message.get('reasoning')
+                                      or message.get('reasoning_content') or '')
+                if _finish_reason == 'length' and _reasoning_text.strip():
+                    _retry_budget = (int(max_tokens) if max_tokens else 1024) * 3 + 1024
+                    print(f'[ask-debug] empty content (finish_reason=length, '
+                          f'reasoning present); retrying {model} once with '
+                          f'max_tokens={_retry_budget}', flush=True)
+                    data = _post_openrouter_raw(model, current_messages, tools=tools,
+                                                max_tokens=_retry_budget,
+                                                tool_choice=tool_choice)
+                    error_detail = _model_error_detail(data)
+                    if error_detail:
+                        record_model_result(model, success=False)
+                        raise RuntimeError(f'model call failed: {error_detail}')
+                    _accrue_spend(service, ((data or {}).get('usage') or {}).get('cost', 0.0),
+                                  village_id=village_id)
+                    if task_id and isinstance(((data or {}).get('usage') or {}).get('cost'), (int, float)) \
+                            and ((data or {}).get('usage') or {}).get('cost'):
+                        _accrue_task_spend(task_id, ((data or {}).get('usage') or {}).get('cost'))
+                    choice = ((data or {}).get('choices') or [{}])[0]
+                    message = choice.get('message') or {}
+                    tool_calls = message.get('tool_calls') or []
+                    if tool_calls:
+                        tool_calls, truncated_ids = _sanitize_tool_call_arguments(tool_calls)
+                        message = dict(message)
+                        message['tool_calls'] = tool_calls
+                    else:
+                        content = sanitize_text((message.get('content') or '').strip())
+                if not content and not tool_calls:
+                    print(f'[ask-debug] empty content for model={model} raw={json.dumps(data)[:2000]}', flush=True)
+            if not tool_calls:
+                current_messages.append(message)
+                return (content, current_messages) if return_transcript else content
         # Executed results -> role:tool, back into the conversation.
         current_messages.append(message)
         if on_before_tools:
