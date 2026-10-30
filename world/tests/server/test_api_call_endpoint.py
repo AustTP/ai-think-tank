@@ -365,7 +365,7 @@ class TestApiBuildTextPreviewMarker(unittest.TestCase):
     model reported a truncated view as the total (8 visible vs 87 actual
     TomTom incidents). The preview must announce its own incompleteness."""
 
-    def test_long_json_preview_carries_truncation_marker(self):
+    def test_long_json_preview_carries_structure_and_marker(self):
         big = {'incidents': [{'id': i, 'properties': {'iconCategory': 1}}
                              for i in range(400)]}
         result = {'body': json.dumps(big), 'contentType': 'application/json',
@@ -373,8 +373,21 @@ class TestApiBuildTextPreviewMarker(unittest.TestCase):
         _pj, _ct, wrapped, _instr = serve._api_build_text(
             result, {'name': 'Test'}, True, 'x.test')
         self.assertIn('PREVIEW TRUNCATED', wrapped)
-        self.assertIn('INCOMPLETE', wrapped)
-        self.assertIn('do not', wrapped)
+        self.assertIn('do NOT count', wrapped)
+        # The machine-computed structure line states the REAL array size --
+        # the model must never count items in the preview again.
+        self.assertIn('incidents: array of 400 items', wrapped)
+        self.assertIn('machine-computed, authoritative', wrapped)
+
+    def test_structure_line_states_real_counts(self):
+        result = {'body': json.dumps({'incidents': [{'id': i} for i in range(87)],
+                                      'viewPort': {'zoom': 5}}),
+                  'contentType': 'application/json', 'status': 200,
+                  'truncated': False, 'finalUrl': 'https://x'}
+        _pj, _ct, wrapped, _instr = serve._api_build_text(
+            result, {'name': 'Test'}, True, 'x.test')
+        self.assertIn('incidents: array of 87 items', wrapped)
+        self.assertIn('viewPort: object(1 keys)', wrapped)
 
     def test_short_json_gets_no_marker(self):
         result = {'body': json.dumps({'incidents': []}),

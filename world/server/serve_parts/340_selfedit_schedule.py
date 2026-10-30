@@ -751,28 +751,43 @@ def _api_build_text(result, service, registered, hostname):
     body = result['body']
     ctype = (result.get('contentType') or '').lower()
     parsed_json = None
+    structure_line = ''
     if 'json' in ctype:
         try:
             parsed_json = json.loads(body)
             text = json.dumps(parsed_json, indent=2, ensure_ascii=False)
+            # 2026-10-30 Tier-1: the model must never COUNT items by reading
+            # the preview -- it counted 7 visible incidents and reported
+            # them as the bbox total (89 actual). Prepend a machine-computed
+            # structural summary: the REAL array sizes, computed from the
+            # parsed body, before any truncation.
+            if isinstance(parsed_json, dict):
+                parts = []
+                for k, v in parsed_json.items():
+                    if isinstance(v, list):
+                        parts.append(f'{k}: array of {len(v)} items')
+                    elif isinstance(v, dict):
+                        parts.append(f'{k}: object({len(v)} keys)')
+                    else:
+                        parts.append(f'{k}: {type(v).__name__}')
+                structure_line = ('[API RESPONSE STRUCTURE (machine-computed, authoritative): '
+                                  + '; '.join(parts) + ']\n')
+            elif isinstance(parsed_json, list):
+                structure_line = (f'[API RESPONSE STRUCTURE (machine-computed, authoritative): '
+                                  f'root array of {len(parsed_json)} items]\n')
         except ValueError:
             text = body
     elif 'html' in ctype:
         text = _strip_html_to_text(body)
     else:
         text = body
-    text = _redact_secrets(text)
-    # 2026-10-30 Tier-1: the 20k preview slice used to cut silently -- the
-    # ask model counted the incidents visible in the preview (8) and
-    # reported them as the bbox total (87 actual). A cut preview must say
-    # so, loudly, or counts read from it are lies.
+    text = structure_line + _redact_secrets(text)
     if len(text) > 20000:
         full_len = len(text)
         text = text[:20000] + (
             f'\n[PREVIEW TRUNCATED: showing the first 20000 of {full_len} chars. '
-            f'ANY list or count read from this preview is INCOMPLETE -- do not '
-            f'report it as a total. Either state the visible count as partial or '
-            f're-query a narrower window.]')
+            f'The STRUCTURE line above is authoritative for totals; do NOT count '
+            f'items in the preview below.]')
     if result.get('truncated'):
         text += '\n[truncated: response larger than the size cap]'
     wrapped, _nonce, _tag, instruction = wrap_external_content(
