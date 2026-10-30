@@ -167,7 +167,15 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
     try:
         result = _api_request_sync(method, url, req_headers, req_body)
     except Exception as e:
-        return {'ok': False, 'allowed': True, 'error': f'Approved, but the request failed: {e}'}
+        # 2026-10-30 Tier-1: a failed call must never leave room for the
+        # model to present invented numbers as data (probe 2: the ask model
+        # answered "173 cafes" and "0 incidents" from calls that all failed).
+        # The loud, unmissable marker goes into the model-facing result so
+        # the failure survives every paraphrase.
+        return {'ok': False, 'allowed': True, 'error':
+                f'API CALL FAILED - NO DATA RETURNED. The request did not complete '
+                f'({e}). Report the failure itself; you have NO numbers from this '
+                f'service and must not state any count, price, or event for it.'}
 
     parsed_json, ctype, wrapped, instruction = _api_build_text(result, service, registered, parsed.hostname)
     price_line = _api_price_line(price_quote)

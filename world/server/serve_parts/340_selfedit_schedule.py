@@ -668,7 +668,12 @@ def _agent_is_in_sandbox_room(agent_id, live_room=None):
 
 
 API_CALL_MAX_BODY_BYTES = 200_000
-API_CALL_TIMEOUT_S = 20
+# 60s (was 20): Overpass QL evaluation routinely takes 10-60s on public
+# infrastructure; the 2026-10-30 Tier-1 probe saw two Overpass reads die at
+# the 20s ceiling while the ask model then invented numbers from the failed
+# calls. The call is rate-limited and Bank-metered, so a longer ceiling is
+# bounded.
+API_CALL_TIMEOUT_S = 60
 # Generation workflows (PixelLab, Higgsfield) submit/poll long jobs. A single
 # request can legitimately outlive the plain api_call timeout, so the workflow
 # interpreter gets its own per-request ceiling; the workflow's own poll

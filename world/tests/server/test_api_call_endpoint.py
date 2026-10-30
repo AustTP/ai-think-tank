@@ -337,3 +337,24 @@ class ApiCallEndpoint(unittest.TestCase):
         self.assertEqual(accrue.call_args.args[0]['id'], 'opensky')
 
 
+
+
+class TestApiCallFailureMarker(unittest.TestCase):
+    """2026-10-30 Tier-1: a failed api_call left 'Approved, but the request
+    failed: ...' in the model-facing text and the ask model then presented
+    INVENTED numbers (173 cafes, 0 incidents) from calls that never
+    succeeded. The failure text must be an unmissable no-data marker."""
+
+    def test_failed_request_carries_no_data_marker(self):
+        import urllib.error
+        with unittest.mock.patch.object(
+                serve, '_api_request_sync',
+                side_effect=TimeoutError('The read operation timed out')), \
+             unittest.mock.patch.object(serve, '_page_budget_exhausted',
+                                        return_value=False):
+            out = serve._api_execute('agent', None,
+                                     'https://overpass-api.de/api/interpreter?data=%5Bout%3Ajson%5D',
+                                     'GET', purpose='probe')
+        self.assertFalse(out.get('ok'))
+        self.assertIn('API CALL FAILED - NO DATA RETURNED', out.get('error', ''))
+        self.assertIn('must not state any count', out.get('error', ''))

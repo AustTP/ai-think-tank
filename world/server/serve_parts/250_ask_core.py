@@ -183,7 +183,10 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
            "request_capability_handle tools to actually make the calls -- report only what "
            "those tools genuinely returned, never a guess at what they might return. "
            if is_security_test_role else "")
-        + "Do not fabricate numbers or tool results you did not actually get from a tool."
+        + "Do not fabricate numbers or tool results you did not actually get from a tool. "
+          "A tool call that FAILED or was BLOCKED produced NO data: report the failure "
+          "itself and never attach a count, price, or event to a failed service. If every "
+          "attempt at a number failed, say exactly that."
         + "Registered API services (list_services, then api_call) are YOURS to call for "
           "live external data: the registry injects credentials server-side, enforces "
           "read-only paths, and the Bank meters the spend. There is no approval gate on "
