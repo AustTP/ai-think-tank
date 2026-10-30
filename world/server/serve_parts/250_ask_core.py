@@ -66,6 +66,13 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
+    # Ambient free-pool scope: every model pick made while this ask runs
+    # (including the tool loop's to_thread, which inherits the context) is
+    # kind 'ask' -- the only kind the operator's scoped second Gemini key
+    # serves. asyncio.to_thread copies the current context, so the stamp
+    # reaches the blocking loop thread. Never cleared: the contextvar is
+    # task-local and this task ends with the ask.
+    _set_free_pool_kind('ask')
     approved_tools = _seed_ask_approved_tools(approved_tools)
 
     # Conversation memory (STM + LTM): when the ask rides a session (the

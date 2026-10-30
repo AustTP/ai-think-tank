@@ -131,6 +131,11 @@ def _load_free_pool_config():
             'price_per_m': 0.0,
             'pool_key': str(ep.get('pool_key') or '').strip() or name,
             'rpm': _limit('rpm'), 'rpd': _limit('rpd'), 'tpm': _limit('tpm'),
+            # Scope whitelist (2026-10-30): an endpoint may restrict itself to
+            # specific call kinds ('ask', ...) to protect a sensitive key's
+            # free tier. Absent/empty = unrestricted. Non-list junk is dropped.
+            'allowed_kinds': ([str(k) for k in ep['allowed_kinds']]
+                              if isinstance(ep.get('allowed_kinds'), list) else []),
         })
     if not endpoints:
         return None
@@ -434,6 +439,42 @@ def _freepool_ready(ep, band):
     return True
 
 
+_FREE_POOL_KIND: contextvars.ContextVar = contextvars.ContextVar(
+    'free_pool_kind', default=None)
+
+
+def _set_free_pool_kind(kind):
+    """Stamp the ambient call KIND for free-pool scope enforcement ('ask' =
+    the player-facing ask lane; unset/None means routine agent work). Set at
+    the top of an async request task or a worker thread; the pickers read it
+    to honor endpoint `allowed_kinds` scopes (2026-10-30: the operator's
+    second Gemini key is scoped to the ask lane only)."""
+    try:
+        _FREE_POOL_KIND.set(str(kind) if kind else None)
+    except Exception:
+        pass
+
+
+def _free_pool_active_kind():
+    """The ambient kind, defaulting to 'work': unset context ALWAYS means
+    routine agent traffic -- the highest-volume class -- so a scoped endpoint
+    is invisible to any path that never opted in."""
+    try:
+        return _FREE_POOL_KIND.get() or 'work'
+    except Exception:
+        return 'work'
+
+
+def _freepool_kind_allows(ep, kind):
+    """An endpoint's `allowed_kinds` scope: absent/empty means unrestricted
+    (every existing key stays any-purpose); present means the endpoint only
+    serves the listed kinds. Unknown kinds never match a scope."""
+    allowed = ep.get('allowed_kinds')
+    if not allowed:
+        return True
+    return kind in allowed
+
+
 def _freepool_route_for_band(band, force=False):
     """The band's current free route as a synthetic slug, or None to use the
     normal paid pick. `force` ignores the mode gate (used by the paid-failure
@@ -443,6 +484,7 @@ def _freepool_route_for_band(band, force=False):
         cfg = _free_pool_cfg()
         if not cfg or band not in cfg['bands']:
             return None
+        kind = _free_pool_active_kind()
         paid_blocked = _low_paid_blocked()
         if not force:
             if cfg['mode'] == 'paid-first' and not paid_blocked:
@@ -456,6 +498,8 @@ def _freepool_route_for_band(band, force=False):
                         or paid_blocked):
                     return None
         for ep in cfg['endpoints']:
+            if not _freepool_kind_allows(ep, kind):
+                continue
             if _freepool_ready(ep, band):
                 return f'@freepool:{band}:{ep["name"]}'
     except Exception:

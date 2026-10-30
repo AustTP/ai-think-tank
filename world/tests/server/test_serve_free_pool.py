@@ -172,6 +172,49 @@ class FreePoolPickerTests(unittest.TestCase):
             self.assertEqual(serve._freepool_route_for_band('low'),
                              '@freepool:low:gemini-x')
 
+    def test_allowed_kinds_scope_gates_the_picker(self):
+        """2026-10-30: the operator's second Gemini key is scoped to the ask
+        lane only. An endpoint with allowed_kinds serves ONLY those kinds;
+        the ambient default kind is 'work', so scoped endpoints are invisible
+        to any path that never opted in."""
+        scoped = {**_POOL_CONFIG, 'endpoints': [
+            {**_POOL_CONFIG['endpoints'][0], 'allowed_kinds': ['ask']},
+            _POOL_CONFIG['endpoints'][1],
+        ]}
+        _write_pool_config(scoped)
+        with unittest.mock.patch.object(
+                serve, '_load_env',
+                return_value={'GEMINI_API_KEY': 'k', 'GROQ_API_KEY': 'g'}):
+            # ambient default (no kind set) = 'work' -> scoped endpoint skipped
+            self.assertEqual(serve._freepool_route_for_band('low'),
+                             '@freepool:low:groq-x')
+            # explicitly work -> still skipped
+            serve._set_free_pool_kind('work')
+            try:
+                self.assertEqual(serve._freepool_route_for_band('low'),
+                                 '@freepool:low:groq-x')
+                # ask -> scoped endpoint becomes first in line
+                serve._set_free_pool_kind('ask')
+                self.assertEqual(serve._freepool_route_for_band('low'),
+                                 '@freepool:low:gemini-x')
+            finally:
+                serve._set_free_pool_kind(None)
+
+    def test_unscoped_endpoints_serve_every_kind(self):
+        unscoped = {**_POOL_CONFIG, 'endpoints': [
+            {**_POOL_CONFIG['endpoints'][0], 'allowed_kinds': []},
+        ]}
+        _write_pool_config(unscoped)
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={'GEMINI_API_KEY': 'k'}):
+            for kind in (None, 'work', 'ask', 'future-kind'):
+                serve._set_free_pool_kind(kind)
+                try:
+                    self.assertEqual(serve._freepool_route_for_band('low'),
+                                     '@freepool:low:gemini-x')
+                finally:
+                    serve._set_free_pool_kind(None)
+
     def test_rpm_exhaustion_moves_to_next(self):
         with serve._free_pool_lock:
             serve._free_pool_state['rpm']['gemini-x'] = {
