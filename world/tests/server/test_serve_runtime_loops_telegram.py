@@ -186,3 +186,72 @@ class HealthCheckLoop(unittest.TestCase):
                 asyncio.run(serve._health_check_loop())
 
 
+
+
+class TelegramOperatorWake(unittest.TestCase):
+    """An allowlisted operator Telegram message must reset the idle clock and
+    wake a dormant tank exactly like the HTTP middleware does -- otherwise an
+    operator chatting via Telegram can never wake the tank, and a dormant
+    tank never sees their idle streak reset (2026-10-30 Tier-0 drill finding)."""
+
+    def test_wake_resets_timer_and_flips_dormancy(self):
+        serve._LAST_REQUEST_TIME = 1000.0
+        flips = []
+        with unittest.mock.patch.object(serve, '_set_dormant',
+                                        side_effect=lambda v: flips.append(v)), \
+             unittest.mock.patch.object(serve, '_dormant', return_value=True), \
+             unittest.mock.patch.object(serve.time, 'time', return_value=5000.0):
+            self.assertTrue(serve._telegram_operator_wake())
+        self.assertEqual(serve._LAST_REQUEST_TIME, 5000.0)
+        self.assertEqual(flips, [False])
+
+    def test_wake_when_already_awake_only_resets_timer(self):
+        serve._LAST_REQUEST_TIME = 1000.0
+        flips = []
+        with unittest.mock.patch.object(serve, '_set_dormant',
+                                        side_effect=lambda v: flips.append(v)), \
+             unittest.mock.patch.object(serve, '_dormant', return_value=False), \
+             unittest.mock.patch.object(serve.time, 'time', return_value=5000.0):
+            self.assertTrue(serve._telegram_operator_wake())
+        self.assertEqual(serve._LAST_REQUEST_TIME, 5000.0)
+        self.assertEqual(flips, [], 'awake tank must not flip dormancy again')
+
+    def test_allowlisted_message_triggers_wake(self):
+        async def run():
+            with unittest.mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS',
+                                            frozenset({'111'})), \
+                 unittest.mock.patch.object(serve, '_telegram_operator_wake',
+                                            return_value=True) as wake, \
+                 unittest.mock.patch.object(serve, '_telegram_operator_command',
+                                            side_effect=AsyncReturn(None)):
+                outcome = await serve._telegram_process_update(
+                    {'message': {'chat': {'id': 111}, 'text': 'status'}})
+            return outcome, wake
+        outcome, wake = asyncio.run(run())
+        self.assertIsNotNone(outcome)
+        wake.assert_called_once()
+
+    def test_non_allowlisted_message_never_wakes(self):
+        async def run():
+            with unittest.mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS',
+                                            frozenset({'111'})), \
+                 unittest.mock.patch.object(serve, '_telegram_operator_wake',
+                                            return_value=True) as wake:
+                outcome = await serve._telegram_process_update(
+                    {'message': {'chat': {'id': 999}, 'text': 'hi'}})
+            return outcome, wake
+        outcome, wake = asyncio.run(run())
+        self.assertIsNone(outcome)
+        wake.assert_not_called()
+
+
+class AsyncReturn:
+    """Awaitable that resolves to value -- for patching async callees."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def __call__(self, *args, **kwargs):
+        fut = asyncio.get_event_loop().create_future()
+        fut.set_result(self._value)
+        return fut

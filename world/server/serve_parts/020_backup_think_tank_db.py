@@ -463,6 +463,7 @@ async def _idle_shutdown_loop(poll_s=30):
     # it, but the simulation loop stops spending and stops churning. Any
     # request flips it awake instantly (see no_store middleware). Only armed
     # when --max-idle-minutes is passed, so behavior never silently changes.
+    _diag_logged = False
     while True:
         await asyncio.sleep(poll_s)
         idle_s = (time.time() - _LAST_REQUEST_TIME) if _LAST_REQUEST_TIME is not None else 0
@@ -473,6 +474,15 @@ async def _idle_shutdown_loop(poll_s=30):
             # port-bound; only the sim pauses.
             _set_dormant(True)
             print(f'[idle] no request for {int(idle_s)}s (>= {_MAX_IDLE_MINUTES}m) -- think tank dormant; waking on next request', flush=True)
+        elif not _diag_logged and idle_s >= 60:
+            # One-shot diagnostic: if a full quiet minute passed WITHOUT the
+            # dormancy transition, name exactly which gate refused it, so an
+            # armed-but-never-sleeping server is visible instead of silent.
+            _diag_logged = True
+            print(f'[idle][diag] idle_s={int(idle_s)}s but no dormancy: '
+                  f'max_idle_minutes={_MAX_IDLE_MINUTES} '
+                  f'last_request={"set" if _LAST_REQUEST_TIME is not None else "None"} '
+                  f'dormant={_dormant()}', flush=True)
 
 
 async def _dormancy_window_loop(poll_s=30):

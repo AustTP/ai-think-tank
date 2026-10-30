@@ -589,6 +589,23 @@ async def _telegram_operator_command(chat_id, text):
     return chat_id, f'Unknown command /{verb}.\n' + _TELEGRAM_HELP
 
 
+def _telegram_operator_wake():
+    """An allowlisted operator message is a live operator: reset the idle
+    clock and wake a dormant tank, exactly as the no_store HTTP middleware
+    does for a waking request. Without this, an operator chatting via
+    Telegram while the tank is dormant never resets the idle streak (the
+    watcher only sees HTTP request timestamps), and an inbound Telegram
+    message cannot wake the tank at all -- the worst case being an operator
+    messaging a tank that sleeps forever until some HTTP request arrives.
+    Returns True so callers can assert on it."""
+    global _LAST_REQUEST_TIME
+    _LAST_REQUEST_TIME = time.time()
+    if _dormant():
+        _set_dormant(False)
+        print('[idle] wake request from Telegram operator -- think tank resumed', flush=True)
+    return True
+
+
 async def _telegram_process_update(update):
     """One update -> (chat_id, reply_text), or None to send nothing (bad
     shape, non-allowlisted sender). Pulled out of the poll loop below
@@ -602,6 +619,8 @@ async def _telegram_process_update(update):
     if chat_id not in TELEGRAM_ALLOWED_CHAT_IDS:
         print(f'[telegram] message from non-allowlisted chat {chat_id}, ignored', flush=True)
         return None
+    # Operator is present: reset dormancy exactly like an HTTP request.
+    _telegram_operator_wake()
     captcha_match = re.match(r'^captcha\s+(cap_[a-f0-9]+)\s+(.+)$', text, re.I)
     if captcha_match:
         request_id, answer = captcha_match.group(1), captcha_match.group(2).strip()
