@@ -34,3 +34,26 @@ def test_plain_and_briefing_questions_do_not_match():
               "What did the CEO of ideabrowser.com announce last week?",
               "read my mailbox"):
         assert not serve._ask_wants_live_registry_data(q), q
+
+
+def test_ask_tools_seed_grants_api_call_when_caller_passes_nothing():
+    assert serve._seed_ask_approved_tools(None) == ['api_call']
+
+
+def test_ask_tools_explicit_lists_keep_their_narrowing():
+    assert serve._seed_ask_approved_tools([]) == []
+    assert serve._seed_ask_approved_tools(['local_file']) == ['local_file']
+    assert serve._seed_ask_approved_tools('search_web') == ['search_web']
+    assert serve._seed_ask_approved_tools(['api_call', 'local_file', '']) == \
+        ['api_call', 'local_file']
+
+
+def test_ask_task_policy_admits_api_call_with_the_seed():
+    # The exact gate the ask loop applies (task_tool_policy on the seeded
+    # task): the registry gateway must pass, an unrelated commit tool must not.
+    policy = serve.task_tool_policy(
+        {'approvedTools': serve._seed_ask_approved_tools(None),
+         'taskType': 'ask', 'allowCommit': False})
+    assert policy('api_call') is True
+    assert policy('send_mail') is False
+    assert policy('search_web') is True

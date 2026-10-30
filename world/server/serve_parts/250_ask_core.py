@@ -1,5 +1,24 @@
 
 
+def _seed_ask_approved_tools(approved_tools):
+    """Normalize the ask task's approvedTools list. When the caller passed
+    NOTHING (None), seed the registry gateway api_call: asks are read-shaped
+    Q&A, and the registry is the metered, fail-closed way to reach live
+    external data (per-service path/method rules enforced server-side,
+    unregistered hosts GET/HEAD-only, credentials injected, Bank-capped
+    spend). The 2026-10-30 Tier-1 probe showed the tool offered and
+    dispatched but never grantable -- every live-data ask died on the
+    commit-approval refusal. A caller passing an explicit list (even empty)
+    keeps their narrowing."""
+    if approved_tools is None:
+        approved_tools = ('api_call',)
+    if isinstance(approved_tools, str):
+        approved_tools = [approved_tools]
+    elif not isinstance(approved_tools, (list, tuple, set)):
+        approved_tools = []
+    return [str(t) for t in approved_tools if t]
+
+
 _LIVE_DATA_TIME = (
     r'\b(?:live|right[_\s-]?now|current(?:ly)?|as[_\s-]?of[_\s-]?(?:now|today)|'
     r"today(?:'s)?|at[_\s-]?this[_\s-]?moment|this[_\s-]?(?:morning|afternoon|evening))\b")
@@ -47,11 +66,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
-    if isinstance(approved_tools, str):
-        approved_tools = [approved_tools]
-    elif not isinstance(approved_tools, (list, tuple, set)):
-        approved_tools = []
-    approved_tools = [str(t) for t in approved_tools if t]
+    approved_tools = _seed_ask_approved_tools(approved_tools)
 
     # Conversation memory (STM + LTM): when the ask rides a session (the
     # Telegram bridge passes the chat id), the question is answered in the
