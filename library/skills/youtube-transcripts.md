@@ -43,3 +43,22 @@ the real spoken content as text, never an invented-sounding summary from memory.
   matter which route produced the text.
 - A blocked or captionless video must return an honest error, never a fabricated
   transcript.
+
+## Review convening policy (operator, 2026-10-29)
+
+Transcript reviews are convened ONLY on operator-nominated sources or operator-owned
+data. Do not convene a panel for general-interest YouTube content on your own
+initiative. A review that cannot answer "so what for the operator" is not worth its
+model calls: the October ledger measured the whole review+report lane at ~$1.63 of
+$126.55 lifetime spend, so cost is not the argument -- SIGNAL is. Random-video panels
+produced news summaries and verification homework with no operator decision attached.
+
+Every panel review MUST end with this section, after the decisions and action items:
+
+## So what for the operator
+
+One short paragraph naming: (1) the single decision or change this review justifies
+for the operator's own goals and assets, or an explicit "none -- this source does not
+warrant action"; (2) the estimated cost to act on it; (3) who owns the action. A
+review that cannot fill this section should not convene. "Investigate X" without an
+operator-relevant reason is not an action item.
