@@ -648,8 +648,9 @@ class OpenrouterReasoningOffTest(unittest.TestCase):
 
 class EnsureStoryWorktreeTest(unittest.TestCase):
     def _call(self, identity=None, head=1, branch=1, add_rc=0,
-              isdir=False, linked=False):
+              isdir=False, linked=False, add_rcs=None):
         calls = []
+        add_codes = list(add_rcs) if add_rcs is not None else None
 
         def git(_dir, args, *a, **k):
             calls.append(args)
@@ -658,6 +659,8 @@ class EnsureStoryWorktreeTest(unittest.TestCase):
             if args[:3] == ['rev-parse', '--verify', 'story/x']:
                 return mock.Mock(returncode=branch)
             if args[:2] == ['worktree', 'add']:
+                if add_codes:
+                    return mock.Mock(returncode=add_codes.pop(0))
                 return mock.Mock(returncode=add_rc)
             return mock.Mock(returncode=0)
 
@@ -698,6 +701,16 @@ class EnsureStoryWorktreeTest(unittest.TestCase):
                        'HEAD'], calls)
         with self.assertRaises(ValueError):
             self._call(head=0, branch=1, add_rc=1)
+
+    def test_stale_registration_prunes_and_retries(self):
+        """2026-10-30 Tier-2: a crashed story run left a missing-but-
+        registered worktree; every retry of the task then failed at
+        creation. The add must prune once and retry before giving up."""
+        out, calls = self._call(head=0, branch=1, add_rcs=[1, 0])
+        add_calls = [c for c in calls if c[:2] == ['worktree', 'add']]
+        self.assertEqual(len(add_calls), 2, 'prune must be followed by one retry')
+        self.assertIn(['worktree', 'prune'], calls)
+        self.assertEqual(out, '/tmp/sbx/s1')
 
 
 class ApiExecuteUnitTest(unittest.TestCase):

@@ -159,6 +159,18 @@ def ensure_story_worktree(sandbox_id, base_sandbox_id=None):
     else:
         result = _run_git_sync(base_dir, ['worktree', 'add', '-b', branch, worktree_dir, 'HEAD'])
     if result.returncode != 0:
+        # 2026-10-30 Tier-2: a crashed story run can leave the dir deleted
+        # while its worktree registration survives ("is a missing but already
+        # registered worktree; use add -f to override"). That stale
+        # registration then poisons EVERY retry of the task. Prune and retry
+        # once before giving up.
+        retry = _run_git_sync(base_dir, ['worktree', 'prune'])
+        if retry.returncode == 0:
+            if branch_exists:
+                result = _run_git_sync(base_dir, ['worktree', 'add', worktree_dir, branch])
+            else:
+                result = _run_git_sync(base_dir, ['worktree', 'add', '-b', branch, worktree_dir, 'HEAD'])
+    if result.returncode != 0:
         raise ValueError(f'failed to create story worktree {sandbox_id}: {(result.stderr or result.stdout or "").strip()}')
     if not _git_identity_configured(worktree_dir):
         _run_git_sync(worktree_dir, ['config', 'user.email', 'sandbox-backup@ai-think-tank.local'])
