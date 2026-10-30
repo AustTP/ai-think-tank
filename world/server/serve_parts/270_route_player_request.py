@@ -66,6 +66,15 @@ async def _route_player_request(state, text, session_id=None,
                            else 'denied')}
             return {'reply': 'No pending approval %s to decide -- or it '
                              'was already decided.' % approval_id}
+        # Draft-desk owner commands (Tier-2, 2026-10-30): "draft" generates
+        # 0-2 grounded local-area candidates, "post <id>"/"skip <id>" decide
+        # them, "drafts" lists pending. Handled BEFORE lane classification so
+        # a draft decision is never mistaken for a request. "post" is a
+        # ledger entry only -- the tank never posts anywhere (Facebook hard
+        # rule: the operator's personal account is untouchable by the tank).
+        draft_reply = _draft_desk_handle_owner_command(state, text, session_id)
+        if draft_reply is not None:
+            return await draft_reply
     admin_id = _admin_agent_id(state)
     lane = await asyncio.to_thread(_lane_decider, state, text) or 'unclear'
     actor_id = (key.agent_id if key is not None
