@@ -358,3 +358,28 @@ class TestApiCallFailureMarker(unittest.TestCase):
         self.assertFalse(out.get('ok'))
         self.assertIn('API CALL FAILED - NO DATA RETURNED', out.get('error', ''))
         self.assertIn('must not state any count', out.get('error', ''))
+
+
+class TestApiBuildTextPreviewMarker(unittest.TestCase):
+    """2026-10-30 Tier-1: the 20k preview slice cut silently and the ask
+    model reported a truncated view as the total (8 visible vs 87 actual
+    TomTom incidents). The preview must announce its own incompleteness."""
+
+    def test_long_json_preview_carries_truncation_marker(self):
+        big = {'incidents': [{'id': i, 'properties': {'iconCategory': 1}}
+                             for i in range(400)]}
+        result = {'body': json.dumps(big), 'contentType': 'application/json',
+                  'status': 200, 'truncated': False, 'finalUrl': 'https://x'}
+        _pj, _ct, wrapped, _instr = serve._api_build_text(
+            result, {'name': 'Test'}, True, 'x.test')
+        self.assertIn('PREVIEW TRUNCATED', wrapped)
+        self.assertIn('INCOMPLETE', wrapped)
+        self.assertIn('do not', wrapped)
+
+    def test_short_json_gets_no_marker(self):
+        result = {'body': json.dumps({'incidents': []}),
+                  'contentType': 'application/json', 'status': 200,
+                  'truncated': False, 'finalUrl': 'https://x'}
+        _pj, _ct, wrapped, _instr = serve._api_build_text(
+            result, {'name': 'Test'}, True, 'x.test')
+        self.assertNotIn('PREVIEW TRUNCATED', wrapped)

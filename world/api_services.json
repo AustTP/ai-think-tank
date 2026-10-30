@@ -1089,7 +1089,8 @@
       "pricing": {
         "kind": "free",
         "note": "Free, no account. Keep queries bounded (bounding box + timeout) or the server rejects them."
-      }
+      },
+      "spend_note": " QUERY SYNTAX (verified): Overpass bbox order is (south,west,north,east) = (minLat,minLon,maxLat,maxLon) -- DIFFERENT from TomTom (lon first). Working example: data=[out:json][timeout:60];node[\"amenity\"=\"cafe\"](35.15,-80.95,35.40,-80.70);out count; URL-encode the whole QL string as the data param; for POST send it as the raw body. out count; returns element totals without listing every node."
     },
     "redfin-data": {
       "name": "Redfin Data Center (housing TSVs)",

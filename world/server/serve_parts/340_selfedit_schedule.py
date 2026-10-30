@@ -754,14 +754,25 @@ def _api_build_text(result, service, registered, hostname):
     if 'json' in ctype:
         try:
             parsed_json = json.loads(body)
-            text = json.dumps(parsed_json, indent=2, ensure_ascii=False)[:20000]
+            text = json.dumps(parsed_json, indent=2, ensure_ascii=False)
         except ValueError:
-            text = body[:20000]
+            text = body
     elif 'html' in ctype:
-        text = _strip_html_to_text(body)[:20000]
+        text = _strip_html_to_text(body)
     else:
-        text = body[:20000]
+        text = body
     text = _redact_secrets(text)
+    # 2026-10-30 Tier-1: the 20k preview slice used to cut silently -- the
+    # ask model counted the incidents visible in the preview (8) and
+    # reported them as the bbox total (87 actual). A cut preview must say
+    # so, loudly, or counts read from it are lies.
+    if len(text) > 20000:
+        full_len = len(text)
+        text = text[:20000] + (
+            f'\n[PREVIEW TRUNCATED: showing the first 20000 of {full_len} chars. '
+            f'ANY list or count read from this preview is INCOMPLETE -- do not '
+            f'report it as a total. Either state the visible count as partial or '
+            f're-query a narrower window.]')
     if result.get('truncated'):
         text += '\n[truncated: response larger than the size cap]'
     wrapped, _nonce, _tag, instruction = wrap_external_content(
