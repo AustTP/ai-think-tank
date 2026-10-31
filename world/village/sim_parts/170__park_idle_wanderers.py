@@ -216,9 +216,16 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
     # director's id (the two keyings team records use) -- resolve each to a
     # director id so _sim_direct_reports can list its members.
     directors = []
+    member_fallback = set()
     for tid in (record.get('teamIds') or []):
         t = _team_row(state, tid)
-        directors.append(t.get('directorId') if t else tid)
+        director_id = t.get('directorId') if t else tid
+        directors.append(director_id)
+        if not director_id and t and t.get('memberIds'):
+            # A team keyed by memberIds with no directorId: membership is the
+            # explicit list (the pre-layer pool filter matched these via the
+            # None == None accident; keep the same eligibility, named).
+            member_fallback.update(t['memberIds'])
     if not directors:
         return []
     # A lean sprint (below the SM-size floor) is worked by the team's workers,
@@ -234,10 +241,28 @@ def _sprint_worker_pool(state, sprint_id, worker_count=None):
             if t and t.get('scrumMasterId'):
                 excluded.add(t['scrumMasterId'])
     pool = []
+    roots = governance.team_director_map(state)
+    subs_by_root = {}
+    for d in (state.get('agentRoster') or []):
+        if isinstance(d, dict) and d.get('id') and not d.get('isAdmin') \
+                and governance.direct_reports(state, d.get('id')) \
+                and d.get('director'):
+            root = roots.get(d.get('id'))
+            if root:
+                subs_by_root.setdefault(root, set()).add(d.get('id'))
     for d in (state.get('agentRoster') or []):
         if d.get('isAdmin'):
             continue
-        if d.get('director') not in directors:
+        # Root-director membership: a worker under a subdirector still staffs
+        # the team's sprints; the subdirector layer itself facilitates and is
+        # not counted as worker hands, and neither is the team director (the
+        # pre-layer filter excluded her via her missing own director).
+        if roots.get(d.get('id')) not in directors \
+                and d.get('id') not in member_fallback:
+            continue
+        if d.get('id') in subs_by_root.get(roots.get(d.get('id')), set()):
+            continue
+        if d.get('id') in directors:
             continue
         if d['id'] in excluded:
             continue

@@ -52,8 +52,203 @@ def is_scrum_master(state, agent_id):
     return bool(row.get('scrumMaster') or row.get('isScrumMaster'))
 
 
+# --- Subdirector layer (operator direction, 2026-10-31) --------------------
+#
+# A subdirector is middle management: an agent reporting to a director who
+# themselves has reports. The role is EMERGENT from the reporting graph
+# (roster `director` fields), not a stored flag -- promoting someone means
+# giving them reports, which the promote endpoint does by handing over a
+# share of the director's workers.
+#
+# The 3+ rule: once a director leads SUBDIRECTOR_LAYER_MIN or more
+# subdirectors, they stop directing workers in addition to the layer -- the
+# remaining direct workers are distributed across the subdirectors, and the
+# director's direct reports become exactly the subdirector layer. Below the
+# threshold the director may still supervise workers directly.
+
+SUBDIRECTOR_LAYER_MIN = 3
+# The ceiling mirrors the house's working span (six desks to a room, sprint
+# pools capped at maxTeamMembers 6): a director supervising more than six
+# subdirectors has rebuilt the original over-wide span one level up. Past
+# the ceiling the answer is a NEW TEAM (spawn_new_team_for_request), not a
+# wider layer.
+SUBDIRECTOR_LAYER_MAX = 6
+
+
+def subdirectors_of(state, director_id):
+    """Direct reports of director_id who themselves lead people."""
+    return [rid for rid in direct_reports(state, director_id)
+            if direct_reports(state, rid)]
+
+
+def has_subdirector_layer(state, director_id, minimum=None):
+    minimum = SUBDIRECTOR_LAYER_MIN if minimum is None else minimum
+    return len(subdirectors_of(state, director_id)) >= minimum
+
+
+def _roster_index(state):
+    return {r.get('id'): r for r in _roster(state)
+            if isinstance(r, dict) and r.get('id')}
+
+
+def team_director_of(state, agent_id):
+    """The TOP-LEVEL director owning the reporting chain that `agent_id`
+    sits in: the first ancestor whose own parent is absent, self-referencing,
+    or the chief of staff. Team directors report to the admin in this
+    codebase, so "walk to the root" would land on the admin for everyone --
+    the stop anchor is the admin itself, and an admin's child who leads
+    people IS a top-level team director while a childless admin-aide belongs
+    to the admin's own team (the pre-layer one-hop behavior). This keeps
+    every reader that treats the roster `director` field as "the team"
+    (spend attribution, sprint staffing, status views) correct across the
+    subdirector layer. Cycle-safe: a corrupted multi-node cycle resolves to
+    None rather than looping forever."""
+    if not agent_id:
+        return None
+    index = _roster_index(state)
+    report_counts = {}
+    for r in _roster(state):
+        if isinstance(r, dict):
+            d = r.get('director')
+            if isinstance(d, str):
+                report_counts[d] = report_counts.get(d, 0) + 1
+    current = agent_id
+    seen = set()
+    while True:
+        if current in seen:
+            return None
+        seen.add(current)
+        row = index.get(current)
+        if row is None:
+            return None
+        parent = row.get('director')
+        if not parent or parent == current or parent not in index:
+            return current
+        prow = index[parent]
+        if prow.get('isAdmin'):
+            # `current` sits directly under the chief of staff: with reports
+            # it is a top-level team director; childless, it is the admin's
+            # own aide and belongs to the admin's team (one hop, pre-layer).
+            return current if report_counts.get(current) else parent
+        current = parent
+
+
+def team_director_map(state):
+    """{agent_id: top-level director id} for every roster entry, one pass
+    (same semantics as team_director_of, computed in bulk for attribution
+    code that used to read the `director` field directly)."""
+    index = _roster_index(state)
+    report_counts = {}
+    for r in _roster(state):
+        if isinstance(r, dict):
+            d = r.get('director')
+            if isinstance(d, str):
+                report_counts[d] = report_counts.get(d, 0) + 1
+
+    def _root(aid):
+        seen = set()
+        current = aid
+        while current in index:
+            if current in seen:
+                return None
+            seen.add(current)
+            parent = index[current].get('director')
+            if not parent or parent == current or parent not in index:
+                return current
+            if index[parent].get('isAdmin'):
+                return current if report_counts.get(current) else parent
+            current = parent
+        return current if current in index else None
+
+    return {aid: _root(aid) for aid in index}
+
+
+def team_members(state, director_id):
+    """Every roster member whose ROOT director is director_id: direct reports
+    plus everyone under their subdirectors, in roster order."""
+    roots = team_director_map(state)
+    return [r.get('id') for r in _roster(state)
+            if isinstance(r, dict) and r.get('id')
+            and roots.get(r.get('id')) == director_id]
+
+
+def team_workers(state, director_id):
+    """The working members of a team: team_members minus the director
+    themself and the subdirector layer (supervisors facilitate and coach;
+    they are not counted as worker hands). Roster order, deterministic."""
+    subs = set(subdirectors_of(state, director_id))
+    return [aid for aid in team_members(state, director_id)
+            if aid != director_id and aid not in subs]
+
+
+def rebalance_under_subdirectors(state, director_id):
+    """The 3+ rule, applied: move the director's remaining direct workers
+    under the subdirectors, least-loaded subdirector first (roster-order
+    tiebreak), so the director's direct reports become exactly the layer.
+    No-op below the threshold or with no workers to move. Returns the number
+    of workers moved."""
+    subs = subdirectors_of(state, director_id)
+    if len(subs) < SUBDIRECTOR_LAYER_MIN:
+        return 0
+    workers = [rid for rid in direct_reports(state, director_id)
+               if rid not in subs]
+    if not workers:
+        return 0
+    index = {r.get('id'): r for r in _roster(state) if isinstance(r, dict)}
+    loads = {sid: len(direct_reports(state, sid)) for sid in subs}
+    order = {sid: pos for pos, sid in enumerate(subs)}
+    moved = 0
+    for wid in workers:
+        row = index.get(wid)
+        if row is None:
+            continue
+        target = min(subs, key=lambda sid: (loads[sid], order[sid]))
+        row['director'] = target
+        loads[target] += 1
+        moved += 1
+    return moved
+
+
+def supervisor_for_new_hire(state, director_id):
+    """Which existing agent a NEW hire reports to. Below the 3+ threshold the
+    hire reports to the team director as always; with an active layer the
+    hire lands under the least-loaded subdirector (deterministic roster-order
+    tiebreak) -- a director with a layer directs subdirectors, not workers."""
+    if not has_subdirector_layer(state, director_id):
+        return director_id
+    subs = subdirectors_of(state, director_id)
+    if not subs:
+        return director_id
+    loads = {sid: len(direct_reports(state, sid)) for sid in subs}
+    order = {sid: pos for pos, sid in enumerate(subs)}
+    return min(subs, key=lambda sid: (loads[sid], order[sid]))
+
+
+def enforce_subdirector_layers(state):
+    """Defense in depth for the 3+ rule: sweep every director whose layer is
+    active and whose direct reports still include plain workers (an organic
+    crossing -- a worker quietly gained their own reports -- leaves exactly
+    that state behind), and rebalance them. Idempotent and cheap; called
+    after roster-graph-changing events. Returns the total workers moved."""
+    moved = 0
+    for r in _roster(state):
+        if not isinstance(r, dict) or not r.get('id'):
+            continue
+        aid = r.get('id')
+        if r.get('isAdmin'):
+            continue
+        reports = direct_reports(state, aid)
+        if not reports or not has_subdirector_layer(state, aid):
+            continue
+        if set(reports) - set(subdirectors_of(state, aid)):
+            moved += rebalance_under_subdirectors(state, aid)
+    return moved
+
+
 def may_work_code(state, agent_id):
-    """Directors and the chief of staff delegate code; they do not write it."""
+    """Directors and the chief of staff delegate code; they do not write it.
+    Subdirectors lead people, so the same policy reaches them through
+    is_director's emergent definition."""
     return not is_director(state, agent_id)
 
 

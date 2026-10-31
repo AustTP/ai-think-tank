@@ -513,6 +513,100 @@ async def intent_broadcast(request: Request):
     return JSONResponse({'ok': True, 'delivered': delivered, 'scope': scope})
 
 
+@app.post('/api/intent/promote-subdirector')
+@_state_writer
+async def intent_promote_subdirector(request: Request):
+    """Subdirector layer (scale slice 4): POST {agentId, handOver?}.
+
+    A subdirector is middle management, EMERGENT from the reporting graph:
+    an agent reporting to a director who themselves leads people. Promoting
+    an agent hands over `handOver` (default 2, clamp 1..8) of their
+    director's current direct workers, making the agent a subdirector by
+    structure. Then the 3+ rule applies: once the director leads three or
+    more subdirectors, the director's remaining direct workers are
+    distributed across the layer (rebalance_under_subdirectors) and the
+    director directs only subdirectors from then on. New hires under an
+    active layer land on the least-loaded subdirector (see
+    governance.supervisor_for_new_hire); team attribution, sprint staffing,
+    and spend budgets walk the chain to the root director so nothing that
+    treats the roster `director` field as "the team" breaks. Operator/admin
+    gate."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    agent_id = (body.get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId is required'}, status_code=400)
+    try:
+        hand_over = int(body.get('handOver') or 2)
+    except (TypeError, ValueError):
+        hand_over = 2
+    hand_over = max(1, min(8, hand_over))
+    roster = state.get('agentRoster') or []
+    index = {d.get('id'): d for d in roster if isinstance(d, dict) and d.get('id')}
+    row = index.get(agent_id)
+    if row is None:
+        return JSONResponse({'error': 'agent not found'}, status_code=404)
+    director_id = row.get('director')
+    director_row = index.get(director_id) if director_id else None
+    if not director_id or director_row is None:
+        return JSONResponse(
+            {'error': 'agent has no director to promote under'},
+            status_code=400)
+    if director_row.get('isAdmin'):
+        return JSONResponse(
+            {'error': 'cannot promote under the chief of staff'},
+            status_code=400)
+    existing_subs = governance.subdirectors_of(state, director_id)
+    if len(existing_subs) >= governance.SUBDIRECTOR_LAYER_MAX \
+            and agent_id not in existing_subs:
+        # The ceiling mirrors the house's six-desk working span: past six
+        # subdirectors the director is back to an over-wide span, one level
+        # up. The sanctioned growth path is a NEW team under the large-request
+        # lane (spawn_new_team_for_request), not a wider layer.
+        return JSONResponse(
+            {'error': f'director {director_id} already leads '
+                      f'{len(existing_subs)} subdirectors (max '
+                      f'{governance.SUBDIRECTOR_LAYER_MAX}); spawn a new '
+                      f'team for additional capacity instead',
+             'subdirectors': existing_subs},
+            status_code=400)
+    moved = 0
+
+    if not governance.direct_reports(state, agent_id):
+        workers = [rid for rid in governance.direct_reports(state, director_id)
+                   if rid != agent_id
+                   and not governance.direct_reports(state, rid)]
+        for wid in workers[:hand_over]:
+            index[wid]['director'] = agent_id
+            moved += 1
+    rebalanced = governance.rebalance_under_subdirectors(state, director_id)
+    # Re-enforce every active layer: a promotion can cross the threshold on
+    # THIS director, and any organic crossing elsewhere gets healed here too.
+    rebalanced += governance.enforce_subdirector_layers(state)
+    save_state_to_db(state)
+    layer_active = governance.has_subdirector_layer(state, director_id)
+    log_action('player', 'subdirector_promoted',
+               {'agentId': agent_id, 'directorId': director_id,
+                'handOver': moved, 'rebalanced': rebalanced,
+                'layerActive': layer_active},
+               authorized=True)
+    return JSONResponse({
+        'ok': True, 'agentId': agent_id, 'directorId': director_id,
+        'handOver': moved, 'rebalanced': rebalanced,
+        'layerActive': layer_active,
+        'subdirectors': governance.subdirectors_of(state, director_id),
+        'directReports': governance.direct_reports(state, director_id),
+    })
+
+
 @app.post('/api/pipelines')
 @_state_writer
 async def pipelines_create(request: Request):

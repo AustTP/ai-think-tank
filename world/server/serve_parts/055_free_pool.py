@@ -233,9 +233,10 @@ def _free_pool_team_of(agent_id):
     if stale:
         try:
             state = get_state_from_db() or {}
-            roster = state.get('agentRoster') or []
-            mapping = {d.get('id'): (d.get('director') or None)
-                       for d in roster if isinstance(d, dict) and d.get('id')}
+            # Root-director attribution: a worker under a subdirector still
+            # spends against the TEAM's budget -- walk the reporting chain up
+            # instead of trusting one `director` hop.
+            mapping = governance.team_director_map(state)
         except Exception:
             mapping = {}
         with _free_pool_lock:

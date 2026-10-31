@@ -686,6 +686,9 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     # agent lands inside that director's team + shared dir the moment they're
     # created. Falls back to the hiring admin id only if not stamped.
     director_id = pending.get('directorId') or pending.get('adminId')
+    # Subdirector layer: with 3+ subdirectors the director directs the layer,
+    # not workers -- a new hire lands under the least-loaded subdirector.
+    supervisor_id = governance.supervisor_for_new_hire(state, director_id)
     role = f"Assistant to {pending['helpForName']}"
     # The hiring DIRECTOR (pending['adminName']) names the new employee via a
     # real generative call -- no predetermined names. All-time uniqueness is
@@ -734,7 +737,10 @@ def _complete_auto_hire(state, pending, grid, now_ms):
         return None
     roster.append({
         'id': new_id, 'name': name, 'color': color, 'role': role, 'model': 'small',
-        'director': director_id,   # -> resolves into the team for _derive_team_members
+        # Root-director attribution walks the reporting chain up, so a hire
+        # under a subdirector still resolves into the team for
+        # _derive_team_members, spend budgets, and sprint staffing.
+        'director': supervisor_id,
         'villageId': village_of_agent(state, director_id),
         'approvedCount': 0, 'droppedCount': 0, 'weekApprovals': 0,
         'mailbox': [f"Welcome aboard -- you're here to help {pending['helpForName']} with {help_for.get('role', '').lower()} work."],
@@ -765,6 +771,13 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     # _governance_pass after this hire starts the Town-Hall meeting. Colleagues
     # are the hire's intended collaborator set (its `helpFor`, plus any team
     # member already on the roster for that director).
+    # Defense in depth for the 3+ rule: a hire changed the reporting graph,
+    # so re-enforce every active layer (organic crossings included) before
+    # the onboarding ceremony derives this hire's collaborator set from it.
+    try:
+        governance.enforce_subdirector_layers(state)
+    except Exception:
+        pass  # org hygiene must never break a hire
     coworkers = [c for c in _sim_direct_reports(state, director_id) if c != new_id]
     if pending.get('helpForId') and pending['helpForId'] not in coworkers:
         coworkers.append(pending['helpForId'])

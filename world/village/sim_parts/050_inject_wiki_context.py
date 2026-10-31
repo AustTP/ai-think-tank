@@ -608,7 +608,10 @@ def roster_view_from_state(state):
         if not isinstance(entry, dict):
             continue
         agent_id = entry.get('id')
-        team = entry.get('director')
+        # Root-director attribution: a worker under a subdirector still shows
+        # under the TEAM (a team is its root director id), not the layer.
+        team = governance.team_director_of(state, agent_id) \
+            if agent_id else None
         if not agent_id or not team:
             continue
         if view.agent(agent_id) is None:
