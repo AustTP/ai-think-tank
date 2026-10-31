@@ -390,7 +390,8 @@ async def promote_to_director(team_id: str, request: Request):
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     teams = state.get('teams', [])
-    if team_id not in [t.get('id') for t in teams]:
+    t = next((x for x in teams if x.get('id') == team_id), None)
+    if not t:
         return JSONResponse({'error': 'unknown team'}, status_code=404)
     if not _can_write_team(state, requester, team_id):
         return JSONResponse({'error': 'only this team\'s director or a chain-above director may promote'}, status_code=403)
