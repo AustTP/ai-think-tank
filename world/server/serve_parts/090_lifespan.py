@@ -909,7 +909,9 @@ def _can_write_team(state, writer_id, team_id):
     t = next((x for x in teams if x.get('id') == team_id), None)
     if not t:
         return False
-    if _is_admin(state, writer_id):
+    # The player session is the chief of staff (the same exemption
+    # _can_set_team_agreement grants).
+    if writer_id == 'player' or _is_admin(state, writer_id):
         return True
     # The team director themself, or a member (derived live, so a promotion
     # immediately strips the old team's membership from the ACL).

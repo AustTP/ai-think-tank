@@ -906,10 +906,13 @@ def _resolve_requester(request):
         claimed = None
     if session_ok:
         # A real player session. Honor an explicit, verified agent claim (the
-        # UI asks for a specific agent with the session present), else player.
+        # UI asks for a specific agent with the session present), else the
+        # player themself. The session alone is enough to be the player --
+        # returning None here would make every endpoint guard treat the
+        # player as unauthenticated.
         if claimed and key_owner == claimed:
             return claimed
-        return None
+        return 'player'
     if key_owner:
         # No session: the key's owner is the requester. An explicit claim that
         # differs is ignored -- the key is what authenticates, not the body.

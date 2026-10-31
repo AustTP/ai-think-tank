@@ -1014,7 +1014,9 @@ async def propose_wiki_page(request: Request):
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
     actor = _resolve_requester(request)
-    if not actor:
+    # Proposals are agent-authored: the player session is the chief of
+    # staff, not an author, so it needs an agent key here like anyone else.
+    if not actor or actor == 'player':
         return JSONResponse({'error': 'an agent key is required to propose a wiki page'}, status_code=403)
     page_id = (body.get('id') or '').strip()
     title = (body.get('title') or '').strip() or page_id
