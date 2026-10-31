@@ -384,14 +384,13 @@ async def promote_to_director(team_id: str, request: Request):
     requester = _resolve_requester(request)
     if not requester:
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
-    if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
+    if requester != 'player' and verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
     teams = state.get('teams', [])
-    t = next((x for x in teams if x.get('id') == team_id), None)
-    if not t:
+    if team_id not in [t.get('id') for t in teams]:
         return JSONResponse({'error': 'unknown team'}, status_code=404)
     if not _can_write_team(state, requester, team_id):
         return JSONResponse({'error': 'only this team\'s director or a chain-above director may promote'}, status_code=403)
@@ -421,7 +420,7 @@ async def set_team_scrum_master(team_id: str, request: Request):
     requester = _resolve_requester(request)
     if not requester:
         return JSONResponse({'error': 'unauthenticated'}, status_code=401)
-    if verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
+    if requester != 'player' and verify_agent_key(requester, request.headers.get('X-Agent-Key')) is not True:
         return JSONResponse({'error': 'attribution key mismatch'}, status_code=403)
     state = _state_begin()
     if not state:
