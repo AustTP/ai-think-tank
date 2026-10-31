@@ -530,6 +530,7 @@ def _room_trailing_grade(state, room):
     grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
               if d.get('room') == room and isinstance(d.get('grade'), (int, float))
               and d.get('gradeIsReal', True)
+              and not d.get('gradeSuspect')
               and not _is_auxiliary_deliverable(d)]
     if not grades:
         return None
@@ -548,11 +549,15 @@ def _agent_trailing_grade(state, agent_id):
     """Trailing-window mean grade for ONE agent's real completed deliverables
     (the per-agent health signal the director's team-health review keys on).
     Only real Jev grades count -- fabricated fallbacks (gradeIsReal=False) would
-    otherwise pull a weak agent's mean toward 5.0 and hide the signal. Returns a
-    float or None when the agent has no real graded deliverable yet."""
+    otherwise pull a weak agent's mean toward 5.0 and hide the signal. A
+    gradeSuspect entry (the calibration audit's contradiction flag) is also
+    excluded: a suspected grading error is not evidence about the agent until
+    it is reconciled. Returns a float or None when the agent has no real
+    graded deliverable yet."""
     grades = [d.get('grade') for d in (state.get('completedDeliverables') or [])
               if d.get('agentId') == agent_id and isinstance(d.get('grade'), (int, float))
               and d.get('gradeIsReal', True)
+              and not d.get('gradeSuspect')
               and not _is_auxiliary_deliverable(d)]
     if not grades:
         return None
@@ -605,10 +610,35 @@ def _team_health_review(state, team_ids, now_ms):
     return reviewed
 
 
+def _artifact_evidence_present(task):
+    """True when the task record carries real ARTIFACT evidence a grader
+    could actually have judged -- deliverable text, completion note, written
+    files, library/wiki/source pointers -- beyond the work order itself
+    (mirror of _deliverable_evidence_lines minus its first section)."""
+    if not isinstance(task, dict):
+        return False
+    return bool((task.get('deliverableText') or '').strip()
+                or (task.get('note') or '').strip()
+                or task.get('writtenPy')
+                or (task.get('libraryPath') or '').strip()
+                or (task.get('wikiPage') or '').strip()
+                or task.get('sourceUrls'))
+
+
+GRADE_SUSPECT_CEILING = 1.0
+
+
 def _grade_completed_task(state, agent_id, task, now_ms):
     """Fire-and-forget grader for a landed deliverable. Never blocks completion;
     on outage records a deterministic default (room's trailing mean, else mid-
-    5.0). Also triggers a growth-plan entry if graded below the floor."""
+    5.0). Also triggers a growth-plan entry if graded below the floor.
+
+    Calibration audit (1,000-agent scale prep): a devastating grade (<=
+    GRADE_SUSPECT_CEILING) on a record that carries real artifact evidence is
+    the false-negative signature -- the grader judged the title, not the work.
+    Such grades are annotated `gradeSuspect`, logged, excluded from the
+    trailing-grade averages, and never trigger coaching. An honest empty
+    record (no artifact evidence) is still a legitimate low grade."""
     if not task or task.get('reviewOf') or _is_auxiliary_deliverable(task):
         # No committed deliverable -> nothing to grade. Meetings, spikes,
         # reviews, avatars, and supervisor sweeps were being graded against the
@@ -660,6 +690,14 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         if real_grade is None:
             real_grade = 5.0
     grade = real_grade
+    # Calibration audit: the grade-vs-artifact contradiction test.
+    grade_suspect = (grade_is_real and grade <= GRADE_SUSPECT_CEILING
+                     and _artifact_evidence_present(task))
+    if grade_suspect:
+        _log_governance(state, 'admin', 'grade_artifact_mismatch',
+                        {'task': task.get('id'), 'agent': agent_id,
+                         'grade': grade,
+                         'room': room, 'title': (title or '')[:120]})
     state.setdefault('completedDeliverables', []).append({
         'id': task.get('id'), 'room': room, 'title': title,
         'agentId': agent_id, 'grade': grade,
@@ -670,6 +708,7 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         # beyond just labeling (it stops fallback grades compounding into
         # future fallbacks).
         'gradeIsReal': grade_is_real, 'gradedAt': now_ms,
+        'gradeSuspect': grade_suspect,
         # Knowledge-rot/freshness signal (external-eval port): the in-document
         # "Last reviewed" date is authoritative for aging -- mtime alone is a weak
         # signal (resets on copy). Consumers can treat a deliverable newer than
@@ -683,7 +722,10 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     # A fabricated fallback is a placeholder, not a personnel signal. It may
     # be recorded for continuity, but it must not coach, escalate, or feed
     # success mining as if Jev had judged the work.
-    if grade_is_real and grade < _floor:
+    if grade_is_real and grade < _floor and not grade_suspect:
+        # A suspect grade never coaches: the calibration audit flagged it as
+        # a probable grader error, and coaching an agent for the grader's
+        # mistake is the noise the audit exists to stop.
         _coach_low_grade(state, agent_id, room, grade, now_ms,
                          title, task=task)
     elif grade_is_real and grade >= _success:
