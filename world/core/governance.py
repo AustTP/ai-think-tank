@@ -252,6 +252,49 @@ def may_work_code(state, agent_id):
     return not is_director(state, agent_id)
 
 
+def scale_worker_row(state, agent_id):
+    """The roster row of a SCALE-TIER worker, or None. Structural only --
+    callers combine it with the operator's `scaleTierWorkers` switch. A
+    scale-tier worker is a plain worker: not the admin, leads nobody (so no
+    director and no subdirector), and not the designated scrum master (the
+    SM's coordination calls need judgment, not cheap volume)."""
+    if not agent_id:
+        return None
+    row = _entry(state, agent_id)
+    if not row or row.get('isAdmin'):
+        return None
+    if direct_reports(state, agent_id):
+        return None
+    if is_scrum_master(state, agent_id):
+        return None
+    return row
+
+
+def scale_worker_ids(state):
+    """{ids of scale-tier workers} in one roster pass -- the membership test
+    model-tier resolution uses behind a short cache (never a per-call state
+    read). Same semantics as scale_worker_row."""
+    rows = [r for r in _roster(state) if isinstance(r, dict) and r.get('id')]
+    counts = {}
+    for r in rows:
+        d = r.get('director')
+        if isinstance(d, str):
+            counts[d] = counts.get(d, 0) + 1
+    sm_ids = {t.get('scrumMasterId') for t in (state or {}).get('teams') or []
+              if t.get('scrumMasterId')}
+    sm_ids |= {r.get('id') for r in rows
+               if r.get('scrumMaster') or r.get('isScrumMaster')}
+    out = set()
+    for r in rows:
+        aid = r.get('id')
+        if r.get('isAdmin') or aid in sm_ids:
+            continue
+        if counts.get(aid):
+            continue
+        out.add(aid)
+    return out
+
+
 def may_self_edit(state, agent_id):
     return may_work_code(state, agent_id)
 

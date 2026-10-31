@@ -582,7 +582,7 @@ TIER_THROTTLE_RATIO = 0.7
 # lane the good-value band's cards start first. Neutral when history is thin.
 GOOD_VALUE_RATIO = 1.3
 MAX_ACTIVE_AGENTS = 25  # hiring.js:41
-MAX_TOTAL_AGENTS = 500  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS
+MAX_TOTAL_AGENTS = 1000  # hiring.js:40 -- total inventory cap, vs MAX_ACTIVE_AGENTS; raised for the 1,000-agent scale scenario (the operator_policy.json value governs live)
 # Per-SPRINT staffing cap: at most 6 workers may staff one sprint
 # (scrum master excluded). This is NOT a lifetime team-size limit -- a director
 # may hire unlimited workers over time; only a single sprint is capped at 6.

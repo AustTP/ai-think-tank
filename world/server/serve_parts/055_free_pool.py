@@ -215,6 +215,8 @@ POLICY_SERVICES = FREE_POOL_SERVICES + ('paid',)
 
 _FREE_POOL_ACTOR_TEAM: contextvars.ContextVar = contextvars.ContextVar(
     'free_pool_actor_team', default=None)
+_FREE_POOL_ACTOR_AGENT: contextvars.ContextVar = contextvars.ContextVar(
+    'free_pool_actor_agent', default=None)
 _FREE_POOL_TEAM_MAP = {'at': 0.0, 'map': {}}
 _FREE_POOL_TEAM_MAP_TTL_S = 60.0
 _FREE_POOL_POLICY_CACHE = {'at': 0.0, 'policy': None}
@@ -247,11 +249,16 @@ def _free_pool_team_of(agent_id):
 
 
 def _set_free_pool_actor(agent_id):
-    """Stamp the acting agent's team into the ambient slot. Called at the top
-    of a work-dispatch worker thread (sim 030) so every free-pool pick made
-    while that agent's work runs is attributed to the agent's team."""
+    """Stamp the acting agent's identity and team into the ambient slots.
+    Called at the top of a work-dispatch worker thread (sim 030) so every
+    free-pool pick made while that agent's work runs is attributed to the
+    agent's team, and scale-tier decisions (070) can see WHO is acting."""
     try:
         _FREE_POOL_ACTOR_TEAM.set(_free_pool_team_of(agent_id))
+    except Exception:
+        pass
+    try:
+        _FREE_POOL_ACTOR_AGENT.set(agent_id)
     except Exception:
         pass
 

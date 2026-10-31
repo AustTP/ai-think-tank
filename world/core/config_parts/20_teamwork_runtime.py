@@ -144,6 +144,10 @@ def _coerce_operator_value(key, value):
         return None
     kind, lo, hi = spec
     try:
+        if kind == 'bool':
+            # Fail-closed: only real JSON booleans; truthy ints/strings are
+            # rejected rather than coerced.
+            return value if isinstance(value, bool) else None
         if kind == 'int':
             if isinstance(value, bool):
                 return None

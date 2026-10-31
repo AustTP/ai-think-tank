@@ -19,11 +19,20 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'scrumMasterMinTeamSize': 4,
     'smallTeamStuckTrigger': 3,
     'maxActiveAgents': 25,
-    'maxTotalAgents': 500,
+    'maxTotalAgents': 1000,
     # Grading floors (a deliverable graded below is coaching-worthy; at/above
     # the success floor it counts as a success).
     'deliverableGradeFloor': 5.0,
     'successGradeFloor': 8.0,
+    # Scale tier (1,000-agent scenario): when on, worker-role agents (no
+    # reports, not scrum master, not admin) run on the cheap sublow band with
+    # no JEV escalation, and their closes skip the coaching loop entirely --
+    # at scale, coaching noise is the cost. Lower accepted grades are the
+    # trade. Code/review/qa work is NEVER pinned (grading correctness is the
+    # whole job there), and the switch never touches directors, the layer,
+    # or the admin.
+    'scaleTierWorkers': False,
+    'scaleTierGradeFloor': 4.0,
     # Hiring / firing cooldowns (ms)
     'hireCooldownMs': 45000,
     'firingCooldownMs': 60000,
@@ -201,6 +210,8 @@ _OPERATOR_SCHEMA: dict = {
     'maxTotalAgents': ('int', 1, 1000),
     'deliverableGradeFloor': ('float', 0.0, 10.0),
     'successGradeFloor': ('float', 0.0, 10.0),
+    'scaleTierWorkers': ('bool', 0, 1),
+    'scaleTierGradeFloor': ('float', 0.0, 10.0),
     'hireCooldownMs': ('int', 0, 3600000),
     'firingCooldownMs': ('int', 0, 3600000),
     'skillReviewCadenceMs': ('int', 60000, 7 * 24 * 3600 * 1000),

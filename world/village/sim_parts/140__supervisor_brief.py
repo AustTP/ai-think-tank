@@ -589,6 +589,11 @@ def _team_health_review(state, team_ids, now_ms):
             grade = _agent_trailing_grade(state, worker_id)
             if grade is None or grade >= _floor:
                 continue
+            if _scale_tier_worker(state, worker_id):
+                _log_governance(state, 'admin', 'scale_tier_grade_accepted',
+                                {'agent': worker_id, 'grade': grade,
+                                 'floor': _floor, 'source': 'team_health'})
+                continue
             _write_growth_plan(
                 state, worker_id, team.get('room') or 'pressoffice',
                 'team_health', now_ms,
@@ -679,7 +684,8 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     # be recorded for continuity, but it must not coach, escalate, or feed
     # success mining as if Jev had judged the work.
     if grade_is_real and grade < _floor:
-        _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=task)
+        _coach_low_grade(state, agent_id, room, grade, now_ms,
+                         title, task=task)
     elif grade_is_real and grade >= _success:
         # Positive learning loop (ChatDev ECL): a deliverable graded at/above
         # the success floor is the raw material for the weekly success-mining
@@ -693,6 +699,16 @@ def _grade_completed_task(state, agent_id, task, now_ms):
             pass
 
 
+def _scale_tier_worker(state, agent_id):
+    """True when `agent_id` is a plain worker under the operator's
+    scaleTierWorkers switch (the 1,000-agent scenario): cheap-model closes
+    skip the coaching loop, and low grades log instead of coaching."""
+    import core.config as _cfg
+    if not (_cfg.OPERATOR_POLICY or {}).get('scaleTierWorkers'):
+        return False
+    return bool(governance.scale_worker_row(state, agent_id))
+
+
 def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     """W5: round-aware low-grade coaching. A single _write_growth_plan deduped by
     kind coached a weak worker ONCE; a worker who keeps closing below the floor
@@ -702,9 +718,19 @@ def _coach_low_grade(state, agent_id, room, grade, now_ms, title, task=None):
     -- either the coaching works, or it surfaces. Bounded: escalation fires once
     per round-cap, and the work-request dedups.
 
+    The scale-tier gate lives HERE (not at call sites): a scale-tier worker's
+    cheap-model close skips the coaching loop entirely and logs
+    `scale_tier_grade_accepted` instead -- at 1,000-agent scale, coaching
+    noise IS the cost.
+
     When `task` carries acceptance criteria or a user story, the note quotes
     them -- agents reported 0.0-grade coaching that said "meet the spec" but
     never stated what the spec was, leaving nothing to act on."""
+    if _scale_tier_worker(state, agent_id):
+        _log_governance(state, 'admin', 'scale_tier_grade_accepted',
+                        {'agent': agent_id, 'grade': grade,
+                         'title': (title or '')[:120]})
+        return
     _tref = agent_team_ref(state, agent_id)
     _maxr = team_policy(state, _tref, 'coachingMaxRounds')
     _floor = team_policy(state, _tref, 'deliverableGradeFloor')

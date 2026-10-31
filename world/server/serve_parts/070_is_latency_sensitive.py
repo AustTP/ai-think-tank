@@ -20,7 +20,38 @@ def _slug_for_band(band):
         return _high_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if band == 'mid':
         return _mid_tier_slug() or _low_tier_slug()
+    if band == 'sublow':
+        return _raw_model_tier_slug('sublow') or _low_tier_slug() or _mid_tier_slug()
     return _low_tier_slug() or _mid_tier_slug()
+
+
+_SCALE_ACTOR_CACHE = {'at': 0.0, 'ids': frozenset()}
+_SCALE_ACTOR_CACHE_TTL_S = 60.0
+
+
+def _scale_tier_actor():
+    """True when the stamped acting agent is a scale-tier worker under the
+    operator's `scaleTierWorkers` switch (the 1,000-agent scenario: plain
+    workers run cheap sublow calls with no JEV escalation). The roster
+    membership is cached for 60s -- tier resolution runs inside every model
+    call, so this must never be a per-call state read."""
+    try:
+        if not config.OPERATOR_POLICY.get('scaleTierWorkers'):
+            return False
+    except Exception:
+        return False
+    agent_id = _FREE_POOL_ACTOR_AGENT.get()
+    if not agent_id:
+        return False
+    now = time.time()
+    if now - _SCALE_ACTOR_CACHE['at'] > _SCALE_ACTOR_CACHE_TTL_S:
+        try:
+            state = get_state_from_db() or {}
+            ids = frozenset(governance.scale_worker_ids(state))
+            _SCALE_ACTOR_CACHE.update({'at': now, 'ids': ids})
+        except Exception:
+            pass  # keep the last known set; a cold miss stays False
+    return agent_id in _SCALE_ACTOR_CACHE['ids']
 
 
 def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
@@ -36,6 +67,17 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
 
     Fails CLOSED to low: a JEV outage, a non-binary answer, or a low-confidence
     escalation all keep the cheap tier."""
+    # Scale-tier workers (operator's scaleTierWorkers switch): short, bounded,
+    # cheap work at scale. Never pinned for code/review/qa (grading
+    # correctness is the whole job there) or latency work (already cheap);
+    # everything else goes straight to the sublow band with no JEV call.
+    # Fail-open: no sublow slug configured and the normal path takes over.
+    if task_type not in ('code', 'review', 'qa', '3d', '3d-modeling') \
+            and not _is_latency_sensitive(purpose, task_type) \
+            and _scale_tier_actor():
+        slug = _slug_for_band('sublow')
+        if slug:
+            return slug
     # A best-effort call is a request for JEV to consider the high band, not
     # a bypass around it. The deterministic coding and latency lanes still
     # win below; every other best-effort band choice is JEV-gated.
