@@ -548,7 +548,10 @@ async def provision_player_email_endpoint(request: Request):
     password (16 chars, 4 groups of 4), stores it sealed in the vault, and fires
     a self-test send so provisioning is verified, not assumed. The password is
     never returned or logged."""
-    if _resolve_requester(request):
+    # PLAYER-only: the resolver now returns 'player' for a valid session, so
+    # gate on the session itself (the resolver's truthiness is no longer an
+    # inverted player test).
+    if verify_session(request.cookies.get(SESSION_COOKIE_NAME)) is not True:
         return JSONResponse({'error': 'email provisioning is player-only'}, status_code=403)
     try:
         body = await request.json()
@@ -568,7 +571,7 @@ async def provision_player_email_endpoint(request: Request):
 async def test_player_email(request: Request):
     """Send a self-test notification email using the currently-provisioned
     credential. PLAYER-only."""
-    if _resolve_requester(request):
+    if verify_session(request.cookies.get(SESSION_COOKIE_NAME)) is not True:
         return JSONResponse({'error': 'email test is player-only'}, status_code=403)
     ok = _send_player_email_sync(
         '[AI Think Tank] Email still working',

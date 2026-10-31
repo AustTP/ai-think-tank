@@ -112,6 +112,15 @@ def _player_env(state=None, **patches):
     return unittest.mock.patch.multiple(serve, **p)
 
 
+def _no_session_env(state=None):
+    """Unauthenticated caller: no valid session, no agent key."""
+    return unittest.mock.patch.multiple(
+        serve,
+        get_state_from_db=lambda: state,
+        verify_session=lambda cookie: False,
+    )
+
+
 def _agent_env(state=None, requester="agent-1", key_ok=True):
     return unittest.mock.patch.multiple(
         serve,
@@ -230,7 +239,7 @@ class ListBacklog(unittest.TestCase):
 
 class UpdateTeam(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _client().put("/api/teams/team-1", json={"name": "Beta"})
         self.assertEqual(r.status_code, 401)
 
@@ -275,7 +284,7 @@ class PromoteToDirector(unittest.TestCase):
         return state
 
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _post(_client(), "/api/teams/team-1/promote", {"promoteeId": "agent-3"})
         self.assertEqual(r.status_code, 401)
 
@@ -328,7 +337,7 @@ class PromoteToDirector(unittest.TestCase):
 
 class SetTeamScrumMaster(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _post(_client(), "/api/teams/team-1/scrum-master", {"scrumMasterId": "agent-1"})
         self.assertEqual(r.status_code, 401)
 
@@ -397,7 +406,7 @@ class SetTeamScrumMaster(unittest.TestCase):
 
 class UpdateRoomPurpose(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _post(_client(), "/api/rooms/observatory/purpose", {"purpose": "look up"})
         self.assertEqual(r.status_code, 401)
 
@@ -473,7 +482,7 @@ class GetTemplate(unittest.TestCase):
 
 class UpsertTemplate(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _post(_client(), "/api/templates",
                       {"role": "NewRole", "instructions": ["a"]})
         self.assertEqual(r.status_code, 401)
@@ -533,7 +542,7 @@ class UpsertTemplate(unittest.TestCase):
 
 class ApplyTemplate(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _post(_client(), "/api/templates/Research/apply", {})
         self.assertEqual(r.status_code, 401)
 
@@ -570,7 +579,7 @@ class ApplyTemplate(unittest.TestCase):
 
 class DeleteTemplate(unittest.TestCase):
     def test_unauthorized(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _client().delete("/api/templates/Research")
         self.assertEqual(r.status_code, 401)
 
@@ -898,7 +907,7 @@ class TeamAgreementApi(unittest.TestCase):
             self.assertEqual(r.status_code, 400)
 
     def test_player_name_only_still_401(self):
-        with _player_env(_roster_state()):
+        with _no_session_env(_roster_state()):
             r = _client().put("/api/teams/team-1", json={"name": "Beta"})
         self.assertEqual(r.status_code, 401)
 

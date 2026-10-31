@@ -122,11 +122,12 @@ def _agent_env(state=None, requester="agent-1", key_ok=True):
     )
 
 
-def _post(client, path, payload=None, session=True, content=None):
+def _post(client, path, payload=None, session=True, content=None, headers=None):
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
     if content is not None:
-        return client.post(path, content=content,
-                           headers={"Content-Type": "application/json"})
-    return client.post(path, json=payload or {})
+        return client.post(path, content=content, headers=h)
+    return client.post(path, json=payload or {}, headers=h)
 
 
 def _queue_work_append(state, items):
@@ -375,8 +376,16 @@ class RespondPlayerInbox(unittest.TestCase):
 class ProvisionPlayerEmail(unittest.TestCase):
     def test_agent_requester_rejected(self):
         state = _roster_state()
-        with _player_env(state, _resolve_requester=lambda r: "agent-1"):
-            r = _post(_client(), "/api/player-email/credential", {"appPassword": "abcd efgh ijkl mnop"})
+        # An agent credential the middleware accepts (a real agent key, no
+        # session) must still not provision email: the handler is
+        # session-gated.
+        with unittest.mock.patch.multiple(
+                serve, get_state_from_db=lambda: state,
+                verify_session=lambda cookie: False,
+                _valid_agent_key_presented=lambda key: True):
+            r = _post(_client(), "/api/player-email/credential",
+                      {"appPassword": "abcd efgh ijkl mnop"},
+                      headers={"X-Agent-Key": "k"})
         self.assertEqual(r.status_code, 403)
 
     def test_malformed_body(self):
@@ -398,7 +407,8 @@ class ProvisionPlayerEmail(unittest.TestCase):
              unittest.mock.patch.object(serve, "provision_player_email",
                                         return_value={"ok": True, "test_ok": True}):
             r = _post(_client(), "/api/player-email/credential",
-                      {"appPassword": "abcd efgh ijkl mnop"})
+                      {"appPassword": "abcd efgh ijkl mnop"},
+                      headers={"X-Agent-Key": "k"})
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["testSent"])
 
@@ -407,8 +417,15 @@ class ProvisionPlayerEmail(unittest.TestCase):
 class TestPlayerEmail(unittest.TestCase):
     def test_agent_requester_rejected(self):
         state = _roster_state()
-        with _player_env(state, _resolve_requester=lambda r: "agent-1"):
-            r = _post(_client(), "/api/player-email/test", {})
+        # An agent credential the middleware accepts (a real agent key, no
+        # session) must still not send player email: the handler is
+        # session-gated.
+        with unittest.mock.patch.multiple(
+                serve, get_state_from_db=lambda: state,
+                verify_session=lambda cookie: False,
+                _valid_agent_key_presented=lambda key: True):
+            r = _post(_client(), "/api/player-email/test", {},
+                      headers={"X-Agent-Key": "k"})
         self.assertEqual(r.status_code, 403)
 
     def test_success(self):
