@@ -573,9 +573,37 @@ function renderSouthDestinations() {
   }
 }
 
+// The schematic-native villages: every scene registered with a grid and NO
+// background sprite renders from data alone, so the outlet dialog offers an
+// option for ALL of them -- entering and exiting both route through these
+// lists, and a generated village appears here on the client's next boot
+// with no code change.
+function schematicVillages() {
+  const out = [];
+  for (const id in SCENES) {
+    const s = SCENES[id];
+    if (s && s.grid && !s.bgSprite) out.push(id);
+  }
+  return out;
+}
+
+function renderSchematicVillages() {
+  const box = document.getElementById('southOutletVillages');
+  if (!box) return;
+  box.innerHTML = '';
+  for (const id of schematicVillages()) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Enter the ' + id.replace(/-/g, ' ') + ' village (map view)';
+    btn.addEventListener('click', () => travelToVillage(id));
+    box.appendChild(btn);
+  }
+}
+
 function travelToVillage(id) {
   const scene = SCENES[id];
-  if (!scene || !scene.bg || !scene.grid) {
+  // A schematic-native scene (no bgSprite) needs only its grid; an
+  // image-world scene needs both its art and grid loaded.
+  if (!scene || !scene.grid || (scene.bgSprite && !scene.bg)) {
     showToast('That village is not ready yet.');
     return;
   }
@@ -590,6 +618,7 @@ function openSouthMenu() {
   state.ui = 'southOutlet';
   applySouthOutletAvailability();
   renderSouthDestinations();
+  renderSchematicVillages();
   document.getElementById('southOutletModal').classList.remove('hidden');
 }
 
@@ -609,6 +638,64 @@ function southMenuTravel() {
   showToast('Arrived in the south village.');
 }
 
+// Exiting a schematic village: its north gate opens the gate dialog with an
+// option for every destination -- the main village plus every other
+// schematic-native village. With a single destination the walk-back stays
+// direct, as before.
+function gateDestinations() {
+  return ['main'].concat(schematicVillages().filter(id => id !== state.scene));
+}
+
+function openGateMenu() {
+  if (state.ui) return;
+  state.ui = 'villageGate';
+  const box = document.getElementById('villageGateDestinations');
+  if (!box) { returnToMainFromSouth(); return; }
+  box.innerHTML = '';
+  for (const id of gateDestinations()) {
+    const btn = document.createElement('button');
+    btn.textContent = id === 'main'
+      ? 'Walk back to the main village'
+      : 'Walk to the ' + id.replace(/-/g, ' ') + ' village (map view)';
+    btn.addEventListener('click', () => travelFromGate(id));
+    box.appendChild(btn);
+  }
+  const text = document.getElementById('villageGateText');
+  if (text) {
+    text.textContent = 'You reach the path out of the '
+      + state.scene.replace(/-/g, ' ')
+      + ' village. Where to?';
+  }
+  document.getElementById('villageGateModal').classList.remove('hidden');
+}
+
+function closeGateMenu() {
+  state.ui = null;
+  const modal = document.getElementById('villageGateModal');
+  if (modal) modal.classList.add('hidden');
+  // Nudge south off the gate tile so closing does not immediately re-open.
+  const gate = (SCENE && SCENE.gate) || (state.scene === 'south' ? SOUTH_GATE : null);
+  if (gate) {
+    state.player.y = gate.y + gate.h + state.player.h + 6;
+    state.player.dir = 'south';
+  }
+}
+
+function travelFromGate(id) {
+  closeGateMenu();
+  if (id === 'main') {
+    returnToMainFromSouth();
+    return;
+  }
+  const scene = SCENES[id];
+  if (!scene || !scene.grid || (scene.bgSprite && !scene.bg)) {
+    showToast('That village is not ready yet.');
+    return;
+  }
+  switchScene(id);
+  showToast('Arrived in the ' + id.replace(/-/g, ' ') + ' village (map view).');
+}
+
 function southMenuCallMeeting() {
   closeSouthMenu();
   openMeetingUI('south_outlet');
@@ -622,6 +709,9 @@ function wireSouthOutletMenu() {
   travel.addEventListener('click', southMenuTravel);
   meet.addEventListener('click', southMenuCallMeeting);
   cancel.addEventListener('click', closeSouthMenu);
+  // Not part of the closed extras: the schematic village is always open.
+  const schematic = document.getElementById('southOutletSchematicBtn');
+  if (schematic) schematic.addEventListener('click', southMenuSchematic);
 }
 
 function wireDoorMenu() {

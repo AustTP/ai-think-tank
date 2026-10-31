@@ -155,6 +155,7 @@ bind_policy(__name__, [
     ('SMALL_TEAM_STUCK_TRIGGER', 'smallTeamStuckTrigger'),
     ('MAX_ACTIVE_AGENTS', 'maxActiveAgents'),
     ('MAX_TOTAL_AGENTS', 'maxTotalAgents'),
+    ('MAX_TEAMS_PER_VILLAGE', 'maxTeamsPerVillage'),
     ('DELIVERABLE_GRADE_FLOOR', 'deliverableGradeFloor'),
     ('SUCCESS_GRADE_FLOOR', 'successGradeFloor'),
     ('HIRE_COOLDOWN_MS', 'hireCooldownMs'),

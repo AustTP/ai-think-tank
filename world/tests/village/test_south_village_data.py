@@ -47,15 +47,27 @@ class SouthVillageData(unittest.TestCase):
         self.assertIn('pressoffice', doors)
         self.assertNotIn('south_outlet', doors, 'the south map returns through its north gate')
 
-    def test_south_doors_are_mirrored_from_main(self):
-        _grid, main_doors = sim._load_outdoor_geometry()
-        _grid, south_doors = sim._load_outdoor_geometry('south')
-        for building in ('pressoffice', 'media', 'library', 'townhall'):
-            main = main_doors[building]
-            south = south_doors[building]
-            scaled_width = 688 * 2
-            self.assertEqual(south['x'], scaled_width - (main['x'] + main['w']))
-            self.assertEqual(south['y'], main['y'])
+    def test_south_doors_are_an_original_schematic_layout(self):
+        # The baked-art era mirrored the main map; the schematic-native
+        # regeneration is an original data layout instead. What still holds:
+        # the same building ids, in bounds, each door on open south ground.
+        # _load_outdoor_geometry returns world-scaled doors (native x2);
+        # the grid stays native, so halve the doors before indexing.
+        _grid, _main_doors = sim._load_outdoor_geometry()
+        south_grid, south_doors = sim._load_outdoor_geometry('south')
+        cell = south_grid['cell']
+        for building in ('pressoffice', 'media', 'library', 'townhall',
+                         'bank', 'postoffice', 'observatory',
+                         'weatherstation', 'house', 'phonebooth'):
+            door = south_doors[building]
+            self.assertGreaterEqual(door['x'], 0)
+            self.assertGreaterEqual(door['y'], 0)
+            self.assertLessEqual(door['x'] + door['w'], 688 * 2)
+            self.assertLessEqual(door['y'] + door['h'], 384 * 2)
+            cx, cy = door['x'] // 2 // cell, door['y'] // 2 // cell
+            self.assertEqual(
+                south_grid['grid'][cy][cx], 0,
+                f'{building} door trigger sits on open ground')
 
     def test_map_builder_does_not_mirror_the_main_outlet(self):
         import importlib.util

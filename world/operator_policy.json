@@ -19,6 +19,7 @@
   "smallTeamStuckTrigger": 3,
   "maxActiveAgents": 81,
   "maxTotalAgents": 1000,
+  "maxTeamsPerVillage": 12,
   "deliverableGradeFloor": 5.0,
   "successGradeFloor": 8.0,
   "scaleTierWorkers": false,

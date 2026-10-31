@@ -88,6 +88,12 @@ function updateOutside(dt) {
   // gate from scenes.json.
   const sceneGate = (SCENE && SCENE.gate) || (state.scene === 'south' ? SOUTH_GATE : null);
   if (state.scene !== 'main' && sceneGate && overlaps(p, sceneGate)) {
+    // One destination (main only) walks back directly; with a second
+    // schematic village registered, the gate opens the choice dialog.
+    if (typeof openGateMenu === 'function' && gateDestinations().length > 1) {
+      openGateMenu();
+      return;
+    }
     returnToMainFromSouth();
     return;
   }
@@ -555,7 +561,9 @@ async function main() {
     const zoom = state.zoom;
     const toScreen = cameraFor(zoom, GROUND_W, GROUND_H, cameraFocus.x, cameraFocus.y);
 
-    if (state.schematic) {
+    if (state.schematic || !SCENE.bg) {
+      // Schematic-native scenes (no village image -- e.g. the south village)
+      // render from data even when the global schematic toggle is off.
       renderOutsideSchematic(toScreen, zoom);
       for (const id in AGENTS) {
         const a = AGENTS[id];

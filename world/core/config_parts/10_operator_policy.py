@@ -20,6 +20,10 @@ OPERATOR_POLICY_DEFAULT: dict = {
     'smallTeamStuckTrigger': 3,
     'maxActiveAgents': 81,
     'maxTotalAgents': 1000,
+    # Village capacity: team records per village (the admin's aide cluster is
+    # not a team). At the cap, new-team creation is refused and the agents'
+    # generate_village tool becomes the sanctioned next step.
+    'maxTeamsPerVillage': 12,
     # Grading floors (a deliverable graded below is coaching-worthy; at/above
     # the success floor it counts as a success).
     'deliverableGradeFloor': 5.0,
@@ -208,6 +212,7 @@ _OPERATOR_SCHEMA: dict = {
     'smallTeamStuckTrigger': ('int', 1, 20),
     'maxActiveAgents': ('int', 1, 1000),
     'maxTotalAgents': ('int', 1, 1000),
+    'maxTeamsPerVillage': ('int', 1, 200),
     'deliverableGradeFloor': ('float', 0.0, 10.0),
     'successGradeFloor': ('float', 0.0, 10.0),
     'scaleTierWorkers': ('bool', 0, 1),

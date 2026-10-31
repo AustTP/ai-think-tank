@@ -43,7 +43,9 @@ await test('the south scene is a separate map with its own data files', () => {
   const scene = evalIn('SCENES.south');
   assert.equal(scene.gridSprite, '/collision_grid_south.json');
   assert.equal(scene.doorsSprite, '/door_triggers_south.json');
-  assert.equal(scene.bgSprite, '/assets/think_tank_south.png');
+  // Schematic-native: the south village renders from grid/door/room data
+  // and declares no village image at all.
+  assert.equal(scene.bgSprite, undefined);
   assert.notEqual(scene.gridSprite, evalIn('SCENES.main.gridSprite'));
 });
 
@@ -150,6 +152,50 @@ await test('the arrival spawn stands on walkable south ground', () => {
   const cx = Math.floor((spawn.x + 10) / 2 / g.cell);
   const cy = Math.floor((spawn.y + 8) / 2 / g.cell);
   assert.equal(g.grid[cy][cx], 0, `spawn cell ${cx},${cy} must be walkable`);
+});
+
+const readSrc = (rel) => fs.readFileSync(path.join(worldDir, rel), 'utf8');
+const uiAgent = readSrc('js/ui_agent.js');
+const uiLoop = readSrc('js/ui_loop.js');
+const indexHtml = readSrc('index.html');
+
+console.log('schematic-native villages');
+
+await test('the south village is schematic-native: no background sprite', () => {
+  const scenes = readJson('scenes.json');
+  assert.equal(scenes.south.bgSprite, undefined,
+    'scenes.json south must not declare a village image');
+  assert.ok(!/bgSprite:\s*'\/assets\/think_tank_south\.png'/.test(readSrc('js/world.js')),
+    'world.js SCENES.south must not declare a village image');
+});
+
+await test('a scene with no background renders from data', () => {
+  assert.ok(uiLoop.includes('state.schematic || !SCENE.bg'),
+    'renderOutside falls back to the schematic path without a bg');
+  assert.ok(readSrc('js/world.js').includes('if (s.bgSprite && !s.bg) return;'),
+    'switchScene only refuses scenes that DECLARE a bg and failed to load');
+});
+
+await test('the outlet dialog offers every schematic village', () => {
+  assert.ok(uiAgent.includes('function schematicVillages()'),
+    'schematicVillages() lists scenes with a grid and no bgSprite');
+  assert.ok(uiAgent.includes("getElementById('southOutletVillages')"),
+    'the outlet dialog has a dynamic villages container');
+  assert.ok(indexHtml.includes('id="southOutletVillages"'),
+    'index.html has the villages container');
+  assert.ok(uiAgent.includes('(scene.bgSprite && !scene.bg)'),
+    'travelToVillage accepts grid-only schematic scenes');
+});
+
+await test('the village gate dialog offers every destination on exit', () => {
+  assert.ok(indexHtml.includes('id="villageGateModal"'),
+    'index.html has the gate dialog');
+  assert.ok(uiAgent.includes("['main'].concat(schematicVillages()"),
+    'gateDestinations offers main plus every other schematic village');
+  assert.ok(uiAgent.includes('function openGateMenu()'),
+    'the gate opens a choice dialog');
+  assert.ok(uiLoop.includes('gateDestinations().length > 1'),
+    'the walk-back opens the dialog only when there is a real choice');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

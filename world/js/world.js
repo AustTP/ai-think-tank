@@ -630,7 +630,10 @@ const SCENES = {
     spawn: { x: 12, y: 29 * 8 * SCALE },
   },
   south: {
-    bgSprite: '/assets/think_tank_south.png',
+    // No bgSprite: the south village is schematic-native -- it renders from
+    // its collision grid, door triggers and room labels alone (the
+    // renderOutside schematic path also takes over whenever SCENE.bg is
+    // null). New villages following this pattern need data, not art.
     gridSprite: '/collision_grid_south.json',
     doorsSprite: '/door_triggers_south.json',
     // Just inside the north arrival road, facing south into the village.
@@ -676,8 +679,16 @@ async function loadSceneAssets() {
     const s = SCENES[key];
     // Best-effort per scene: a missing winter background/grid must never break
     // the main map's boot (winter is only reachable when enabled anyway).
+    // A scene with NO bgSprite is schematic-native: it renders from its
+    // grid/door/room data alone and never needs a village image.
+    if (s.bgSprite) {
+      try {
+        s.bg = await loadImage(s.bgSprite);
+      } catch (e) {
+        console.error(`Failed to load scene "${key}" background:`, e);
+      }
+    }
     try {
-      s.bg = await loadImage(s.bgSprite);
       const res = await fetch(s.gridSprite + '?v=' + Date.now());
       s.grid = await res.json();
     } catch (e) {
@@ -715,8 +726,10 @@ function switchScene(to) {
   const s = SCENES[to];
   if (!s || state.scene === to) return;
   // Refuse to enter a scene whose assets failed to load (e.g. winter files
-  // missing) -- never render a null background.
-  if (!s.bg || !s.grid) return;
+  // missing) -- never render a null background. A schematic-native scene
+  // (no bgSprite) needs only its grid: it renders from data alone.
+  if (!s.grid) return;
+  if (s.bgSprite && !s.bg) return;
   applyScene(to);
   state.scene = to;
   state.player.x = s.spawn.x;

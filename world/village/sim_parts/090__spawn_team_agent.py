@@ -98,6 +98,20 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     admin_id = admin_id or next((d.get('id') for d in roster if d.get('isAdmin')), None)
     if not admin_id:
         return None
+    # Village team capacity: each village hosts a bounded number of team
+    # records (the admin's aide cluster is not a team). At the cap the spawn
+    # is refused with a note naming the sanctioned next step -- the agents'
+    # generate_village tool founds a new data-only village.
+    # `governance` is sim's shared-namespace module (core.governance).
+    team_count = governance.village_team_count(state, admin_id)
+    if team_count >= MAX_TEAMS_PER_VILLAGE:
+        state['_teamSpawnBlockedAtVillageCap'] = {
+            'teams': team_count, 'cap': MAX_TEAMS_PER_VILLAGE, 'atMs': now_ms}
+        _log_governance(state, 'admin', 'village_team_cap_reached',
+                        {'teams': team_count, 'cap': MAX_TEAMS_PER_VILLAGE,
+                         'next': 'senior-most directors found a new village '
+                                 '(generate_village)'})
+        return None
     admin_def = next((d for d in roster if d.get('id') == admin_id), {})
     admin_name = admin_def.get('name') or admin_id
     director_name = chooser(state, admin_name, _all_used_names(state), 'Director') or _next_new_team_name(state)

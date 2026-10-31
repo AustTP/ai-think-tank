@@ -828,6 +828,12 @@ AGENT_ASK_TOOLS = [
     },
 ] + _MCP_TOOLS + _DURABLE_STREAM_TOOLS + _OBJECT_STORE_TOOLS + _CLI_TOOLS
 
+# Village founding: agent-callable infrastructure for the 12-teams-per-village
+# cap. Senior-most directors only, self-gated on the cap -- villages are
+# founded on overflow, not sprawl.
+from agents import village_gen as _village_gen
+AGENT_ASK_TOOLS += list(_village_gen.VILLAGE_GEN_TOOLS)
+
 # Operator/village-editable tool descriptions: world/tool_descriptions.json is
 # an override layer over the inline text above (config.TOOL_DESCRIPTIONS). The
 # inline text stays as the fail-closed default, so deleting an override -- or

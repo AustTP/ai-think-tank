@@ -359,6 +359,13 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
             # what's queued, what's stuck) -- same DB-only safety as digest.
             tools_used.append(name)
             return _team_status_text()
+        if name == 'generate_village':
+            # Village founding at team capacity: pure data generation (grid,
+            # door triggers, scenes.json entry). The tool self-gates on the
+            # village's team cap -- villages are for overflow, not sprawl.
+            tools_used.append(name)
+            from agents.village_gen import execute_village_gen_tool
+            return execute_village_gen_tool(pick, name, args)
         if name == 'allowlist_status':
             # Read-only allowlist pending-queue / host-tier view -- the
             # observability half of the allowlist flow (the request itself is

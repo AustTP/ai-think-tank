@@ -847,6 +847,27 @@ def _promote_to_director(state, promotee_id, promoter_id):
     # director (a chief of staff MAY directly director another director).
     promotee['isDirector'] = True
     admin_id = _admin_agent_id(state)
+    # Village team capacity: this endpoint is the TOP-LEVEL director path
+    # (every promoted director sits flat under the chief of staff). At the
+    # village's top-level team cap the promotion is refused BEFORE any
+    # mutation; growth continues through the subdirector path instead.
+    import core.config as config  # serve's shared-namespace policy module
+    cap = int((config.OPERATOR_POLICY or {}).get('maxTeamsPerVillage') or 12)
+    top_level = sum(
+        1 for t in (state.get('teams') or [])
+        if (state.get('agentRoster') and
+            next((r for r in state['agentRoster']
+                  if r.get('id') == t.get('directorId')), {}).get('director') == admin_id)
+    ) if admin_id else 0
+    if admin_id and top_level >= cap:
+        state['_teamSpawnBlockedAtVillageCap'] = {
+            'teams': top_level, 'cap': cap, 'atMs': time.time() * 1000}
+        log_action('system', 'village_team_cap_reached',
+                   {'teams': top_level, 'cap': cap,
+                    'next': 'subdirector growth; the senior-most directors '
+                            'found the next village (generate_village)'},
+                   authorized=True)
+        return None
     proposed = admin_id if admin_id else promoter_id
     promotee['director'] = _safe_director(state, promotee_id, proposed)
     promotee['directorSince'] = time.time()

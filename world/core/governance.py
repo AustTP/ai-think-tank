@@ -493,3 +493,26 @@ def admin_change_request_enabled(state):
     """
     return bool(((state or {}).get('governance') or {})
                 .get('changeRequestAdminApproval'))
+
+
+def village_team_count(state, admin_id=None):
+    """Top-level team records in the village: teams whose director reports
+    directly to the admin. The admin's own aide cluster is not a team, and
+    subdirector sub-teams (director reporting to a director) do not count --
+    the operator fixed the SENIOR layer at 12 per village; growth beyond it
+    is subdirectors, not more top-level directors."""
+    state = state or {}
+    admin_id = admin_id or next(
+        (d.get('id') for d in (state.get('agentRoster') or []) if d.get('isAdmin')),
+        None)
+    if not admin_id:
+        return 0
+    rows = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+    count = 0
+    for t in (state.get('teams') or []):
+        did = t.get('directorId')
+        if not did or did == admin_id:
+            continue
+        if (rows.get(did) or {}).get('director') == admin_id:
+            count += 1
+    return count
