@@ -338,6 +338,12 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS sim_agent_snapshot (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Durable cursor for a live feed collector. AISStream is live-only, so
         # this records the last ingested frame and the reconnect coverage gap;
         # it is a checkpoint, not a replay buffer.

@@ -519,7 +519,7 @@ def _start_auto_hire(state, now_ms, grid, decider):
     # overload kept triggering new hires that could never relieve it.
     if state.get('_pendingOnboard') or state.get('_onboardQueue'):
         return False
-    # Active-ceiling gate: stop spawning at MAX_ACTIVE_AGENTS (25). When a
+    # Active-ceiling gate: stop spawning at MAX_ACTIVE_AGENTS. When a
     # sprint ends and workers go dormant, active_agent_count drops below the
     # ceiling and this gate reopens on its own. `lastHireAt` is deliberately
     # NOT advanced, so the next governance pass retries the moment a slot frees

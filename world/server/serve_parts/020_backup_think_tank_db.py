@@ -706,9 +706,18 @@ def _reconcile_task_archive(done):
 EXTRACTED_SECTIONS = (
     # (state key, table name, shape): dict sections key rows by entry id;
     # list sections order rows by seq (list index) with id as tiebreaker.
+    # A 'sim:' prefix marks a section nested under state['sim'] (the key
+    # after the colon); the blob keeps sim's OTHER keys, and the nested
+    # strip in save_state_to_db only touches a detached blob view.
     ('agents', 'live_agent', 'dict'),
     ('agentRoster', 'roster_agent', 'list'),
     ('playerInbox', 'inbox_message', 'list'),
+    # The tick's per-agent spatial/activity snapshot: rebuilt every tick,
+    # ~200 bytes x headcount, and persisted on EVERY save -- at 1,000 agents
+    # that alone would re-serialize the whole roster into the blob each
+    # time. Row-extracted, a save writes only the agents whose snapshot
+    # actually changed (walkers move; working agents sit still).
+    ('sim:agents', 'sim_agent_snapshot', 'dict'),
 )
 _EXTRACTED_LOCK = threading.Lock()
 _EXTRACTED_CACHE = {key: {'db': None, 'loaded': False, 'rows': {}}
@@ -753,7 +762,14 @@ def _merge_extracted_sections(data):
         else:
             merged = [obj for _rid, (_seq, obj)
                       in sorted(rows.items(), key=lambda kv: (kv[1][0], kv[0]))]
-        data[key] = copy.deepcopy(merged)
+        merged = copy.deepcopy(merged)
+        if key.startswith('sim:'):
+            sim = data.get('sim')
+            if not isinstance(sim, dict):
+                sim = data['sim'] = {}
+            sim[key[4:]] = merged
+        else:
+            data[key] = merged
 
 
 def _reconcile_extracted_sections(conn, data):
@@ -772,7 +788,11 @@ def _reconcile_extracted_sections(conn, data):
         with _EXTRACTED_LOCK:
             cache = _EXTRACTED_CACHE[key]
             rows = _extracted_rows_load_locked(table, cache)
-        entries = data.get(key)
+        if key.startswith('sim:'):
+            sim = data.get('sim')
+            entries = sim.get(key[4:]) if isinstance(sim, dict) else None
+        else:
+            entries = data.get(key)
         if entries is None:
             # Absent key in a full-state save == the section is empty: clear
             # the rows exactly as the blob replace drops the key.
@@ -897,6 +917,16 @@ def save_state_to_db(data):
             extracted_ok = _reconcile_extracted_sections(conn, data)
             if extracted_ok:
                 blob = {k: v for k, v in blob.items() if k not in extracted_ok}
+                for nkey in extracted_ok:
+                    # Nested sections ('sim:agents'): strip the leaf from the
+                    # BLOB VIEW only. This runs after the dict comprehension
+                    # above detached `blob` from the caller's state, so the
+                    # live in-memory snapshot is untouched.
+                    if nkey.startswith('sim:'):
+                        sim_blob = blob.get('sim')
+                        if isinstance(sim_blob, dict) and nkey[4:] in sim_blob:
+                            blob['sim'] = {k: v for k, v in sim_blob.items()
+                                           if k != nkey[4:]}
             conn.execute(
                 'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',

@@ -256,32 +256,34 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
     """
     cols, rows, cell = grid['cols'], grid['rows'], grid['cell']
 
+    # One spatial index per path search: a BFS probes thousands of candidate
+    # boxes, and a full-roster scan per probe made a single replan cost >1s
+    # at 1,000 agents (measured: find_path was 96% of stuck-replan ticks).
+    # Results are identical -- only a nearby agent can overlap a 20px box.
+    index = _spatial_index(agents)
+
     # "Co-located" = already overlapping the mover's own start box, not
     # bit-identical coordinates -- a live deadlock is caused by two agents a
     # fraction of a pixel apart whose 20px boxes still fully overlap.
     co_located = set()
     start_box = {'x': start_x, 'y': start_y, 'w': AGENT_W, 'h': AGENT_H}
-    for aid, other in agents.items():
-        if aid == exclude_agent_id:
-            continue
-        if other is None or not other.get('visible'):
-            continue
-        if other.get('x') is None or other.get('y') is None:
-            continue
-        if _overlaps(start_box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
-            co_located.add(aid)
+    sx0 = int(start_x // _SPATIAL_CELL)
+    sy0 = int(start_y // _SPATIAL_CELL)
+    for cx in (sx0 - 1, sx0, sx0 + 1):
+        for cy in (sy0 - 1, sy0, sy0 + 1):
+            for aid, other in index.get((cx, cy), ()):
+                if aid == exclude_agent_id:
+                    continue
+                ox, oy = other.get('x'), other.get('y')
+                if ox is None or oy is None:
+                    continue
+                if _overlaps(start_box, {'x': ox, 'y': oy,
+                                         'w': AGENT_W, 'h': AGENT_H}):
+                    co_located.add(aid)
 
     def agent_blocked_ignoring_co_located(box):
-        for aid, other in agents.items():
-            if aid == exclude_agent_id or aid in co_located:
-                continue
-            if not other or not other.get('visible'):
-                continue
-            if other.get('x') is None or other.get('y') is None:
-                continue
-            if _overlaps(box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
-                return True
-        return False
+        return agent_blocked_at_indexed(box, index, exclude_agent_id,
+                                        co_located, doors=None)
 
     def box_free(x, y):
         return not _blocked_at({'x': x, 'y': y, 'w': AGENT_W, 'h': AGENT_H}, grid) \
@@ -291,23 +293,28 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
         p = _cell_world_pos(gx, gy, cell)
         return box_free(p['x'], p['y'])
 
+    # Second index, keyed by CLAIMED TARGET cell: pathTarget can be far from
+    # an agent's current position, so target claims are indexed directly --
+    # the per-candidate-cell full scan this replaces was the other half of
+    # the replan cost at scale.
+    target_claims = {}
+    for oid, other in agents.items():
+        if oid == exclude_agent_id:
+            continue
+        if not other or not other.get('visible') or not other.get('pathTarget'):
+            continue
+        other_target = other['pathTarget']
+        ogx = math.floor((other_target['x'] / SCALE) / cell)
+        ogy = math.floor((other_target['y'] / SCALE) / cell)
+        target_claims.setdefault((ogx, ogy), []).append(oid)
+
     def cell_claimed_by_anothers_target(gx, gy):
         # Another agent's ALREADY-CHOSEN pathTarget claims this cell (not just
         # its current physical position) -- this is what lets two agents
         # planned in the SAME synchronous batch pick different relaxed cells
         # instead of gridlocking on the identical one. callers set
         # pathTarget AFTER find_path returns, so this only ever sees a real one.
-        for oid, other in agents.items():
-            if oid == exclude_agent_id:
-                continue
-            if not other or not other.get('visible') or not other.get('pathTarget'):
-                continue
-            other_target = other['pathTarget']
-            ogx = math.floor((other_target['x'] / SCALE) / cell)
-            ogy = math.floor((other_target['y'] / SCALE) / cell)
-            if ogx == gx and ogy == gy:
-                return True
-        return False
+        return bool(target_claims.get((gx, gy)))
 
     def cell_is_free_for_destination(gx, gy):
         return cell_is_free(gx, gy) and not cell_claimed_by_anothers_target(gx, gy)
@@ -430,17 +437,49 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
 # functions will drive the server engine once `sim.owner` flips to 'server'.
 # ---------------------------------------------------------------------------
 
+_DOOR_TILE_CACHE = {'key': None, 'cells': frozenset()}
+
+
+def _door_tile_cells(doors):
+    """The (static) door rects as a set of integer tiles, memoized on the
+    doors dict identity (it is loaded once per process). The per-candidate
+    rect-overlap loop this replaces ran inside agent_blocked_at for EVERY
+    scanned agent -- 27M _overlaps calls per tick at 1,000 agents."""
+    key = id(doors)
+    if _DOOR_TILE_CACHE['key'] == key and _DOOR_TILE_CACHE['cells']:
+        return _DOOR_TILE_CACHE['cells']
+    cells = set()
+    for rect in (doors or {}).values():
+        try:
+            x0 = int(math.floor(rect['x']))
+            y0 = int(math.floor(rect['y']))
+            x1 = int(math.ceil(rect['x'] + rect['w']))
+            y1 = int(math.ceil(rect['y'] + rect['h']))
+        except (KeyError, TypeError):
+            continue
+        for cx in range(x0, x1):
+            for cy in range(y0, y1):
+                cells.add((cx, cy))
+    _DOOR_TILE_CACHE.update({'key': key, 'cells': frozenset(cells)})
+    return _DOOR_TILE_CACHE['cells']
+
+
 def _is_on_door_tile(x, y, doors):
     """Mirror of agents.js isOnADoorTile: True when the 1x1 point box at
     (x,y) overlaps any ROOM_DOOR_TRIGGERS rect. `doors` is the world-space
     (already *SCALE'd) { building: {x,y,w,h} } dict -- callers load and
-    scale door_triggers.json exactly as rooms.js does."""
+    scale door_triggers.json exactly as rooms.js does. Tile-set backed: the
+    1x1 box spans up to four integer tiles when its corner is fractional."""
     if not doors:
         return False
-    point = {'x': x, 'y': y, 'w': 1, 'h': 1}
-    for _rect in doors.values():
-        if _overlaps(point, _rect):
-            return True
+    cells = _door_tile_cells(doors)
+    if not cells:
+        return False
+    x0, y0 = int(math.floor(x)), int(math.floor(y))
+    for cx in (x0, x0 + (1 if x > x0 else 0)):
+        for cy in (y0, y0 + (1 if y > y0 else 0)):
+            if (cx, cy) in cells:
+                return True
     return False
 
 
@@ -461,6 +500,54 @@ def agent_blocked_at(box, agents, exclude_id=None, ignore_ids=None, doors=None):
             continue
         if _overlaps(box, {'x': a['x'], 'y': a['y'], 'w': AGENT_W, 'h': AGENT_H}):
             return True
+    return False
+
+
+_SPATIAL_CELL = 64
+
+
+def _spatial_index(agents):
+    """{cell: [(id, agent_ref)]} of visible agents with positions, rebuilt
+    once per movement substep (O(N) dict inserts). The movement loop's
+    collision checks then touch only a 3x3 neighborhood instead of scanning
+    the whole roster per walker -- the O(walkers x headcount) pass that was
+    96% of tick time at 1,000 agents. Positions are read LIVE from the agent
+    refs at check time, so same-pass movement stays order-visible exactly as
+    the full scan was; only an agent's CELL assignment can lag one substep
+    (2px of motion), which self-corrects on the next substep."""
+    buckets = {}
+    for aid, a in agents.items():
+        if not a or not a.get('visible'):
+            continue
+        x, y = a.get('x'), a.get('y')
+        if x is None or y is None:
+            continue
+        buckets.setdefault((int(x // _SPATIAL_CELL), int(y // _SPATIAL_CELL)),
+                           []).append((aid, a))
+    return buckets
+
+
+def agent_blocked_at_indexed(box, index, exclude_id=None, ignore_ids=None,
+                             doors=None):
+    """agent_blocked_at over a _spatial_index: identical semantics and skip
+    order, but the candidate scan is the box's 3x3 cell neighborhood (a box
+    is AGENT_W wide, far smaller than one cell, so 3x3 always covers it)."""
+    ignore = set(ignore_ids) if ignore_ids else set()
+    cx0 = int(box['x'] // _SPATIAL_CELL)
+    cy0 = int(box['y'] // _SPATIAL_CELL)
+    for cx in (cx0 - 1, cx0, cx0 + 1):
+        for cy in (cy0 - 1, cy0, cy0 + 1):
+            for aid, a in index.get((cx, cy), ()):
+                if aid == exclude_id or aid in ignore:
+                    continue
+                ax, ay = a.get('x'), a.get('y')
+                if ax is None or ay is None:
+                    continue
+                if _is_on_door_tile(ax, ay, doors):
+                    continue
+                if _overlaps(box, {'x': ax, 'y': ay,
+                                   'w': AGENT_W, 'h': AGENT_H}):
+                    return True
     return False
 
 
@@ -572,6 +659,10 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
         pick_free = lambda avoid, agents_map: pick_free_spot(
             grid, avoid, spawn=SPAWN, ground_w=GROUND_W, ground_h=GROUND_H)
 
+    # One spatial index per call (== per substep): every walker's collision
+    # work below is neighborhood-local instead of a full-roster scan.
+    index = _spatial_index(agents)
+
     for aid, a in agents.items():
         if not a.get('path') or not a.get('visible'):
             continue
@@ -623,25 +714,31 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
         # Co-located overlap exemption: any OTHER visible agent whose box
         # overlaps the mover's own box is freed from agent-vs-agent blocking
         # -- the deadlock where two agents legitimately share a
-        # door-front spot. Matched by overlap, not bit-equality.
+        # door-front spot. Matched by overlap, not bit-equality. Resolved
+        # through the spatial index (same results: only a nearby agent can
+        # overlap a 16px box).
         co_located = set()
         a_box = {'x': a['x'], 'y': a['y'], 'w': AGENT_W, 'h': AGENT_H}
-        for oid, other in agents.items():
-            if oid == aid:
-                continue
-            if not other or not other.get('visible'):
-                continue
-            if other.get('x') is None or other.get('y') is None:
-                continue
-            if _overlaps(a_box, {'x': other['x'], 'y': other['y'], 'w': AGENT_W, 'h': AGENT_H}):
-                co_located.add(oid)
+        cx0 = int(a['x'] // _SPATIAL_CELL)
+        cy0 = int(a['y'] // _SPATIAL_CELL)
+        for cx in (cx0 - 1, cx0, cx0 + 1):
+            for cy in (cy0 - 1, cy0, cy0 + 1):
+                for oid, other in index.get((cx, cy), ()):
+                    if oid == aid:
+                        continue
+                    ox, oy = other.get('x'), other.get('y')
+                    if ox is None or oy is None:
+                        continue
+                    if _overlaps(a_box, {'x': ox, 'y': oy,
+                                         'w': AGENT_W, 'h': AGENT_H}):
+                        co_located.add(oid)
 
-        if not _blocked_at(try_both, grid) and not agent_blocked_at(try_both, agents, aid, co_located, doors):
+        if not _blocked_at(try_both, grid) and not agent_blocked_at_indexed(try_both, index, aid, co_located, doors):
             a['x'] = try_both['x']
             a['y'] = try_both['y']
-        elif not _blocked_at(try_x, grid) and not agent_blocked_at(try_x, agents, aid, co_located, doors):
+        elif not _blocked_at(try_x, grid) and not agent_blocked_at_indexed(try_x, index, aid, co_located, doors):
             a['x'] = try_x['x']
-        elif not _blocked_at(try_y, grid) and not agent_blocked_at(try_y, agents, aid, co_located, doors):
+        elif not _blocked_at(try_y, grid) and not agent_blocked_at_indexed(try_y, index, aid, co_located, doors):
             a['y'] = try_y['y']
 
         moved = math.hypot(a['x'] - before_x, a['y'] - before_y) > 0.01

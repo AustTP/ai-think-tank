@@ -88,7 +88,8 @@ class StateSplitTest(unittest.TestCase):
         # case), then start from empty rows. init_db is idempotent.
         serve.init_db()
         with serve._db() as conn:
-            for table in ('roster_agent', 'live_agent', 'inbox_message'):
+            for table in ('roster_agent', 'live_agent', 'inbox_message',
+                          'sim_agent_snapshot'):
                 conn.execute(f'DELETE FROM {table}')
             conn.execute('DELETE FROM kv_state')
             conn.execute('DELETE FROM state_checksum')
@@ -189,6 +190,35 @@ class StateSplitTest(unittest.TestCase):
         back = serve.get_state_from_db()
         self.assertEqual(len(back['playerInbox']), 3)
         self.assertEqual([r['id'] for r in back['agentRoster']], ['ada', 'ben'])
+
+    def test_tick_snapshot_leaves_the_blob_and_diff_writes(self):
+        # The tick's sim['agents'] snapshot is row-extracted too: it is
+        # rebuilt every tick and persisted on every save, so at scale it must
+        # cost only the CHANGED agents per save, not the whole headcount.
+        state = _base_state()
+        state['sim'] = {'tick': 1, 'owner': 'server', 'agents': {
+            'ada': {'x': 1, 'y': 2, 'busy': False, 'inRoom': None,
+                    'offDuty': False, 'visible': True, 'dir': 'south',
+                    'task': None, 'pathActive': False},
+            'ben': {'x': 3, 'y': 4, 'busy': True, 'inRoom': 'workroom',
+                    'offDuty': False, 'visible': True, 'dir': 'east',
+                    'task': 't9', 'pathActive': False},
+        }}
+        serve.save_state_to_db(copy.deepcopy(state))
+        blob = _raw_blob()
+        self.assertNotIn('agents', blob.get('sim') or {})
+        self.assertEqual(blob['sim']['tick'], 1)  # sim's other keys survive
+        back = serve.get_state_from_db()
+        self.assertEqual(back['sim']['agents'], state['sim']['agents'])
+        # Second save, one agent moved: only that row is rewritten.
+        state['sim']['agents']['ada']['x'] = 9
+        state['sim']['tick'] = 2
+        serve.save_state_to_db(copy.deepcopy(state))
+        with serve._db() as conn:
+            rows = {rid: json.loads(b) for rid, b in conn.execute(
+                'SELECT id, blob FROM sim_agent_snapshot')}
+        self.assertEqual(rows['ada']['x'], 9)
+        self.assertEqual(rows['ben']['x'], 3)
 
     def test_absent_key_clears_the_section(self):
         # A full-state save without playerInbox means the section is EMPTY:
