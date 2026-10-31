@@ -857,7 +857,8 @@ def _promote_to_director(state, promotee_id, promoter_id):
         1 for t in (state.get('teams') or [])
         if (state.get('agentRoster') and
             next((r for r in state['agentRoster']
-                  if r.get('id') == t.get('directorId')), {}).get('director') == admin_id)
+                  if r.get('id') == t.get('directorId')), {}).get('director')
+            in (admin_id, None))
     ) if admin_id else 0
     if admin_id and top_level >= cap:
         state['_teamSpawnBlockedAtVillageCap'] = {

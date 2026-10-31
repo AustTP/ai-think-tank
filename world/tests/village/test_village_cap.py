@@ -64,6 +64,17 @@ class VillageTeamCount(unittest.TestCase):
         self.assertIn('generate_village', note.get('next', '')
                       if 'next' in note else 'generate_village')
 
+    def test_directorless_supporting_director_counts(self):
+        # The supporting director sits at the senior tier with an absent
+        # director pointer; her team consumes village capacity like any
+        # other top-level team.
+        st = _state(top_level=2)
+        st['agentRoster'].append({'id': 'nora', 'name': 'Nora',
+                                  'isDirector': True, 'director': None})
+        st['teams'].append({'id': 'nora', 'directorId': 'nora',
+                            'members': []})
+        self.assertEqual(governance.village_team_count(st, 'theo'), 3)
+
     def test_cap_boundary_counts(self):
         under = _state(top_level=sim.MAX_TEAMS_PER_VILLAGE - 1)
         at = _state(top_level=sim.MAX_TEAMS_PER_VILLAGE)
