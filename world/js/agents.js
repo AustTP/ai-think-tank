@@ -530,6 +530,29 @@ function drawSpeechBubble(ctx, toScreen, zoom, a, x, y) {
 }
 
 function drawAgentAt(ctx, toScreen, zoom, playerSprites, a, x, y) {
+  if (typeof schematicMode === 'function' && schematicMode()) {
+    // Schematic room interior: same marker vocabulary as the outdoor map --
+    // colored box + name, no sprite. Speech bubbles still render below.
+    const [sx2, sy2] = toScreen(x, y);
+    const w = AGENT_W * zoom, h = AGENT_H * zoom;
+    ctx.fillStyle = a.color || '#8ab4f8';
+    ctx.fillRect(sx2, sy2, w, h);
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = Math.max(1, zoom);
+    ctx.strokeRect(sx2, sy2, w, h);
+    const [nx, ny] = toScreen(x + AGENT_W / 2, y - 4);
+    ctx.save();
+    ctx.font = 'bold 11px monospace';
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+    ctx.strokeText(a.name, nx, ny);
+    ctx.fillStyle = '#e8e8e8';
+    ctx.fillText(a.name, nx, ny);
+    ctx.restore();
+    drawSpeechBubble(ctx, toScreen, zoom, a, x, y);
+    return;
+  }
   const per = (agentSprites && agentSprites[a.id]) ? agentSprites[a.id][a.dir] : null;
   const spr = per || playerSprites[a.dir];
   const [sx, sy] = toScreen(x - (spr.width - AGENT_W) / 2, y - (spr.height - AGENT_H));

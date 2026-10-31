@@ -244,6 +244,11 @@ async function main() {
   // in as it arrives.
   agentSprites = {};
   void (async () => {
+    // Schematic mode renders from data: skip the per-agent avatar fetches
+    // (4N requests -- the documented 37-agent page load was 148 round trips)
+    // and the room images entirely. preloadArt() re-fetches when the
+    // operator toggles back to the classic look.
+    if (schematicMode()) return;
     const adminIds = new Set(AGENT_ROSTER.filter(d => d.isAdmin).map(d => d.id));
     for (const id in AGENTS) {
       if (adminIds.has(id)) continue;
@@ -259,6 +264,30 @@ async function main() {
     }
   })().catch(e => console.warn('agent art preload failed:', e));
 
+  // The art preload above, callable again: toggling schematic off after a
+  // schematic boot skipped it must fetch the avatars and room images before
+  // the classic look can render. Idempotent per path (roomImages guards).
+  function preloadArt() {
+    void (async () => {
+      if (!schematicMode()) {
+        const adminIds = new Set(AGENT_ROSTER.filter(d => d.isAdmin).map(d => d.id));
+        for (const id in AGENTS) {
+          if (adminIds.has(id)) continue;
+          if (agentSprites[id]) continue;
+          const set = {};
+          for (const o of ['south', 'north', 'east', 'west']) {
+            set[o] = await loadImage(`/api/avatar/${id}/${o}.png`).catch(() => null);
+          }
+          if (['south', 'north', 'east', 'west'].some(o => set[o])) agentSprites[id] = set;
+        }
+        for (const building in ROOMS) {
+          const path = ROOMS[building].image;
+          if (!roomImages[path]) roomImages[path] = await loadImage(path).catch(() => null);
+        }
+      }
+    })().catch(e => console.warn('agent art preload failed:', e));
+  }
+
   window.addEventListener('keydown', e => {
     // Typing in the chat box (or any future text field) shouldn't leak into
     // game controls -- without this, typing a message containing "g" would
@@ -267,6 +296,13 @@ async function main() {
     const k = e.key.toLowerCase();
     state.keys.add(k);
     if (k === 'g') state.showFootprints = !state.showFootprints;
+    if (k === 'v') {
+      state.schematic = !state.schematic;
+      try {
+        localStorage.setItem('schematic', state.schematic ? '1' : '0');
+      } catch (_e) { /* private mode: session-only toggle */ }
+      if (!state.schematic) preloadArt();
+    }
     if (k === 'b' && nearbyAgentId && !state.ui && state.location.kind === 'outside') {
       openConversation(nearbyAgentId);
     }
@@ -462,10 +498,91 @@ async function main() {
     ctx.drawImage(spr, px, py, spr.width * zoom, spr.height * zoom);
   }
 
+  function drawAgentMarker(toScreen, zoom, a, x, y) {
+    // Schematic agent: a colored box with the roster color and the name --
+    // the same identity data drawAgentAt labels, no sprite required. At
+    // large headcounts (or low zoom) names drop and only markers remain.
+    const [sx, sy] = toScreen(x, y);
+    const w = AGENT_W * zoom, h = AGENT_H * zoom;
+    ctx.fillStyle = a.color || '#8ab4f8';
+    ctx.fillRect(sx, sy, w, h);
+    ctx.strokeStyle = a.id === state.player.id ? '#ffffff' : 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = Math.max(1, zoom);
+    ctx.strokeRect(sx, sy, w, h);
+    if (zoom >= 0.9 && Object.keys(AGENTS).length <= 120) {
+      ctx.save();
+      ctx.font = 'bold 11px monospace';
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0,0,0,0.8)';
+      ctx.strokeText(a.name, sx + w / 2, sy - 4);
+      ctx.fillStyle = '#e8e8e8';
+      ctx.fillText(a.name, sx + w / 2, sy - 4);
+      ctx.restore();
+    }
+  }
+
+  function renderOutsideSchematic(toScreen, zoom) {
+    // The village from DATA alone: ground plane, boundary, door rects as
+    // building markers with labels. Same truth the footprints overlay
+    // debug-draws; here it IS the map.
+    const [gx, gy] = toScreen(0, 0);
+    ctx.fillStyle = '#1d242b';
+    ctx.fillRect(gx, gy, GROUND_W * zoom, GROUND_H * zoom);
+    ctx.strokeStyle = 'rgba(140,160,180,0.6)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(gx, gy, GROUND_W * zoom, GROUND_H * zoom);
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    for (const building in ROOM_DOOR_TRIGGERS) {
+      const d = ROOM_DOOR_TRIGGERS[building];
+      const [dx, dy] = toScreen(d.x, d.y);
+      ctx.fillStyle = 'rgba(70,90,110,0.5)';
+      ctx.fillRect(dx, dy, d.w * zoom, d.h * zoom);
+      ctx.strokeStyle = 'rgba(255,210,60,0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(dx, dy, d.w * zoom, d.h * zoom);
+      const room = ROOMS[building];
+      if (room) {
+        ctx.fillStyle = '#cfd8e0';
+        ctx.fillText(room.label, dx + d.w * zoom / 2, dy - 5);
+      }
+    }
+  }
+
   function renderOutside() {
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     const zoom = state.zoom;
     const toScreen = cameraFor(zoom, GROUND_W, GROUND_H, cameraFocus.x, cameraFocus.y);
+
+    if (state.schematic) {
+      renderOutsideSchematic(toScreen, zoom);
+      for (const id in AGENTS) {
+        const a = AGENTS[id];
+        if (!agentIsDrawn(a)) continue;
+        drawAgentMarker(toScreen, zoom, a, a.x, a.y);
+      }
+      if (state.location.kind !== 'meeting') {
+        drawAgentMarker(toScreen, zoom, { ...state.player, color: '#f2f2f2', id: 'player' },
+                        state.player.x, state.player.y);
+      }
+      if (state.showFootprints) {
+        ctx.strokeStyle = 'rgba(255,40,40,0.4)';
+        if (COLLISION_GRID) {
+          const { cols, rows, cell, grid } = COLLISION_GRID;
+          const cellWorld = cell * SCALE;
+          for (let gy2 = 0; gy2 < rows; gy2++) {
+            for (let gx2 = 0; gx2 < cols; gx2++) {
+              if (!grid[gy2][gx2]) continue;
+              const [dx, dy] = toScreen(gx2 * cellWorld, gy2 * cellWorld);
+              ctx.fillStyle = 'rgba(255,40,40,0.4)';
+              ctx.fillRect(dx, dy, cellWorld * zoom, cellWorld * zoom);
+            }
+          }
+        }
+      }
+      return;
+    }
 
     const [bx, by] = toScreen(0, 0);
     ctx.drawImage(SCENE.bg, bx, by, GROUND_W * zoom, GROUND_H * zoom);
@@ -512,8 +629,35 @@ async function main() {
     const toScreen = cameraFor(zoom, ROOM_NATIVE_W, ROOM_NATIVE_H, state.player.x, state.player.y);
     const room = ROOMS[state.location.building];
 
-    const [bx, by] = toScreen(0, 0);
-    ctx.drawImage(roomImages[room.image], bx, by, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+    if (state.schematic) {
+      // The room from DATA alone: floor, walls, collision furniture, label.
+      const [fx, fy] = toScreen(0, 0);
+      ctx.fillStyle = '#232a31';
+      ctx.fillRect(fx, fy, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+      ctx.strokeStyle = 'rgba(140,160,180,0.7)';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(fx, fy, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+      ctx.fillStyle = 'rgba(90,110,130,0.45)';
+      for (const r of ROOM_COLLISIONS[room.collision]) {
+        const [rx, ry] = toScreen(r.x * SCALE, r.y * SCALE);
+        ctx.fillRect(rx, ry, r.w * SCALE * zoom, r.h * SCALE * zoom);
+      }
+    } else {
+      const img = roomImages[room.image];
+      if (img) {
+        const [bx, by] = toScreen(0, 0);
+        ctx.drawImage(img, bx, by, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+      } else {
+        // A room with no baked art (e.g. added after a schematic-mode
+        // session) degrades to the schematic floor instead of a blank room.
+        const [fx2, fy2] = toScreen(0, 0);
+        ctx.fillStyle = '#232a31';
+        ctx.fillRect(fx2, fy2, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+        ctx.strokeStyle = 'rgba(140,160,180,0.7)';
+        ctx.lineWidth = 3;
+        ctx.strokeRect(fx2, fy2, ROOM_NATIVE_W * zoom, ROOM_NATIVE_H * zoom);
+      }
+    }
     renderAgentsInRoom(ctx, toScreen, zoom, playerSprites, state.location.building);
     drawPlayer(toScreen, zoom);
 

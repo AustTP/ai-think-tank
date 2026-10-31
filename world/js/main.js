@@ -66,10 +66,22 @@ const state = {
   keys: new Set(),
   zoom: ZOOM_SHOW_ALL,
   showFootprints: false,
+  // Schematic mode: the physical simulation (positions, rooms, doors,
+  // collisions, boundaries) renders from DATA -- flat shapes and labels --
+  // with zero image dependency. The baked art (village background, room
+  // images, per-agent avatar sheets) stays available as the classic look,
+  // but nothing requires it, so headcount and rooms scale without new
+  // artwork (and without the 4N avatar requests per page load).
+  schematic: (new URLSearchParams(location.search).get('schematic') === '1'
+              || localStorage.getItem('schematic') === '1'),
   location: { kind: 'outside' },
   ui: null,
   scene: 'main',
 };
+
+function schematicMode() {
+  return !!state.schematic;
+}
 
 // Remembered so exitRoom() has somewhere sane to put the player back for a
 // room with no physical door on the outdoor map (Control Room -- reachable
