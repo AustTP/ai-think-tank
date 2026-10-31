@@ -443,6 +443,76 @@ async def intent_schedule_once(request: Request):
     return JSONResponse({'ok': True, 'task': {'title': title, 'atMs': at_ms, 'notBefore': item.get('notBefore')}})
 
 
+@app.post('/api/intent/broadcast')
+@_state_writer
+async def intent_broadcast(request: Request):
+    """Broadcast primitive (scale slice 3): one note to many mailboxes, and
+    nothing else. The 1:1 mail path funnels every announcement through the
+    chief of staff, whose office files it as queueable work (the DEV-85
+    lesson) -- a broadcast is direction that must never become a card: no
+    issue, no lane routing, no grooming. POST {text, scope?, room?}:
+    scope 'directors' (default) reaches every roster director and the admin,
+    'room' reaches the agents currently in `room`, 'all' reaches every roster
+    agent. Recipients get a normal mailbox entry (read: False) they read
+    through the ordinary mail tool; the operator is the sender.
+    Operator/admin gate; text bounded like mail."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    text = body.get('text')
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse({'error': 'text is required'}, status_code=400)
+    text = text.strip()[:2000]
+    scope = (body.get('scope') or 'directors').strip()
+    if scope not in ('directors', 'room', 'all'):
+        return JSONResponse(
+            {'error': '`scope` must be one of: directors, room, all'},
+            status_code=400)
+    room = (body.get('room') or '').strip() or None
+    if scope == 'room' and not room:
+        return JSONResponse({'error': '`room` is required for scope "room"'},
+                            status_code=400)
+    roster = state.get('agentRoster') or []
+    agents = state.get('agents') or {}
+    if scope == 'directors':
+        recipients = [d.get('id') for d in roster
+                      if isinstance(d, dict) and d.get('id')
+                      and (d.get('isAdmin') or d.get('isDirector'))]
+    elif scope == 'room':
+        recipients = [a.get('id') for a in agents.values()
+                      if isinstance(a, dict) and a.get('id')
+                      and a.get('inRoom') == room]
+    else:
+        recipients = [d.get('id') for d in roster
+                      if isinstance(d, dict) and d.get('id')]
+    recipients = [rid for rid in recipients if isinstance(rid, str)]
+    if not recipients:
+        return JSONResponse({'error': 'no recipients matched that scope'},
+                            status_code=400)
+    import sim as _sim
+    entry = {'text': f'Operator (broadcast): {text}', 'read': False,
+             'ts': int(time.time() * 1000)}
+    delivered = 0
+    for rid in recipients:
+        target = agents.get(rid)
+        if not isinstance(target, dict):
+            continue
+        _sim._append_mailbox(target, dict(entry))
+        delivered += 1
+    save_state_to_db(state)
+    log_action('player', 'broadcast_sent',
+               {'scope': scope, 'room': room, 'recipients': delivered},
+               authorized=True)
+    return JSONResponse({'ok': True, 'delivered': delivered, 'scope': scope})
+
+
 @app.post('/api/pipelines')
 @_state_writer
 async def pipelines_create(request: Request):
