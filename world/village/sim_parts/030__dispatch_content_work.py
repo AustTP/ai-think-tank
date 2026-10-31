@@ -221,8 +221,20 @@ def queue_work(state, items):
         # (_assign_due_item). Every other caller supplies a room.
         if not item or not item.get('title'):
             continue
-        if _dedup_blocked(state, item.get('title'),
-                          force=bool(item.get('force'))):
+        # The twin check guards NEW card creation only. An item that links
+        # back to an existing task continues that work by design: reviewOf
+        # (peer-review gates enqueue one review card per reviewer under the
+        # same 'Review: X' title; transport/completion recovery re-queues the
+        # same fix), reissueOf (stale/credit-paused sweeps re-issue the same
+        # card), and investigationOf (blocker-recovery investigations, one
+        # per blocked task, often sharing a title). A moonshot free spike is
+        # its own authorized weekly repeat (the spare-time lane keeps its own
+        # room+week guard, so the title twin check must not double-gate it).
+        # Dedup must never strand any of those.
+        if not (item.get('reviewOf') or item.get('reissueOf')
+                or item.get('investigationOf') or item.get('moonshot')) \
+                and _dedup_blocked(state, item.get('title'),
+                                   force=bool(item.get('force'))):
             continue
         work_queue.append({
             'title': item['title'],

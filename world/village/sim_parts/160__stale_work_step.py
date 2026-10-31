@@ -101,6 +101,9 @@ def _requeue_stale_work(state, task):
     room = task.get('room') or _resolve_assignment_room(task)
     queue_work(state, [{
         'title': task.get('title'),
+        # reissueOf marks this as the SAME work continuing, not a new card:
+        # the card-dedup twin check must never strand a re-issue.
+        'reissueOf': task.get('id'),
         'room': room,
         'instructions': (
             (task.get('instructions') or '') +
@@ -131,6 +134,9 @@ def _requeue_paused_work(state, task, now_ms):
     room = task.get('room') or _resolve_assignment_room(task)
     queue_work(state, [{
         'title': task.get('title'),
+        # reissueOf marks this as the SAME work continuing, not a new card:
+        # the card-dedup twin check must never strand a re-issue.
+        'reissueOf': task.get('id'),
         'room': room,
         'instructions': task.get('instructions'),
         'goal': task.get('goal'),

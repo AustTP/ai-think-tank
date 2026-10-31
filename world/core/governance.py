@@ -122,8 +122,12 @@ def team_director_of(state, agent_id):
         if row is None:
             return None
         parent = row.get('director')
-        if not parent or parent == current or parent not in index:
+        if not parent or parent == current:
             return current
+        if parent not in index:
+            # The named director has no roster row (trimmed or synthetic):
+            # the name IS the team, exactly the pre-layer one-hop read.
+            return parent
         prow = index[parent]
         if prow.get('isAdmin'):
             # `current` sits directly under the chief of staff: with reports
@@ -153,8 +157,10 @@ def team_director_map(state):
                 return None
             seen.add(current)
             parent = index[current].get('director')
-            if not parent or parent == current or parent not in index:
+            if not parent or parent == current:
                 return current
+            if parent not in index:
+                return parent
             if index[parent].get('isAdmin'):
                 return current if report_counts.get(current) else parent
             current = parent

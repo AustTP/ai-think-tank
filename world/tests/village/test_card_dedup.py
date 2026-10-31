@@ -146,6 +146,23 @@ class QueueDedupTest(unittest.TestCase):
         self.assertEqual(titles, ['Fix the observatory route',
                                   'An unrelated task'])
 
+    def test_reviewof_items_bypass_the_twin_check(self):
+        # Work that CONTINUES an existing task is never a duplicate: peer
+        # gates enqueue one review card per reviewer under the same title,
+        # and transport recovery re-queues the same fix. Only NEW cards
+        # (no reviewOf) hit the twin check.
+        self.state['tasks']['task-1'] = {
+            'id': 'task-1', 'title': 'Review: the story', 'status':
+            'needs_review'}
+        added = sim.queue_work(self.state, [
+            {'title': 'Review: the story', 'reviewOf': 'task-1',
+             'assignedTo': 'r1'},
+            {'title': 'Review: the story', 'reviewOf': 'task-1',
+             'assignedTo': 'r2'},
+        ])
+        self.assertEqual(added, 2)
+        self.assertEqual(len(self.state['workQueue']), 2)
+
     def test_case_and_punctuation_normalization_matches(self):
         self.state['tasks']['task-1'] = {
             'id': 'task-1', 'title': 'Fix  the Observatory route!',

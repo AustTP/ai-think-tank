@@ -762,35 +762,45 @@ def _reconcile_extracted_sections(conn, data):
     section keys that may be dropped from the blob (reconcile succeeded); a
     section that cannot be rowed (absent from the state, not a list/dict,
     entries without ids) or whose table write fails keeps its blob copy --
-    never lose data. An ABSENT key is 'no information', not an empty section:
-    the table is left untouched and the key is only droppable when the table
-    already holds rows (which will restore it on read)."""
+    never lose data. An ABSENT key means the saved state has no such section:
+    the blob write it accompanies is a full replace (every writer passes the
+    whole state), so absent rows are DELETED exactly as the blob replace would
+    drop the key -- an empty section and a missing section are the same
+    thing. A section that cannot be rowed keeps its blob copy untouched."""
     ok, now = [], time.time()
     for key, table, shape in EXTRACTED_SECTIONS:
         with _EXTRACTED_LOCK:
             cache = _EXTRACTED_CACHE[key]
             rows = _extracted_rows_load_locked(table, cache)
         entries = data.get(key)
-        if not isinstance(entries, (list, dict)) or (
+        if entries is None:
+            # Absent key in a full-state save == the section is empty: clear
+            # the rows exactly as the blob replace drops the key.
+            desired = {}
+            unrowable = False
+        elif not isinstance(entries, (list, dict)) or (
                 shape == 'list' and not isinstance(entries, list)) or (
                 shape == 'dict' and not isinstance(entries, dict)):
+            # Present but unrowable (fail-closed): the blob keeps its copy,
+            # the rows stay -- no information is lost either way.
             if rows:
                 ok.append(key)
             continue
-        desired = {}
-        unrowable = False
-        if shape == 'dict':
-            for rid, entry in entries.items():
-                if not isinstance(entry, dict) or not isinstance(rid, str) or not rid:
-                    unrowable = True
-                    break
-                desired[rid] = (0, entry)
         else:
-            for seq, entry in enumerate(entries):
-                if not isinstance(entry, dict) or not entry.get('id'):
-                    unrowable = True
-                    break
-                desired[str(entry['id'])] = (seq, entry)
+            desired = {}
+            unrowable = False
+            if shape == 'dict':
+                for rid, entry in entries.items():
+                    if not isinstance(entry, dict) or not isinstance(rid, str) or not rid:
+                        unrowable = True
+                        break
+                    desired[rid] = (0, entry)
+            else:
+                for seq, entry in enumerate(entries):
+                    if not isinstance(entry, dict) or not entry.get('id'):
+                        unrowable = True
+                        break
+                    desired[str(entry['id'])] = (seq, entry)
         if unrowable:
             continue
         changed = {rid: (seq, obj) for rid, (seq, obj) in desired.items()

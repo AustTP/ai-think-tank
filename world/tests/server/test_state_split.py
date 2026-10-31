@@ -190,16 +190,20 @@ class StateSplitTest(unittest.TestCase):
         self.assertEqual(len(back['playerInbox']), 3)
         self.assertEqual([r['id'] for r in back['agentRoster']], ['ada', 'ben'])
 
-    def test_absent_key_is_no_information_not_an_empty_section(self):
+    def test_absent_key_clears_the_section(self):
+        # A full-state save without playerInbox means the section is EMPTY:
+        # the blob write was always a full replace (absent key = dropped
+        # key), so the rows must follow the same contract. A partial-state
+        # test helper seeding {} therefore clears the rows too -- which is
+        # what the supervisor-meeting suite's _seed({}) expects.
         serve.save_state_to_db(_base_state())
-        # A state dict without playerInbox must not wipe the rows: absent
-        # means "no information", and the rows restore the section on read.
         state = serve.get_state_from_db()
         state.pop('playerInbox')
         serve.save_state_to_db(state)
         back = serve.get_state_from_db()
-        self.assertEqual([m['id'] for m in back['playerInbox']],
-                         ['mail-1', 'card-2'])
+        # No rows survive; the key itself may be absent (the reader-side
+        # `or []` convention handles that, exactly as a fresh blob did).
+        self.assertFalse(back.get('playerInbox'))
 
     def test_unrowable_entries_stay_in_blob(self):
         state = _base_state()
