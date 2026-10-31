@@ -127,9 +127,91 @@ def resolve_room_with_overflow(state, room):
     if room_occupancy(state, overflow_to) < room_desk_capacity(_ROOM_COLLISION.get(overflow_to, 'workstations')):
         return overflow_to
     return room
+
+# --- Anti-entropy: card creation dedup (scale slice 2) ---------------------
+#
+# The dominant duplicate-card waste is the same ask re-carded under its own
+# title: chief backlog directives minting issues for already-open work, the
+# six observatory re-cards, DEV-73/74. Every creation path normalizes the
+# title and refuses to open a second card while an open twin exists.
+#
+# Deliberately NARROW: only re-request markers peel off ('re: X' == 'X'), and
+# wrapper titles ('Review: X', 'Fix issues found in review testing of "X"')
+# do NOT normalize down to X. Those wrappers are lifecycle edges -- the gate
+# flow legitimately reviews still-open work -- and an over-eager key would
+# block real review/fix cards against their own targets. Anti-entropy must
+# never block a legitimate lifecycle edge; it only blocks true re-requests.
+
+_DEDUP_STRIP_CHARS = '[]"\''
+
+
+def card_dedup_key(title):
+    """Normalized identity shared by every card-creation path. Lowercase,
+    collapse whitespace, peel re-request prefixes repeatedly ('re: X' ==
+    'X'), drop bracketed lane tags and stray bracket/quote punctuation, trim
+    trailing punctuation. None when nothing remains (never dedup on an empty
+    key)."""
+    text = ' '.join(str(title or '').split()).lower()
+    # Bracketed lane tags ('[STORY]', '[BUG]', '[SUPERVISE]') are grooming
+    # wrappers around the same ask: drop the whole bracketed tag, then any
+    # stray bracket/quote punctuation.
+    text = re.sub(r'\[[^\]]*\]', ' ', text)
+    text = ''.join(c for c in text if c not in _DEDUP_STRIP_CHARS)
+    changed = True
+    while changed:
+        changed = False
+        stripped = re.sub(r'^(?:re-request|re)\s*:\s*', '', text)
+        if stripped != text:
+            text = stripped.strip()
+            changed = True
+    return text.strip(' !?.,;:') or None
+
+
+_OPEN_TWIN_STATUSES = frozenset(
+    {'queued', 'walking', 'working', 'needs_review', 'blocked'})
+
+
+def _find_open_twin(state, key):
+    """The one open card (queued / waiting / being worked / blocked) with the
+    same dedup key, or None. Terminal and archived cards never block new
+    work, and a failed card's own recovery chain re-cards freely: completion
+    recovery targets a 'failed'/'repairing' original, which is not open."""
+    if not key:
+        return None
+    for item in (state.get('workQueue') or []):
+        if item and card_dedup_key(item.get('title')) == key:
+            return {'where': 'workQueue', 'title': item.get('title') or ''}
+    for tid, t in (state.get('tasks') or {}).items():
+        if not isinstance(t, dict):
+            continue
+        if t.get('status') in _OPEN_TWIN_STATUSES \
+                and card_dedup_key(t.get('title')) == key:
+            return {'where': 'task', 'id': tid, 'title': t.get('title') or ''}
+    return None
+
+
+def _dedup_blocked(state, title, force=False):
+    """Shared gate for queue_work / queue_once. Returns the open twin when
+    creation must be refused (logging the refusal); None when creation may
+    proceed. `force` is the operator's explicit bypass."""
+    key = card_dedup_key(title)
+    if not key or force:
+        return None
+    twin = _find_open_twin(state, key)
+    if twin:
+        try:
+            _log_governance(state, 'system', 'card_dedup_blocked',
+                            {'title': (title or '')[:120], 'twin': twin})
+        except Exception:
+            pass  # the refusal itself must never depend on the audit sink
+    return twin
+
+
 def queue_work(state, items):
     """Port of tasks.js queueWork: whitelist each item's fields into a WORK_QUEUE
-    entry. Mutates state['workQueue'] (creates it if absent). Returns new length."""
+    entry. Mutates state['workQueue'] (creates it if absent). Returns new length.
+    Anti-entropy: an item whose dedup key matches an OPEN card is skipped
+    (logged) unless the item sets force: True."""
     work_queue = state.setdefault('workQueue', [])
     if not isinstance(work_queue, list):
         work_queue = state['workQueue'] = []
@@ -138,6 +220,9 @@ def queue_work(state, items):
         # purpose, and the ASSIGNED agent resolves the room at assignment
         # (_assign_due_item). Every other caller supplies a room.
         if not item or not item.get('title'):
+            continue
+        if _dedup_blocked(state, item.get('title'),
+                          force=bool(item.get('force'))):
             continue
         work_queue.append({
             'title': item['title'],
@@ -437,7 +522,7 @@ def queue_meeting(state, title, room, facilitator_id, attendees=None,
 
 def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None,
                goal=None, priority=None, project_label=None, depends_on_task=None,
-               assigned_to=None, lane=None):
+               assigned_to=None, lane=None, force=False):
     """Queue a single work item to fire ONCE at an absolute wall-clock time
     (`at_ms`, epoch milliseconds). The item rides the same `notBefore` gate
     the rest of the queue already honors (see is_work_item_due): it sits in
@@ -446,8 +531,9 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
     task id) adds the dependency gate: even once `at_ms` passes, the item is
     NOT assigned until that task reaches 'done' (see _work_item_dependency_met)
     -- the composed "run X once the dependency lands" scheduling lane. Returns
-    the queued work item dict, or None if rejected (no title, or `at_ms` is
-    not a positive future epoch-ms).
+    the queued work item dict, or None if rejected (no title, `at_ms` is
+    not a positive future epoch-ms, or an OPEN twin with the same dedup key
+    already exists -- anti-entropy; `force=True` is the operator bypass).
     Human-in-the-loop: `assigned_to='player'` hands the item to the PLAYER
     instead of an agent -- combined with `depends_on_task` this is the
     "give the player X once story T lands" lane (see _assign_player_task).
@@ -455,6 +541,8 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
     (see LANES); `parking-lot` defers it with a bookmark -- never auto-assigned."""
     at_ms = int(at_ms or 0)
     if not title or at_ms <= 0:
+        return None
+    if _dedup_blocked(state, title, force=force):
         return None
     item = {
         'title': title,
@@ -469,7 +557,10 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
         'assignedTo': assigned_to or None,
         'lane': lane,
     }
-    queue_work(state, [item])
+    # queue_work re-runs the dedup gate on its own whitelist; carry the
+    # operator's force decision through so a forced queue_once is not
+    # silently dropped one layer down.
+    queue_work(state, [{**item, 'force': bool(force)}])
     return item
 
 
