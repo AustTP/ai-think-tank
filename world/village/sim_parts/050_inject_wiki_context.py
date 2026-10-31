@@ -770,6 +770,98 @@ def emit_signals(state, subject, data):
 _DELIVERABLE_TASK_TYPES = frozenset({'code', 'bug', 'research', 'spike', 'report'})
 
 
+_PROVENANCE_FETCH_ACTIONS = ('browse', 'search_web', 'api-call')
+# An artifact that records WHY nothing could be fetched (the vault refusal,
+# a budget stop, a rate limit) is honest inability, not fabrication -- the
+# provenance gate accepts it (task-2193's honest refusal report must keep
+# completing; task-2208's memory-written "Verified" report must not).
+_PROVENANCE_INABILITY_MARKERS = (
+    'refused', 'not active', 'credential', 'unavailable', 'resource_exhausted',
+    'rate limit', '[budget]', 'policy_refusal',
+)
+
+
+def _norm_provenance_url(u):
+    u = str(u or '').strip().lower()
+    u = re.sub(r'^https?://', '', u)
+    u = u.split('#', 1)[0].split('?', 1)[0].rstrip('/')
+    return u
+
+
+def _research_fetch_urls(task):
+    """URLs the assigned agent actually fetched for THIS task (action_log,
+    read-only). The window starts at the task's creation; the fetch actions
+    are the same ones the weekly provenance audit treats as ground truth.
+    Returns [] on any DB problem -- the gate then demands the refusal-marker
+    escape rather than guessing."""
+    agent = task.get('assignedTo')
+    started = task.get('createdAt')
+    if not agent or not isinstance(started, (int, float)):
+        return []
+    import serve
+    try:
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT details FROM action_log WHERE agent_id = ? AND ts >= ? '
+                'AND action IN (?,?,?)',
+                (agent, int(started / 1000),
+                 *_PROVENANCE_FETCH_ACTIONS)).fetchall()
+    except Exception:
+        return []
+    urls = set()
+    for (details,) in rows:
+        try:
+            d = json.loads(details) if details else {}
+        except Exception:
+            d = {}
+        for k in ('url', 'finalUrl'):
+            u = _norm_provenance_url(d.get(k))
+            if u:
+                urls.add(u)
+    return sorted(urls)
+
+
+def _research_provenance_gap(task):
+    """None when a plain research card's deliverable is anchored to observed
+    work; otherwise the exact refusal reason. The gate (not the weekly audit)
+    is the chokepoint: a sandbox write never produces a library_write row, so
+    the     audit cannot see this class (task-2208: a 12-source 'Verified' report
+    written from model memory 64s after assignment, delivered from the sandbox
+    only, completed 112s in)."""
+    import serve
+    try:
+        if str(serve._load_env().get('COMPLETION_PROVENANCE_GATE', '1')).strip() == '0':
+            return None
+    except Exception:
+        pass
+    rel = task.get('libraryPath') or task.get('reportPath')
+    if not rel or not str(rel).strip():
+        return ('no Library artifact: save the report through the Library '
+                'write path so it lands in the trusted tree, and cite the '
+                'URLs you actually fetched')
+    path = os.path.join(serve.LIBRARY_DIR, str(rel).strip())
+    if not os.path.isfile(path):
+        return f'report artifact {rel} is not in the trusted Library'
+    try:
+        with open(path, encoding='utf-8', errors='ignore') as fh:
+            text = fh.read().lower()
+    except Exception:
+        return f'report artifact {rel} could not be read'
+    fetched = _research_fetch_urls(task)
+    for u in fetched:
+        if u and u in text:
+            return None
+    if any(m in text for m in _PROVENANCE_INABILITY_MARKERS):
+        return None
+    if not fetched:
+        return ('no fetch evidence in the action log for this task: do the '
+                'research (search_web or browse) before completing, then '
+                'cite the URLs you actually retrieved')
+    return ('the report cites no source that was fetched in-task: add the '
+            'retrieved URLs, or record the exact refusal that stopped the '
+            'fetches')
+
+
 def _completion_has_evidence(state, task):
     """A primary deliverable card may not close on an empty work channel.
 
@@ -822,13 +914,25 @@ def _completion_has_evidence(state, task):
         return True
     if (ttype == 'research' or task.get('research') or task.get('distill')
             or task.get('skillReview')):
-        # Scheduled research, distill, and skill-review cards record their
-        # outcome in the task note (a distill writes the wiki, a skill review
-        # promotes/rejects files); none of them files a per-task Library
-        # artifact. Require the note, not a fabricated path. They are queued
-        # as taskType 'code', so the generic code rule below would otherwise
-        # refuse every successful distillation.
-        return bool(str(task.get('note') or '').strip()) or bool(task.get('wikiPage'))
+        # Distill and skill-review cards record their outcome outside a
+        # per-task artifact (the wiki page, the promote/reject decision);
+        # standing research-topic cards write scheduled digests, not per-card
+        # files. Plain research cards are different: their deliverable IS the
+        # report, so note-only completion let a memory-written "Verified"
+        # report close as done with zero fetches (task-2208). A plain
+        # research card must save a trusted-Library artifact that cites a
+        # URL actually fetched in-task (or records the exact refusal that
+        # stopped the fetches -- honest inability stays completable,
+        # task-2193).
+        if task.get('wikiPage'):
+            return True
+        if task.get('distill') or task.get('skillReview'):
+            return bool(str(task.get('note') or '').strip())
+        if task.get('research'):
+            return bool(str(task.get('note') or '').strip())
+        if not str(task.get('note') or '').strip():
+            return False
+        return _research_provenance_gap(task) is None
     if ttype == 'bug':
         # codePublished is the coding lane's validated-publish signal. A bug
         # fix that shipped a real staged change must not be refused for a
@@ -862,8 +966,16 @@ def _completion_evidence_gap(task):
     ttype = str(task.get('taskType') or '')
     if (task.get('distill') or task.get('research') or task.get('skillReview')
             or ttype == 'research'):
-        return ('the task note is empty; record what the run produced in the note '
-                '(or the wiki page for a distill)')
+        if task.get('wikiPage'):
+            return 'the wiki page for the distill is missing'
+        if task.get('distill') or task.get('skillReview') or task.get('research'):
+            return ('the task note is empty; record what the run produced in the note '
+                    '(or the wiki page for a distill)')
+        if not str(task.get('note') or '').strip():
+            return ('the task note is empty; record what the run produced in the note '
+                    '(or the wiki page for a distill)')
+        gap = _research_provenance_gap(task)
+        return gap or 'the task note is empty'
     deliverable = str(task.get('deliverable') or '').strip().lower()
     if deliverable == 'report':
         return 'no reportPath or task note'
