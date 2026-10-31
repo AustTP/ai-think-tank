@@ -308,6 +308,36 @@ def init_db():
             created_at REAL NOT NULL,
             PRIMARY KEY (kind, key)
         )''')
+        # Scale slices (2026-10-31): the remaining high-cardinality state
+        # sections leave the whole-blob kv_state the same way task_archive
+        # did. state['agents'] (per-agent runtime: position, busy flags, walk
+        # path) mutates on every tick and scales linearly with headcount --
+        # at a 1,000-agent tank it is re-serialized on EVERY state save.
+        # agentRoster and playerInbox scale the same way (roster with
+        # headcount, inbox without bound, append-mostly). Per-row tables let
+        # a save upsert only the rows that changed and let the blob hold none
+        # of the three sections. get_state_from_db merges rows back in so
+        # every existing reader keeps its exact shape. seq preserves list
+        # order (roster order is deterministic round-robin / seniority order;
+        # inbox is chronological); the dict section needs no seq.
+        conn.execute('''CREATE TABLE IF NOT EXISTS live_agent (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS roster_agent (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS inbox_message (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Durable cursor for a live feed collector. AISStream is live-only, so
         # this records the last ingested frame and the reconnect coverage gap;
         # it is a checkpoint, not a replay buffer.

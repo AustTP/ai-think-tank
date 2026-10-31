@@ -555,6 +555,7 @@ def get_state_from_db(archive_merge='copy'):
         if not row:
             return None
         data = json.loads(row[0])
+    _merge_extracted_sections(data)
     _merge_archived_tasks(data, mode=archive_merge)
     return data
 
@@ -684,6 +685,139 @@ def _reconcile_task_archive(done):
         return True
 
 
+# --- Scale slices: high-cardinality sections leave the whole blob ---------
+#
+# The task_archive pattern, applied to the three sections that scale with
+# headcount/history and mutate constantly: state['agents'] (per-agent runtime
+# rewritten by every tick), state['agentRoster'] (metadata list, order
+# significant), state['playerInbox'] (append-mostly, unbounded). Each lives in
+# its own per-row table; a save upserts only rows that actually changed and
+# the blob holds none of the three. get_state_from_db merges the rows back in
+# so every existing reader keeps its exact shape.
+#
+# Authority rule (mirrors task_archive's live-wins merge, inverted): once a
+# section's table holds ANY rows, the table is authoritative and any legacy
+# blob copy is ignored. The first reconciling save writes the full section to
+# rows and drops the blob key in the same transaction, so a reader never sees
+# both carrying different data: before that save the table is empty (blob
+# legacy copy stands), after it the blob has no key. A reconcile failure keeps
+# the key in the blob -- a table that cannot be written must never silently
+# swallow its section.
+EXTRACTED_SECTIONS = (
+    # (state key, table name, shape): dict sections key rows by entry id;
+    # list sections order rows by seq (list index) with id as tiebreaker.
+    ('agents', 'live_agent', 'dict'),
+    ('agentRoster', 'roster_agent', 'list'),
+    ('playerInbox', 'inbox_message', 'list'),
+)
+_EXTRACTED_LOCK = threading.Lock()
+_EXTRACTED_CACHE = {key: {'db': None, 'loaded': False, 'rows': {}}
+                    for key, _table, _shape in EXTRACTED_SECTIONS}
+
+
+def _extracted_rows_load_locked(table, cache):
+    # Per-DB cache keyed like _TASK_ARCHIVE_CACHE so a test that repoints
+    # DB_PATH never reads another database's rows. An absent table (test
+    # schema predating the split) is an empty row set, never an error: the
+    # blob copy keeps standing and the first save recreates the table.
+    if cache['loaded'] and cache['db'] == DB_PATH:
+        return cache['rows']
+    rows = {}
+    try:
+        with _db() as conn:
+            for rid, seq, blob in conn.execute(
+                    f'SELECT id, seq, blob FROM {table}'):
+                rows[rid] = (int(seq), json.loads(blob))
+    except sqlite3.OperationalError:
+        rows = {}
+    cache['rows'] = rows
+    cache['db'] = DB_PATH
+    cache['loaded'] = True
+    return rows
+
+
+def _merge_extracted_sections(data):
+    # Always deep-copy, never alias: unlike the task archive (whose alias
+    # mode is load-bearing for reader perf), these sections are read by
+    # callers that heal/mutate them in place (190's identity heal runs on
+    # every read), and an aliased cache entry would swallow those mutations
+    # at the next diff -- silent data loss. The sections are small; the
+    # scaling win this slice exists for is on the WRITE path.
+    for key, table, shape in EXTRACTED_SECTIONS:
+        with _EXTRACTED_LOCK:
+            rows = _extracted_rows_load_locked(table, _EXTRACTED_CACHE[key])
+        if not rows:
+            continue
+        if shape == 'dict':
+            merged = {rid: obj for rid, (_seq, obj) in rows.items()}
+        else:
+            merged = [obj for _rid, (_seq, obj)
+                      in sorted(rows.items(), key=lambda kv: (kv[1][0], kv[0]))]
+        data[key] = copy.deepcopy(merged)
+
+
+def _reconcile_extracted_sections(conn, data):
+    """Diff the three sections against their row tables inside the caller's
+    transaction: upsert new/changed rows, delete removed ones. Returns the
+    section keys that may be dropped from the blob (reconcile succeeded); a
+    section that cannot be rowed (absent from the state, not a list/dict,
+    entries without ids) or whose table write fails keeps its blob copy --
+    never lose data. An ABSENT key is 'no information', not an empty section:
+    the table is left untouched and the key is only droppable when the table
+    already holds rows (which will restore it on read)."""
+    ok, now = [], time.time()
+    for key, table, shape in EXTRACTED_SECTIONS:
+        with _EXTRACTED_LOCK:
+            cache = _EXTRACTED_CACHE[key]
+            rows = _extracted_rows_load_locked(table, cache)
+        entries = data.get(key)
+        if not isinstance(entries, (list, dict)) or (
+                shape == 'list' and not isinstance(entries, list)) or (
+                shape == 'dict' and not isinstance(entries, dict)):
+            if rows:
+                ok.append(key)
+            continue
+        desired = {}
+        unrowable = False
+        if shape == 'dict':
+            for rid, entry in entries.items():
+                if not isinstance(entry, dict) or not isinstance(rid, str) or not rid:
+                    unrowable = True
+                    break
+                desired[rid] = (0, entry)
+        else:
+            for seq, entry in enumerate(entries):
+                if not isinstance(entry, dict) or not entry.get('id'):
+                    unrowable = True
+                    break
+                desired[str(entry['id'])] = (seq, entry)
+        if unrowable:
+            continue
+        changed = {rid: (seq, obj) for rid, (seq, obj) in desired.items()
+                   if rows.get(rid) != (seq, obj)}
+        deleted = [rid for rid in rows if rid not in desired]
+        try:
+            for rid, (seq, obj) in changed.items():
+                conn.execute(
+                    f'INSERT INTO {table} (id, seq, blob, updated_at) '
+                    f'VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET '
+                    f'seq = excluded.seq, blob = excluded.blob, '
+                    f'updated_at = excluded.updated_at',
+                    (rid, seq, json.dumps(obj), now))
+            for rid in deleted:
+                conn.execute(f'DELETE FROM {table} WHERE id = ?', (rid,))
+        except sqlite3.OperationalError:
+            continue
+        with _EXTRACTED_LOCK:
+            cache['rows'] = {**{rid: val for rid, val in rows.items()
+                                if rid not in deleted},
+                             **changed}
+            cache['db'] = DB_PATH
+            cache['loaded'] = True
+        ok.append(key)
+    return ok
+
+
 def save_state_to_db(data):
     # Pass 1 completion recovery: a stale whole-state save must not erase a
     # newer player recovery decision. Only tasks with newer intervention
@@ -744,6 +878,15 @@ def save_state_to_db(data):
             # every task in the blob so nothing is ever lost.
             blob = data
         with _db() as conn:
+            # Scale slices: reconcile the extracted sections (roster, live
+            # agents, player inbox) in the SAME transaction as the blob write,
+            # then drop the reconciled keys from the blob. A crash before this
+            # transaction leaves the blob carrying the legacy copies with an
+            # empty row table; a crash after it leaves rows authoritative with
+            # no blob copy. Either state reads correctly.
+            extracted_ok = _reconcile_extracted_sections(conn, data)
+            if extracted_ok:
+                blob = {k: v for k, v in blob.items() if k not in extracted_ok}
             conn.execute(
                 'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
