@@ -28,6 +28,8 @@ if _WORLD not in sys.path:
     sys.path.insert(0, _WORLD)
 
 _REPO = os.path.dirname(_WORLD)
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
 _LIVE_DB = os.path.join(_REPO, 'think_tank.db')
 
 _TMP_PREFIX = 'tt-test-db-'
