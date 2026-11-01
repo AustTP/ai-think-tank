@@ -565,17 +565,34 @@ def cell_fits_agent(gx, gy, cell, grid):
     return not _blocked_at({'x': p['x'], 'y': p['y'], 'w': AGENT_W, 'h': AGENT_H}, grid)
 
 
+_REACHABLE_MASK_CACHE = []
+
+
 def compute_reachable_mask(grid, spawn=None):
     """Mirror of agents.js computeReachableMask: flood-fill from the spawn
     cell over cellFitsAgent cells (full-box placement, the live-fixed rule).
     Returns a rows x cols list-of-lists of bool. A spawn cell that doesn't
-    fit the agent box yields an all-false mask (JS bails the same way)."""
+    fit the agent box yields an all-false mask (JS bails the same way).
+
+    Memoized per (grid identity, spawn): the mask is a pure function of the
+    static collision geometry, but recomputing the full BFS on every call cost
+    ~7ms at the main-grid scale -- once per tick in _reconcile_stranded_agents
+    and up to ~300 times inside a single pick_free_spot retry loop. Grids come
+    from the cached _load_outdoor_geometry or per-test synthetic grids and are
+    never mutated after construction, so a small identity-keyed cache is safe.
+    Entries keep a strong grid reference so id() reuse after GC can never
+    alias a stale mask."""
     spawn = spawn or SPAWN
+    key = (id(grid), spawn.get('x'), spawn.get('y'))
+    for cached_key, cached_grid, cached_mask in _REACHABLE_MASK_CACHE:
+        if cached_key == key and cached_grid is grid:
+            return cached_mask
     cols, rows, cell = grid['cols'], grid['rows'], grid['cell']
     mask = [[False] * cols for _ in range(rows)]
     start_gx = math.floor((spawn['x'] / SCALE) / cell)
     start_gy = math.floor((spawn['y'] / SCALE) / cell)
     if not cell_fits_agent(start_gx, start_gy, cell, grid):
+        _cache_reachable_mask(key, grid, mask)
         return mask
     stack = [(start_gx, start_gy)]
     mask[start_gy][start_gx] = True
@@ -589,7 +606,18 @@ def compute_reachable_mask(grid, spawn=None):
                 continue
             mask[ny][nx] = True
             stack.append((nx, ny))
+    _cache_reachable_mask(key, grid, mask)
     return mask
+
+
+def _cache_reachable_mask(key, grid, mask):
+    """LRU store for compute_reachable_mask (identity-checked, bounded)."""
+    for i, (cached_key, cached_grid, _) in enumerate(_REACHABLE_MASK_CACHE):
+        if cached_key == key and cached_grid is grid:
+            _REACHABLE_MASK_CACHE.pop(i)
+            break
+    _REACHABLE_MASK_CACHE.insert(0, (key, grid, mask))
+    del _REACHABLE_MASK_CACHE[8:]
 
 
 def is_reachable(x, y, grid, mask):
