@@ -348,13 +348,19 @@ def _expire_stale_dormancy_window(esc_id, esc):
     return True
 
 
-def _mark_escalation_rung(esc, rung):
+def _mark_escalation_rung(esc, rung, reviewer_id=None):
+    # Legacy per-rung flags stay written for compatibility with records and
+    # tests that read them; the chain walker uses `_chainTried` (reviewer ids),
+    # which survives a multi-run reporting chain without collapsing distinct
+    # rungs into one boolean.
     if rung == 'immediate':
         esc['_immediateTried'] = True
     elif rung == 'senior':
         esc['_seniorTried'] = True
     elif rung == 'admin':
         esc['_adminTried'] = True
+    if reviewer_id:
+        esc.setdefault('_chainTried', []).append(reviewer_id)
     esc['askCount'] = 0
     esc['lastAskedAt'] = 0
 
@@ -379,40 +385,50 @@ def _resolve_pending_escalations_sync():
     if not pending:
         return 0
     state = get_state_from_db()
-    senior_id = _senior_most_director_id(state)
-    if not senior_id:
-        return 0
     roster = {d['id']: d for d in (state.get('agentRoster', []) if state else [])}
+    # No governance at all -- no senior layer and no chief of staff: nothing
+    # to delegate to and nobody to route around, so stay quiet (the old
+    # senior-only guard kept these off the human's phone; the chain walker
+    # cannot do better).
+    if not _senior_directors(state) and not _admin_agent_id(state):
+        return 0
 
     resolved = 0
     now = time.time()
     dirty = False
     for esc_id, esc in pending.items():
         esc_kind = esc.get('kind') or 'unknown'
-        # Chain: the requester's own director, then the senior director, then
-        # the chief of staff. `_immediateTried` is set when the first rung
-        # gives up or cannot decide.
         # Migration for records written before the admin-as-reviewer fix:
         # the rung was marked tried even though the admin was never asked.
-        # Give it its one turn. adminAskedAt is set when it is actually asked,
-        # so this cannot loop.
+        # Give it its one turn. adminAskedAt is set when it is actually
+        # asked, so this cannot loop.
         if esc.get('_adminTried') and not esc.get('adminAskedAt'):
             esc['_adminTried'] = False
             dirty = True
-        immediate_id = _escalation_requester_director(state, esc)
-        admin_id = _admin_agent_id(state)
-        # One attempt per rung: the requester's own director, then the senior
-        # director (only when distinct), then the chief of staff/admin. A
-        # non-decision marks that rung tried and the NEXT pass asks the next
-        # rung, instead of re-asking the same unsure reviewer for hours.
+        # The full review chain, in hand-up order (see
+        # _escalation_review_chain): the requester's own reporting chain rung
+        # by rung, then the senior layer, then the chief of staff. One attempt
+        # per reviewer: a non-decision marks that reviewer tried and the NEXT
+        # pass asks the NEXT rung, instead of re-asking the same unsure
+        # reviewer for hours. Legacy `_immediateTried`/`_seniorTried`/
+        # `_adminTried` flags fold into the tried set so pre-chain records
+        # keep their place in the walk.
+        chain = _escalation_review_chain(state, esc)
+        tried = list(esc.get('_chainTried') or [])
+        for flag, rung_label in (('_immediateTried', 'immediate'),
+                                 ('_seniorTried', 'senior'),
+                                 ('_adminTried', 'admin')):
+            if esc.get(flag):
+                for rid, rg in chain:
+                    if rg == rung_label and rid not in tried:
+                        tried.append(rid)
+                        break
         reviewer_id, rung = None, None
-        if immediate_id and not esc.get('_immediateTried'):
-            reviewer_id, rung = immediate_id, 'immediate'
-        elif senior_id and senior_id != immediate_id and not esc.get('_seniorTried'):
-            reviewer_id, rung = senior_id, 'senior'
-        elif admin_id and admin_id not in (immediate_id, senior_id) and not esc.get('_adminTried'):
-            reviewer_id, rung = admin_id, 'admin'
-        director_id = reviewer_id or senior_id
+        for rid, rg in chain:
+            if rid not in tried:
+                reviewer_id, rung = rid, rg
+                break
+        director_id = reviewer_id
         director_def = roster.get(director_id, {}) if director_id else {}
         director_name = director_def.get('name', director_id or 'the director')
         if _expire_stale_dormancy_window(esc_id, esc):
@@ -445,8 +461,9 @@ def _resolve_pending_escalations_sync():
                 esc['humanNotified'] = True
                 notify_human_of_escalation(
                     esc_id, esc,
-                    context='The director, senior director, and chief of staff all '
-                            'declined or could not decide this, so it is now yours.')
+                    context='The full director chain (the requester\'s managers, the senior '
+                            'directors, and the chief of staff) declined or could not '
+                            'decide this, so it is now yours.')
                 dirty = True
             continue
         if rung == 'admin':
@@ -456,13 +473,15 @@ def _resolve_pending_escalations_sync():
                 resolved += 1
                 continue
             esc['_adminTried'] = True
+            esc.setdefault('_chainTried', []).append(reviewer_id)
             dirty = True
             if not esc.get('humanNotified'):
                 esc['humanNotified'] = True
                 notify_human_of_escalation(
                     esc_id, esc,
-                    context='The director, senior director, and chief of staff all '
-                            'declined or could not decide this, so it is now yours.')
+                    context='The full director chain (the requester\'s managers, the senior '
+                            'directors, and the chief of staff) declined or could not '
+                            'decide this, so it is now yours.')
             continue
         esc['lastAskedAt'] = now
         esc['askCount'] = (esc.get('askCount') or 0) + 1
@@ -496,7 +515,7 @@ def _resolve_pending_escalations_sync():
             # move to the next one on the next pass. Never auto-approve on a
             # classifier failure.
             _escalation_jev_errors.bump(esc_kind)
-            _mark_escalation_rung(esc, rung)
+            _mark_escalation_rung(esc, rung, reviewer_id)
             dirty = True
             continue
         # Composite multi-signal trust gate: confidence is just one signal. We
@@ -520,7 +539,7 @@ def _resolve_pending_escalations_sync():
                         'confidence': confidence, 'composite': round(composite, 3), 'floor': floor,
                         'model': review_model,
                         'reason': 'below-kind-floor' if composite < floor else 'low-confidence'}, authorized=False)
-            _mark_escalation_rung(esc, rung)
+            _mark_escalation_rung(esc, rung, reviewer_id)
             dirty = True
             continue
         # Heterogeneous-judge cross-check: the director's auto-approval now has
@@ -541,7 +560,7 @@ def _resolve_pending_escalations_sync():
                            {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
                             'primary': decision, 'primary_confidence': confidence},
                            authorized=False)
-                _mark_escalation_rung(esc, rung)
+                _mark_escalation_rung(esc, rung, reviewer_id)
                 dirty = True
                 continue
             if judge_decision != decision:
@@ -551,7 +570,7 @@ def _resolve_pending_escalations_sync():
                             'primary': decision, 'judge_decision': judge_decision,
                             'primary_confidence': confidence, 'judge_confidence': judge_conf},
                            authorized=False)
-                _mark_escalation_rung(esc, rung)
+                _mark_escalation_rung(esc, rung, reviewer_id)
                 dirty = True
                 continue
             if (confidence >= ESCALATION_JUDGE_ALPHA_HIGH
@@ -562,7 +581,7 @@ def _resolve_pending_escalations_sync():
                            {'escalationId': esc_id, 'kind': esc_kind, 'judge': judge_model,
                             'decision': decision, 'confidence': confidence, 'judge_confidence': judge_conf},
                            authorized=False)
-                _mark_escalation_rung(esc, rung)
+                _mark_escalation_rung(esc, rung, reviewer_id)
                 dirty = True
                 continue
         esc['status'] = 'approved' if decision == 'approve' else 'denied'

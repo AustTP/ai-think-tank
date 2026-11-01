@@ -722,11 +722,15 @@ def _room_definitions(state):
 
 
 def _free_authority(state):
-    """tasks.js assignBigTask's authority pick: the chief of staff (Theo) if free, else
-    the senior-most director (Nora). Works from server-authoritative roster +
-    agent busy/offDuty state."""
+    """tasks.js assignBigTask's authority pick: the chief of staff (Theo) if
+    free, else the first AVAILABLE senior director. The senior layer is the
+    directors who stand in for the admin on approvals -- a directorless root
+    (Nora) or a top-level team director reporting directly to an admin -- so
+    any free member can take the delegation. Works from server-authoritative
+    roster + agent busy/offDuty state."""
     roster = state.get('agentRoster') or []
     agents = state.get('agents') or {}
+    admin_ids = {d.get('id') for d in roster if d.get('isAdmin')}
     def _is_free(d):
         a = agents.get(d.get('id'))
         return a is not None and not a.get('busy') and not a.get('offDuty')
@@ -734,7 +738,9 @@ def _free_authority(state):
         if d.get('isAdmin') and _is_free(d):
             return d
     for d in roster:
-        if d.get('isDirector') and not d.get('isAdmin') and not d.get('director') and _is_free(d):
+        if (d.get('isDirector') and not d.get('isAdmin')
+                and (not d.get('director') or d.get('director') in admin_ids)
+                and _is_free(d)):
             return d
     return None
 
@@ -745,13 +751,17 @@ def _wake_authority_on_request(state):
     admin' (tasks.js). Without this an all-off-duty think tank is un-delegable:
     _free_authority needs someone on-duty, but there's no player-facing wake
     control, so a resting authority can never accept the very first task.
-    Reach for an off-duty admin, else the senior-most off-duty director, and
-    wake her in place (appear_from_outskirts). No-op (returns None) if *all*
-    authorities are busy rather than merely resting."""
+    Reach for an off-duty admin, else the first off-duty senior director (the
+    senior layer: directorless roots or team directors reporting to an
+    admin), and wake her in place (appear_from_outskirts). No-op (returns
+    None) if *all* authorities are busy rather than merely resting."""
+    roster = state.get('agentRoster') or []
+    admin_ids = {d.get('id') for d in roster if d.get('isAdmin')}
     for pick in (
-        (d for d in state.get('agentRoster') or [] if d.get('isAdmin')),
-        (d for d in state.get('agentRoster') or []
-         if d.get('isDirector') and not d.get('isAdmin') and not d.get('director')),
+        (d for d in roster if d.get('isAdmin')),
+        (d for d in roster
+         if d.get('isDirector') and not d.get('isAdmin')
+         and (not d.get('director') or d.get('director') in admin_ids)),
     ):
         for d in pick:
             a = (state.get('agents') or {}).get(d.get('id'))

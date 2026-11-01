@@ -322,11 +322,8 @@ class ResolveEscalationsTest(unittest.TestCase):
                                return_value={'e1': esc}), \
              mock.patch.object(serve, 'get_state_from_db', return_value={
                  'agentRoster': [{'id': 'd1'}, {'id': 'a1', 'director': 'd1'},
+                                 {'id': 's1', 'isDirector': True},
                                  {'id': 'admin1', 'isAdmin': True}]}), \
-             mock.patch.object(serve, '_senior_most_director_id',
-                               return_value=patches.get('senior', 'd1')), \
-             mock.patch.object(serve, '_escalation_requester_director',
-                               return_value='d1'), \
              mock.patch.object(serve, '_escalation_floor',
                                return_value=patches.get('floor', 0.0)), \
              mock.patch.object(serve, '_escalation_judge_drift',
@@ -367,17 +364,22 @@ class ResolveEscalationsTest(unittest.TestCase):
         self.assertEqual(self._run(esc, floor=0.9, score=0.0), 0)
         self.assertTrue(esc['_immediateTried'])
 
-    def test_admin_resolves_after_the_director(self):
+    def test_admin_resolves_after_the_director_and_senior(self):
+        # The chain walks a1 -> d1 (immediate) -> s1 (senior) -> admin1; both
+        # earlier rungs already tried, so the admin attempt is the live one.
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
-               '_immediateTried': True}
+               '_immediateTried': True, '_seniorTried': True}
         self.assertEqual(self._run(esc, admin=True), 1)
         self.assertFalse(esc.get('_adminTried'))
 
     def test_unsure_senior_marks_senior_tried(self):
+        # A non-decision by the senior rung marks HER tried; the next pass
+        # climbs to the admin instead of re-asking the same unsure senior.
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',
                '_immediateTried': True}
-        self.assertEqual(self._run(esc, senior='d2', floor=0.9, score=0.0), 0)
+        self.assertEqual(self._run(esc, floor=0.9, score=0.0), 0)
         self.assertTrue(esc['_seniorTried'])
+        self.assertEqual(esc.get('_chainTried'), ['s1'])
 
     def test_below_floor_resets_immediate(self):
         esc = {'status': 'pending', 'kind': 'routine', 'agentId': 'a1',

@@ -184,11 +184,22 @@ class FreeAuthority(unittest.TestCase):
         state["agents"]["agent-1"]["busy"] = True
         self.assertEqual(serve._free_authority(state)["id"], "agent-2")
 
-    def test_director_with_director_attr_skipped(self):
+    def test_director_of_a_non_admin_is_skipped(self):
+        # A subdirector (a director whose own director is not an admin) is
+        # not in the senior layer: she reports to her director, not to the
+        # chief of staff.
+        state = _roster_state()
+        state["agents"]["agent-1"]["busy"] = True
+        state["agentRoster"][1]["director"] = "agent-3"
+        self.assertIsNone(serve._free_authority(state))
+
+    def test_director_of_the_admin_is_in_the_senior_layer(self):
+        # The senior layer includes directors reporting directly to an admin:
+        # any free member can take the delegation, not one named senior.
         state = _roster_state()
         state["agents"]["agent-1"]["busy"] = True
         state["agentRoster"][1]["director"] = "agent-1"
-        self.assertIsNone(serve._free_authority(state))
+        self.assertEqual(serve._free_authority(state)["id"], "agent-2")
 
     def test_all_busy(self):
         state = _roster_state()

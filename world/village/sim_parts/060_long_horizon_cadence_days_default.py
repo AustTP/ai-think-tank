@@ -747,14 +747,26 @@ _governance_decider = _governance_decider_default
 
 
 def _senior_director(state):
-    """firing.js firingReviewers: the senior-most director -- a roster entry
-    that isDirector, not the admin, and has no `director` of its own (the top
-    of the chain that stands in for the admin on approvals)."""
+    """firing.js firingReviewers: the senior-most director -- the first
+    AVAILABLE senior director (on-duty, not busy) in roster order, falling
+    back to the first senior director in roster order when every one is busy
+    or off duty. The senior layer is any director (not the admin) with no
+    `director` of its own or reporting directly to an admin: the directorless
+    root (Nora) and the top-level team directors all stand in for the admin
+    on approvals; no single one of them is special."""
     roster = state.get('agentRoster') or []
-    for d in roster:
-        if d.get('isDirector') and not d.get('isAdmin') and not d.get('director'):
+    admin_ids = {d.get('id') for d in roster if d.get('isAdmin')}
+    pool = [d for d in roster
+            if d.get('isDirector') and not d.get('isAdmin')
+            and (not d.get('director') or d.get('director') in admin_ids)]
+    if not pool:
+        return None
+    agents = state.get('agents') or {}
+    for d in pool:
+        a = agents.get(d.get('id'))
+        if a is not None and not a.get('busy') and not a.get('offDuty'):
             return d
-    return None
+    return pool[0]
 
 
 def _firing_reviewers(state):

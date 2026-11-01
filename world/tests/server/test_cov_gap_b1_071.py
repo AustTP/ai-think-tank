@@ -492,11 +492,35 @@ def test_grant_budget_reopens_budget_failure(monkeypatch):
 
 def test_senior_most_director_id():
     assert serve._senior_most_director_id(None) is None
+    # The senior layer is shared duty: the directorless root AND the directors
+    # reporting directly to an admin all stand in for the admin on approvals,
+    # so roster order picks when nobody is busy or off duty.
     assert serve._senior_most_director_id({'agentRoster': [
         {'id': 'theo', 'isDirector': True, 'isAdmin': True},
         {'id': 'ben', 'isDirector': True, 'director': 'theo'},
         {'id': 'nora', 'isDirector': True},
-    ]}) == 'nora'
+    ]}) == 'ben'
+    # Availability first: a busy ben defers to the free nora.
+    assert serve._senior_most_director_id({
+        'agentRoster': [
+            {'id': 'theo', 'isDirector': True, 'isAdmin': True},
+            {'id': 'ben', 'isDirector': True, 'director': 'theo'},
+            {'id': 'nora', 'isDirector': True}],
+        'agents': {'ben': {'busy': True}}}) == 'nora'
+    # Everyone busy or resting: fall back to the first senior in roster order
+    # so a resting-but-present senior is still routed to.
+    assert serve._senior_most_director_id({
+        'agentRoster': [
+            {'id': 'theo', 'isDirector': True, 'isAdmin': True},
+            {'id': 'ben', 'isDirector': True, 'director': 'theo'},
+            {'id': 'nora', 'isDirector': True}],
+        'agents': {'ben': {'busy': True}, 'nora': {'offDuty': True}}}) == 'ben'
+    # exclude skips one senior (the chain walker's next-rung step).
+    assert serve._senior_most_director_id({'agentRoster': [
+        {'id': 'theo', 'isDirector': True, 'isAdmin': True},
+        {'id': 'ben', 'isDirector': True, 'director': 'theo'},
+        {'id': 'nora', 'isDirector': True},
+    ]}, exclude=('ben',)) == 'nora'
     assert serve._senior_most_director_id({'agentRoster': [
         {'id': 'ben', 'isDirector': False}]}) is None
 

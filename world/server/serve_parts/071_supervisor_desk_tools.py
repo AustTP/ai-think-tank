@@ -717,17 +717,98 @@ def supervisor_grant_budget(agent_id, task_id, budget_usd, reason=''):
                   'spentUsd': spent, 'reopened': status == 'failed'}
 
 
-def _senior_most_director_id(state):
-    # "Senior-most director" = the director who stands in for the ADMIN to
-    # approve/deny on the chief of staff's behalf. It is therefore the top of the
-    # director chain EXCLUDING the admin(s): a director, not themselves
-    # supervised by any other director (no `director` field), and not an admin.
-    # In the current roster that is Nora (Theo is the chief of staff and also a director,
-    # but she doesn't delegate to herself). Returns the agent id, or None if
-    # there is no eligible non-chief-of-staff director to stand in (in which case
-    # escalations just keep waiting for the human, as before).
+def _senior_directors(state):
+    # The senior layer: directors (not admins) at the top of the chain -- no
+    # `director` of their own, or reporting directly to an admin. The
+    # directorless root (Nora) and the top-level team directors reporting to
+    # the chief of staff are all stand-ins for the ADMIN on approvals; no
+    # single one of them is special.
     roster = state.get('agentRoster', []) if state else []
-    for d in roster:
-        if d.get('isDirector') and not d.get('isAdmin') and not d.get('director'):
+    admin_ids = {d.get('id') for d in roster if d.get('isAdmin')}
+    return [d for d in roster
+            if d.get('isDirector') and not d.get('isAdmin')
+            and (not d.get('director') or d.get('director') in admin_ids)]
+
+
+def _senior_director_available(state, d):
+    # A senior director can take a delegated review when she is on duty and
+    # not busy with a task. Roster rows without a live agent record (cold
+    # tests, seeded rosters) count as available -- the delegated review is a
+    # model call on the director's behalf, not a task the agent must schedule.
+    agents = (state or {}).get('agents') or {}
+    a = agents.get((d or {}).get('id'))
+    return a is None or (not a.get('busy') and not a.get('offDuty'))
+
+
+def _senior_most_director_id(state, exclude=None):
+    # "Senior-most director" = the director who stands in for the ADMIN to
+    # approve/deny on the chief of staff's behalf. The senior layer (see
+    # _senior_directors) shares the duty: prefer the first AVAILABLE senior
+    # director (on-duty, not busy) in roster order, falling back to the first
+    # senior director in roster order when every one is busy or off duty, so a
+    # resting-but-present senior can still be routed to. `exclude` skips one
+    # senior (used when walking a review chain to the next rung). Returns the
+    # agent id, or None if there is no eligible senior director to stand in
+    # (in which case escalations just keep waiting for the human, as before).
+    for d in _senior_directors(state):
+        if d.get('id') in (exclude or ()):
+            continue
+        if _senior_director_available(state, d):
+            return d.get('id')
+    for d in _senior_directors(state):
+        if d.get('id') not in (exclude or ()):
             return d.get('id')
     return None
+
+
+def _escalation_review_chain(state, esc):
+    """The escalation rungs for one escalation, in hand-up order:
+    [(reviewerId, rung), ...]. The requester's own reporting chain is walked
+    rung by rung (immediate director first, then her director's director, and
+    so on), then the senior layer is asked (available seniors first in roster
+    order, then the rest), and the admin (chief of staff) is the final
+    internal rung. At village scale this matters: a deep worker's escalation
+    first reaches her own subdirector layer, and only an escalation every
+    rung of her chain hesitated on climbs toward the senior directors and the
+    admin -- the senior layer is not a shortcut past subdirector judgment.
+    Chains are computed from live state per pass, so reviewer availability
+    shapes the senior-layer order at pickup time; the walk up the reporting
+    chain is purely structural (roster order)."""
+    if esc is None:
+        return []
+    roster = {d.get('id'): d for d in (state.get('agentRoster', []) if state else [])}
+    admin_ids = {d.get('id') for d in roster.values() if d.get('isAdmin')}
+    admin = _admin_agent_id(state)
+    requester = esc.get('agentId')
+    chain = []
+    seen = set()
+
+    def _add(rid, rung):
+        if rid and rid not in seen and rid != requester:
+            seen.add(rid)
+            chain.append((rid, rung))
+
+    # 1. Walk up the requester's reporting chain. Every ancestor below the
+    #    senior layer judges from its own vantage point; the walk stops at an
+    #    admin (the final rung, added last below) or at the roster root.
+    #    Legacy records without an agentId (pre-agent-attribution writes)
+    #    skip the walk and go straight to the senior layer, as the old
+    #    senior-most-director loop did.
+    if requester:
+        cur = (roster.get(requester) or {}).get('director')
+        while cur and cur in roster and cur != requester and cur not in seen:
+            if cur in admin_ids:
+                break
+            _add(cur, 'immediate')
+            cur = (roster.get(cur) or {}).get('director')
+    # 2. The senior layer stands in for the admin on approvals. Prefer
+    #    available seniors so a resting senior does not gate a chain an
+    #    on-duty senior could resolve now; roster order breaks ties.
+    for d in _senior_directors(state):
+        if _senior_director_available(state, d):
+            _add(d.get('id'), 'senior')
+    for d in _senior_directors(state):
+        _add(d.get('id'), 'senior')
+    # 3. The chief of staff is the last internal rung before the owner.
+    _add(admin, 'admin')
+    return chain

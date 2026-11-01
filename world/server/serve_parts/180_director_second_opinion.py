@@ -29,13 +29,15 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
     except Exception:
         state = {}
     roster = {d.get('id'): d for d in (state.get('agentRoster') or [])}
-    senior_id = _senior_most_director_id(state)
     admin_id = _admin_agent_id(state)
-    immediate_id = (roster.get(agent_id) or {}).get('director')
-    chain = []
-    for cid in (immediate_id, senior_id, admin_id):
-        if cid and cid != agent_id and cid not in chain and cid in roster:
-            chain.append(cid)
+    # The full review chain (see _escalation_review_chain): the requester's
+    # own reporting chain rung by rung, then the senior layer (available
+    # seniors first), then the chief of staff. A low-confidence allow from a
+    # worker therefore climbs her own managers before it reaches a senior or
+    # the owner -- subdirector-level judgment stays where the requester sits.
+    chain = [(rid, rg) for rid, rg in
+             _escalation_review_chain(state, {'agentId': agent_id})
+             if rid in roster]
     if not chain:
         return False
     threshold = _effective_safety_confidence()
@@ -50,11 +52,9 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
         'approve': 'Ordinary, legitimate, in-scope work; the low JEV confidence was caution, not a concrete risk.',
         'deny': 'Unsafe, destructive, credential/secret access or exfiltration, out of scope, or not justified.',
     }
-    for level, reviewer_id in enumerate(chain):
+    for level, (reviewer_id, rung) in enumerate(chain):
         reviewer = roster.get(reviewer_id) or {}
         name = reviewer.get('name') or reviewer_id
-        rung = ('admin' if reviewer_id == admin_id else
-                'senior' if reviewer_id == senior_id else 'immediate')
         # Role-differentiated rung framing (see _escalation_rung_instructions):
         # the requester's own director judges task scope with team context, the
         # senior director judges the authority boundary, and the chief of staff
@@ -118,9 +118,10 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
             f'Agent {agent_id} needs a decision on this {noun}: {target_for_review}\n'
             f'Stated purpose: {purpose or "not given"}\n'
             f'JEV confidence {confidence:.2f} was below the {threshold:.2f} '
-            'safety threshold, and the director, senior director, and chief '
-            'of staff all declined or could not decide.',
-            what_checked='JEV plus the full director -> senior director -> chief of staff chain',
+            'safety threshold, and the full director chain (the agent\'s '
+            'managers, the senior directors, and the chief of staff) all '
+            'declined or could not decide.',
+            what_checked='JEV plus the full reporting-chain -> senior -> chief-of-staff chain',
             look_first=target_for_review,
             agent_id=agent_id)
         # The rung votes survive onto the record so the owner (and any later
@@ -441,9 +442,17 @@ def set_model_benchmark_score(model_id, benchmark, score, source_url, evaluator=
         )
 
 
-def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
-    """The candidates that clear the band's quality bar, cheapest first: those
-    within `floor_gap` points of the best stored score in the pool. Pure and
+def _best_value_qualifiers_sync(candidates, scores, floor_gap=None,
+                                min_score=None):
+    """The candidates that clear the band's quality bar, cheapest first:
+    those within `floor_gap` points of the best stored score in the pool,
+    and -- when `min_score` is set -- only candidates whose own stored score
+    is at or above that absolute floor. Two different failure modes, two
+    different bars: the relative gap keeps a pick near the best of its pool;
+    the absolute floor is the operator's rule that a tier's models HOLD an
+    evaluation-score threshold -- an unscored candidate (no benchmark row at
+    all) is never eligible for a floored band, which is exactly how the low
+    band once landed on the cheapest unscored candidate. Pure and
     network-free -- `_best_value_pick` live-verifies down this list, and the
     price watch reuses the same list to spot a cheaper qualifier appearing
     WITHOUT paying for verify probes. Returns [] when nothing in `candidates`
@@ -454,6 +463,10 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
     scored = [m for m in candidates if m['id'] in scores]
     if not scored:
         return []
+    if min_score is not None:
+        scored = [m for m in scored if scores[m['id']] >= min_score]
+        if not scored:
+            return []
     best_score = max(scores[m['id']] for m in scored)
     return sorted(
         (m for m in scored if scores[m['id']] >= best_score - floor_gap),
@@ -461,7 +474,8 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None):
     )
 
 
-async def _best_value_pick(candidates, scores, floor_gap=None, band=None):
+async def _best_value_pick(candidates, scores, floor_gap=None, band=None,
+                           min_score=None):
     # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
     # quality floor of the best score present, then take the first one on
@@ -476,7 +490,9 @@ async def _best_value_pick(candidates, scores, floor_gap=None, band=None):
     # Returns None if nothing in `candidates` has a stored score yet, or
     # nothing verified works -- callers fall back to Jev's classifier in
     # that case.
-    for candidate in _speed_tie_order(_best_value_qualifiers_sync(candidates, scores, floor_gap), band):
+    for candidate in _speed_tie_order(
+            _best_value_qualifiers_sync(candidates, scores, floor_gap,
+                                        min_score=min_score), band):
         if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
             return candidate
     return None

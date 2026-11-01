@@ -47,7 +47,9 @@ def test_low_confidence_nora_deny_moves_to_chief_of_staff():
     models = []
 
     def quorum(instr, criteria, **kwargs):
-        calls.append('nora' if ', the senior director' in instr else 'theo')
+        # Nora is ruth's own director (an immediate rung in the chain walk);
+        # the instructions carry the reviewer's name in every framing.
+        calls.append('nora' if 'Nora' in instr else 'theo')
         models.append(kwargs.get('model'))
         return ('deny', 0.30, 0.0) if len(calls) == 1 else ('approve', 0.91, 0.0)
 

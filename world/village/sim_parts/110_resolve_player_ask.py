@@ -443,10 +443,10 @@ def _queue_watchdog_alert(state, agent_id, payload, now_ms):
         'instructions': text or 'Investigate the sim-loop watchdog alert now that you have been notified.',
         'goal': 'sim-watchdog',
         # A watchdog investigation is a research lane, NOT the default code
-        # lane. The senior director (Nora when she is the top director) is
-        # excluded from code work by governance.may_work_code, so a default
-        # code item pinned to her was filtered out at assignment and the
-        # alert never got an owner.
+        # lane. A senior director (the notification's recipient) is excluded
+        # from code work by governance.may_work_code, so a default code item
+        # pinned to her was filtered out at assignment and the alert never
+        # got an owner.
         'taskType': 'research',
         'assignedTo': agent_id,  # wake-on-mail pin: THIS agent investigates
         '_mailResume': True,

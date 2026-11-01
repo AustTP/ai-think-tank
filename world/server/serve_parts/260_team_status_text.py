@@ -744,18 +744,23 @@ async def _route_lane_unclear(state, text, admin_id, session_id=None):
 
 
 def _unclear_lane_authority(state):
-    """The authority who answers an 'unclear' lane ask: the senior-most
-    non-chief-of-staff director if free, else the chief of staff if free, else None (ask_core
-    degrades to a round-robin agent / parking). Mirrors _free_authority's
-    free/on-duty gate but flips the priority -- a multi-intent bundle is a
-    director judgment call, so the senior-most director speaks first."""
+    """The authority who answers an 'unclear' lane ask: the first AVAILABLE
+    senior director (the senior layer: directorless roots or team directors
+    reporting to an admin), else the chief of staff if free, else None
+    (ask_core degrades to a round-robin agent / parking). Mirrors
+    _free_authority's free/on-duty gate but flips the priority -- a
+    multi-intent bundle is a director judgment call, so the senior layer
+    speaks first."""
     roster = state.get('agentRoster') or []
     agents = state.get('agents') or {}
+    admin_ids = {d.get('id') for d in roster if d.get('isAdmin')}
     def _free(d):
         a = agents.get(d.get('id'))
         return a is not None and not a.get('busy') and not a.get('offDuty')
     for d in roster:
-        if d.get('isDirector') and not d.get('isAdmin') and not d.get('director') and _free(d):
+        if (d.get('isDirector') and not d.get('isAdmin')
+                and (not d.get('director') or d.get('director') in admin_ids)
+                and _free(d)):
             return d
     for d in roster:
         if d.get('isAdmin') and _free(d):
