@@ -168,8 +168,11 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('vendor/free', '0', '0',
                         input_mods=('image', 'text')),
         ]
-        serve.set_model_benchmark_score('low/m1', 'intelligence_index', 0.7, 'u')
-        serve.set_model_benchmark_score('mid/m1', 'intelligence_index', 0.75, 'u')
+        # intelligence_index is a 0-100 scale in the real catalog (AA);
+        # the band floor (BAND_MIN_SCORE, default low=30) is read on that
+        # scale, so fixtures use it.
+        serve.set_model_benchmark_score('low/m1', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('mid/m1', 'intelligence_index', 75.0, 'u')
         serve.set_model_benchmark_score('mid/c1', 'coding_index', 0.65, 'u')
         serve.set_model_benchmark_score('high/h1', 'agentic_index', 0.55, 'u')
         serve.set_model_benchmark_score('mid/v1', 'MMMU', 0.6, 'u')
@@ -290,7 +293,7 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('low/primary', '0.0000001', '0.0000001'),
             self._model('low/fallback', '0.0000001', '0.0000001'),
         ]
-        serve.set_model_benchmark_score('low/primary', 'intelligence_index', 0.7, 'u')
+        serve.set_model_benchmark_score('low/primary', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('low/fallback', 'MMLU-Pro', 0.95, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
@@ -322,6 +325,87 @@ class RefreshModelTiers(unittest.TestCase):
             chosen = asyncio.run(serve.refresh_model_tiers())
         self.assertEqual(chosen['low']['id'], 'low/b')
 
+    def test_band_min_score_excludes_below_floor_and_unscored(self):
+        # The absolute floor (the operator's "the low tier holds the
+        # evaluation score threshold" rule): a scored candidate below the
+        # floor is not eligible, and an unscored candidate is never eligible
+        # either -- the failure mode that once landed an unscored
+        # cheapest-candidate pick in the low band.
+        models = [
+            self._model('low/unscored', '0.00000005', '0.00000005'),
+            self._model('low/weak', '0.00000006', '0.00000006'),
+            self._model('low/ok', '0.00000008', '0.00000008'),
+        ]
+        serve.set_model_benchmark_score('low/weak', 'intelligence_index', 20.0, 'u')
+        serve.set_model_benchmark_score('low/ok', 'intelligence_index', 40.0, 'u')
+        scores = {r['model_id']: r['score'] for r in serve.get_model_benchmark_scores()}
+        pool = serve._band_candidate_pools(models)['low']
+        quals = serve._best_value_qualifiers_sync(
+            pool, scores, serve.BAND_QUALITY_FLOOR_GAP.get('low'),
+            min_score=serve.BAND_MIN_SCORE.get('low'))
+        self.assertEqual([m['id'] for m in quals], ['low/ok'])
+
+    def test_floored_band_widens_to_the_cheapest_floor_holder(self):
+        # The low band's own price bucket holds no candidate at the floor:
+        # the refresh widens across every price bucket (under the band's
+        # price ceiling) and picks the cheapest scored model that DOES hold
+        # the floor, instead of trusting the unscored classifier fallback.
+        models = [
+            self._model('low/unscored', '0.00000005', '0.00000005'),
+            self._model('mid/holder', '0.0000005', '0.0000005'),
+        ]
+        serve.set_model_benchmark_score('mid/holder', 'intelligence_index', 70.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['low']['id'], 'mid/holder')
+
+    def test_floored_band_fails_closed_without_any_scores(self):
+        # No evaluation score on file for any metric in the band's chain: a
+        # floored band cannot claim to hold the threshold, so the refresh
+        # keeps the previous pick instead of handing the tier to the
+        # unscored classifier fallback.
+        models = [self._model('low/unscored', '0.00000005', '0.00000005')]
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch('builtins.print') as pr:
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertNotIn('low', chosen)
+        self.assertTrue(any('no evaluation score on file' in str(c)
+                            for c in pr.call_args_list))
+
+    def test_floored_band_keeps_previous_pick_when_floor_unreachable(self):
+        # The floor exists nowhere in the catalog (no scored candidate holds
+        # it): fail closed -- keep the previous pick, never an unscored one.
+        models = [
+            self._model('low/weak', '0.00000005', '0.00000005'),
+            self._model('mid/weak', '0.0000005', '0.0000005'),
+        ]
+        serve.set_model_benchmark_score('low/weak', 'intelligence_index', 10.0, 'u')
+        serve.set_model_benchmark_score('mid/weak', 'intelligence_index', 12.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch('builtins.print') as pr:
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertNotIn('low', chosen)
+        self.assertTrue(any('keeping the previous pick' in str(c)
+                            for c in pr.call_args_list))
+
     def test_empty_band_skips_and_classifier_fallback_picks(self):
         models = [self._model('mid/only', '0.000002', '0.000002')]
         decision = {'answers': {'q': {'choice': 'mid/only'}}, 'usage': {'cost': 0.01}}
@@ -348,8 +432,8 @@ class RefreshModelTiers(unittest.TestCase):
             dict(self._model('low/reason', '0.00000001', '0.00000001'),
                  reasoning={'default_enabled': True}),
         ]
-        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 0.4, 'u')
-        serve.set_model_benchmark_score('low/reason', 'intelligence_index', 0.7, 'u')
+        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 40.0, 'u')
+        serve.set_model_benchmark_score('low/reason', 'intelligence_index', 70.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
@@ -371,8 +455,8 @@ class RefreshModelTiers(unittest.TestCase):
             dict(self._model('low/mand', '0.00000004', '0.00000004'),
                  reasoning={'mandatory': True}),
         ]
-        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 0.4, 'u')
-        serve.set_model_benchmark_score('low/mand', 'intelligence_index', 0.7, 'u')
+        serve.set_model_benchmark_score('low/plain', 'intelligence_index', 40.0, 'u')
+        serve.set_model_benchmark_score('low/mand', 'intelligence_index', 70.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',

@@ -219,6 +219,25 @@ BAND_BENCHMARK_DEFAULT = {
     '3d': ('coding_index',),
 }
 BAND_QUALITY_FLOOR_GAP_DEFAULT = {'default': 6, 'high': 2}
+# Absolute evaluation-score floor per band, on the band's own benchmark (the
+# first metric in BAND_BENCHMARK that any candidate is scored on). The
+# quality_floor_gap above is RELATIVE -- it keeps a pick within N points of
+# the best scored candidate in the pool, but says nothing when a band's whole
+# pool is unscored (that is exactly how the low band once landed on an
+# unscored cheapest-candidate pick) and it cannot stop a genuinely weak but
+# scored model from winning a cheap bucket. The floor is the operator's rule
+# "the models used by the low tier should hold the evaluation score metric
+# threshold": an unscored candidate is never eligible for a floored band, and
+# a scored candidate below the floor is not either. Data grounding
+# (2026-10 artificial-analysis indexes): the working low pick (ling-3.1-flash)
+# holds 41.1; the sublow pick (ling-3.0-flash) holds 20.1; the free pool's
+# coherence bar is 20. low=30 keeps the tier meaningfully above the sublow
+# bar; sublow=20 IS the pool's coherence bar (a sublow-ceiling candidate that
+# cannot follow basic instructions serves nobody).
+# Applied ONLY on the band's primary benchmark (BAND_BENCHMARK[band][0]):
+# the chain's fallback metric may use a different scale, so a numeric floor
+# is not meaningful there.
+BAND_MIN_SCORE_DEFAULT = {'low': 30, 'sublow': 20}
 MODEL_BAND_ALIASES_DEFAULT = {'3d': 'coding'}
 MODEL_PROVIDER_OVERRIDES_DEFAULT = {'default': None, 'tiers': {}}
 TIER_GATE_CRITERIA_DEFAULT = {
@@ -231,6 +250,7 @@ MODEL_PRICE_BANDS: dict = dict(MODEL_PRICE_BANDS_DEFAULT)
 MODEL_BAND_PURPOSE: dict = dict(MODEL_BAND_PURPOSE_DEFAULT)
 BAND_BENCHMARK: dict = dict(BAND_BENCHMARK_DEFAULT)
 BAND_QUALITY_FLOOR_GAP: dict = dict(BAND_QUALITY_FLOOR_GAP_DEFAULT)
+BAND_MIN_SCORE: dict = dict(BAND_MIN_SCORE_DEFAULT)
 TIER_GATE_CRITERIA: dict = dict(TIER_GATE_CRITERIA_DEFAULT)
 MODEL_BAND_ALIASES: dict = dict(MODEL_BAND_ALIASES_DEFAULT)
 MODEL_PROVIDER_OVERRIDES: dict = {'default': None, 'tiers': {}}
@@ -445,6 +465,7 @@ def _load_model_bands(path):
         'band_purpose': _prose(data.get('band_purpose'), MODEL_BAND_PURPOSE_DEFAULT),
         'band_benchmark': _chains(data.get('band_benchmark'), BAND_BENCHMARK_DEFAULT),
         'quality_floor_gap': _numbers(data.get('quality_floor_gap'), BAND_QUALITY_FLOOR_GAP_DEFAULT),
+        'min_score': _numbers(data.get('min_score'), BAND_MIN_SCORE_DEFAULT),
         'tier_gate_criteria': _prose(data.get('tier_gate_criteria'), TIER_GATE_CRITERIA_DEFAULT),
         'band_aliases': _aliases(data.get('band_aliases'), MODEL_BAND_ALIASES_DEFAULT),
     }

@@ -290,7 +290,8 @@ def _tier_watch_moves_sync():
         for benchmark in BAND_BENCHMARK.get(band, ()):
             scores = {r['model_id']: r['score'] for r in benchmark_rows if r['benchmark'] == benchmark}
             qualifiers = _best_value_qualifiers_sync(
-                pools.get(band, []), scores, BAND_QUALITY_FLOOR_GAP.get(band))
+                pools.get(band, []), scores, BAND_QUALITY_FLOOR_GAP.get(band),
+                min_score=BAND_MIN_SCORE.get(band))
             if not qualifiers:
                 continue
             # Mirror the pick's own order (BP-63 speed tie-break inside the

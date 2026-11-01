@@ -251,11 +251,18 @@ def _sublow_tier_slug():
     # The hard-ceilinged band for short, bounded test scenarios run at scale
     # (hundreds of reenactment/testing agents): the cheapest coherent model
     # under the per-model price ceiling, picked on the same intelligence
-    # signal as low. Returns None (never the low tier) when the refresh
-    # hasn't produced a sublow pick -- falling back to low would silently
-    # run sublow-scale work at ~5x the ceiling, which is exactly what the
-    # ceiling exists to prevent. Callers (mint_sublow_grant, the inference
-    # proxy, quote_sublow_grant) already refuse or 503 on a missing pick.
+    # signal as low. The free pool serves the band first when it can (the
+    # operator's rule: sublow uses the free endpoints below threshold before
+    # any spend), with the paid pick as the leg underneath -- exactly the
+    # conjunction _low_tier_slug serves for the low band. Returns None (never
+    # the low tier) when neither the free pool nor the refresh has produced a
+    # sublow pick -- falling back to low would silently run sublow-scale work
+    # at ~5x the ceiling, which is exactly what the ceiling exists to
+    # prevent. Callers (mint_sublow_grant, the inference proxy,
+    # quote_sublow_grant) already refuse or 503 on a missing pick.
+    free = _freepool_route_for_band('sublow')
+    if free:
+        return free
     return _model_tier_slug('sublow')
 
 

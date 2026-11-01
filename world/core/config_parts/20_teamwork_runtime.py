@@ -366,6 +366,7 @@ def reload_policy_config():
     MODEL_BAND_PURPOSE.clear(); MODEL_BAND_PURPOSE.update(_model_bands['band_purpose'])
     BAND_BENCHMARK.clear(); BAND_BENCHMARK.update(_model_bands['band_benchmark'])
     BAND_QUALITY_FLOOR_GAP.clear(); BAND_QUALITY_FLOOR_GAP.update(_model_bands['quality_floor_gap'])
+    BAND_MIN_SCORE.clear(); BAND_MIN_SCORE.update(_model_bands.get('min_score') or {})
     TIER_GATE_CRITERIA.clear(); TIER_GATE_CRITERIA.update(_model_bands['tier_gate_criteria'])
     MODEL_BAND_ALIASES.clear(); MODEL_BAND_ALIASES.update(_model_bands.get('band_aliases') or {})
     _providers = _load_model_providers(MODEL_PROVIDERS_PATH)
@@ -421,6 +422,7 @@ def reload_policy_config():
                         'band_purpose': dict(MODEL_BAND_PURPOSE),
                         'band_benchmark': dict(BAND_BENCHMARK),
                         'quality_floor_gap': dict(BAND_QUALITY_FLOOR_GAP),
+                        'min_score': dict(BAND_MIN_SCORE),
                         'tier_gate_criteria': dict(TIER_GATE_CRITERIA),
                         'band_aliases': dict(MODEL_BAND_ALIASES)},
         'model_providers': {'default': dict(MODEL_PROVIDER_OVERRIDES.get('default') or {}),

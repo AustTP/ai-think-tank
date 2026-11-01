@@ -190,7 +190,8 @@ def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
     seen = {picked['id']}
     out = []
     for m in _best_value_qualifiers_sync(pool, scores or {},
-                                         BAND_QUALITY_FLOOR_GAP.get(band)):
+                                         BAND_QUALITY_FLOOR_GAP.get(band),
+                                         min_score=BAND_MIN_SCORE.get(band)):
         if m['id'] not in seen:
             out.append(m)
             seen.add(m['id'])
@@ -257,18 +258,76 @@ async def refresh_model_tiers():
         scores = {}
         for benchmark in BAND_BENCHMARK[band]:
             scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == benchmark}
-            picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band), band=band)
+            # The numeric floor applies ONLY on the band's primary benchmark
+            # (BAND_BENCHMARK[band][0]): a fallback metric may use a
+            # different scale, so a numeric floor there is not meaningful.
+            min_score = BAND_MIN_SCORE.get(band) if benchmark == BAND_BENCHMARK[band][0] else None
+            picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band), band=band,
+                                            min_score=min_score)
             if picked is not None:
                 # Cheapest in-floor qualifier under the winning benchmark's
                 # scores: the baseline the BP-63 audit compares this pick
                 # against (a strictly pricier pick inside the parity band is
                 # a latency-decided decision; see _attach_latency_audit).
-                quals = _best_value_qualifiers_sync(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band))
+                quals = _best_value_qualifiers_sync(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band),
+                                                    min_score=min_score)
                 cheapest_qual = quals[0] if quals else None
                 break
 
         if picked is None and not pool:
             continue
+
+        min_score = BAND_MIN_SCORE.get(band)
+        if picked is None and min_score is not None:
+            # The absolute floor is a hard bar: no scored candidate in this
+            # band's own pool holds it (or none is scored at all -- the
+            # failure mode that once landed an unscored cheapest-candidate
+            # pick in the low band). Widen the search across every price
+            # bucket (still under the band's price ceiling, which IS the
+            # sublow band) and take the cheapest scored candidate that DOES
+            # hold the floor: the tier keeps its evaluation-score threshold
+            # and pays the minimum price that satisfies it. The Jev
+            # classifier fallback below is deliberately NOT run for a
+            # floored band -- a classifier pick has no evaluation score, so
+            # by construction it cannot hold the threshold; leaving the
+            # previous pick in place and logging the gap is the fail-closed
+            # shape.
+            wide_pool = _apply_band_price_ceiling(
+                band, [m for bp in buckets.values() for m in bp])
+            # Prefer the primary benchmark's scores so the floor applies on
+            # its own scale; fall back to another benchmark only when the
+            # primary has no rows, and drop the floor then (different scale).
+            wide_scores = {r['model_id']: r['score']
+                           for r in all_benchmark_rows if r['benchmark'] == BAND_BENCHMARK[band][0]}
+            wide_min_score = BAND_MIN_SCORE.get(band) if wide_scores else None
+            if not wide_scores:
+                for benchmark in BAND_BENCHMARK[band]:
+                    wide_scores = {r['model_id']: r['score']
+                                   for r in all_benchmark_rows if r['benchmark'] == benchmark}
+                    if wide_scores:
+                        break
+            if not wide_scores:
+                # No evaluation score on file for ANY metric in the band's
+                # chain: a floored band cannot claim to hold the threshold,
+                # so keep the previous pick rather than handing the tier to
+                # the unscored classifier fallback.
+                print(f'[model-tiers] {band}: no evaluation score on file for '
+                      'the band benchmark chain; keeping the previous pick', flush=True)
+                continue
+            for candidate in _speed_tie_order(
+                    _best_value_qualifiers_sync(
+                        wide_pool, wide_scores, BAND_QUALITY_FLOOR_GAP.get(band),
+                        min_score=wide_min_score),
+                    band):
+                if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+                    picked = candidate
+                    break
+            if picked is None:
+                print(f'[model-tiers] {band}: no scored candidate holds the '
+                      f'{wide_min_score:g} floor anywhere in the catalog; keeping the '
+                      'previous pick', flush=True)
+                continue
+            scores = wide_scores
 
         if picked is None:
             # Cap the shortlist Jev actually sees -- a real band can still

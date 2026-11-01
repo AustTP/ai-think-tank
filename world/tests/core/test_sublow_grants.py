@@ -237,6 +237,24 @@ class SublowGrantFailures(SublowGrantCase):
         quote = serve.quote_sublow_grant('agent-a', estimated_calls='abc')
         self.assertEqual(quote['estimatedCalls'], 1)
 
+    def test_sublow_slug_resolves_the_free_pool_first(self):
+        # The operator's rule: sublow uses the free endpoints below threshold
+        # before any spend -- the slug resolves the free-pool route when one
+        # is ready, and only reaches the paid pick when it is not.
+        with unittest.mock.patch.object(
+                serve, '_freepool_route_for_band',
+                return_value='@freepool:sublow:gemini-3.5-flash'), \
+             unittest.mock.patch.object(serve, '_model_tier_slug') as tier:
+            self.assertEqual(serve._sublow_tier_slug(),
+                             '@freepool:sublow:gemini-3.5-flash')
+            tier.assert_not_called()
+        with unittest.mock.patch.object(serve, '_freepool_route_for_band',
+                                        return_value=None), \
+             unittest.mock.patch.object(serve, '_model_tier_slug',
+                                        return_value='inclusionai/ling-3.0-flash'):
+            self.assertEqual(serve._sublow_tier_slug(),
+                             'inclusionai/ling-3.0-flash')
+
     def test_quote_degrades_when_the_tiers_read_fails(self):
         # The sublow lane has NO fallback price (it must never price
         # sublow work at another band's rate), so a failed tiers read
@@ -498,9 +516,14 @@ class SublowEndpoints(SublowGrantCase):
             conn.execute('DELETE FROM model_tiers')
         # _sublow_tier_slug returns None when no sublow pick exists (it never
         # falls back to the low tier -- that would silently run sublow-scale
-        # work at ~5x the ceiling), so the proxy 503s.
+        # work at ~5x the ceiling), so the proxy 503s. The free-pool leg is
+        # pinned to None so the outcome cannot depend on ambient key
+        # presence: with the pool able to serve, the slug would be a free
+        # route instead of None.
         mock_call = unittest.mock.Mock()
-        with unittest.mock.patch.object(serve, '_call_openrouter_sync', mock_call):
+        with unittest.mock.patch.object(serve, '_call_openrouter_sync', mock_call), \
+             unittest.mock.patch.object(serve, '_freepool_route_for_band',
+                                        return_value=None):
             r = self.client.post(
                 '/api/experiments/sublow/inference',
                 json={'messages': [{'role': 'user', 'content': 'hi'}]},
