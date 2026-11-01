@@ -94,6 +94,11 @@ SIM_TICK_S = 1.0
 # the server chunks each tick into small fixed steps so arrival/sliding resolve
 # like per-frame movement. 0.1s -> 6px/step, well under TASK_ARRIVE_DIST.
 SIM_SUBSTEP_S = 0.1
+# Identity-heal gate (see SimEngine.tick): the full-roster identity heal runs
+# on any roster-size change, or at least every N ticks -- 26% of a
+# movement-only tick at 1,000 agents was per-tick heal overhead, and a 30s
+# window keeps the stale-autosave self-heal durable.
+_HEAL_EVERY_N_TICKS = 30
 
 # Bind the real CancelledError at import time. Tests patch `sim.asyncio`
 # wholesale with a Mock, so writing `except asyncio.CancelledError` inside
@@ -239,7 +244,8 @@ def _cell_fits_agent(gx, gy, cell, grid):
 
 
 # BEGIN MOVEMENT PHYSICS -- owner-protected, see selfedit._physics_refusal
-def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, grid):
+def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents,
+              grid, index=None):
     """Python port of tasks.js findPath -- a BFS over the collision grid that
     returns a list of top-left-corner waypoints, or None when no route exists.
 
@@ -253,14 +259,20 @@ def find_path(start_x, start_y, target_x, target_y, exclude_agent_id, agents, gr
     conversion, target ring relaxation, pathTarget claiming, 4-point
     transition sampling, the single-waypoint start==target return, and the
     out-of-bounds start/target -> None guards). Do not "improve" any of it.
-    """
+
+    `index` (2026-11-01 scale fix): a caller holding a fresh _spatial_index
+    (SimEngine.tick builds ONE per tick) passes it in instead of paying an
+    O(N) rebuild per search. Positions are read live from the agent refs at
+    check time, so a reused index has the same one-cell-assignment lag the
+    per-substep rebuild already documented -- only cheaper."""
     cols, rows, cell = grid['cols'], grid['rows'], grid['cell']
 
     # One spatial index per path search: a BFS probes thousands of candidate
     # boxes, and a full-roster scan per probe made a single replan cost >1s
     # at 1,000 agents (measured: find_path was 96% of stuck-replan ticks).
     # Results are identical -- only a nearby agent can overlap a 20px box.
-    index = _spatial_index(agents)
+    if index is None:
+        index = _spatial_index(agents)
 
     # "Co-located" = already overlapping the mover's own start box, not
     # bit-identical coordinates -- a live deadlock is caused by two agents a
@@ -663,7 +675,7 @@ def pick_free_spot(grid, avoid_points=None, ground_w=GROUND_W, ground_h=GROUND_H
 
 def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED,
                         arrive_dist=TASK_ARRIVE_DIST, stuck_timeout=TASK_STUCK_TIMEOUT,
-                        pick_free=None):
+                        pick_free=None, index=None):
     """Pure-function port of tasks.js tickAgentMovement(dt) -- the real
     per-frame step/slide/stuck/replan/respawn loop, minus the task system.
 
@@ -688,8 +700,11 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
             grid, avoid, spawn=SPAWN, ground_w=GROUND_W, ground_h=GROUND_H)
 
     # One spatial index per call (== per substep): every walker's collision
-    # work below is neighborhood-local instead of a full-roster scan.
-    index = _spatial_index(agents)
+    # work below is neighborhood-local instead of a full-roster scan. A
+    # caller holding a fresh index (SimEngine.tick builds ONE per tick) skips
+    # the O(N) rebuild -- see find_path's index note.
+    if index is None:
+        index = _spatial_index(agents)
 
     for aid, a in agents.items():
         if not a.get('path') or not a.get('visible'):
@@ -781,7 +796,8 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
             target = a.get('pathTarget')
             new_path = None
             if target:
-                new_path = find_path(a['x'], a['y'], target['x'], target['y'], aid, agents, grid)
+                new_path = find_path(a['x'], a['y'], target['x'], target['y'],
+                                     aid, agents, grid, index=index)
             a['replanCount'] = (a.get('replanCount') or 0) + 1
             if new_path and a['replanCount'] < 3:
                 a['path'] = new_path
@@ -792,7 +808,9 @@ def step_agent_movement(dt, agents, grid, doors=None, walk_speed=TASK_WALK_SPEED
                 a['respawnedForTask'] = True
                 occupied = [{'x': v['x'], 'y': v['y']} for v in agents.values() if v.get('visible') and v.get('id') != aid]
                 spot = pick_free(occupied, agents)
-                retry_path = find_path(spot['x'], spot['y'], target['x'], target['y'], aid, agents, grid)
+                retry_path = find_path(spot['x'], spot['y'], target['x'],
+                                       target['y'], aid, agents, grid,
+                                       index=index)
                 if retry_path:
                     a['x'] = spot['x']
                     a['y'] = spot['y']
@@ -853,7 +871,10 @@ def _reconcile_stranded_agents(state, grid):
     return moved
 
 
-def _repair_stalled_walkers(state, grid, doors, now_ms=None):
+_WALKER_REPAIR_RETRY_MS = 2000
+
+
+def _repair_stalled_walkers(state, grid, doors, now_ms=None, index=None):
     """An agent can be left HOLDING a 'walking' task with an EMPTY
     path (busy cleared but task kept -- e.g. a save landed between path-clear and
     arrival, or a pinned spawn raced its assign). step_agent_movement skips any
@@ -861,7 +882,17 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
     the task sits 'walking' forever while she freezes on the map -- invisible to
     _reconcile_stranded_agents (which skips task-holders). Repair: re-issue a
     fresh path to the task's room door exactly as assign_task does. Painless,
-    idempotent -- no-op unless a task-holder actually lacks a path."""
+    idempotent -- no-op unless a task-holder actually lacks a path.
+
+    Re-plan backoff (2026-11-01 scale fix): a pathless walker used to be
+    re-pathed EVERY pass -- a transient pile-up at a door (find_path None or
+    an empty route) re-ran the full BFS every tick and dominated tick time at
+    density (measured: 9,520 find_path calls for 200 agents in 90 ticks, 68%
+    of the run). A walker now retries on _WALKER_REPAIR_RETRY_MS intervals;
+    the replan-ceiling cancel below still releases a genuinely wedged walker
+    unconditionally, and the per-pass visibility re-affirmation is untouched.
+    `now_ms` accepts the tick's seconds `now` or epoch-ms (normalized here);
+    `index` is a caller-held fresh spatial index passed to find_path."""
     agents = state.get('agents') or {}
     tasks = state.get('tasks') or {}
     for aid, a in list(agents.items()):
@@ -896,13 +927,21 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None):
             continue
         if a.get('path'):
             continue  # already has a walk to the door -- just needed to be seen
+        # Backoff gate (2026-11-01 scale fix): stamp the attempt whether or
+        # not the BFS succeeds, so a crowded door retries on an interval
+        # instead of every pass.
+        stamp = now_ms if now_ms is not None else time.time()
+        stamp_ms = int(stamp * 1000) if stamp < 1e11 else int(stamp)
+        if stamp_ms - (a.get('lastPathRepairMs') or 0) < _WALKER_REPAIR_RETRY_MS:
+            continue
+        a['lastPathRepairMs'] = stamp_ms
         room = resolve_room_with_overflow(state, task.get('room'))
         door = (doors or {}).get(room)
         if not door:
             continue
         tx = door['x'] + door['w'] / 2
         ty = door['y'] + door['h'] + 4
-        path = find_path(a['x'], a['y'], tx, ty, aid, agents, grid)
+        path = find_path(a['x'], a['y'], tx, ty, aid, agents, grid, index=index)
         if not path:
             # A fresh BFS from her spot finds no route at all -- JS's exact
             # "give up" condition ("Even a fresh spot can't reach it", reached

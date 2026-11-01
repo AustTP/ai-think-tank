@@ -628,10 +628,184 @@ def _artifact_evidence_present(task):
 GRADE_SUSPECT_CEILING = 1.0
 
 
+# Background grader (2026-11-01 scale fix): the tick thread never waits on
+# the grader's OpenRouter round trip. Same two-phase discipline as
+# _content_results (020): the worker fills a locked mailbox, and the NEXT
+# _task_cycle pass merges results into state -- the worker never touches
+# state, so the tick stays the single state writer.
+_pending_grades = {}
+_pending_grades_lock = threading.Lock()
+_grade_results = {}
+_grade_results_lock = threading.Lock()
+_grading_worker_started = False
+_grading_worker_stop = threading.Event()
+# Tests disable the daemon (tests/village/conftest.py) and drive the same
+# two-phase contract deterministically via _grade_pending_sync -- a daemon
+# racing a test's queue could pop a job between queue and sync drain.
+_GRADING_WORKER_DISABLED = False
+
+
+def _process_grading_batch(jobs):
+    """One grader pass: fetch state once, judge each queued job with the
+    same _grading_decider the synchronous path used, and post the results to
+    the mailbox. Returns False when the batch was requeued (DB unavailable),
+    True otherwise. Also the deterministic seam tests use --
+    _grade_pending_sync runs this exact logic without the daemon thread."""
+    if not jobs:
+        return True
+    try:
+        import serve as _serve_mod
+        state = _serve_mod.get_state_from_db()
+    except Exception:
+        # DB unavailable: requeue the batch; the caller backs off. The
+        # fallback grades already recorded keep consumers working meanwhile.
+        with _pending_grades_lock:
+            for job in jobs:
+                _pending_grades.setdefault(job['taskId'], job)
+        return False
+    for job in jobs:
+        try:
+            try:
+                grade = _grading_decider(
+                    state, job['instructions'], job['title'],
+                    job['room'], job['taskId'])
+            except TypeError:
+                # Older injected stubs keep their 3-arg signature; the
+                # task ref only enriches the decision tape, so a stub
+                # without it grades normally.
+                grade = _grading_decider(
+                    state, job['instructions'], job['title'],
+                    job['room'])
+        except Exception:
+            grade = None  # outage -> the merge keeps the fallback
+        with _grade_results_lock:
+            _grade_results[job['taskId']] = {
+                'grade': grade, 'agentId': job['agentId'],
+                'room': job['room'], 'title': job['title'],
+                'artifactEvidence': job.get('artifactEvidence')}
+    return True
+
+
+def _grade_pending_sync(state):
+    """Deterministic two-phase drain (the test seam for the background
+    grader): synchronously judge every queued job and merge the results
+    into `state` -- the exact contract the daemon thread plus _task_cycle's
+    merge pass implement, without threads or sleeps."""
+    with _pending_grades_lock:
+        jobs = list(_pending_grades.values())
+        _pending_grades.clear()
+    _process_grading_batch(jobs)
+    return _merge_completed_grades(state)
+
+
+def _ensure_grading_worker():
+    """Start the background deliverable grader once per process. The worker
+    drains queued judgments in small batches (one fresh state fetch per
+    batch via _process_grading_batch); an outage posts grade None and the
+    merge keeps the already-recorded fallback, exactly as the synchronous
+    outage path did."""
+    global _grading_worker_started
+    if _grading_worker_started or _GRADING_WORKER_DISABLED:
+        return
+    _grading_worker_started = True
+
+    def _loop():
+        while not _grading_worker_stop.is_set():
+            with _pending_grades_lock:
+                jobs = [_pending_grades.pop(k)
+                        for k in list(_pending_grades)[:8]]
+            if not jobs:
+                if _grading_worker_stop.wait(0.5):
+                    return
+                continue
+            if _process_grading_batch(jobs):
+                if _grading_worker_stop.wait(0.05):
+                    return  # yield; more work may already be queued
+            else:
+                if _grading_worker_stop.wait(2.0):
+                    return  # requeued batch: back off before retrying
+
+    threading.Thread(target=_loop, daemon=True,
+                     name='deliverable-grader').start()
+
+
+def _merge_completed_grades(state, now_ms=None):
+    """Drain the background grader's mailbox into state (tick-thread only).
+    Upgrades a pending deliverable entry with the real judgment and runs the
+    grade-dependent actions the synchronous grader used to do inline: the
+    calibration suspect audit, low-grade coaching, and success mining. A
+    None grade (Jev outage) just closes the pending marker -- the fallback
+    grade recorded at completion stands, exactly as before. Entries whose
+    task/deliverable rolled out of state are dropped."""
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    global _grade_results
+    with _grade_results_lock:
+        if not _grade_results:
+            return 0
+        results = _grade_results
+        _grade_results = {}
+    merged = 0
+    by_id = {}
+    for entry in state.get('completedDeliverables') or []:
+        if isinstance(entry, dict) and entry.get('gradePending'):
+            by_id.setdefault(entry.get('id'), entry)
+    tasks = state.get('tasks') or {}
+    for task_id, res in results.items():
+        entry = by_id.get(task_id)
+        if entry is None:
+            continue  # deliverable rolled out of state; nothing to upgrade
+        grade = res.get('grade')
+        if not isinstance(grade, (int, float)):
+            entry['gradePending'] = False  # outage: the fallback stands
+            continue
+        grade = float(grade)
+        task = tasks.get(task_id)
+        # Suspect audit on the QUEUE-TIME evidence snapshot: the audit judges
+        # the artifact evidence as completed (a task record that rolled out
+        # of state, or was mutated since, must not flip the verdict).
+        grade_suspect = (grade <= GRADE_SUSPECT_CEILING
+                         and bool(res.get('artifactEvidence')))
+        if grade_suspect:
+            _log_governance(state, 'admin', 'grade_artifact_mismatch',
+                            {'task': task_id, 'agent': res.get('agentId'),
+                             'grade': grade, 'room': res.get('room'),
+                             'title': (res.get('title') or '')[:120]})
+        entry.update({'grade': grade, 'gradeIsReal': True,
+                      'gradePending': False, 'gradedAt': now_ms,
+                      'gradeSuspect': grade_suspect})
+        _tref = ((task or {}).get('teamId')
+                 or agent_team_ref(state, res.get('agentId')))
+        _floor = team_policy(state, _tref, 'deliverableGradeFloor')
+        _success = team_policy(state, _tref, 'successGradeFloor')
+        if grade < _floor and not grade_suspect \
+                and res.get('agentId') in (state.get('agents') or {}):
+            # A suspect grade never coaches (see the calibration audit), and
+            # a rolled-off-roster agent has no growth plan to coach.
+            _coach_low_grade(state, res.get('agentId'), res.get('room'),
+                             grade, now_ms, res.get('title'), task=task)
+        elif grade >= _success:
+            # Positive learning loop (ChatDev ECL): best-effort, failure
+            # swallowed so merging never blocks the tick.
+            try:
+                import serve as _serve_mod
+                _serve_mod._record_success(res.get('room'), res.get('title'),
+                                           grade, agent_id=res.get('agentId'))
+            except Exception:
+                pass
+        merged += 1
+    return merged
+
+
 def _grade_completed_task(state, agent_id, task, now_ms):
-    """Fire-and-forget grader for a landed deliverable. Never blocks completion;
-    on outage records a deterministic default (room's trailing mean, else mid-
-    5.0). Also triggers a growth-plan entry if graded below the floor.
+    """Record a landed deliverable and QUEUE its Jev judgment. Never blocks
+    completion, and (2026-11-01 scale fix) never blocks the tick: the entry
+    lands synchronously with the deterministic fallback grade the outage path
+    always produced (gradeIsReal False, gradePending True), and the
+    background grader (_ensure_grading_worker) computes the real judgment
+    off-thread; a later _merge_completed_grades pass upgrades the entry and
+    runs the grade-dependent actions (suspect audit, coaching, success
+    mining). On a grader outage the fallback stands, exactly as before.
+    Also triggers a growth-plan entry if graded below the floor.
 
     Calibration audit (1,000-agent scale prep): a devastating grade (<=
     GRADE_SUSPECT_CEILING) on a record that carries real artifact evidence is
@@ -677,22 +851,21 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         instructions += ('\n\nThe task record carries no deliverable content beyond '
                          'the title itself: no deliverable text, no completion note, '
                          'no written files, no artifact path. Grade what is actually here.')
-    real_grade = None
-    try:
-        real_grade = _grading_decider(state, instructions, title, room, task.get('id'))
-    except TypeError:
-        # Older injected stubs keep their 3-arg signature; the task ref only
-        # enriches the decision tape, so a stub without it grades normally.
-        real_grade = _grading_decider(state, instructions, title, room)
-    grade_is_real = real_grade is not None
-    if real_grade is None:
-        real_grade = _room_trailing_grade(state, room)
-        if real_grade is None:
-            real_grade = 5.0
-    grade = real_grade
-    # Calibration audit: the grade-vs-artifact contradiction test.
-    grade_suspect = (grade_is_real and grade <= GRADE_SUSPECT_CEILING
-                     and _artifact_evidence_present(task))
+    # Provisional record (2026-11-01 scale fix): the tick thread never waits
+    # on the grader's OpenRouter round trip (measured: 12.5s of a 67s
+    # 200-agent lifecycle run was synchronous Jev calls inside _task_cycle).
+    # The entry lands NOW with the same deterministic fallback an outage
+    # always produced (gradeIsReal False), and the background worker computes
+    # the real judgment; _merge_completed_grades (next _task_cycle pass)
+    # upgrades the entry and runs the grade-dependent actions.
+    grade = _room_trailing_grade(state, room)
+    if grade is None:
+        grade = 5.0
+    grade_is_real = False
+    # Calibration audit: the grade-vs-artifact contradiction test. Runs at
+    # MERGE time against the real judgment (see _merge_completed_grades);
+    # the provisional record is never suspect by construction.
+    grade_suspect = False
     if grade_suspect:
         _log_governance(state, 'admin', 'grade_artifact_mismatch',
                         {'task': task.get('id'), 'agent': agent_id,
@@ -709,6 +882,9 @@ def _grade_completed_task(state, agent_id, task, now_ms):
         # future fallbacks).
         'gradeIsReal': grade_is_real, 'gradedAt': now_ms,
         'gradeSuspect': grade_suspect,
+        # The real Jev judgment is computed off-thread (see
+        # _ensure_grading_worker) and merged onto this entry later.
+        'gradePending': True,
         # Knowledge-rot/freshness signal (external-eval port): the in-document
         # "Last reviewed" date is authoritative for aging -- mtime alone is a weak
         # signal (resets on copy). Consumers can treat a deliverable newer than
@@ -739,6 +915,17 @@ def _grade_completed_task(state, agent_id, task, now_ms):
             _serve_mod._record_success(room, title, grade, agent_id=agent_id)
         except Exception:
             pass
+    # Queue the real judgment for the background grader (see the module-top
+    # note on the two-phase mailbox discipline). The evidence flag is a
+    # queue-time snapshot: the calibration audit judges the artifact evidence
+    # AS COMPLETED -- the task record may mutate or roll out of state before
+    # the merge runs.
+    with _pending_grades_lock:
+        _pending_grades[task.get('id')] = {
+            'taskId': task.get('id'), 'agentId': agent_id, 'room': room,
+            'title': title, 'instructions': instructions,
+            'artifactEvidence': bool(_artifact_evidence_present(task))}
+    _ensure_grading_worker()
 
 
 def _scale_tier_worker(state, agent_id):

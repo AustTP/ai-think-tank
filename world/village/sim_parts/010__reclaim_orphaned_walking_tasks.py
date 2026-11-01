@@ -137,6 +137,14 @@ class SimEngine:
         self._last_task_wall = 0.0
         self._grid = None
         self._doors = None
+        # Identity-heal gate (2026-11-01 scale fix): _heal_agent_identity is
+        # 26% of a movement-only tick at 1,000 agents and is pure overhead
+        # between changes -- run it on a roster-size change or every
+        # _HEAL_EVERY_N ticks (the 30s window keeps the stale-autosave
+        # self-heal durable; see the docstring there for why per-tick was
+        # originally chosen and why a bounded window preserves that fix).
+        self._heal_len = None
+        self._heal_age = 0
 
     def tick(self, state, now=None):
         if not isinstance(state, dict):
@@ -147,13 +155,22 @@ class SimEngine:
         sim['lastTickEpochS'] = now
         sim['owner'] = sim.get('owner', 'client')  # 'server' once Phase 2 owns movement
 
-        # Per-tick identity self-heal (see serve._heal_agent_identity): a
-        # boot-only migration wasn't durable against a stale client tab's 5s
-        # autosave re-POSTing pre-fix agent records (confirmed via a
-        # save_state_to_db stack trace), so this runs every tick, same shape
-        # as _reconcile_stranded_agents/_repair_stalled_walkers below.
-        import serve
-        serve._heal_agent_identity(state)
+        # Identity self-heal, gated (2026-11-01 scale fix; see __init__):
+        # the per-tick invariant the heal originally provided is preserved by
+        # re-running it on any roster-size change (a stale autosave that
+        # re-POSTs pre-fix records changes the count) or at least every
+        # _HEAL_EVERY_N ticks, instead of scanning the full roster every
+        # tick for pure overhead between changes.
+        agents_now = state.get('agents')
+        agents_len = len(agents_now) if isinstance(agents_now, dict) else -1
+        if self._heal_len != agents_len \
+                or self._heal_age >= _HEAL_EVERY_N_TICKS:
+            import serve
+            serve._heal_agent_identity(state)
+            self._heal_len = agents_len
+            self._heal_age = 0
+        else:
+            self._heal_age += 1
 
         # Phase-2 flip: when the server owns movement, this tick DRIVES agent
         # positions (mutating state['agents'] in place via the proven pure
@@ -176,9 +193,18 @@ class SimEngine:
                 # the interval into small fixed steps (6px at 0.1s) so arrival
                 # and sliding resolve exactly like per-frame movement.
                 events = []
+                # One spatial index for the WHOLE tick (2026-11-01 scale
+                # fix): _spatial_index is an O(N) rebuild, and rebuilding it
+                # per substep (and per find_path) was measurable tick
+                # overhead at 1,000 agents. Positions are read live from the
+                # agent refs at check time, so a shared index carries the
+                # same one-cell lag the per-substep rebuild already
+                # documented -- self-correcting, only cheaper.
+                tick_index = _spatial_index(agents_map)
                 for _ in range(max(1, int(SIM_TICK_S / SIM_SUBSTEP_S))):
                     events += step_agent_movement(SIM_SUBSTEP_S, agents_map,
-                                                  self._grid, doors=self._doors)
+                                                  self._grid, doors=self._doors,
+                                                  index=tick_index)
                 # Phase-3 dispatch: arrival/cancel events now feed the task
                 # lifecycle (the Phase-2 boundary closed). An agent arriving at
                 # a task's door gets marked working (busy/inRoom/workUntil);
@@ -245,7 +271,8 @@ class SimEngine:
                 # Covers the inverse stranding: an agent HOLDING a 'walking' task
                 # with no path (path cleared, arrival never fired). Movement skips
                 # pathless agents, so without this they freeze mid-task forever.
-                _repair_stalled_walkers(state, self._grid, self._doors, now)
+                _repair_stalled_walkers(state, self._grid, self._doors, now,
+                                        index=tick_index)
                 # Covers the class _repair_stalled_walkers explicitly skips: a
                 # handoff/pairWith session (client-only lifecycle) stalled
                 # with no path and no way to ever resume or resolve on its
