@@ -392,6 +392,9 @@ def _sim_loop_pass_inner():
     # sublow/JEV experiment grants on each tick so a stale nonce can never be
     # presented. All idempotent; no-op when empty.
     serve._expire_handles()
+    # GitHub repo workspaces: TTL backstop for review checkouts (disk-only,
+    # no state needed) -- the player's "delete them when finished" promise.
+    serve._expire_repo_workspaces()
     serve.expire_sublow_grants()
     serve.expire_jev_grants()
     # Sleep-not-die gate: while DORMANT (idle auto-sleep armed), do NOT run the

@@ -164,3 +164,6 @@ library/media/
 
 # Operator-registered MCP servers (host-specific commands, like .env)
 mcp_servers.json
+
+# Ephemeral agent repo-review checkouts (auto-deleted, never tracked)
+.repo-workspaces/

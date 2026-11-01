@@ -482,6 +482,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
                 save_state_to_db(state)
             log_action(pick, 'adversarial_village', {'action': action, 'ok': ok})
             return msg
+        if name == 'github_repo':
+            tools_used.append(name)
+            return _github_repo_tool(pick, args)
         if name == 'local_file':
             tools_used.append(name)
             return _local_file_tool(pick, args)
@@ -515,6 +518,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     tools = (AGENT_ASK_TOOLS + _PULSE_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
+    tools = tools + [_GITHUB_REPO_TOOL]
     if FILE_ACCESS_ENABLED and _effective_file_grants(state):
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
     if APP_ACCESS_ENABLED and _effective_app_grants(state):
