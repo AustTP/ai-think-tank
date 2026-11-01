@@ -408,6 +408,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # think tank -- and no-ops with nothing split-pending.
     _director_split_step(state, now, now_ms)
 
+    # Foundation approvals: a subdirector's founding PROPOSAL is judged by
+    # their parent director (necessity review, parent + proposer convened).
+    # Runs ungated next to the split step; no-ops with nothing pending.
+    _foundation_step(state, now, now_ms)
+
     # WS-14: sprint retrospectives -- a just-closed sprint's team meets to capture
     # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
     # like the Social / refinement, so a closed sprint never strands its retro.

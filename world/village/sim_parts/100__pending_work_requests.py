@@ -123,14 +123,18 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
         # layer's future work (see sim_helpers' village comment).
         team_director = (_team_row(state, team_id) or {}).get('directorId') or team_id
         req['villageId'] = village_of_agent(state, team_director)
-        # Director-split layer: when the receiving director already leads a
-        # subdirector layer, the DIRECTOR reviews the ask first and decides how
-        # it partitions across the subteams (135__director_split) -- the plain
-        # breakdown convene skips this request until the split decides. A
-        # director with no subdirectors keeps the proven single-team path.
+        # Director-split layer: when the receiving LEADER reviews asks before
+        # any team starts -- a root director WITH a subdirector layer, or any
+        # SUBDIRECTOR (their emergent subteam plans its pieces, and founding
+        # proposals route through their parent) -- the plain breakdown
+        # convene skips this request until the split decides. A leader with
+        # no layer and no subteam keeps the proven single-team path.
         try:
             split_director = team_director
-            if split_director and governance.subdirectors_of(state, split_director):
+            if split_director and (
+                    governance.subdirectors_of(state, split_director)
+                    or (governance.direct_reports(state, split_director)
+                        and not _team_row(state, split_director))):
                 req['awaitingSplit'] = True
         except Exception:
             pass

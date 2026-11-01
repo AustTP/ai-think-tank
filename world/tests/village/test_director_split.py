@@ -75,6 +75,10 @@ def _org():
     ]
     state['backlogRequests'] = []
     state['workQueue'] = []
+    state['pendingFoundations'] = []
+    state['pendingFoundationReviews'] = {}
+    state['pendingDirectorSplits'] = {}
+    state['pendingBreakdowns'] = {}
     return state
 
 
@@ -213,7 +217,10 @@ class SplitReviewTest(unittest.TestCase):
             self.assertEqual(child.get('splitBy'), 'dev')
             self.assertEqual(child.get('villageId'), 'main')
 
-    def test_subteam_breakdown_convene_sees_split_pieces(self):
+    def test_subteam_piece_routes_through_the_subdirectors_review(self):
+        """A piece routed to a subdirector awaits THEIR split review (not the
+        plain breakdown); the review's 'own' routing lands it in their
+        subteam's breakdown intake without re-awaiting another split."""
         state = serve.get_state_from_db()
         req = sim.file_large_request(state, 'admin', 'Build the arch', 'dev')
         _save(state)
@@ -221,16 +228,26 @@ class SplitReviewTest(unittest.TestCase):
         def decider(_state, _instructions, _goal):
             return {'pieces': [{'team': 'lead1', 'ask': 'Foundations'}]}
 
-        sim._director_split_step(state, 1, 1000, decider=decider)
-        sim._director_split_step(state, 2, 2000, decider=decider)
+        sim._director_split_step(state, 1, 1000, decider=decider)   # dev convenes
+        sim._director_split_step(state, 2, 2000, decider=decider)   # dev resolves
         _save(state)
-        # The subteam's emergent ceremony intake now sees the piece.
+        piece = next(r for r in _reqs(state) if r.get('splitFrom') == req['id'])
+        self.assertEqual(piece.get('teamId'), 'lead1')
+        # Not in the breakdown intake yet: lead1 reviews first.
+        self.assertEqual(sim._pending_breakdown_requests(state, 'lead1'), [])
+        # lead1's split review routes the piece to their own subteam.
+        own_decider = (lambda _s, _i, _g:
+                       {'pieces': [{'team': 'own', 'ask': piece['goal']}]})
+        sim._director_split_step(state, 3, 3000, decider=own_decider)
+        sim._director_split_step(state, 4, 4000, decider=own_decider)
+        _save(state)
+        leaf = next(r for r in _reqs(state) if r.get('splitFrom') == piece['id'])
+        self.assertEqual(leaf.get('teamId'), 'lead1')
+        self.assertNotIn('awaitingSplit', leaf)  # no split ping-pong
         got = sim._pending_breakdown_requests(state, 'lead1')
-        self.assertEqual([r['id'] for r in got],
-                         [r['id'] for r in _reqs(state) if r.get('splitFrom') == req['id']])
+        self.assertEqual([r['id'] for r in got], [leaf['id']])
         # And the subteam can convene with the subdirector facilitating.
-        child_id = got[0]['id']
-        self.assertTrue(sim._start_breakdown(state, 'lead1', [child_id], 'lead1', 3000))
+        self.assertTrue(sim._start_breakdown(state, 'lead1', [leaf['id']], 'lead1', 5000))
         _save(state)
         attendees = state['pendingBreakdowns']['lead1']
         self.assertIn('w1', attendees.get('people') or {})
@@ -326,19 +343,205 @@ class NewSubdirectorTest(unittest.TestCase):
                     'newSubdirectors': [{'seedWorker': 'w3', 'handOver': 2,
                                          'purpose': ' owns the arch lane'}]}
 
-        sim._director_split_step(state, 1, 1000, decider=decider)
-        sim._director_split_step(state, 2, 2000, decider=decider)
+        sim._director_split_step(state, 1, 1000, decider=decider)   # convene
+        sim._director_split_step(state, 2, 2000, decider=decider)   # resolve
         _save(state)
-        # w3 is now a subdirector by structure: they lead w1/w2 (handed over
-        # from lead1's pool? No -- from DEV's plain workers; lead1's workers
-        # are not dev's direct reports anymore, so the hand-over pool is
-        # whoever still reports straight to dev).
+        # Root director: founding is immediate, no approval ceremony needed.
+        self.assertEqual(len([p for p in (state.get('pendingFoundations') or [])
+                              if p.get('status') == 'pending']), 0)
+        # w3 is now a subdirector by structure: they lead two workers handed
+        # over from dev's own pool.
         subs = governance.subdirectors_of(state, 'dev')
         self.assertIn('w3', subs)
         self.assertTrue(governance.direct_reports(state, 'w3'))
         children = [r for r in _reqs(state) if r.get('splitFrom') == req['id']]
         self.assertEqual(len(children), 1)
         self.assertEqual(children[0].get('teamId'), 'w3')
+
+    def test_subdirector_proposal_requires_parent_approval(self):
+        """The approval chain: a subdirector may PROPOSE a founding, but the
+        founder's PARENT director judges necessity in an approval review.
+        Unilateral founding below the root is refused; only the parent's
+        approval executes it (parent -> subdirector -> new sub: one managed
+        level deeper, every level consented)."""
+        state = serve.get_state_from_db()
+        self.assertTrue(governance.subdirectors_of(state, 'dev'))
+        # lead1 (a subdirector) receives a piece: it awaits lead1's review.
+        req = sim.file_large_request(state, 'admin', 'Build the arch', 'lead1')
+        _save(state)
+        self.assertTrue(req.get('awaitingSplit'))
+        # lead1's review context offers PROPOSALS, not direct founding.
+        org = sim._split_org_summary(state, 'lead1')
+        text = sim._split_instructions(
+            state, req, org, 'One Lead',
+            founding_mode=sim._founding_mode(state, 'lead1'))
+        self.assertIn('PROPOSALS ONLY', text)
+        self.assertIn('PARENT DIRECTOR judges', text)
+        self.assertEqual(sim._founding_mode(state, 'lead1'), 'propose')
+        # Unilateral mechanic: no approval -> refused; a NON-parent approver
+        # -> refused too. Only the founder's own parent may sign.
+        self.assertIsNone(sim._found_subdirector(state, 'lead1', seed_worker='w1'))
+        self.assertIsNone(sim._found_subdirector(state, 'lead1', seed_worker='w1',
+                                                 approved_by='ops'))
+
+    def test_subteam_piece_routes_through_the_subdirectors_review(self):
+        """A piece routed to a subdirector awaits THEIR split review (not the
+        plain breakdown); the review's 'own' routing lands it in their
+        subteam's breakdown intake without re-awaiting another split."""
+        state = serve.get_state_from_db()
+        req = sim.file_large_request(state, 'admin', 'Build the arch', 'dev')
+        _save(state)
+
+        def decider(_state, _instructions, _goal):
+            return {'pieces': [{'team': 'lead1', 'ask': 'Foundations'}]}
+
+        sim._director_split_step(state, 1, 1000, decider=decider)   # dev convenes
+        sim._director_split_step(state, 2, 2000, decider=decider)   # dev resolves
+        _save(state)
+        piece = next(r for r in _reqs(state) if r.get('splitFrom') == req['id'])
+        self.assertEqual(piece.get('teamId'), 'lead1')
+        # Not in the breakdown intake yet: lead1 reviews first.
+        self.assertEqual(sim._pending_breakdown_requests(state, 'lead1'), [])
+        # lead1's split review routes the piece to their own subteam.
+        sim._director_split_step(state, 3, 3000, decider=lambda _s, _i, _g:
+                                 {'pieces': [{'team': 'own', 'ask': piece['goal']}]})
+        sim._director_split_step(state, 4, 4000, decider=lambda _s, _i, _g:
+                                 {'pieces': [{'team': 'own', 'ask': piece['goal']}]})
+        _save(state)
+        leaf = next(r for r in _reqs(state) if r.get('splitFrom') == piece['id'])
+        self.assertEqual(leaf.get('teamId'), 'lead1')
+        self.assertNotIn('awaitingSplit', leaf)  # no split ping-pong
+        got = sim._pending_breakdown_requests(state, 'lead1')
+        self.assertEqual([r['id'] for r in got], [leaf['id']])
+        # And the subteam can convene with the subdirector facilitating.
+        self.assertTrue(sim._start_breakdown(state, 'lead1', [leaf['id']], 'lead1', 5000))
+        _save(state)
+        attendees = state['pendingBreakdowns']['lead1']
+        self.assertIn('w1', attendees.get('people') or {})
+
+    def test_subdirector_proposal_holds_piece_until_parent_decides(self):
+        """A subdirector's 'new' piece is HELD on a proposal; the parent's
+        approval review decides; approved -> the piece files for the new
+        subteam, denied -> it files inside the proposer's own subteam. The
+        work is never dropped either way, and nothing is created without the
+        parent's judgment."""
+        state = serve.get_state_from_db()
+        req = sim.file_large_request(state, 'admin', 'Build the arch', 'lead1')
+        _save(state)
+
+        def decider(_state, _instructions, _goal):
+            return {'pieces': [{'team': 'new', 'ask': 'New lane', 'priority': 'high'}],
+                    'newSubdirectors': [{'seedWorker': 'w2', 'handOver': 2,
+                                         'purpose': 'owns the arch lane'}]}
+
+        sim._director_split_step(state, 1, 1000, decider=decider)   # lead1 convenes
+        sim._director_split_step(state, 2, 2000, decider=decider)   # lead1 resolves
+        _save(state)
+        # The ask is accepted with the piece held; NOTHING was founded yet.
+        self.assertEqual(req.get('status'), 'accepted')
+        self.assertEqual(req['splitPieces'][0]['team'], 'pending-approval')
+        props = [p for p in (state.get('pendingFoundations') or [])
+                 if p.get('status') == 'pending']
+        self.assertEqual(len(props), 1)
+        prop = props[0]
+        self.assertEqual(prop['founder'], 'lead1')
+        self.assertEqual(prop['parent'], 'dev')
+        self.assertEqual(prop['piece']['ask'], 'New lane')
+        children = [r for r in _reqs(state) if r.get('splitFrom') == req['id']
+                    and r.get('status') == 'pending']
+        self.assertEqual(children, [])  # held, not filed
+        # The parent's approval review convenes (parent + proposer) and DENIES.
+        sim._foundation_step(state, 3, 3000,
+                             decider=lambda _s, _i, _g: {'approvals': [
+                                 {'id': prop['id'], 'approve': False,
+                                  'reason': 'lead1 has capacity'}]})
+        sim._foundation_step(state, 4, 4000,
+                             decider=lambda _s, _i, _g: {'approvals': [
+                                 {'id': prop['id'], 'approve': False,
+                                  'reason': 'lead1 has capacity'}]})
+        _save(state)
+        self.assertEqual(prop.get('status'), 'denied')
+        children = [r for r in _reqs(state) if r.get('splitFrom') == req['id']]
+        self.assertEqual(len(children), 1)
+        # Denied -> the piece stays with the proposer's own subteam.
+        self.assertEqual(children[0].get('teamId'), 'lead1')
+        self.assertIn('judged the founding unnecessary', children[0].get('splitNotes') or '')
+        self.assertNotIn('w2', governance.subdirectors_of(state, 'lead1'))
+
+    def test_subdirector_proposal_approved_founds_deeper(self):
+        state = serve.get_state_from_db()
+        req = sim.file_large_request(state, 'admin', 'Build the arch', 'lead1')
+        _save(state)
+
+        def split_decider(_state, _instructions, _goal):
+            return {'pieces': [{'team': 'new', 'ask': 'New lane'}],
+                    'newSubdirectors': [{'seedWorker': 'w2', 'handOver': 2,
+                                         'purpose': 'owns the arch lane'}]}
+
+        sim._director_split_step(state, 1, 1000, decider=split_decider)
+        sim._director_split_step(state, 2, 2000, decider=split_decider)
+        _save(state)
+        prop = next(p for p in state['pendingFoundations'] if p['status'] == 'pending')
+
+        def approve_decider(_state, _instructions, _goal):
+            return {'approvals': [{'id': prop['id'], 'approve': True,
+                                   'reason': 'the arch needs its own lane'}]}
+
+        sim._foundation_step(state, 3, 3000, decider=approve_decider)
+        sim._foundation_step(state, 4, 4000, decider=approve_decider)
+        _save(state)
+        self.assertEqual(prop.get('status'), 'approved')
+        self.assertEqual(prop.get('subdirector'), 'w2')
+        # The new sub leads w1 (handed over from lead1's pool).
+        self.assertIn('w1', governance.direct_reports(state, 'w2'))
+        self.assertIn('w2', governance.subdirectors_of(state, 'lead1'))
+        # The held piece now files bound for the new subteam.
+        children = [r for r in _reqs(state) if r.get('splitFrom') == req['id']]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].get('teamId'), 'w2')
+        self.assertIn('Approved by', children[0].get('splitNotes') or '')
+
+    def test_foundation_outage_denies_conservatively(self):
+        state = serve.get_state_from_db()
+        req = sim.file_large_request(state, 'admin', 'Build the arch', 'lead1')
+        _save(state)
+
+        def split_decider(_state, _instructions, _goal):
+            return {'pieces': [{'team': 'new', 'ask': 'New lane'}],
+                    'newSubdirectors': [{'purpose': 'owns the arch lane'}]}
+
+        sim._director_split_step(state, 1, 1000, decider=split_decider)
+        sim._director_split_step(state, 2, 2000, decider=split_decider)
+        _save(state)
+        self.assertEqual(len([p for p in state['pendingFoundations']
+                              if p['status'] == 'pending']), 1)
+        # Outage: decider returns None -> deny is the conservative default.
+        sim._foundation_step(state, 3, 3000, decider=lambda _s, _i, _g: None)
+        sim._foundation_step(state, 4, 4000, decider=lambda _s, _i, _g: None)
+        _save(state)
+        self.assertFalse(any(p['status'] == 'pending'
+                             for p in state['pendingFoundations']))
+        children = [r for r in _reqs(state) if r.get('splitFrom') == req['id']]
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].get('teamId'), 'lead1')
+
+    def test_founding_converts_workers_never_spawns(self):
+        """Founding reorganizes existing people: roster size is unchanged,
+        one worker became a manager, and the hand-over workers still work --
+        the pool never fills with managers."""
+        state = serve.get_state_from_db()
+        before = len(state['agentRoster'])
+        worker_count = sum(1 for r in state['agentRoster']
+                           if not governance.direct_reports(state, r['id'])
+                           and not r.get('isAdmin'))
+        sid = sim._found_subdirector(state, 'dev', seed_worker='w3', hand_over=2,
+                                     approved_by=None)
+        self.assertEqual(sid, 'w3')  # root director: unilateral founding stands
+        self.assertEqual(len(state['agentRoster']), before)
+        after_workers = sum(1 for r in state['agentRoster']
+                            if not governance.direct_reports(state, r['id'])
+                            and not r.get('isAdmin'))
+        self.assertEqual(after_workers, worker_count - 1)  # exactly one manager minted
 
     def test_founding_respects_ceiling_and_invalid_seeds(self):
         state = serve.get_state_from_db()

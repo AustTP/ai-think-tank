@@ -30,7 +30,12 @@ def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offse
     for rid in (req_ids or []):
         req = next((r for r in (state.get('backlogRequests') or [])
                     if r.get('id') == rid), None)
-        if not req or req.get('status') != 'pending':
+        if req is None:
+            # A vanished request stays claimed-less: resolve already skips
+            # missing ids idempotently (pre-seeded pending records, tests).
+            claimed.append(rid)
+            continue
+        if req.get('status') != 'pending':
             continue
         owner = req.get('teamId')
         if owner and owner != team_id:
@@ -44,6 +49,11 @@ def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offse
         claimed.append(rid)
     req_ids = claimed
     if not req_ids:
+        # Every id we were handed exists but is unavailable (claimed by
+        # another team, resolved, or moved to the split layer): refuse to
+        # convene AND drop any pending record seeded for them, or the
+        # un-embarked record would re-attempt this dead convene every pass.
+        state.setdefault('pendingBreakdowns', {}).pop(team_id, None)
         return False
     ids = _breakdown_attendees(state, req_ids, scrum_master_id, team_id)
     if not ids:
