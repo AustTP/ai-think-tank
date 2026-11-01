@@ -196,6 +196,22 @@ def _refinement_scrum_master_for_team(state, team_id):
     return None
 
 
+def _team_row_for(state, team_id):
+    """The team record for `team_id`, or -- when the id names a roster agent
+    who leads people -- a SYNTHETIC subteam row for that subdirector. A
+    subdirector's subteam is emergent from the reporting graph (no teams
+    row exists); ceremonies and assignment treat the subdirector exactly
+    like a team director, while budget/spend attribution keeps walking the
+    chain to the root team."""
+    row = _team_row(state, team_id)
+    if row:
+        return row
+    if team_id and any(d.get('id') == team_id for d in (state.get('agentRoster') or [])) \
+            and governance.direct_reports(state, team_id):
+        return {'id': team_id, 'directorId': team_id}
+    return None
+
+
 def _ceremony_facilitator(state, team_id):
     """A FREE, ON-DUTY facilitator for `team_id`'s ceremony -- the one change
     that makes scrum-master absence never block a ceremony. Mirrors the retro's
@@ -216,7 +232,20 @@ def _ceremony_facilitator(state, team_id):
     sm = _refinement_scrum_master_for_team(state, team_id)
     if sm and _free(sm):
         return sm
-    did = (teams.get(team_id) or {}).get('directorId')
+    # A subdirector-led subteam (no teams row): the subdirector IS the
+    # facilitator of their subteam's planning; their parent director is the
+    # first fallback before the generic borrow ladder.
+    sub_row = _team_row_for(state, team_id)
+    if sub_row and sub_row.get('directorId') == team_id \
+            and not _team_row(state, team_id):
+        sub_id = team_id
+        if _free(sub_id):
+            return sub_id
+        parent = next((d.get('director') for d in (state.get('agentRoster') or [])
+                       if d.get('id') == sub_id), None)
+        if parent and _free(parent):
+            return parent
+    did = (teams.get(team_id) or sub_row or {}).get('directorId')
     if did and _free(did):
         return did
     # Borrow a free director from another team rather than leaving the team's
@@ -972,12 +1001,18 @@ def _refinement_step(state, now, now_ms, decider=None, reader=None):
 
 def _pending_breakdown_requests(state, team_id):
     """Pending large-request breakdowns targeted at `team_id` (breakdown:True
-    records only) -- the breakdown ceremony's intake. Distinct from the
-    refinement ceremony's `_pending_work_requests`, which must never groom
-    these: the two ceremonies own different request kinds."""
+    records only), PLUS unclaimed SHARED requests (filed with no team on
+    purpose -- either team may pick them up; the first ceremony to convene
+    claims one by stamping teamId). A request still awaiting the director's
+    split review is never carded here -- the split layer owns it until the
+    director decides. Distinct from the refinement ceremony's
+    `_pending_work_requests`, which must never groom these: the two ceremonies
+    own different request kinds."""
     return [r for r in (state.get('backlogRequests') or [])
             if r.get('status') == 'pending' and r.get('breakdown')
-            and r.get('teamId') == team_id]
+            and not r.get('awaitingSplit')
+            and (r.get('teamId') == team_id
+                 or (not r.get('teamId') and r.get('shared')))]
 
 
 def _breakdown_attendees(state, req_ids, scrum_master_id, team_id):
@@ -991,7 +1026,7 @@ def _breakdown_attendees(state, req_ids, scrum_master_id, team_id):
     attendee ids, or None if any attendee is busy."""
     agents = state.get('agents') or {}
     ids = [scrum_master_id]
-    t = _team_row(state, team_id) or {}
+    t = _team_row_for(state, team_id) or {}
     director_id = t.get('directorId')
     for aid in _sim_direct_reports(state, director_id):
         if aid not in ids and aid != director_id:

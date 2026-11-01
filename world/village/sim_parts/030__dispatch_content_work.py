@@ -266,6 +266,10 @@ def queue_work(state, items):
             'projectLabel': item.get('projectLabel') or None,
             'research': item.get('research') or None,
             'taskType': item.get('taskType') or 'code',
+            # Which village the work lives in (split pieces route across
+            # villages; agents inherit their director's villageId). Provenance
+            # for the multi-village org -- rooms are shared geometry today.
+            'villageId': item.get('villageId') or None,
             # What the card must produce. Survives refinement -> queue ->
             # assignment so the completion gate reads the explicit contract
             # (code/report/note) instead of guessing from the title.

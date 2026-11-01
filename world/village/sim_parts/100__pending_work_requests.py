@@ -50,13 +50,39 @@ def file_work_request(state, agent_id, title, room, reason=None):
     return req
 
 
-def file_large_request(state, authority_id, goal, team_id, now_ms=None, constraints=None):
+def _canonical_priority(priority):
+    """A whole-ask urgency tag as its canonical string ('low'..'urgent'),
+    defaulting to 'normal'. Accepts the string names or the int values the
+    queue already uses; anything unrecognized is 'normal', never an error --
+    a malformed priority must not block filing the ask."""
+    if isinstance(priority, str) and priority.strip().lower() in WORK_PRIORITY:
+        return priority.strip().lower()
+    if isinstance(priority, (int, float)):
+        for name, value in WORK_PRIORITY.items():
+            if value == int(priority):
+                return name
+    return 'normal'
+
+
+def file_large_request(state, authority_id, goal, team_id, now_ms=None, constraints=None,
+                       priority=None):
     """File a staffable large ask as a pending BREAKDOWN request for a team's
     breakdown ceremony to card into stories/spikes. The ask is attributed to
     the free authority who chose the team and tagged with the receiving team
     so the breakdown ceremony convenes the RIGHT team's scrum master + workers.
     Never predicts subtasks up front -- the ceremony does that. Returns the new
     request dict, or None if malformed.
+
+    `team_id=None` files a SHARED request: no owning team, pickable by ANY
+    team's breakdown ceremony (the first ceremony to convene claims it by
+    stamping teamId). The player's ask may name no team on purpose -- either
+    subteam can pick the work up.
+
+    `priority` is an optional urgency signal on the WHOLE ask ('low' through
+    'urgent', default 'normal'). It orders ceremony intake (urgent asks card
+    before normal ones) and rides onto every card the ceremony queues. It is
+    CONTEXT, never a mechanical override -- the ceremonies weigh it like any
+    other signal.
 
     `constraints` is an OPTIONAL dict of player-pinned guidance the filing
     path may attach when the player chooses to steer (all keys optional, all
@@ -74,16 +100,43 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
     constraints dict is ignored (the ask still files -- a bad pin never blocks
     the work)."""
     goal = (goal or '').strip()
-    if not goal or not team_id:
+    if not goal:
         return None
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     req = {
         'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
         'filedBy': authority_id, 'title': goal[:120], 'room': 'pressoffice',
         'reason': f"Large request: {goal[:200]}", 'goal': goal,
-        'filedAt': now_ms, 'status': 'pending', 'teamId': team_id,
+        'filedAt': now_ms, 'status': 'pending',
         'origin': 'large_request', 'breakdown': True,
+        # Whole-ask urgency (canonical string; the queue normalizes it again
+        # onto each card). 'normal' when the caller didn't name one.
+        'priority': _canonical_priority(priority),
     }
+    if team_id:
+        req['teamId'] = team_id
+        # Which village the work will LIVE in: teams are village-scoped (the
+        # spawn cap counts per village) and agents inherit their director's
+        # villageId, so the receiving director's village is the work's home.
+        # Recorded for provenance + the split ceremony's awareness; rooms are
+        # shared geometry today, and cross-village WALKING is the mobility
+        # layer's future work (see sim_helpers' village comment).
+        team_director = (_team_row(state, team_id) or {}).get('directorId') or team_id
+        req['villageId'] = village_of_agent(state, team_director)
+        # Director-split layer: when the receiving director already leads a
+        # subdirector layer, the DIRECTOR reviews the ask first and decides how
+        # it partitions across the subteams (135__director_split) -- the plain
+        # breakdown convene skips this request until the split decides. A
+        # director with no subdirectors keeps the proven single-team path.
+        try:
+            split_director = team_director
+            if split_director and governance.subdirectors_of(state, split_director):
+                req['awaitingSplit'] = True
+        except Exception:
+            pass
+    else:
+        req['shared'] = True
+        req['villageId'] = village_of_agent(state, authority_id)
     if isinstance(constraints, dict) and constraints:
         pinned = {}
         budget = constraints.get('budgetUsd')

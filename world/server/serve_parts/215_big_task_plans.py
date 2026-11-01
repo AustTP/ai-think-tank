@@ -109,7 +109,8 @@ def _apply_staffed_plan(state, plan, actor):
     req = _sim.file_large_request(state, admin_id, plan['goal'],
                                   team.get('id') or team.get('directorId'),
                                   int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000),
-                                  constraints=plan.get('constraints') or {})
+                                  constraints=plan.get('constraints') or {},
+                                  priority=plan.get('priority'))
     if not req:
         raise plan_approvals.PlanError('Could not file the request; revise the plan.', 'apply')
     log_action(actor, 'big_task_plan_applied',

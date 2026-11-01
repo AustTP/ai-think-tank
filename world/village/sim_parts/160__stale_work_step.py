@@ -400,6 +400,14 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # sprint until it's free.
     _breakdown_step(state, now, now_ms)
 
+    # Director split: a large ask landing on a director with a subdirector
+    # layer is REVIEWED by the director first and partitioned across the
+    # subteams (pieces per subteam, shared pieces either subteam may pick up,
+    # and new-subdirector foundings when the org needs capacity). Runs ungated
+    # next to the breakdown step -- the review is the point even on a quiet
+    # think tank -- and no-ops with nothing split-pending.
+    _director_split_step(state, now, now_ms)
+
     # WS-14: sprint retrospectives -- a just-closed sprint's team meets to capture
     # START / STOP / CONTINUE (director excluded) on a later pass. Runs ungated
     # like the Social / refinement, so a closed sprint never strands its retro.
@@ -912,6 +920,14 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                     f'could not be assigned after {pick["attempts"]} attempts',
                     category='abandoned', now_ms=now_ms)
                 _on_work_item_abandoned(state, pick, now_ms)
+    # Background grader merge (2026-11-01 scale fix): drain the grader's
+    # mailbox into state on the tick thread -- the worker never touches
+    # state, so this pass stays the single state writer (same two-phase
+    # discipline as _content_results).
+    try:
+        _merge_completed_grades(state, now_ms=now_ms)
+    except Exception:
+        pass
     return state
 
 

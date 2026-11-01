@@ -115,7 +115,7 @@ def _breakdown_into_shared_backlog(state, goal, admin_id, constraints=None):
     return {'feature': feature, 'items': out}
 
 
-async def _dispatch_big_task(state, goal, actor, constraints=None):
+async def _dispatch_big_task(state, goal, actor, constraints=None, priority=None):
     """Core routing for a large request, shared by /api/intent/assign-big-task
     and the x-mention webhook consumer loop: when EVERY existing team is
     committed to an active sprint, the ask is broken down into stories/spikes
@@ -178,7 +178,7 @@ async def _dispatch_big_task(state, goal, actor, constraints=None):
     team_id = team.get('id') or team.get('directorId')
     now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
     req = _sim.file_large_request(state, admin_id, goal, team_id, now_ms,
-                                  constraints=constraints)
+                                  constraints=constraints, priority=priority)
     if not req:
         return 'failed', {}
     save_state_to_db(state)
@@ -215,6 +215,7 @@ async def intent_assign_big_task(request: Request):
     raw_c = body.get('constraints')
     if isinstance(raw_c, dict) and raw_c:
         constraints = raw_c
+    priority = body.get('priority')
 
     # Logged-in player (the /api/intent prefix is auth-protected above; the
     # session is a player login, not an agent -- there's no agent id on it, so
@@ -228,7 +229,8 @@ async def intent_assign_big_task(request: Request):
     # Large-request routing is shared with the webhook consumer loop: see
     # _dispatch_big_task (backlog breakdown / new-team / staffing).
     outcome, data = await _dispatch_big_task(state, goal, player_id,
-                                             constraints=constraints)
+                                             constraints=constraints,
+                                             priority=priority)
     if outcome == 'backlogged':
         return JSONResponse({'ok': True, 'backlogged': True,
                              'feature': data['feature'].get('id'),

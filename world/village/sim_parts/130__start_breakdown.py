@@ -1,11 +1,50 @@
 import re
 
 
+def _request_priority_rank(req):
+    """A request's urgency as the queue's int scale (low 0 .. urgent 3),
+    defaulting to normal. Accepts the canonical string the filer stored or a
+    raw int; anything unrecognized is normal -- a malformed tag never
+    reorders intake."""
+    value = (req or {}).get('priority')
+    if isinstance(value, str):
+        return WORK_PRIORITY.get(value.strip().lower(), WORK_PRIORITY['normal'])
+    if isinstance(value, (int, float)) and int(value) in _WORK_PRIORITY_VALUES:
+        return int(value)
+    return WORK_PRIORITY['normal']
+
+
 def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offset=0):
     """Convene the breakdown ceremony at the Command Center: snapshot each
     attendee's prior state into `pending['people']`, mark them busy at a spread,
     and schedule the resolve BREAKDOWN_MEET_MS later. Returns True if convened
     (attendees healthy), False to defer and retry next pass."""
+    # Shared-backlog claim (cut 1 of the multi-team split): a request filed
+    # with no team is pickable by ANY team's ceremony, and the first ceremony
+    # to actually convene claims it by stamping teamId. Re-check every id
+    # against CURRENT state rather than trusting the gathered list: between
+    # this team's convene scan and this call, another team's ceremony may
+    # have started (claimed a shared request) or a request may have been
+    # resolved/withdrawn. A request stamped for another team is not ours.
+    claimed = []
+    for rid in (req_ids or []):
+        req = next((r for r in (state.get('backlogRequests') or [])
+                    if r.get('id') == rid), None)
+        if not req or req.get('status') != 'pending':
+            continue
+        owner = req.get('teamId')
+        if owner and owner != team_id:
+            continue
+        if req.get('awaitingSplit'):
+            continue  # the director's split review owns this one
+        if not owner:
+            req['teamId'] = team_id
+            req['claimedFromShared'] = True
+            req['claimedAt'] = now_ms
+        claimed.append(rid)
+    req_ids = claimed
+    if not req_ids:
+        return False
     ids = _breakdown_attendees(state, req_ids, scrum_master_id, team_id)
     if not ids:
         return False
@@ -285,6 +324,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             queue_work(state, [{
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
+                'villageId': req.get('villageId'),
                 # Provenance: every card a breakdown creates points back at the
                 # request that asked for it. The A2A facade reads completion back
                 # through this link instead of matching titles.
@@ -344,7 +384,8 @@ def _breakdown_step(state, now, now_ms, decider=None):
         team_id = team.get('id') or team.get('directorId')
         if team_id in pending_map:
             continue  # this team already has an in-flight breakdown ceremony
-        req_ids = [r['id'] for r in _pending_breakdown_requests(state, team_id)]
+        reqs = _pending_breakdown_requests(state, team_id)
+        req_ids = [r['id'] for r in reqs]
         if not req_ids:
             continue  # nothing to plan -- don't convene an empty meeting
         if _team_in_active_sprint(state, team_id):
@@ -355,9 +396,41 @@ def _breakdown_step(state, now, now_ms, decider=None):
         facilitator = _ceremony_facilitator(state, team_id)
         if not facilitator:
             continue  # this team has no free+on-duty facilitator right now
-        req_ids = req_ids[:BREAKDOWN_MAX_REQUESTS]
+        # Priority-aware intake: urgent asks card before normal ones, and a
+        # slow-burn ask waits its turn (same-priority order stays
+        # oldest-first). Deterministic; the priority tag is context the
+        # ceremony weighs, but INTAKE ordering is where urgency acts.
+        reqs.sort(key=lambda r: (-_request_priority_rank(r),
+                                 r.get('filedAt') or 0))
+        req_ids = [r['id'] for r in reqs][:BREAKDOWN_MAX_REQUESTS]
         if _start_breakdown(state, team_id, req_ids, facilitator, now_ms, pos_offset=slot):
             slot += 1  # only to spread simultaneous ceremonies apart in the room
+    # Subteams: a split piece routed to a subdirector binds to their emergent
+    # subteam (no teams row) -- the subdirector plans it with their own
+    # workers exactly like a team does, once their subteam's turn comes.
+    seen_directors = set()
+    for team in (state.get('teams') or []):
+        director_id = team.get('directorId')
+        if not director_id or director_id in seen_directors:
+            continue
+        seen_directors.add(director_id)
+        for sid in governance.subdirectors_of(state, director_id):
+            if sid in pending_map:
+                continue  # this subteam already has an in-flight ceremony
+            reqs = _pending_breakdown_requests(state, sid)
+            if not reqs:
+                continue
+            if _team_in_active_sprint(state, sid):
+                continue  # the parent team's committed sprint owns the org
+            facilitator = _ceremony_facilitator(state, sid)
+            if not facilitator:
+                continue
+            reqs.sort(key=lambda r: (-_request_priority_rank(r),
+                                     r.get('filedAt') or 0))
+            req_ids = [r['id'] for r in reqs][:BREAKDOWN_MAX_REQUESTS]
+            if _start_breakdown(state, sid, req_ids, facilitator, now_ms,
+                                pos_offset=slot):
+                slot += 1
 
 
 # ---------------------------------------------------------------------------
