@@ -398,6 +398,15 @@ def queue_work(state, items):
             # 'done' dependents carry this onto their task so the cascade can
             # re-review them too.
             'dependsOn': item.get('dependsOn') or None,
+            # Phase-plan provenance (see _resolve_breakdown): a phased
+            # breakdown's card carries its phase label + execution index so
+            # the assignment barrier can hold it until the previous phase is
+            # done and the board can show the plan. Must survive the queue
+            # round trip or a phased request silently degrades to ungated
+            # parallel work -- the exact class of whitelist gap
+            # 'distill'/'checklist'/'pipelineStep' all hit.
+            'phase': item.get('phase') or None,
+            'phaseIndex': item.get('phaseIndex'),
             # Bot Ops / shadow mode: a SHADOW work item does the work but changes
             # nothing -- on completion its outcome is captured to the append-only
             # state['shadowLedger'] draft instead of shipping (no peer gate, no

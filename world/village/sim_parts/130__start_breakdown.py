@@ -272,8 +272,15 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
             "\"sizeEstimate\" of S/M/L. "
             "Never use story for a prose report or recommendation; use report. "
+            "Plan the work in PHASES when the ask has a preparation stage the build depends on "
+            "(spec definition, research, copywriting, UI research before implementation): tag every "
+            "card with a short \"phase\" name and name phases in EXECUTION order -- every card of a "
+            "later phase waits until EVERY card of the previous phase has landed, while cards that "
+            "share a phase run in parallel. Cards that must not run at the same time (gather before "
+            "write, write before save) belong in DIFFERENT phases; only same-phase cards may overlap. "
+            "A single-stage ask uses one phase (or omits phase entirely). "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike|research|report","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
+            '{"items":[{"title":"short title","type":"story|spike|research|report","phase":"short phase name or omitted","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
         )
         template = _workflow_match_template(state, goal, team_id)
         if template:
@@ -302,6 +309,28 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # Outage / unusable plan: never drop the ask -- queue a single card
                 # titled the goal so it stays in the pipeline for a worker to pick up.
                 items = [{'title': goal[:120], 'type': 'story'}]
+        # Phase plan (2026-11-01): when the scrum master's plan names more
+        # than one phase, the request runs PHASED -- cards of one phase share
+        # a sprint's workers in parallel, and every later-phase card waits at
+        # assignment until every earlier-phase card is DONE (the phase
+        # barrier in _assign_due_item). That is the prep-then-build shape: a
+        # define/research/copy/UI-research phase completes before the build
+        # phase starts. A single-phase plan keeps the legacy strict serial
+        # sequence (order-dependent pipelines like gather -> write -> save
+        # must not be relaxed -- only the decider's own multiple phases
+        # declare safe parallelism).
+        phase_order = []
+        for s in items:
+            label = (s.get('phase') or '').strip().lower()[:24] if isinstance(s, dict) else ''
+            if label and label not in phase_order:
+                phase_order.append(label)
+        phased = len(phase_order) > 1
+        if phased:
+            _log_governance(state, scrum_master_id, 'breakdown_phase_plan',
+                            {'request': req.get('id'), 'phases': phase_order,
+                             'counts': [sum(1 for x in items
+                                            if (x.get('phase') or '').strip().lower()[:24] == lab)
+                                        for lab in phase_order]})
         for seq, s in enumerate(items):
             title = (s.get('title') or '').strip()[:120]
             # Preserve the model's investigation-class type ('spike' or
@@ -366,7 +395,20 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # Serial group: cards of one request run in the model's order.
                 # The assignment guard waits while an earlier card is queued or
                 # active, so gather -> write -> save cannot run in parallel.
-                'sequence': seq,
+                # PHASED plans replace the serial chain with the phase
+                # barrier: sequence stays None (cards of one phase may run in
+                # parallel) and phaseIndex carries the execution order the
+                # guard enforces.
+                'sequence': None if phased else seq,
+                # An untagged card in a phased plan belongs to the FIRST
+                # phase: the conservative reading (it runs with the earliest
+                # work and its completion gates later phases) -- an omitted
+                # tag must never open a hole in the barrier.
+                'phase': ((s.get('phase') or '').strip().lower()[:24] or phase_order[0])
+                         if phased else None,
+                'phaseIndex': phase_order.index(
+                    ((s.get('phase') or '').strip().lower()[:24] or phase_order[0])
+                ) if phased else None,
             }])
         req['status'] = 'accepted'
         req['brokenDown'] = True

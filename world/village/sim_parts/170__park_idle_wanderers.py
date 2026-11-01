@@ -463,6 +463,29 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
             other_seq = other.get('sequence')
             if other_seq is not None and other_seq < sequence:
                 return _ASSIGN_WAIT
+    # Phase barrier (2026-11-01): a PHASED breakdown's card waits until
+    # every card of an EARLIER phase is done (not queued, not active), while
+    # same-phase cards run in parallel -- the prep-then-build shape. This is
+    # the sequence guard's granularity relaxed one level: sequence serializes
+    # a single-phase request; phaseIndex serializes BETWEEN phases only. A
+    # phased pick carries no sequence, so the serial block above never
+    # applies to it.
+    phase_index = pick.get('phaseIndex')
+    if request_id and phase_index is not None:
+        for other in (state.get('tasks') or {}).values():
+            if other.get('requestId') != request_id:
+                continue
+            other_phase = other.get('phaseIndex')
+            if other_phase is not None and other_phase < phase_index \
+                    and other.get('status') in ('walking', 'working',
+                                               'repairing', 'needs_review'):
+                return _ASSIGN_WAIT
+        for other in (state.get('workQueue') or []):
+            if other is pick or other.get('requestId') != request_id:
+                continue
+            other_phase = other.get('phaseIndex')
+            if other_phase is not None and other_phase < phase_index:
+                return _ASSIGN_WAIT
     agents = state.get('agents') or {}
     # Human-in-the-loop: a card pinned to the PLAYER (assignedTo 'player') is
     # never an agent's job. Assign it to the player (durable 'needs_player'
@@ -771,6 +794,11 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         'issueKey': pick.get('issueKey'),
         'requestId': pick.get('requestId'),
         'sequence': pick.get('sequence'),
+        # Phase-plan provenance (see _resolve_breakdown / the phase barrier
+        # above): the task carries its phase so the barrier can see an
+        # ACTIVE earlier-phase card and the board can show the plan.
+        'phase': pick.get('phase'),
+        'phaseIndex': pick.get('phaseIndex'),
         'templateId': pick.get('templateId'),
         # Phase E2d: an INCIDENT routes to the owning team's on-call (taskType
         # 'bug' + productId + assignedTo travel so the fix is attributable and
