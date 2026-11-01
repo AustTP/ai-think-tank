@@ -40,6 +40,7 @@ from village.sim_helpers import (  # noqa: E402, F401
     DEFAULT_VILLAGE,
     appoint_village_chief,
     create_village,
+    ensure_village_chiefs,
     ensure_villages,
     next_village_id,
     set_agent_village,

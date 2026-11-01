@@ -122,6 +122,38 @@ def test_create_village_appoints_a_chief():
     assert g.villages_without_chief(s) == []
 
 
+def test_ensure_sweep_backfills_chiefless_villages_idempotently():
+    s = _state()
+    s['villages'].append({'id': 'vlg-2', 'name': 'Second'})
+    # The sweep appoints where a candidate exists (main: d1) and leaves
+    # what it cannot fill visible for the operator.
+    assert h.ensure_village_chiefs(s) == ['main']
+    assert g.villages_without_chief(s) == ['vlg-2']
+    assert h.ensure_village_chiefs(s) == []  # idempotent
+    assert g.chief_of_village(s, 'main') == 'd1'
+    s['agents']['d2']['villageId'] = 'vlg-2'
+    assert h.ensure_village_chiefs(s) == ['vlg-2']
+    assert g.villages_without_chief(s) == []
+
+
+def test_first_tick_after_deploy_backfills_the_first_village():
+    """The tick's gated heal block runs the sweep on the first post-deploy
+    tick (the _heal_len sentinel), so the FIRST village gets its chief the
+    moment the new code serves a tick -- no operator action needed."""
+    s = _state()
+    s['workQueue'] = []
+    s['tasks'] = {}
+    s['pendingBreakdowns'] = {}
+    s['pendingRetrospectives'] = {}
+    s['pendingDirectorSplits'] = {}
+    s['pendingFailureReviews'] = {}
+    s['pendingFoundationReviews'] = {}
+    s['sim'] = {'owner': 'client'}
+    h.SimEngine().tick(s, now=1000.0)
+    assert g.chief_of_village(s, 'main') == 'd1'
+    assert g.villages_without_chief(s) == []
+
+
 def test_chiefs_never_report_to_themselves_and_admin_is_stable():
     s = _state()
     s['agents']['theo']['villageId'] = 'main'

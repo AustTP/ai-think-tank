@@ -220,6 +220,16 @@ def appoint_village_chief(state, village_id, agent_id=None):
         return ((agents.get(aid) or {}).get('villageId')
                 or DEFAULT_VILLAGE)
 
+    # Seat already filled and no explicit successor asked for: keep the
+    # sitting chief (the appointment is then a no-op, which is what makes
+    # the ensure sweep idempotent).
+    if not agent_id:
+        current = next((e.get('id') for e in entries.values()
+                        if e.get('villageChief')
+                        and (e.get('chiefOfVillage') or None) == (village_id or None)),
+                       None)
+        if current:
+            return current
     # One chief per village: strip the flags from whoever holds them now.
     previous = [e for e in entries.values()
                 if e.get('villageChief')
@@ -273,6 +283,26 @@ def appoint_village_chief(state, village_id, agent_id=None):
                 and de.get('director') in (None, admin_id):
             de['director'] = candidate
     return candidate
+
+
+def ensure_village_chiefs(state):
+    """Backfill sweep for the every-village-has-a-chief invariant: appoint a
+    chief (auto-pick) for every village that lacks one and has an eligible
+    candidate. Idempotent and cheap (villages x roster); villages with no
+    candidate stay chief-less and keep showing up in the health digest
+    until an agent eligible for the seat exists. Returns the ids that were
+    appointed."""
+    appointed = []
+    have = {r.get('chiefOfVillage') for r in (state.get('agentRoster') or [])
+            if isinstance(r, dict) and r.get('villageChief')}
+    for v in (state.get('villages') or []):
+        vid = v.get('id') if isinstance(v, dict) else None
+        if not vid or vid in have:
+            continue
+        chief = appoint_village_chief(state, vid)
+        if chief:
+            appointed.append(vid)
+    return appointed
 
 
 def village_of_agent(state, agent_id):

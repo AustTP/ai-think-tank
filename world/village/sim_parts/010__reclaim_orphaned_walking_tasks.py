@@ -169,6 +169,12 @@ class SimEngine:
             serve._heal_agent_identity(state)
             self._heal_len = agents_len
             self._heal_age = 0
+            # Same gate as the identity heal (2026-11-01): a roster change
+            # is exactly when a chief candidate may have appeared, and the
+            # every-N sweep catches a village born before any director
+            # existed. Backfills the FIRST village's chief on the first
+            # post-deploy tick (its initial _heal_len sentinel fires).
+            ensure_village_chiefs(state)
         else:
             self._heal_age += 1
 
