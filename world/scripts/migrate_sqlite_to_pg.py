@@ -17,7 +17,6 @@ database you have written to independently.
 """
 import argparse
 import os
-import re
 import sqlite3
 import sys
 

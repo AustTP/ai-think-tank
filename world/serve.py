@@ -3,11 +3,12 @@
 import faulthandler
 import signal
 import os as _os
+import sys as _sys
 # --read-only (2026-11-01): start this process as the read-only replica
 # (THINK_TANK_READ_ONLY=1); reads come from the shared store, writes are
 # refused, no background loops, no sim. Parsed BEFORE the parts exec so
 # 00_header sees the flag at import.
-if any(a == '--read-only' for a in _os.sys.argv):
+if any(a == '--read-only' for a in _sys.argv):
     _os.environ.setdefault('THINK_TANK_READ_ONLY', '1')
     print('[args] --read-only: replica mode (writes refused, loops off)', flush=True)
 # kill -USR1 <pid> dumps all python thread stacks to stderr (found the RSS

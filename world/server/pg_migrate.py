@@ -16,7 +16,6 @@ would force SQLite); it sets THINK_TANK_DB_URL itself and refuses to run
 when THINK_TANK_FORCE_SQLITE is set.
 """
 import argparse
-import json
 import os
 import sqlite3
 import sys

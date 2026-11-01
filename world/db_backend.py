@@ -941,7 +941,6 @@ def connect(path=None):
     if not dsn:
         target = path or os.environ.get('THINK_TANK_DB') or 'think_tank.db'
         return sqlite3.connect(target)
-    import psycopg2
     try:
         raw, pool = _checkout(dsn)
     except Exception as e:  # pragma: no cover - operator-environment error

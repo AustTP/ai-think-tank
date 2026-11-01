@@ -340,7 +340,6 @@ def queue_work(state, items):
             # (serve._adversarial_village_tick) can tell when a side has
             # delivered. Same whitelist contract as 'distill'/'checklist'.
             'adversarialTaskId': item.get('adversarialTaskId') or None,
-            'villageId': item.get('villageId') or None,
             # WS-14: a story pulled from the shared backlog keeps its provenance
             # -- the FEATURE it belongs to and the SHARED-BACKLOG item id it was
             # claimed from -- so the sprint digest and backlog board can read
