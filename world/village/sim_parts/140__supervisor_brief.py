@@ -729,6 +729,113 @@ def _ensure_grading_worker():
                      name='deliverable-grader').start()
 
 
+# ---------------------------------------------------------------------------
+# Agent long-term memory (2026-11-01): when a deliverable lands and is
+# judged, distill what that worker learned into agent_ltm (agents/memory.py)
+# so their NEXT task on the same ground recalls it. Same two-phase discipline
+# as the grader above: enqueue on the tick, extract off it; a per-agent
+# cadence and a note-length floor keep the model spend bounded (one cheap
+# tier call per agent per window at most). Tests drive the deterministic
+# seam (_agent_memory_pending_sync) with the daemon disabled.
+
+_AGENT_MEMORY_CADENCE_S = 6 * 3600
+_AGENT_MEMORY_MIN_NOTE_CHARS = 120
+_pending_agent_memory = {}
+_pending_agent_memory_lock = threading.Lock()
+_agent_memory_worker_started = False
+_AGENT_MEMORY_WORKER_DISABLED = False
+_agent_last_extract = {}  # agent_id -> last enqueue ts (process-local cadence)
+
+
+def _maybe_queue_agent_memory(state, task, res, now_ms):
+    """Tick-side enqueue guard: cheap checks only, never a model call. A
+    task with no substantial report teaches nothing worth a call."""
+    if not task or not isinstance(task, dict):
+        return
+    agent_id = res.get('agentId') or task.get('assignedTo')
+    note = str(task.get('note') or '')
+    if not agent_id or len(note) < _AGENT_MEMORY_MIN_NOTE_CHARS:
+        return
+    if agent_id not in (state.get('agents') or {}):
+        return
+    last = _agent_last_extract.get(agent_id, 0.0)
+    if now_ms - last < _AGENT_MEMORY_CADENCE_S * 1000:
+        return
+    _agent_last_extract[agent_id] = now_ms
+    with _pending_agent_memory_lock:
+        _pending_agent_memory[task.get('id') or agent_id] = {
+            'agentId': agent_id, 'title': res.get('title') or task.get('title'),
+            'note': note[:1500], 'room': res.get('room') or task.get('room')}
+    _ensure_agent_memory_worker()
+
+
+def _process_agent_memory_batch(jobs):
+    """One extraction pass off the tick thread: distill each queued job
+    into agent_ltm. Returns False only if the DB is unreachable (requeue)."""
+    if not jobs:
+        return True
+    try:
+        import serve as _serve_mod
+        from agents import memory as _memory
+        _memory._ensure_tables()
+        with _serve_mod._db() as conn:
+            conn.execute('SELECT 1')
+    except Exception:
+        return False
+    from agents import memory as _memory
+    for job in jobs:
+        try:
+            _memory.agent_ltm_extract(job['agentId'], job.get('title'),
+                                      job.get('note'), job.get('room'))
+        except Exception:
+            pass  # one bad extraction never blocks the rest
+    return True
+
+
+def _agent_memory_pending_sync():
+    """Deterministic seam: drain the queue synchronously (no threads)."""
+    with _pending_agent_memory_lock:
+        jobs = list(_pending_agent_memory.values())
+        _pending_agent_memory.clear()
+    _process_agent_memory_batch(jobs)
+
+
+def _ensure_agent_memory_worker():
+    global _agent_memory_worker_started
+    if _agent_memory_worker_started or _AGENT_MEMORY_WORKER_DISABLED:
+        return
+    _agent_memory_worker_started = True
+
+    def _loop():
+        while True:
+            with _pending_agent_memory_lock:
+                jobs = [_pending_agent_memory.pop(k)
+                        for k in list(_pending_agent_memory)[:4]]
+            if not jobs:
+                time.sleep(2.0)
+                continue
+            if not _process_agent_memory_batch(jobs):
+                time.sleep(5.0)  # DB outage: back off
+
+    threading.Thread(target=_loop, daemon=True,
+                     name='agent-memory').start()
+
+
+def _agent_memory_note_for(agent_id, instructions):
+    """The agent's own recalled work-learnings for this task, as lines to
+    append to its instructions. Bounded (2 memories), failure-swallowed --
+    recall enriches the task, it is never a precondition for it."""
+    try:
+        import serve as _serve_mod
+        from agents import memory as _memory
+        block = _memory.agent_ltm_recall(agent_id, instructions, limit=2)
+        if block:
+            return 'From your own completed work, what you learned before:\n' + block
+    except Exception:
+        pass
+    return None
+
+
 def _merge_completed_grades(state, now_ms=None):
     """Drain the background grader's mailbox into state (tick-thread only).
     Upgrades a pending deliverable entry with the real judgment and runs the
@@ -792,6 +899,10 @@ def _merge_completed_grades(state, now_ms=None):
                                            grade, agent_id=res.get('agentId'))
             except Exception:
                 pass
+        # Agent long-term memory (2026-11-01): a landed, judged deliverable
+        # is exactly the moment a worker learned something. Enqueue a
+        # bounded-cadence distillation (worker thread; never on the tick).
+        _maybe_queue_agent_memory(state, task, res, now_ms)
         merged += 1
     return merged
 
@@ -839,7 +950,9 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     # enrich the judgment, they are never a precondition for it.
     try:
         import serve as _serve_mod
-        anchors = _serve_mod._rag_room_anchors(room, exclude_ref=task.get('id'))
+        anchors = _serve_mod._rag_room_anchors(
+            room, exclude_ref=task.get('id'),
+            village=task.get('villageId') or None)
         if anchors:
             instructions += '\n\n' + '\n\n'.join(anchors)
     except Exception:
@@ -1178,12 +1291,34 @@ def _coaching_note_for(state, agent_id):
     return None
 
 
-def _runbook_note_for(state, product_id):
-    """The most recent runbook entry for a product, as a one-line coaching-style
-    note for a new incident task. Returns None if the product has no history."""
+def _runbook_note_for(state, product_id, instructions=None):
+    """A prior incident for this product, as a one-line coaching-style note
+    for a new incident task. With `instructions`, the MOST RELEVANT prior
+    incident is retrieved by word overlap against the task (an older
+    relevant incident beats a newer unrelated one), preferring real
+    model-written accounts over fallback filler and fixes that held up;
+    with no overlap at all (or no instructions), the most recent entry is
+    the note -- the old behavior. Returns None if the product has no
+    history."""
     entries = (state.get('runbooks') or {}).get(product_id) or []
     if not entries:
         return None
+    if instructions:
+        words = {w for w in re.findall(r"[a-z0-9]{3,}", str(instructions).lower())}
+        best = None
+        for idx, entry in enumerate(entries):
+            summary = str(entry.get('summary') or '')
+            overlap = len(words & {w for w in re.findall(r"[a-z0-9]{3,}", summary.lower())})
+            if not overlap:
+                continue
+            # Prefer a real account over filler, and a fix that held up;
+            # later entries break ties (recency is the remaining signal).
+            rank = (overlap + (1 if entry.get('summaryIsReal') else 0)
+                    + (0.5 if entry.get('restoreVerified') is True else 0.0), idx)
+            if best is None or rank > best[0]:
+                best = (rank, entry)
+        if best is not None:
+            return f"Prior incident in this product was: {str(best[1].get('summary'))[:240]}"
     last = entries[-1]
     return f"Prior incident in this product was: {last.get('summary')}"
 
@@ -1241,8 +1376,14 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     note = _coaching_note_for(state, agent_id)
     if note:
         pieces.append(note)
+    # The agent's own distilled work-learnings (agent_ltm): what THIS worker
+    # learned on comparable completed tasks, recalled against these
+    # instructions. Bounded and failure-swallowed (see _agent_memory_note_for).
+    learned = _agent_memory_note_for(agent_id, instructions)
+    if learned:
+        pieces.append(learned)
     if product_id:
-        rb = _runbook_note_for(state, product_id)
+        rb = _runbook_note_for(state, product_id, instructions=instructions)
         if rb:
             pieces.append(rb)
     if refocus:

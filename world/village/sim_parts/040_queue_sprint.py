@@ -239,6 +239,15 @@ def close_sprint(state, sprint_id, now_ms=None):
             for it in _unfinished_sprint_items(state, sprint_id)]
         record['closedAt'] = now_ms
         _record_sprint_velocity(state, record, now_ms)
+        # Team memory (2026-11-01): the close itself writes the team's
+        # retrospective into the wiki (what landed, what carried over, the
+        # velocity line), team-scoped so only this team's tasks read it.
+        # Runs after velocity so the body reports the real numbers.
+        # Failure-swallowed: a memory write must never fail a close.
+        try:
+            _sprint_team_memory(state, record, now_ms)
+        except Exception:
+            pass
     record['status'] = 'closed'
     # Sprint complete is one of the two moments the player should hear from
     # the tank (the other is a player-assigned story/spike landing).
@@ -748,7 +757,7 @@ WIKI_CATEGORY_ROOMS = {  # default category -> room affinity for read-before-act
 def wiki_write_page(state, page_id, title, category, body, edited_by,
                     edited_at_ms=None, village_id=None, owner=None,
                     clock=SLOW_CLOCK, review_after_ms=None,
-                    source=None, scope='team'):
+                    source=None, scope='team', team_id=None):
     """Pure: create or update a wiki page's METADATA + return the lined-up
     record for serve.py to persist (serve writes page['body'] to disk only for
     pre-existing/new pages; the metadata carries version + history). Rejects
@@ -785,6 +794,7 @@ def wiki_write_page(state, page_id, title, category, body, edited_by,
         'clock': clock,
         'owner': owner or edited_by or None,
         'scope': scope,
+        'teamId': team_id or None,
         'source': source or None,
         'reviewAfterMs': int(review_after_ms) if review_after_ms else None,
         'version': version,
@@ -804,7 +814,8 @@ def _page_room_affinity(state, page):
     return mapping.get(cat)
 
 
-def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE, now_ms=None):
+def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE, now_ms=None,
+                    team_id=None):
     """Pure: the subset of wiki pages relevant to a task in `room`, chosen by
     category-room affinity AND the reader's village. Only pages affined to THIS
     room (or to the think tank as a whole -- a None affinity) AND written by
@@ -825,10 +836,20 @@ def wiki_read_pages(state, room, max_pages=3, village_id=DEFAULT_VILLAGE, now_ms
         review_after = rec.get('reviewAfterMs')
         if review_after and int(review_after) < now_ms:
             continue  # expired -- do not inject as trusted knowledge
-        affinity = _page_room_affinity(state, rec)
-        if affinity != room and affinity is not None:
-            continue  # affined to another room -> irrelevant here
-        score = 0 if affinity == room else 1  # exact room beats think tank-wide
+        page_team = rec.get('teamId') or None
+        if page_team is not None:
+            # A TEAM-scoped memory (the auto-written sprint retrospective):
+            # only the owning team's tasks read it, regardless of room --
+            # and a team that doesn't pass its team_id never sees it, so
+            # existing callers keep today's behavior exactly.
+            if page_team != team_id:
+                continue
+            score = 0.5  # team memory beats think-tank-wide, not exact-room
+        else:
+            affinity = _page_room_affinity(state, rec)
+            if affinity != room and affinity is not None:
+                continue  # affined to another room -> irrelevant here
+            score = 0 if affinity == room else 1  # exact room beats think tank-wide
         scored.append((score, -(int(rec.get('editedAt') or 0)), page_id, rec))
     scored.sort()
     return [r for _s, _a, _pid, r in scored[:max_pages]]
@@ -890,3 +911,77 @@ def resolve_memory_fields(state, body, actor):
     review_after_ms = int(_t.time() * 1000) + int(review_days * 24 * 3600 * 1000)
     return {'clock': clock, 'owner': owner, 'scope': scope,
             'source': source, 'review_after_ms': review_after_ms}
+
+
+def _sprint_team_memory(state, record, now_ms):
+    """Team memory at sprint close (2026-11-01): auto-write each touched
+    team's retrospective as a wiki page scoped to that team (teamId) in the
+    team's village. One page per team per sprint close, newest-first in read
+    order, so the latest retrospective is what a team member's next task
+    injects -- the org's primary working unit finally keeps its own memory
+    instead of restarting from the charter every rollover. Category
+    'team-memory' is ensured (a system-authored category, never
+    room-affined: team pages match by teamId, not room). Returns the last
+    page record written, or None."""
+    team_ids = [t for t in (record.get('teamIds') or []) if t]
+    if not team_ids:
+        return None  # an org-wide sprint has no single team to remember it
+    rolled = {(r or {}).get('id') for r in (record.get('rolledOver') or [])}
+    landed, carried = [], []
+    for pair in (record.get('items') or []):
+        try:
+            title, room = tuple(pair)
+        except (TypeError, ValueError):
+            continue
+        if not title:
+            continue
+        (carried if (title, room) in rolled else landed).append(
+            f'- {title}' + (f' ({room})' if room else ''))
+    lines = ['', '']
+    vel = record.get('velocity') or {}
+    vel_bits = []
+    if vel.get('landed') is not None:
+        vel_bits.append(f"landed {vel.get('landed')}/{vel.get('total')}"
+                        + (f" ({vel.get('pct')}%)" if vel.get('pct') is not None else ''))
+    if vel.get('pointsLanded') is not None:
+        vel_bits.append(f"points {vel.get('pointsLanded')}/{vel.get('pointsTotal')}")
+    if vel_bits:
+        lines.append(f"Velocity: {', '.join(vel_bits)}.")
+        lines.append('')
+    if landed:
+        lines.append('Landed this sprint:')
+        lines.extend(landed[:30])
+        lines.append('')
+    if carried:
+        lines.append('Carried over (still open):')
+        lines.extend(carried[:20])
+        lines.append('')
+    lines.append('_Written automatically at sprint close; reviewed before it '
+                 'expires. Team-scoped: only this team reads it._')
+    wiki = state.setdefault('wiki', {})
+    cats = wiki.setdefault('categories', {})
+    cats.setdefault('team-memory', {'label': 'Team memory', 'order': 90})
+    rec = None
+    for team_id in team_ids:
+        team = (state.get('teams') or {}).get(team_id) or {}
+        sm = team.get('scrumMasterId') or 'system'
+        team_lines = list(lines)
+        team_lines[0] = f"# What team {team_id} settled in sprint {record.get('id')}"
+        page_id = f"team-{team_id}-sprint-{record.get('id')}"
+        rec, _is_new = wiki_write_page(
+            state, page_id,
+            f"Team {team_id} -- sprint {record.get('id')} retrospective",
+            'team-memory', '\n'.join(team_lines), edited_by=sm,
+            edited_at_ms=now_ms,
+            village_id=village_of_agent(state, sm) or None,
+            owner=sm, clock=SLOW_CLOCK,
+            review_after_ms=now_ms + 30 * 86400 * 1000,
+            source=f"sprint:{record.get('id')}", scope='team', team_id=team_id)
+        if rec:
+            record_memory_provenance(
+                state, sm, page_id, rec.get('title'),
+                f"Sprint {record.get('id')} retrospective: "
+                f"{vel.get('landed', 0)} landed, {len(carried)} carried over",
+                f"sprint:{record.get('id')}", 'team', SLOW_CLOCK,
+                now_ms + 30 * 86400 * 1000, rec.get('villageId'))
+    return rec

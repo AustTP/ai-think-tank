@@ -211,3 +211,116 @@ class Status(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VillageScoping(unittest.TestCase):
+    """2026-11-01: the index is village-stamped and retrieval is village-
+    scoped -- one village's institutional memory never surfaces in another's
+    retrieval. NULL-village rows (shared craft, legacy) stay visible."""
+
+    def setUp(self):
+        _wipe()
+
+    def test_deliverable_stamped_with_its_village(self):
+        blob = json.dumps({'id': 'task-9', 'room': 'observatory',
+                           'title': 'Village B rate limiter', 'taskType': 'code',
+                           'grade': 8.0, 'villageId': 'village-b',
+                           'deliverableText': 'rate limiting backoff storms',
+                           'instructions': 'build it'})
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?)',
+                ('task-9', blob, time.time()))
+        serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT village_id FROM rag_index WHERE doc_id = 'deliverable:task-9'"
+            ).fetchone()
+        self.assertEqual(row[0], 'village-b')
+
+    def test_library_path_village_follows_the_tree(self):
+        vdir = os.path.join(serve.LIBRARY_DIR, 'villages', 'village-b')
+        os.makedirs(vdir, exist_ok=True)
+        with open(os.path.join(vdir, 'notes.md'), 'w') as f:
+            f.write('village b orbit predictions notes')
+        serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT village_id FROM rag_index WHERE doc_id = 'library:villages/village-b/notes.md'"
+            ).fetchone()
+        self.assertEqual(row[0], 'village-b')
+
+    def test_cross_village_hit_hidden_shared_visible(self):
+        blob_a = json.dumps({'id': 'task-a', 'room': 'observatory',
+                             'title': 'A limiter', 'taskType': 'code',
+                             'grade': 8.0, 'villageId': 'village-a',
+                             'deliverableText': 'rate limiting backoff storms',
+                             'instructions': 'build'})
+        blob_b = json.dumps({'id': 'task-b', 'room': 'observatory',
+                             'title': 'B limiter', 'taskType': 'code',
+                             'grade': 8.0, 'villageId': 'village-b',
+                             'deliverableText': 'rate limiting backoff storms',
+                             'instructions': 'build'})
+        with serve._db() as conn:
+            for tid, blob in (('task-a', blob_a), ('task-b', blob_b)):
+                conn.execute(
+                    'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?)',
+                    (tid, blob, time.time()))
+        serve._rag_index_pass(budget=10)
+        hits = serve._rag_search('rate limiting backoff storms', k=10,
+                                 village='village-a')
+        refs = {h['ref'] for h in hits}
+        self.assertIn('task-a', refs)
+        self.assertNotIn('task-b', refs)
+
+    def test_null_village_rows_stay_visible(self):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO rag_index (doc_id, source, ref, title, room, text, '
+                'vec, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                ('library:skills/shared.md', 'library', 'skills/shared.md',
+                 'shared', '', 'rate limiting backoff storms',
+                 json.dumps(serve._rag_embed('rate limiting backoff storms')),
+                 time.time()))
+        hits = serve._rag_search('rate limiting backoff storms', k=5,
+                                 village='village-b')
+        self.assertTrue(any(h['ref'] == 'skills/shared.md' for h in hits))
+
+    def test_room_anchors_village_scoped(self):
+        for vid in ('village-a', 'village-b'):
+            blob = json.dumps({'id': f'task-{vid}', 'room': 'observatory',
+                               'title': f'{vid} anchor', 'taskType': 'code',
+                               'grade': 8.0, 'villageId': vid,
+                               'deliverableText': 'rate limiting backoff storms',
+                               'instructions': 'build'})
+            with serve._db() as conn:
+                conn.execute(
+                    'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?)',
+                    (f'task-{vid}', blob, time.time()))
+        serve._rag_index_pass(budget=10)
+        anchors = serve._rag_room_anchors('observatory', village='village-a')
+        self.assertTrue(anchors)
+        self.assertTrue(all('village-a anchor' in a for a in anchors))
+
+    def test_legacy_rows_backfilled_without_reindex(self):
+        blob = json.dumps({'id': 'task-legacy', 'room': 'observatory',
+                           'title': 'Legacy', 'taskType': 'code', 'grade': 8.0,
+                           'villageId': 'village-b',
+                           'deliverableText': 'rate limiting backoff storms',
+                           'instructions': 'build'})
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?)',
+                ('task-legacy', blob, time.time()))
+        serve._rag_index_pass(budget=10)
+        # Simulate a pre-feature row: wipe the village stamp.
+        with serve._db() as conn:
+            conn.execute("UPDATE rag_index SET village_id = NULL "
+                         "WHERE doc_id = 'deliverable:task-legacy'")
+        out = serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT village_id FROM rag_index WHERE doc_id = 'deliverable:task-legacy'"
+            ).fetchone()
+        self.assertEqual(row[0], 'village-b')
+        self.assertGreaterEqual(out['indexed'], 1)

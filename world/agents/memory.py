@@ -88,6 +88,11 @@ _CREDENTIAL_PATTERNS = (
     ('JWT', re.compile(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")),
     ('GIT_TOKEN', re.compile(r"\b(ghp_|gho_|ghu_|ghs_|ghr_|glpat-)[a-zA-Z0-9_]{20,}\b")),
     ('DAPI_TOKEN', re.compile(r"\bdapi[a-f0-9]{32,}\b", re.IGNORECASE)),
+    # 2026-11-01: sk- prefixed keys (OpenRouter sk-or-v1-, OpenAI sk-proj-,
+    # Anthropic sk-ant-, Stripe sk-live/sk-test) were the one common shape
+    # the filters above missed; agent work-notes quote them routinely.
+    ('SK_KEY', re.compile(
+        r"\bsk-(?:or-v1|proj|ant|live|test|svcacct)-[A-Za-z0-9_\-]{16,}\b")),
 )
 
 
@@ -166,6 +171,18 @@ def _ensure_tables():
                 fact_checked INTEGER NOT NULL DEFAULT 0
             )''')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_ltm_active ON ltm_memories(active)')
+            conn.execute('''CREATE TABLE IF NOT EXISTS agent_ltm (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id TEXT NOT NULL,
+                mem_type TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                source_type TEXT NOT NULL DEFAULT 'unknown'
+            )''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_agent_ltm_agent '
+                         'ON agent_ltm (agent_id, active)')
             # Migration: ltm_memories predates the trust columns (confidence /
             # source_type / fact_checked), so an existing DB needs the columns
             # added idempotently -- CREATE TABLE IF NOT EXISTS alone cannot.
@@ -823,3 +840,133 @@ def _chat_call(system_prompt, user_text, max_tokens=400):
     except Exception as e:
         print(f'[memory] chat call failed: {e}', flush=True)
     return None
+
+# ---------------------------------------------------------------------------
+# Agent long-term memory (2026-11-01): the same distill-and-recall machinery
+# the player-admin channel uses above, pointed at the ORG's own workers. The
+# player LTM remembers what the ADMIN learned from the player; this section
+# remembers what each WORKER learned from completed work -- the piece the
+# per-agent MEMORY.md activity log never captured (it records titles, not
+# lessons). Storage is a separate table (agent_ltm) so neither channel's
+# recall can pollute the other's: a worker's craft memory must not surface
+# in the player's chat and vice versa.
+#
+# Cadence and cost are governed by the caller: the sim enqueues at most one
+# extraction per agent per cadence window, off the tick thread (same
+# two-phase discipline as the deliverable grader in sim_parts/140).
+
+_AGENT_LTM_MAX_PER_AGENT = 40
+
+_AGENT_LTM_EXTRACT_SYSTEM = (
+    'Extract durable work-learnings from this completed task. Respond with '
+    'ONLY valid JSON, no other text and no markdown fences, in exactly this '
+    'shape: {"memories": [{"type": "preference|fact|decision|'
+    'unresolved_question", "content": "...", "confidence": 0.0-1.0, '
+    '"source": "user_stated|agent_inferred"}]}. Types: "fact" = a stable '
+    'technical fact about the tools, codebase, or environment that would '
+    'still help next time; "decision" = an approach that worked or was '
+    'settled; "preference" = a craft convention to repeat; '
+    '"unresolved_question" = something left open that the next task on this '
+    'topic should check. Skip restating what the task was; capture only what '
+    'transfers to FUTURE work. Return {"memories": []} if nothing durable.'
+)
+
+
+def agent_ltm_extract(agent_id, title, note, room=None):
+    """Distill one completed task into typed agent memories (worker-thread
+    side). Returns the number inserted; 0 on an extraction outage or when
+    nothing durable was found."""
+    if not agent_id or not note or not str(note).strip():
+        return 0
+    user_text = (f'Task: {str(title or "")[:200]}\n'
+                 f'Room: {str(room or "")[:60]}\n'
+                 f'What the agent reported:\n{str(note)[:1800]}')
+    reply = _chat_call(_AGENT_LTM_EXTRACT_SYSTEM, user_text, max_tokens=400)
+    memories = _parse_memories(reply) if reply else []
+    if not memories:
+        return 0
+    return agent_ltm_insert(agent_id, memories)
+
+
+def agent_ltm_insert(agent_id, memories):
+    """Store distilled memories for one agent: dedup against the agent's
+    active set, redact secrets, and cap the store so an aging worker cannot
+    crowd recall forever (oldest rows are deactivated, never destroyed --
+    same shape as the player LTM cap). `memories` are the parsed
+    (mem_type, content, confidence, source) tuples. Returns count stored."""
+    import serve as _serve
+    stored = 0
+    try:
+        _ensure_tables()
+        now = time.time()
+        with _serve._db() as conn:
+            existing = conn.execute(
+                'SELECT content FROM agent_ltm WHERE agent_id = ? AND active = 1',
+                (agent_id,)).fetchall()
+            seen = {_normalize(e[0]) for e in existing}
+            for mem_type, content, confidence, source in memories:
+                content = _redact_secrets(content).strip()
+                if not content or _normalize(content) in seen:
+                    continue
+                seen.add(_normalize(content))
+                conn.execute(
+                    'INSERT INTO agent_ltm (agent_id, mem_type, content, '
+                    'created_at, active, confidence, source_type) '
+                    'VALUES (?, ?, ?, ?, 1, ?, ?)',
+                    (agent_id, mem_type, content, now, confidence, source))
+                stored += 1
+            rows = conn.execute(
+                'SELECT id FROM agent_ltm WHERE agent_id = ? AND active = 1 '
+                'ORDER BY created_at ASC, id ASC', (agent_id,)).fetchall()
+            over = len(rows) - _AGENT_LTM_MAX_PER_AGENT
+            if over > 0:
+                conn.execute(
+                    'UPDATE agent_ltm SET active = 0 WHERE id IN (%s)'  # nosec B608 -- placeholder count only, values are bound parameters
+                    % ','.join('?' * over),
+                    tuple(r[0] for r in rows[:over]))
+    except Exception as e:
+        print(f'[memory] agent ltm insert failed: {e}', flush=True)
+    return stored
+
+
+def agent_ltm_recall(agent_id, query, limit=2):
+    """The most relevant work-learnings for THIS agent, keyword-overlap
+    scored with the same trust factor the player LTM uses (confidence,
+    source priority, staleness decay). Returns a formatted block or None.
+    Best-effort: None on any failure -- recall must never block a task."""
+    import serve as _serve
+    if not agent_id or not query:
+        return None
+    limit = max(1, int(limit or 2))
+    min_conf = float(getattr(_serve, 'LTM_MIN_CONFIDENCE', 0.3) or 0.0)
+    qwords = _words(query)
+    if not qwords:
+        return None
+    _ensure_tables()
+    now = time.time()
+    try:
+        with _serve._db() as conn:
+            rows = conn.execute(
+                'SELECT mem_type, content, created_at, confidence, source_type '
+                'FROM agent_ltm WHERE agent_id = ? AND active = 1 '
+                'ORDER BY created_at DESC LIMIT ?',
+                (agent_id, limit * 40)).fetchall()
+    except Exception:
+        return None
+    scored = []
+    for mem_type, content, created_at, confidence, source_type in rows:
+        overlap = len(qwords & _words(content))
+        if overlap < 1:
+            continue
+        confidence = max(0.0, min(1.0, float(confidence or 0.0)))
+        if confidence < min_conf:
+            continue
+        age_days = max(0.0, (now - created_at) / 86400.0)
+        trust = _TRUST_SOURCE_BOOST.get(source_type or 'unknown', -0.15) \
+            - (age_days / _TRUST_DECAY_DAYS) * 0.2
+        scored.append((overlap + trust, created_at, mem_type, content))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    top = scored[:limit]
+    if not top:
+        return None
+    return '\n'.join(f'- [{mt}] {c}' for _, _, mt, c in top)

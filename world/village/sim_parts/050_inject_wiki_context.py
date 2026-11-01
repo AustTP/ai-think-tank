@@ -25,7 +25,8 @@ def inject_wiki_context(state, task, village_id=None, now_ms=None):
                  and ((ensure_wiki(state)).get(pid).get('villageId') or DEFAULT_VILLAGE) == village_id
                  and not _page_is_expired((ensure_wiki(state)).get(pid), now_ms)]
     else:
-        pages = wiki_read_pages(state, room, village_id=village_id, now_ms=now_ms)
+        pages = wiki_read_pages(state, room, village_id=village_id, now_ms=now_ms,
+                                team_id=(task or {}).get('teamId'))
     if not pages:
         return ''
     lines = ['The think tank knowledge base has these entries relevant to this work:', '']
