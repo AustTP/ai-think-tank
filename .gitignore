@@ -161,3 +161,6 @@ VPS-MIGRATION.md
 
 # blanket: everything the tank generates under media (incident 6a5b7fc)
 library/media/
+
+# Operator-registered MCP servers (host-specific commands, like .env)
+mcp_servers.json

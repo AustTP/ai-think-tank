@@ -159,7 +159,7 @@ def spawn_new_team_for_request(state, goal, now_ms=None, admin_id=None, employee
     team['members'] = member_ids
     # File the goal as this new team's first backlog request.
     req = {
-        'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
+        'id': next_request_id(state),
         'filedBy': director_id, 'title': (goal or 'Large request')[:120],
         'room': 'pressoffice',
         'reason': f"Incoming large request -- new team {director_id} was spun up to take it.",

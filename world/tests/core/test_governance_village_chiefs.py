@@ -154,6 +154,17 @@ def test_first_tick_after_deploy_backfills_the_first_village():
     assert g.villages_without_chief(s) == []
 
 
+def test_next_request_id_never_collides_after_removal():
+    s = {'backlogRequests': [
+        {'id': 'wrq-1'}, {'id': 'wrq-2'}, {'id': 'wrq-40'},
+        {'id': 'wrq-9'}, {'id': 'iss-ADA-53'}, 'not-a-dict']}
+    assert h.next_request_id(s) == 'wrq-41'
+    s['backlogRequests'] = []
+    assert h.next_request_id(s) == 'wrq-1'
+    s['backlogRequests'] = [{'id': 'wrq-abc'}, {}]
+    assert h.next_request_id(s) == 'wrq-1'
+
+
 def test_chiefs_never_report_to_themselves_and_admin_is_stable():
     s = _state()
     s['agents']['theo']['villageId'] = 'main'

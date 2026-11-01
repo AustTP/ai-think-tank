@@ -41,7 +41,7 @@ def file_work_request(state, agent_id, title, room, reason=None):
                 and r.get('title') and title.lower() == r['title'].lower()):
             return None
     req = {
-        'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
+        'id': next_request_id(state),
         'filedBy': agent_id, 'title': title, 'room': room,
         'reason': (reason or 'Pending follow-up in a thinning room').strip(),
         'filedAt': int(time.time() * 1000), 'status': 'pending',
@@ -104,7 +104,7 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
         return None
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     req = {
-        'id': f"wrq-{len(state.get('backlogRequests') or []) + 1}",
+        'id': next_request_id(state),
         'filedBy': authority_id, 'title': goal[:120], 'room': 'pressoffice',
         'reason': f"Large request: {goal[:200]}", 'goal': goal,
         'filedAt': now_ms, 'status': 'pending',

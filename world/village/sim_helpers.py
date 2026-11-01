@@ -285,6 +285,25 @@ def appoint_village_chief(state, village_id, agent_id=None):
     return candidate
 
 
+def next_request_id(state):
+    """Mint the next wrq- backlog-request id from the highest existing id,
+    never from the list length: entries are removed over time, so len+1
+    collides with a historical id -- and a collision here is not cosmetic:
+    tasks and A2A lookups link by requestId, and the row-extracted backlog
+    store upserts rows by id, so two requests sharing an id silently merge
+    into one (reproduced live 2026-11-01: five A2A filings all minted
+    wrq-218 and collapsed into one row)."""
+    max_seq = 0
+    for existing in (state.get('backlogRequests') or []):
+        eid = str(existing.get('id') or '') if isinstance(existing, dict) else ''
+        if eid.startswith('wrq-'):
+            try:
+                max_seq = max(max_seq, int(eid[4:]))
+            except ValueError:
+                continue
+    return f'wrq-{max_seq + 1}'
+
+
 def ensure_village_chiefs(state):
     """Backfill sweep for the every-village-has-a-chief invariant: appoint a
     chief (auto-pick) for every village that lacks one and has an eligible
