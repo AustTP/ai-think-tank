@@ -75,10 +75,57 @@ SUBDIRECTOR_LAYER_MIN = 3
 SUBDIRECTOR_LAYER_MAX = 6
 
 
+def team_director_ids(state):
+    """Ids that hold a teams row -- the senior directors, whatever tier they
+    report to (the admin today, a village chief of staff on the sharded
+    org). Holding a teams row is the STABLE marker of the senior tier: the
+    reporting pointer above them may change as chiefs of staff are added,
+    but a teams row means "this agent owns a team" at every tier."""
+    return {t.get('directorId') for t in (state.get('teams') or [])
+            if isinstance(t, dict) and t.get('directorId')}
+
+
+def village_chief_ids(state):
+    """Village chiefs of staff (operator direction, 2026-11-01): the
+    per-village deputies sitting between the one global chief of staff
+    (the admin) and that village's senior directors. An explicit roster
+    tier -- `villageChief: True` + `chiefOfVillage: <villageId>` -- not an
+    emergent one: unlike subdirectors (middle management grown from the
+    reporting graph), a chief is an AUTHORITY layer the operator appoints,
+    and chiefs never count against the senior-director cap."""
+    return [r.get('id') for r in _roster(state)
+            if isinstance(r, dict) and r.get('villageChief') and r.get('id')]
+
+
+def is_village_chief(state, agent_id):
+    return bool(agent_id) and any(
+        isinstance(r, dict) and r.get('id') == agent_id and r.get('villageChief')
+        for r in _roster(state))
+
+
+def chief_of_village(state, village_id):
+    """The village chief of staff appointed for `village_id`, or None."""
+    for r in _roster(state):
+        if isinstance(r, dict) and r.get('villageChief') \
+                and (r.get('chiefOfVillage') or None) == (village_id or None):
+            return r.get('id')
+    return None
+
+
 def subdirectors_of(state, director_id):
-    """Direct reports of director_id who themselves lead people."""
+    """Direct reports of director_id who themselves lead people -- EXCLUDING
+    team directors. A village chief's team-leading children are that
+    village's SENIOR directors (each holds a teams row), never the chief's
+    subdirectors, and the admin's team-leading children are senior
+    directors too. Subdirector is the middle-management tier BELOW a team
+    director; the teams row is what separates the tiers, so the emergent
+    classification stays correct as chiefs of staff are added above the
+    senior layer."""
+    team_dirs = team_director_ids(state)
+    chiefs = set(village_chief_ids(state))
     return [rid for rid in direct_reports(state, director_id)
-            if direct_reports(state, rid)]
+            if rid not in team_dirs and rid not in chiefs
+            and direct_reports(state, rid)]
 
 
 def has_subdirector_layer(state, director_id, minimum=None):
@@ -496,13 +543,16 @@ def admin_change_request_enabled(state):
 
 
 def village_team_count(state, admin_id=None):
-    """Senior-most team records in the village: teams whose director is at
-    the top of the non-admin hierarchy -- reporting directly to the admin,
-    or having no director at all (the supporting director sits at the same
-    senior tier with an absent pointer). The admin's own aide cluster is not
-    a team, and subdirector sub-teams (director reporting to a director) do
-    not count -- the operator fixed the SENIOR layer at 12 per village;
-    growth beyond it is subdirectors, not more top-level directors."""
+    """SENIOR team records across the WHOLE ORG (operator direction,
+    2026-11-01: 12 senior directors all together -- the cap is global, not
+    per village). A team counts when its director sits at the top of the
+    non-admin hierarchy: reporting to the admin, to their village's chief
+    of staff, or having no director at all (the legacy senior tier). The
+    admin's own aide cluster is not a team, and subdirector sub-teams
+    (director reporting to a director) do not count. Growth beyond the cap
+    is a new VILLAGE with its own chief of staff above its senior
+    directors, or subdirectors below them -- never a 13th senior
+    director."""
     state = state or {}
     admin_id = admin_id or next(
         (d.get('id') for d in (state.get('agentRoster') or []) if d.get('isAdmin')),
@@ -510,11 +560,13 @@ def village_team_count(state, admin_id=None):
     if not admin_id:
         return 0
     rows = {d.get('id'): d for d in (state.get('agentRoster') or [])}
+    chiefs = set(village_chief_ids(state))
     count = 0
     for t in (state.get('teams') or []):
         did = t.get('directorId')
         if not did or did == admin_id:
             continue
-        if (rows.get(did) or {}).get('director') in (admin_id, None):
+        parent = (rows.get(did) or {}).get('director')
+        if parent in (admin_id, None) or parent in chiefs:
             count += 1
     return count

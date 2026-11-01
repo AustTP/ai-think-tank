@@ -927,3 +927,45 @@ Notes ownership) is surfaced to the model as a denial, never a bypass.
 
 **Knob:** `FILE_ACCESS_ENABLED` (default true). Grants themselves are the real
 gate.
+
+## 19. Scaling to 1,000 Agents (assessment, 2026-11-01)
+
+Question: can the system support 1,000 agents given appropriate resources?
+Answer: the data layer can; the single-process runtime cannot without the
+sharding work below. At ~1,000 agents (≈140 teams of ~7, ≈12 villages at
+the 12-senior cap) the walls, in the order they break:
+
+1. **The whole-blob save.** `save_state_to_db` serializes the entire state
+   JSON every pass — ~1.2MB at 145 agents, 10–15MB+ at 1,000, written from
+   one process on every cycle. The row-extraction split (agentRoster,
+   agents/workQueue, backlogRequests, task_archive, ...) is the remedy;
+   its completion is the first prerequisite.
+2. **One Python process.** Sim loop, HTTP, ceremony orchestration, and
+   model-call fan-out share one GIL. Per-pass work scans every agent
+   (movement, assignment eligibility, wake logic) — O(agents × queue).
+   The 2026-11-01 tick hot-spot fixes (identity-heal gated to roster
+   changes or a 30-tick window; one shared spatial index per tick instead
+   of a rebuild per path search) buy headroom but do not remove the wall.
+3. **The admin's span.** Solved by ORG DESIGN (operator direction,
+   2026-11-01): twelve senior directors ALL TOGETHER — the cap is global,
+   not per village — and per-village chiefs of staff (an appointed
+   authority tier: `villageChief: True` + `chiefOfVillage: <villageId>`,
+   `director` = the admin) sitting between theo and each village's senior
+   directors. Growth beyond 12 senior directors is a new village with its
+   own chief, never a 13th senior director. A chief reviews large asks by
+   routing pieces to their village's senior teams; founding subdirectors
+   is not the chief's tool (senior directors grow layers below
+   themselves). A chief's team-leading children are senior directors by
+   definition — the teams row is the tier marker, so the emergent
+   subdirector classification stays correct as chiefs are added.
+4. **Model throughput.** 1,000 agents' decisions, ceremonies, and reviews
+   are the real resource bill; the runtime needs a bounded-concurrency
+   queue with per-agent rate limiting rather than inline awaits.
+
+**Sharding plan.** Villages are the natural shard key (already the
+identity/memory boundary): one sim process per village, shared Postgres,
+cross-village contact through the existing a2a/message lanes; rooms stay
+shared geometry (cosmetic only). Prerequisites: finished blob extraction,
+the chiefs tier (landed), and the model-call queue. The senior-tier cap
+and chief appointments are operator actions on the live world — the code
+supports both today.

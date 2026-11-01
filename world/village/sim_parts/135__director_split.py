@@ -97,7 +97,20 @@ def _split_org_summary(state, director_id):
             'village': village_of_agent(state, director_id),
             'members': governance.direct_reports(state, director_id),
             'sprint': own['sprint'], 'dedicatedTo': own['dedicatedTo']}]
-    for sid in governance.subdirectors_of(state, director_id):
+    if governance.is_village_chief(state, director_id):
+        # A village chief reviews at the SENIOR tier: their org is the
+        # village's senior directors' teams (each holds a teams row and
+        # reports to the chief), not a subdirector layer. Subdirectors_of
+        # deliberately excludes team directors, so the chief sources their
+        # org from the teams rows themselves.
+        subs = [t.get('directorId') for t in (state.get('teams') or [])
+                if isinstance(t, dict) and t.get('directorId')
+                and (({r.get('id'): r for r in (state.get('agentRoster') or [])
+                       if isinstance(r, dict)}.get(t.get('directorId')) or {})
+                      .get('director')) == director_id]
+    else:
+        subs = governance.subdirectors_of(state, director_id)
+    for sid in subs:
         members = governance.direct_reports(state, sid)
         busy = sum(1 for m in members
                    if (agents.get(m) or {}).get('busy')
@@ -160,7 +173,8 @@ def _split_decider_default(state, instructions, goal):
 _director_split_decider = _split_decider_default
 
 
-def _split_instructions(state, req, org, director_name, founding_mode='immediate'):
+def _split_instructions(state, req, org, director_name, founding_mode='immediate',
+                        director_id=None):
     """The director's review prompt: the ask, its urgency, the player's pins,
     and the org's subteams with their loads and villages. The output contract
     is pieces (+ optional new-subdirector foundings); every field except the
@@ -199,7 +213,22 @@ def _split_instructions(state, req, org, director_name, founding_mode='immediate
                      f"owned by team \"{req.get('ownerTeamId')}\". Every piece must stay inside your own "
                      "org -- a \"shared\" piece means your own subteams only, first-come among them; "
                      "the work must never leave the owning team.")
-    if founding_mode == 'immediate':
+    if director_id and governance.is_village_chief(state, director_id):
+        # A village chief of staff reviews at the senior tier: their tools
+        # are ROUTING (pieces to their village's senior teams), not
+        # founding -- every founding turns a worker into a manager, and the
+        # chief's direct reports are senior directors, not workers to
+        # convert. Senior directors found subdirector layers below
+        # themselves in their own reviews.
+        founding_text = (
+            "- You are a village chief of staff: route pieces to your senior "
+            "directors' teams (the org list above) and say why each team "
+            "fits. Founding subdirectors is not your tool -- your direct "
+            "reports are senior directors, not workers to convert; a senior "
+            "director grows their own subdirector layer in their own "
+            "review when their team needs one.\n"
+        )
+    elif founding_mode == 'immediate':
         founding_text = (
             "- \"newSubdirectors\": each {\"seedWorker\": an existing member id to promote "
             "(omit to promote your most proven contributor), \"handOver\": how many workers "
@@ -261,7 +290,13 @@ def _founding_mode(state, leader_id):
     if not row or row.get('isAdmin'):
         return None
     parent_row = index.get(row.get('director'))
-    if parent_row is None or parent_row.get('isAdmin'):
+    if parent_row is None or parent_row.get('isAdmin') \
+            or parent_row.get('villageChief'):
+        # Immediate founding covers the whole AUTHORITY chain: a village
+        # chief of staff founders under the admin's standing authority, and
+        # a SENIOR director under a chief holds the same standing their
+        # admin-reporting peers have -- the chief tier must not demote the
+        # senior layer into proposers.
         return 'immediate'
     return 'propose' if governance.direct_reports(state, leader_id) else None
 
@@ -379,7 +414,8 @@ def _resolve_split(state, pending, now_ms, decider=None):
         goal = req.get('goal') or req.get('title') or 'untitled large request'
         org = _split_org_summary(state, director_id)
         data = decider(state, _split_instructions(
-            state, req, org, director_name, founding_mode=mode), goal)
+            state, req, org, director_name, founding_mode=mode,
+            director_id=director_id), goal)
         pieces, raw_pieces, new_subs = [], [], []
         if isinstance(data, dict):
             raw_pieces = [p for p in (data.get('pieces') or [])
