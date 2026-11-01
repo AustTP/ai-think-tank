@@ -260,6 +260,20 @@ def _sublow_tier_slug():
     # at ~5x the ceiling, which is exactly what the ceiling exists to
     # prevent. Callers (mint_sublow_grant, the inference proxy,
     # quote_sublow_grant) already refuse or 503 on a missing pick.
+    #
+    # ROUTING POLICY (operator directive: requests should rarely if ever be
+    # routed to sublow). A call reaches this band only through one of:
+    #   1. A minted sublow experiment grant (operator or director via
+    #      /api/experiments/sublow/grant): a declared, estimate-bounded,
+    #      TTL'd, token-capped allowance consumed only by the grant proxy.
+    #   2. Captcha/utility micro-tasks, which ride the SAME grant discipline
+    #      (the solve endpoint requires a valid X-Sublow-Grant).
+    #   3. The explicit scaleTierWorkers operator switch for the 1,000-agent
+    #      scenario (_resolve_model_tier's scale path; OFF by default).
+    # No default request path picks sublow: policies.choose_route never
+    # returns the band, and the normal _resolve_model_tier ladder bottoms
+    # out at low. Do not add a sublow branch to any default path without an
+    # operator decision recorded here.
     free = _freepool_route_for_band('sublow')
     if free:
         return free

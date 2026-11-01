@@ -1,90 +1,90 @@
 {
-  "comment": "Operator overrides for model tiers. \"default\" applies to every band without its own entry. Each entry may set base_url (OpenAI-compatible chat-completions URL), model (actual slug sent to the endpoint), api_key_env (env var holding the key), price_per_m (USD per million tokens), and send_reasoning (true only for endpoints that accept the OpenRouter reasoning field). Leave base_url empty to keep OpenRouter as the transport. A positive price_per_m also keeps the global spend cap; a zero price is treated as local/free. free_pool is NOT a pin: it is a free-first augmentation layer for the listed bands -- the tier pick underneath stays live, and when every free endpoint is quota-exhausted or failing, the paid pick serves. Each endpoint: name (unique, [a-z0-9._-]), service (key-health group), base_url + model + api_key_env for custom OpenAI-compatible endpoints, openrouter_free=true for a zero-price catalog model picked automatically, extra (body fields merged into every POST, e.g. Gemini's reasoning_effort), rpm/rpd/tpm limits (0 = unlimited), pool_key (endpoints sharing one provider rate pool, e.g. all Groq models share the org-wide RPM bucket, share one pool_key so their RPM windows are counted together; defaults to name).",
-  "default": null,
-  "tiers": {
-    "argon": {
-      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-      "model": "gemini-4-argon",
-      "api_key_env": "GEMINI_API_KEY_4",
-      "price_per_m": 10.0,
-      "send_reasoning": false
-    }
-  },
-  "free_pool": {
-    "enabled": true,
-    "bands": [
-      "low",
-      "sublow"
-    ],
-    "mode": "free-first",
-    "endpoints": [
-      {
-        "name": "gemini-3.5-flash",
-        "service": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-3.5-flash",
-        "api_key_env": "GEMINI_API_KEY",
-        "price_per_m": 0,
-        "rpm": 10,
-        "rpd": 250,
-        "tpm": 250000
-      },
-      {
-        "name": "groq-qwen3.8-27b",
-        "service": "groq",
-        "base_url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "qwen/qwen3.8-27b",
-        "api_key_env": "GROQ_API_KEY",
-        "price_per_m": 0,
-        "pool_key": "groq",
-        "rpm": 30,
-        "rpd": 1000,
-        "tpm": 6000
-      },
-      {
-        "name": "gemini-3.5-flash-lite",
-        "service": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-3.5-flash-lite",
-        "api_key_env": "GEMINI_API_KEY",
-        "price_per_m": 0,
-        "rpm": 15,
-        "rpd": 1000,
-        "tpm": 250000
-      },
-      {
-        "name": "openrouter-free",
-        "service": "openrouter",
-        "openrouter_free": true,
-        "price_per_m": 0,
-        "rpm": 20,
-        "rpd": 1000,
-        "tpm": 0
-      },
-      {
-        "name": "groq-gpt-oss-120b",
-        "service": "groq",
-        "base_url": "https://api.groq.com/openai/v1/chat/completions",
-        "model": "openai/gpt-oss-120b",
-        "api_key_env": "GROQ_API_KEY",
-        "price_per_m": 0,
-        "pool_key": "groq",
-        "rpm": 30,
-        "rpd": 1000,
-        "tpm": 12000
-      },
-      {
-        "name": "gemini-3.5-flash-lite-key3",
-        "service": "gemini",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-        "model": "gemini-3.5-flash-lite",
-        "api_key_env": "GEMINI_API_KEY_3",
-        "price_per_m": 0,
-        "rpm": 15,
-        "rpd": 1000,
-        "tpm": 250000
-      }
-    ],
-    "or_free_min_score": 20
+ "comment": "Operator overrides for model tiers. \"default\" applies to every band without its own entry. Each entry may set base_url (OpenAI-compatible chat-completions URL), model (actual slug sent to the endpoint), api_key_env (env var holding the key), price_per_m (USD per million tokens), and send_reasoning (true only for endpoints that accept the OpenRouter reasoning field). Leave base_url empty to keep OpenRouter as the transport. A positive price_per_m also keeps the global spend cap; a zero price is treated as local/free. free_pool is NOT a pin: it is a free-first augmentation layer for the listed bands -- the tier pick underneath stays live, and when every free endpoint is quota-exhausted or failing, the paid pick serves. Each endpoint: name (unique, [a-z0-9._-]), service (key-health group), base_url + model + api_key_env for custom OpenAI-compatible endpoints, openrouter_free=true for a zero-price catalog model picked automatically, extra (body fields merged into every POST, e.g. Gemini's reasoning_effort), rpm/rpd/tpm limits (0 = unlimited), pool_key (endpoints sharing one provider rate pool, e.g. all Groq models share the org-wide RPM bucket, share one pool_key so their RPM windows are counted together; defaults to name). A gemini endpoint may set model to \"auto\": the concrete model is never pinned -- the key's live models list is gathered hourly and the per-band score floor picks the strongest free model (weakest for sublow) with a benchmark score on file. A gemini endpoint's rpd is an endpoint-level daily cap shared by all its models; set it to 0 to ride Google's true per-model-per-key free allowance -- the rotation then only skips a model once Google itself answers with a daily-limit 429, so one key can serve each model's full daily budget. model_rpd (a gemini endpoint may set it) is a per-model cap map: keys match model names by substring with longest-key-wins (so 'flash-lite' is not shadowed by 'flash'); a matching key's value caps that model's daily calls locally, while models matching no key stay uncapped (riding rpd).",
+ "default": null,
+ "tiers": {
+  "argon": {
+   "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+   "model": "gemini-4-argon",
+   "api_key_env": "GEMINI_API_KEY_4",
+   "price_per_m": 10.0,
+   "send_reasoning": false
   }
+ },
+ "free_pool": {
+  "enabled": true,
+  "bands": [
+   "low",
+   "sublow"
+  ],
+  "mode": "free-first",
+  "endpoints": [
+   {
+    "name": "gemini-free",
+    "service": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "model": "auto",
+    "api_key_env": "GEMINI_API_KEY",
+    "price_per_m": 0,
+    "rpm": 10,
+    "rpd": 0,
+    "model_rpd": {
+     "flash-lite": 1000,
+     "flash": 250
+    },
+    "tpm": 250000
+   },
+   {
+    "name": "gemini-free-key3",
+    "service": "gemini",
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "model": "auto",
+    "api_key_env": "GEMINI_API_KEY_3",
+    "price_per_m": 0,
+    "rpm": 10,
+    "rpd": 0,
+    "model_rpd": {
+     "flash-lite": 1000,
+     "flash": 250
+    },
+    "tpm": 250000,
+    "allowed_kinds": [
+     "ask"
+    ]
+   },
+   {
+    "name": "groq-qwen3.8-27b",
+    "service": "groq",
+    "base_url": "https://api.groq.com/openai/v1/chat/completions",
+    "model": "qwen/qwen3.8-27b",
+    "api_key_env": "GROQ_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "groq",
+    "rpm": 30,
+    "rpd": 1000,
+    "tpm": 6000
+   },
+   {
+    "name": "openrouter-free",
+    "service": "openrouter",
+    "openrouter_free": true,
+    "price_per_m": 0,
+    "rpm": 20,
+    "rpd": 1000,
+    "tpm": 0
+   },
+   {
+    "name": "groq-gpt-oss-120b",
+    "service": "groq",
+    "base_url": "https://api.groq.com/openai/v1/chat/completions",
+    "model": "openai/gpt-oss-120b",
+    "api_key_env": "GROQ_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "groq",
+    "rpm": 30,
+    "rpd": 1000,
+    "tpm": 12000
+   }
+  ],
+  "or_free_min_score": 20
+ }
 }

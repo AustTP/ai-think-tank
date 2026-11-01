@@ -5,6 +5,11 @@ Three free sources, each with its own quota reality (operator-researched):
   * Google AI Studio (Gemini free tier) -- quotas are PER MODEL: exhausting
     one model's limit never touches another's. Flash-class models are the
     usable workhorses (Pro-class is ~2 RPM / ~50 RPD and useless for volume).
+    Gemini endpoints may set model 'auto': the concrete model is then
+    gathered from the key's live models list (one read-only GET per key per
+    hour) and determined per band -- sublow takes the weakest scored model
+    holding the band floor, low the strongest. No Gemini model name is ever
+    pinned in config.
   * Groq Console (free tier) -- quotas are ORG-WIDE SHARED: every Groq model
     draws from one collective RPM bucket (and per-model TPM that is tight,
     6k-30k/min, so TPM exhausts long before the daily request ceiling).
@@ -43,6 +48,8 @@ import json
 import os
 import threading
 import time
+import urllib.parse
+import urllib.request
 
 # Resolved once at import from ROOT (world/) -- the same file
 # _load_model_providers reads. Kept as this part's own constant so tests can
@@ -73,6 +80,9 @@ _free_pool_state = {
     'cooldown': {},       # endpoint name -> ts until which the endpoint is skipped
     'or_free_banned': {},  # catalog model_id -> ts until which the pick skips it
     'or_free_chosen': None,
+    # api_key_env -> {'at': ts, 'names': [model_id, ...]}: the chat-capable
+    # models the gathered Google models list exposes for that key.
+    'gem_models': {},
 }
 
 _FREE_POOL_NAME_RE_STRICT = 'abcdefghijklmnopqrstuvwxyz0123456789._-'
@@ -111,9 +121,18 @@ def _load_free_pool_config():
             continue
         model = str(ep.get('model') or '').strip()
         is_or_free = bool(ep.get('openrouter_free'))
-        if not is_or_free and not (base_url and model):
-            continue
         service = str(ep.get('service') or '').strip() or ('openrouter' if is_or_free else name)
+        # 'auto' (gemini service only, and an absent model counts as auto):
+        # the concrete model is gathered from the key's models list and
+        # determined per band at call time -- the free Gemini models are
+        # never pinned in this file.
+        is_gemini_auto = (service == 'gemini' and model in ('', 'auto'))
+        # 'auto' is a gemini-only escape hatch: any other service naming it
+        # is a config typo and must drop the endpoint, never redirect traffic.
+        if model == 'auto' and not is_gemini_auto:
+            continue
+        if not is_or_free and not (base_url and (model or is_gemini_auto)):
+            continue
         api_key_env = str(ep.get('api_key_env') or '').strip()
         extra = ep.get('extra') if isinstance(ep.get('extra'), dict) else None
 
@@ -129,8 +148,20 @@ def _load_free_pool_config():
             'model': model, 'api_key_env': api_key_env,
             'openrouter_free': is_or_free, 'extra': extra,
             'price_per_m': 0.0,
+            # Auto-gemini family filter: lowercase substrings a gathered
+            # model name must contain to be a candidate. Defaults to the
+            # operator-researched flash class ("Pro-class is ~2 RPM / ~50
+            # RPD and useless for volume") -- the CLASS is the policy, the
+            # model names inside it are always gathered live.
+            'model_family': ([str(f).lower() for f in ep['model_family']]
+                             if isinstance(ep.get('model_family'), list)
+                             else (['flash'] if is_gemini_auto else [])),
             'pool_key': str(ep.get('pool_key') or '').strip() or name,
             'rpm': _limit('rpm'), 'rpd': _limit('rpd'), 'tpm': _limit('tpm'),
+            # Per-model daily cap map (gemini auto picks): keys match model
+            # names by substring, longest key wins (see _freepool_model_cap).
+            'model_rpd': (ep['model_rpd'] if isinstance(ep.get('model_rpd'),
+                                                        dict) else {}),
             # Scope whitelist (2026-10-30): an endpoint may restrict itself to
             # specific call kinds ('ask', ...) to protect a sensitive key's
             # free tier. Absent/empty = unrestricted. Non-list junk is dropped.
@@ -410,6 +441,151 @@ def _freepool_openrouter_free_model(band):
     return None
 
 
+# Markers that identify Gemini-list models that are NOT plain text chat
+# workhorses (speech, image generation, robotics, research agents...). The
+# free pool only serves text completion calls, so anything carrying one of
+# these substrings is not a candidate.
+_GEMINI_NON_CHAT_MARKERS = (
+    'tts', 'image', 'transcribe', 'lyria', 'robotics', 'nano-banana',
+    'computer-use', 'deep-research', 'antigravity', 'customtools',
+    'embedding', 'aqa', 'live',
+)
+_GEMINI_MODELS_TTL_S = 3600.0
+_GEMINI_MODELS_URL = ('https://generativelanguage.googleapis.com/v1beta/models')
+
+
+def _freepool_gemini_models(ep):
+    """The text-chat model ids the endpoint's Google API key can actually
+    serve, gathered live from the models-list endpoint and cached per key for
+    an hour. The pool's Gemini models are never hardcoded: the key decides
+    what exists (the list only ever shows models the key can reach), and the
+    per-band picker decides what serves. A failed gather keeps the
+    last-known-good list; with no list at all the endpoint is simply not
+    ready. One read-only GET per key per hour."""
+    key_env = ep.get('api_key_env') or ''
+    now = time.time()
+    with _free_pool_lock:
+        cached = _free_pool_state['gem_models'].get(key_env)
+        if cached and now - cached['at'] < _GEMINI_MODELS_TTL_S:
+            return cached['names']
+    key = (_load_env().get(key_env) or '').strip() if key_env else ''
+    if not key:
+        return (cached or {}).get('names')
+    try:
+        url = (_GEMINI_MODELS_URL + '?key=' + urllib.parse.quote(key)
+               + '&pageSize=1000')
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            data = json.load(resp)
+        names = []
+        for m in (data.get('models') or []):
+            name = str(m.get('name') or '').split('models/', 1)[-1]
+            if not name or 'generateContent' not in (m.get('supportedGenerationMethods') or []):
+                continue
+            low = name.lower()
+            if any(w in low for w in _GEMINI_NON_CHAT_MARKERS):
+                continue
+            names.append(name)
+    except Exception:
+        return (cached or {}).get('names')
+    with _free_pool_lock:
+        _free_pool_state['gem_models'][key_env] = {'at': now, 'names': names}
+    return names
+
+
+def _freepool_gemini_candidates(band, ep):
+    """The qualifying free Gemini models for one band on this endpoint, in
+    the band's ROTATION ORDER. 'sublow' ranks weakest-scored first (its role
+    is 'cheapest coherent', and it keeps the stronger models' daily quotas
+    for the low band's real work); every other band ranks strongest-first
+    (free is free -- quality is the only axis left). Both rules skip
+    unscored models (a floored band cannot claim a threshold it has no
+    measurement for) and reasoning-mandatory models (the pool's tight token
+    budgets starve hidden thinkers into null content), mirroring the
+    OpenRouter free leg's starvation rule. Candidates are also restricted to
+    the endpoint's model_family classes (default ['flash']): the strongest
+    gathered model is often a flagship whose free-tier quota is useless for
+    volume -- the class restriction encodes that quota reality without
+    pinning any model name."""
+    names = _freepool_gemini_models(ep) or []
+    if not names:
+        return []
+    families = [f for f in (ep.get('model_family') or []) if f]
+    if families:
+        names = [n for n in names if any(f in n.lower() for f in families)]
+        if not names:
+            return []
+    benchmark = ((BAND_BENCHMARK or {}).get(band) or ['intelligence_index'])[0]
+    floor = BAND_MIN_SCORE.get(band)
+    if floor is None:
+        floor = _or_free_min_score()
+    try:
+        placeholders = ','.join('?' * len(names))
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT b.model_id, b.score FROM model_benchmark_scores b '
+                'WHERE b.benchmark = ? AND b.model_id IN (' + placeholders + ')',
+                [benchmark] + ['google/' + n for n in names]).fetchall()
+    except Exception:
+        return []
+    scored = []
+    for model_id, score in rows:
+        if not model_id or ':batch' in model_id or score is None or score < floor:
+            continue
+        name = model_id.split('google/', 1)[-1]
+        if any(w in name.lower() for w in ('reason', 'think', '-r1')):
+            continue
+        scored.append((float(score), name))
+    if not scored:
+        return []
+    scored.sort()
+    # Weakest-first for sublow, strongest-first for everything else.
+    return [name for _score, name in scored] if band == 'sublow' \
+        else [name for _score, name in reversed(scored)]
+
+
+def _freepool_model_cap(ep, name):
+    """The daily call cap for one model on this endpoint: the LONGEST entry
+    in the endpoint's model_rpd map whose key occurs in the model name
+    (longest wins so 'flash-lite' is not shadowed by 'flash'), else the
+    endpoint-level rpd (0 = ride Google's true per-model free allowance via
+    the daily-limit 429 marker). Unlisted models are always uncapped."""
+    try:
+        cap_map = ep.get('model_rpd') or {}
+        if name and cap_map:
+            for key in sorted(cap_map, key=len, reverse=True):
+                if key and str(key) in str(name):
+                    return int(cap_map[key])
+        return int(ep.get('rpd') or 0)
+    except Exception:
+        return int(ep.get('rpd') or 0)
+
+
+def _freepool_gemini_model(band, ep):
+    """The free Gemini model a band should serve on this endpoint right now:
+    the first candidate in the band's rotation order that still has
+    per-model daily quota room. Google's free tier meters PER MODEL PER KEY,
+    so exhausting one model's day never touches another's -- walking the
+    ordered candidate list as each model's allowance fills multiplies the
+    free calls a single key can serve in a day. The counter is keyed by
+    (endpoint, model) and SHARED across bands: one key has one allowance
+    per model, whoever spends it. A model is spent when its cap is reached
+    (the endpoint's model_rpd map entry, falling back to the endpoint's rpd),
+    or -- with no cap (ride Google's true per-model free allowance) -- once
+    the daily-limit 429 marker is set. Returns None when every candidate is
+    spent (the endpoint is then not ready and the pool rotates onward)."""
+    for name in _freepool_gemini_candidates(band, ep):
+        key = ep['name'] + '::' + name
+        with _free_pool_lock:
+            rpd = _free_pool_state['rpd'].get(key) or {}
+            if rpd.get('date') == _utc_today():
+                cap = _freepool_model_cap(ep, name)
+                if rpd.get('exhausted') \
+                        or (cap and rpd.get('count', 0) >= cap):
+                    continue
+        return name
+    return None
+
+
 def _freepool_ready(ep, band):
     """True when this endpoint may take a call right now: not switched off by
     the global or team policy, key present, key healthy, circuit closed,
@@ -417,14 +593,19 @@ def _freepool_ready(ep, band):
     RPD per endpoint) has room."""
     if _freepool_service_blocked(ep):
         return False
+    is_gemini_auto = (ep['service'] == 'gemini'
+                      and (ep.get('model') or 'auto') == 'auto')
     if ep.get('openrouter_free'):
         if not _freepool_openrouter_free_model(band):
             return False
-    else:
-        if ep.get('api_key_env') and not (_load_env().get(ep['api_key_env']) or '').strip():
+    elif is_gemini_auto:
+        # Auto gemini endpoint: ready only when the per-band pick resolves.
+        if not _freepool_gemini_model(band, ep):
             return False
-        if _api_key_is_broken(ep['service']):
-            return False
+    if ep.get('api_key_env') and not (_load_env().get(ep['api_key_env']) or '').strip():
+        return False
+    if _api_key_is_broken(ep['service']):
+        return False
     if is_model_circuit_broken(f'@freepool:{band}:{ep["name"]}'):
         return False
     now = time.time()
@@ -531,8 +712,15 @@ def _freepool_provider_for(model):
         ep = next((e for e in (cfg or {}).get('endpoints') or [] if e['name'] == name), None)
         if ep is None:
             return None
-        model_slug = (_freepool_openrouter_free_model(band)
-                      if ep.get('openrouter_free') else ep['model'])
+        pinned = (ep.get('model') or '').strip()
+        if ep.get('openrouter_free'):
+            model_slug = _freepool_openrouter_free_model(band)
+        elif ep['service'] == 'gemini' and pinned in ('', 'auto'):
+            # Auto gemini: the model is gathered from the key's live models
+            # list and determined per band, never a pinned name.
+            model_slug = _freepool_gemini_model(band, ep)
+        else:
+            model_slug = pinned
         if not model_slug:
             return None
         return {
@@ -550,6 +738,11 @@ def _freepool_provider_for(model):
             'name': ep['name'],
             'band': band,
             'pool_key': ep['pool_key'],
+            # Auto-gemini endpoints meter their daily quota PER MODEL (one
+            # key = one allowance per model, shared across bands), so the
+            # RPD counter key carries the concrete model slug.
+            'auto_model': (ep['service'] == 'gemini' and model_slug is not None
+                           and (ep.get('model') or 'auto') == 'auto'),
         }
     except Exception:
         return None
@@ -609,7 +802,8 @@ def _note_free_pool_call(provider, result):
                     tpm['tokens'] = 0
                 tpm['tokens'] += tokens
             today = _utc_today()
-            rpd = _free_pool_state['rpd'].setdefault(provider['name'], {'date': today, 'count': 0})
+            rpd = _free_pool_state['rpd'].setdefault(
+                _freepool_rpd_key(provider), {'date': today, 'count': 0})
             if rpd.get('date') != today:
                 rpd['date'] = today
                 rpd['count'] = 0
@@ -637,6 +831,11 @@ def _note_free_pool_rate_limited(provider, detail='', retry_after=None):
         if retry_after > 0:
             cooldown = min(retry_after, 3600.0)
         elif any(w in detail for w in ('per day', 'per-day', 'daily', 'day limit', 'requests per day', 'rpd')):
+            # Auto-gemini meters per model: a daily-limit 429 spends THAT
+            # model's day and the rotation takes the next candidate, instead
+            # of idling the whole endpoint until UTC midnight.
+            if _freepool_exhaust_model_day(provider):
+                return
             cooldown = max(60.0, _next_utc_midnight(now) - now)
         with _free_pool_lock:
             _free_pool_state['cooldown'][provider['name']] = now + cooldown
@@ -659,6 +858,53 @@ def _freepool_note_rejected(provider):
                 _free_pool_state['or_free_chosen'] = None
     except Exception:
         pass
+
+
+def _freepool_rpd_key(provider):
+    """The daily-counter key for one free call: the endpoint name, or
+    'name::model' for auto-gemini endpoints whose Google quota is per model
+    per key. Must agree with the picker's rotation check exactly."""
+    if not provider:
+        return ''
+    if provider.get('auto_model') and provider.get('model'):
+        return provider['name'] + '::' + provider['model']
+    return provider.get('name') or ''
+
+
+def _freepool_exhaust_model_day(provider):
+    """Mark ONE auto-gemini model's daily allowance as spent (the provider
+    answered with a daily-limit 429). Retrying that model today would only
+    burn calls; the picker's rotation walk skips a fully-spent model and
+    takes the next candidate, and the endpoint itself stays ready. The
+    marker is the 'exhausted' flag on the per-model counter -- it must skip
+    models even when no cap is configured (riding Google's true per-model
+    free allowance, where no local cap exists to trip). The cap lookup must
+    agree with the picker's rotation check exactly (the endpoint's model_rpd
+    entry for this model, falling back to the endpoint's rpd)."""
+    key = _freepool_rpd_key(provider)
+    if not key or key == provider.get('name'):
+        return False
+    cap = None
+    try:
+        cfg = _free_pool_cfg()
+        ep = next((e for e in (cfg or {}).get('endpoints') or []
+                   if e['name'] == provider.get('name')), None)
+        cap = _freepool_model_cap(ep, provider.get('model'))
+    except Exception:
+        cap = None
+    try:
+        today = _utc_today()
+        with _free_pool_lock:
+            rpd = _free_pool_state['rpd'].setdefault(key, {'date': today, 'count': 0})
+            if rpd.get('date') != today:
+                rpd['date'] = today
+                rpd['count'] = 0
+            if cap:
+                rpd['count'] = max(rpd['count'], cap)
+            rpd['exhausted'] = True
+        return True
+    except Exception:
+        return False
 
 
 def _freepool_status():
@@ -694,8 +940,21 @@ def _freepool_status():
                 entry['ready'] = _freepool_ready(ep, (cfg['bands'] or ['low'])[0])
             except Exception:
                 entry['ready'] = None
+            first_band = (cfg['bands'] or ['low'])[0]
             if ep.get('openrouter_free'):
-                entry['chosen_model'] = _freepool_openrouter_free_model((cfg['bands'] or ['low'])[0])
+                entry['chosen_model'] = _freepool_openrouter_free_model(first_band)
+            elif ep['service'] == 'gemini' and (ep.get('model') or 'auto') == 'auto':
+                entry['chosen_model'] = _freepool_gemini_model(first_band, ep)
+                # The rotation's daily counter is per model; report the pick's.
+                if entry['chosen_model']:
+                    with _free_pool_lock:
+                        rpd = _free_pool_state['rpd'].get(
+                            ep['name'] + '::' + entry['chosen_model']) or {}
+                    entry['rpd_used'] = rpd.get('count', 0) \
+                        if rpd.get('date') == _utc_today() else 0
+                    entry['rpd_exhausted'] = bool(
+                        rpd.get('date') == _utc_today() and rpd.get('exhausted'))
+                    entry['rotation'] = _freepool_gemini_candidates(first_band, ep)
             out['endpoints'].append(entry)
     except Exception:
         pass

@@ -91,11 +91,17 @@ def _reset_pool_state():
         serve._free_pool_state['cooldown'].clear()
         serve._free_pool_state['or_free_banned'].clear()
         serve._free_pool_state['or_free_chosen'] = None
+        serve._free_pool_state['gem_models'].clear()
     # Model circuit state is module-global and survives between tests; the
     # breaker tests open circuits ON PURPOSE, so every suite must start with
     # closed circuits or leaked OPEN state poisons the next test's picks.
     with serve._model_circuit_lock:
         serve._model_circuit_state.clear()
+    # API-key breaker state is module-global too; credential tests OPEN the
+    # gemini key on purpose and that leak skips the pinned gemini endpoints
+    # here, so every suite must start with closed key breakers as well.
+    with serve._api_key_health_lock:
+        serve._api_key_health.clear()
     serve._FREE_POOL_ACTOR_TEAM.set(None)
     serve._invalidate_free_pool_policy_cache()
 
@@ -695,6 +701,425 @@ class FreePoolBreakerTests(_CallLayerBase):
         paid_left = serve._model_circuit_state['paid/low-model']['open_until'] - _time.time()
         self.assertAlmostEqual(free_left, serve.FREE_POOL_CIRCUIT_COOLDOWN_S, delta=5)
         self.assertAlmostEqual(paid_left, serve.CIRCUIT_BREAKER_COOLDOWN_S, delta=5)
+
+
+_GEMINI_LISTING = {'models': [
+    {'name': 'models/gemini-3.5-flash', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3-flash-preview', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.5-flash-lite', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.8-flash', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.6-flash', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.7-flash', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.5-flash-think', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-3.5-flash-image', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-2.5-tts', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/text-embedding-x', 'supportedGenerationMethods': ['generateContent']},
+    {'name': 'models/gemini-2.5-embed', 'supportedGenerationMethods': ['embedContent']},
+]}
+
+
+class _FakeListingResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return json.dumps(self._payload).encode()
+
+
+_AUTO_EP = {'name': 'gemini-free', 'service': 'gemini',
+            'base_url': CFG_GEMINI, 'model': 'auto',
+            'api_key_env': 'GEMINI_API_KEY', 'price_per_m': 0,
+            'rpm': 10, 'rpd': 250, 'tpm': 250000}
+
+
+def _seed_gemini_scores(conn):
+    now = time.time()
+    for model_id, score in (
+            ('google/gemini-3.5-flash', 33.6),
+            ('google/gemini-3-flash-preview', 26.3),
+            ('google/gemini-3.5-flash-lite', 11.7)):
+        conn.execute("INSERT OR REPLACE INTO model_benchmark_scores (model_id, benchmark, "
+                     "score, evaluator, checked_at) VALUES (?, 'intelligence_index', ?, "
+                     "'artificial_analysis', ?)", (model_id, score, now))
+
+
+class GeminiAutoModelTests(unittest.TestCase):
+    """The free Gemini models are gathered from the key's live models list
+    and determined per band -- never a pinned name in config."""
+
+    def setUp(self):
+        _reset_pool_state()
+        import sqlite3
+        with sqlite3.connect(serve.DB_PATH) as conn:
+            # Score rows seeded by one test must not leak into the next
+            # (the module DB persists): this class owns the google/gemini-%
+            # rows and re-seeds its baseline every test.
+            conn.execute("DELETE FROM model_benchmark_scores "
+                         "WHERE model_id LIKE 'google/gemini-%'")
+            _seed_gemini_scores(conn)
+
+    def _gather(self):
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 return_value=_FakeListingResponse(_GEMINI_LISTING)):
+            return serve._freepool_gemini_models(_AUTO_EP)
+
+    def test_gathers_and_filters_to_text_chat_models(self):
+        names = self._gather()
+        self.assertIn('gemini-3.5-flash', names)
+        self.assertIn('gemini-3-flash-preview', names)
+        # Non-chat markers, non-generateContent methods, and the models/ prefix.
+        self.assertNotIn('gemini-3.5-flash-image', names)
+        self.assertNotIn('gemini-2.5-tts', names)
+        self.assertNotIn('text-embedding-x', names)
+        self.assertNotIn('gemini-2.5-embed', names)
+        self.assertTrue(all(not n.startswith('models/') for n in names))
+
+    def test_gather_is_cached_per_key_within_the_ttl(self):
+        self._gather()
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=AssertionError('must not refetch within the TTL')):
+            again = serve._freepool_gemini_models(_AUTO_EP)
+        self.assertIn('gemini-3.5-flash', again)
+
+    def test_failed_gather_keeps_last_known_good(self):
+        self._gather()
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=OSError('down')):
+            again = serve._freepool_gemini_models(_AUTO_EP)
+        self.assertIn('gemini-3.5-flash', again)
+
+    def test_no_key_and_no_cache_yields_nothing(self):
+        with unittest.mock.patch.object(serve, '_load_env', return_value={}):
+            self.assertIsNone(serve._freepool_gemini_models(_AUTO_EP))
+
+    def test_low_takes_the_strongest_qualifying_model(self):
+        self._gather()
+        self.assertEqual(serve._freepool_gemini_model('low', _AUTO_EP),
+                         'gemini-3.5-flash')
+
+    def test_sublow_takes_the_weakest_qualifying_model(self):
+        # 'Cheapest coherent' translated to free models: the weakest scored
+        # model still holding the band floor, keeping the stronger model's
+        # daily quota for the low band's real work.
+        self._gather()
+        self.assertEqual(serve._freepool_gemini_model('sublow', _AUTO_EP),
+                         'gemini-3-flash-preview')
+
+    def test_unscored_below_floor_and_thinking_models_excluded(self):
+        self._gather()
+        # gemini-3.8-flash is unscored, gemini-3.5-flash-lite (11.7) is below
+        # the sublow floor, and the -think model is reasoning-mandatory: none
+        # may serve, whatever their rank order would be.
+        for band in ('low', 'sublow'):
+            pick = serve._freepool_gemini_model(band, _AUTO_EP)
+            self.assertNotEqual(pick, 'gemini-3.8-flash')
+            self.assertNotEqual(pick, 'gemini-3.5-flash-think')
+        self.assertNotEqual(serve._freepool_gemini_model('sublow', _AUTO_EP),
+                            'gemini-3.5-flash-lite')
+
+    def test_no_qualifying_model_leaves_the_endpoint_unready(self):
+        self._gather()
+        # A floor nothing reaches (a band with an unreachable threshold)
+        # resolves no pick: the endpoint is not ready rather than serving an
+        # unscored or below-floor model.
+        with unittest.mock.patch.dict(serve.BAND_MIN_SCORE, {'low': 99.0}):
+            self.assertIsNone(serve._freepool_gemini_model('low', _AUTO_EP))
+
+    def test_family_filter_excludes_out_of_class_models(self):
+        # The strongest gathered model may be a flagship class whose
+        # free-tier quota is useless for volume (the pool's own researched
+        # reality). The model_family classes bound the candidates WITHOUT
+        # pinning any model name: a scored pro-class model never wins the
+        # pick, and an empty candidate set after the filter leaves the
+        # endpoint unready.
+        import sqlite3
+        self._gather()
+        with sqlite3.connect(serve.DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO model_benchmark_scores (model_id, benchmark, "
+                         "score, evaluator, checked_at) VALUES "
+                         "('google/gemini-4-argon', 'intelligence_index', 55.0, "
+                         "'artificial_analysis', ?)", (time.time(),))
+        self.assertEqual(serve._freepool_gemini_model('low', _AUTO_EP),
+                         'gemini-3.5-flash')
+        pro_ep = dict(_AUTO_EP, model_family=['pro'])
+        self.assertIsNone(serve._freepool_gemini_model('low', pro_ep))
+
+    def test_low_rotates_strongest_first_as_daily_quota_fills(self):
+        # Google's free tier meters PER MODEL PER KEY: exhausting one
+        # model's day never touches another's, so the band walks its
+        # rotation order (strongest first for low) as each allowance fills.
+        import sqlite3
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        with sqlite3.connect(serve.DB_PATH) as conn:
+            for mid, score in (('google/gemini-3.6-flash', 34.0),
+                               ('google/gemini-3.7-flash', 39.6)):
+                conn.execute("INSERT OR REPLACE INTO model_benchmark_scores (model_id, benchmark, "
+                             "score, evaluator, checked_at) VALUES (?, 'intelligence_index', ?, "
+                             "'artificial_analysis', ?)", (mid, score, time.time()))
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        self.assertEqual(serve._freepool_gemini_model('low', loaded),
+                         'gemini-3.7-flash')
+        today = serve._utc_today()
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3.7-flash'] = \
+                {'date': today, 'count': 250}
+        self.assertEqual(serve._freepool_gemini_model('low', loaded),
+                         'gemini-3.6-flash')
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3.6-flash'] = \
+                {'date': today, 'count': 250}
+            serve._free_pool_state['rpd']['gemini-free::gemini-3.5-flash'] = \
+                {'date': today, 'count': 250}
+        # Every flash-class candidate holding the low floor is spent: no
+        # pick, and the endpoint reports not ready so the pool rotates
+        # onward to the next endpoint / the paid leg.
+        self.assertIsNone(serve._freepool_gemini_model('low', loaded))
+        self.assertFalse(serve._freepool_ready(loaded, 'low'))
+
+    def test_sublow_rotates_weakest_first(self):
+        # Sublow's role is cheapest-coherent: it starts on the weakest
+        # qualifying model and climbs only as that model's day fills,
+        # keeping the stronger models' quotas for the low band.
+        _write_pool_config({'enabled': True, 'bands': ['sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3-flash-preview')
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3-flash-preview'] = \
+                {'date': serve._utc_today(), 'count': 250}
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3.5-flash')
+
+    def test_daily_quota_is_shared_across_bands_on_one_key(self):
+        # One key has ONE allowance per model, whoever spends it: low and
+        # sublow draw from the same per-model counter, so a model low spent
+        # to its cap is gone for sublow too.
+        _write_pool_config({'enabled': True, 'bands': ['low', 'sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3-flash-preview'] = \
+                {'date': serve._utc_today(), 'count': 250}
+        self.assertNotEqual(serve._freepool_gemini_model('sublow', loaded),
+                            'gemini-3-flash-preview')
+
+    def test_daily_limit_429_spends_the_model_not_the_endpoint(self):
+        # A daily-limit 429 on one auto-gemini model marks THAT model's day
+        # as spent; the endpoint stays ready and the next pick rotates to
+        # the next candidate instead of idling until UTC midnight.
+        _write_pool_config({'enabled': True, 'bands': ['low', 'sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        spec = serve._freepool_provider_for('@freepool:sublow:gemini-free')
+        self.assertEqual(spec['model'], 'gemini-3-flash-preview')
+        self.assertTrue(spec['auto_model'])
+        serve._note_free_pool_rate_limited(
+            spec, 'Resource has exhausted all requests per day quota.')
+        with serve._free_pool_lock:
+            spent = serve._free_pool_state['rpd'].get(
+                'gemini-free::gemini-3-flash-preview') or {}
+            self.assertGreaterEqual(spent.get('count', 0), 250)
+            self.assertTrue(spent.get('exhausted'))
+            self.assertNotIn('gemini-free', serve._free_pool_state['cooldown'])
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3.5-flash')
+        self.assertTrue(serve._freepool_ready(loaded, 'sublow'))
+
+    def test_rpd_zero_rides_the_true_per_model_allowance(self):
+        # rpd 0 means no local endpoint cap: the operator lets the key ride
+        # Google's true PER-MODEL free allowance, so a call count alone
+        # never skips a model -- only Google's own daily-limit 429 does
+        # (via the 'exhausted' marker), and the counter is not inflated.
+        _write_pool_config({'enabled': True, 'bands': ['low', 'sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP, rpd=0)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        today = serve._utc_today()
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3-flash-preview'] = \
+                {'date': today, 'count': 250}
+        # Count without a 429 marker is not a skip signal under rpd 0.
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3-flash-preview')
+        # The daily-limit 429 marker IS: rotate onward, counter untouched.
+        spec = serve._freepool_provider_for('@freepool:sublow:gemini-free')
+        self.assertEqual(spec['model'], 'gemini-3-flash-preview')
+        serve._note_free_pool_rate_limited(
+            spec, 'Resource has exhausted all requests per day quota.')
+        with serve._free_pool_lock:
+            spent = serve._free_pool_state['rpd'].get(
+                'gemini-free::gemini-3-flash-preview') or {}
+            self.assertTrue(spent.get('exhausted'))
+            self.assertEqual(spent.get('count', 0), 250)
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3.5-flash')
+        self.assertTrue(serve._freepool_ready(loaded, 'sublow'))
+
+    def test_rpd_cap_still_limits_keeping_the_local_override(self):
+        # An explicit rpd is a conservative local override: reaching the cap
+        # skips the model exactly as before, independent of any 429 marker.
+        import sqlite3
+        with sqlite3.connect(serve.DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO model_benchmark_scores "
+                         "(model_id, benchmark, score, evaluator, checked_at) "
+                         "VALUES ('google/gemini-3.6-flash', 'intelligence_index', "
+                         "34.0, 'artificial_analysis', ?)", (time.time(),))
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP, rpd=2)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        today = serve._utc_today()
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3.5-flash'] = \
+                {'date': today, 'count': 2}
+        self.assertEqual(serve._freepool_gemini_model('low', loaded),
+                         'gemini-3.6-flash')
+
+    def test_model_rpd_caps_listed_models_and_rotates_onward(self):
+        # A model_rpd entry is a PER-MODEL local cap: only the listed model
+        # stops at its cap; the rotation walks onward to the next candidate
+        # exactly as with an endpoint rpd, and unlisted models are untouched.
+        import sqlite3
+        with sqlite3.connect(serve.DB_PATH) as conn:
+            conn.execute("INSERT OR REPLACE INTO model_benchmark_scores "
+                         "(model_id, benchmark, score, evaluator, checked_at) "
+                         "VALUES ('google/gemini-3.6-flash', 'intelligence_index', "
+                         "34.0, 'artificial_analysis', ?)", (time.time(),))
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP, rpd=0,
+                                               model_rpd={'gemini-3.6-flash': 2})]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        today = serve._utc_today()
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-free::gemini-3.6-flash'] = \
+                {'date': today, 'count': 2}
+        # The strongest candidate hit its per-model cap: rotate onward.
+        self.assertEqual(serve._freepool_gemini_model('low', loaded),
+                         'gemini-3.5-flash')
+        # The unlisted candidate still has room (its counter is empty).
+        self.assertTrue(serve._freepool_ready(loaded, 'low'))
+
+    def test_model_rpd_longest_key_wins_and_unlisted_rides_rpd(self):
+        # Matching is substring, longest key wins: 'flash-lite' is not
+        # shadowed by 'flash'. A model matching no key falls back to the
+        # endpoint-level rpd (0 = uncapped, rides the 429 marker).
+        ep = {'name': 'gemini-free', 'rpd': 0,
+              'model_rpd': {'flash-lite': 1000, 'flash': 250}}
+        self.assertEqual(serve._freepool_model_cap(ep, 'gemini-3.5-flash-lite'),
+                         1000)
+        self.assertEqual(serve._freepool_model_cap(ep, 'gemini-3.5-flash'),
+                         250)
+        self.assertEqual(serve._freepool_model_cap(ep, 'gemini-3.0-pro'),
+                         0)
+        # No map at all: the endpoint-level rpd applies to every model.
+        self.assertEqual(serve._freepool_model_cap({'name': 'e', 'rpd': 7},
+                                                   'gemini-3.5-flash'), 7)
+        # A malformed map is ignored, not fatal.
+        self.assertEqual(serve._freepool_model_cap(
+            {'name': 'e', 'rpd': 5, 'model_rpd': 'nope'}, 'gemini-3.5-flash'), 5)
+
+    def test_model_rpd_exhaust_marks_the_count_at_the_model_cap(self):
+        # A daily-limit 429 marks the model spent AND, when the model has a
+        # model_rpd entry, pins the counter at that cap (the same numeric
+        # limit the picker's rotation check reads).
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP, rpd=0,
+                                               model_rpd={'flash': 3})]})
+        self._gather()
+        spec = serve._freepool_provider_for('@freepool:low:gemini-free')
+        self.assertTrue(serve._freepool_exhaust_model_day(spec))
+        today = serve._utc_today()
+        with serve._free_pool_lock:
+            spent = serve._free_pool_state['rpd'].get(
+                'gemini-free::' + spec['model']) or {}
+        self.assertTrue(spent.get('exhausted'))
+        self.assertEqual(spent.get('count', 0), 3)
+
+    def test_rate_limit_429_still_cools_the_whole_endpoint(self):
+        # A per-minute 429 is an endpoint-wide event (the minute bucket is
+        # shared): the cooldown still applies exactly as for pinned
+        # endpoints.
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        spec = serve._freepool_provider_for('@freepool:low:gemini-free')
+        serve._note_free_pool_rate_limited(spec, 'rate limit exceeded')
+        with serve._free_pool_lock:
+            self.assertGreater(serve._free_pool_state['cooldown'].get('gemini-free') or 0,
+                               time.time())
+
+    def test_recorded_calls_count_against_the_models_own_day(self):
+        # The transport's accounting must agree with the picker's rotation
+        # check: a successful auto-gemini call fills THAT model's counter,
+        # and the picker walks past it once the cap is reached.
+        _write_pool_config({'enabled': True, 'bands': ['low', 'sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        spec = serve._freepool_provider_for('@freepool:sublow:gemini-free')
+        for _ in range(250):
+            serve._note_free_pool_call(spec, {'usage': {'total_tokens': 100}})
+        self.assertEqual(serve._freepool_gemini_model('sublow', loaded),
+                         'gemini-3.5-flash')
+
+    def test_auto_endpoint_ready_and_resolved_in_provider_spec(self):
+        _write_pool_config({'enabled': True, 'bands': ['low', 'sublow'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        self._gather()
+        loaded = serve._free_pool_cfg()['endpoints'][0]
+        self.assertTrue(serve._freepool_ready(loaded, 'low'))
+        self.assertEqual(serve._freepool_route_for_band('low'),
+                         '@freepool:low:gemini-free')
+        self.assertEqual(serve._freepool_route_for_band('sublow'),
+                         '@freepool:sublow:gemini-free')
+        spec = serve._freepool_provider_for('@freepool:low:gemini-free')
+        self.assertEqual(spec['model'], 'gemini-3.5-flash')
+        spec = serve._freepool_provider_for('@freepool:sublow:gemini-free')
+        self.assertEqual(spec['model'], 'gemini-3-flash-preview')
+
+    def test_auto_endpoint_unready_when_the_gather_yields_nothing(self):
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [dict(_AUTO_EP)]})
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=OSError('down')):
+            self.assertFalse(serve._freepool_ready(_AUTO_EP, 'low'))
+            self.assertIsNone(serve._freepool_route_for_band('low'))
+
+    def test_auto_is_a_gemini_only_escape_hatch(self):
+        # A non-gemini endpoint may not omit its model: a typo must disable
+        # the endpoint, never redirect traffic.
+        _write_pool_config({'enabled': True, 'bands': ['low'],
+                            'mode': 'free-first',
+                            'endpoints': [{'name': 'groq-auto', 'service': 'groq',
+                                           'base_url': CFG_GROQ, 'model': 'auto',
+                                           'api_key_env': 'GROQ_API_KEY',
+                                           'price_per_m': 0}]})
+        # Dropping the malformed endpoint leaves the pool with no endpoints,
+        # which disables the pool outright (the typo discipline).
+        self.assertIsNone(serve._free_pool_cfg())
 
 
 if __name__ == '__main__':
