@@ -103,6 +103,17 @@ def is_village_chief(state, agent_id):
         for r in _roster(state))
 
 
+def villages_without_chief(state):
+    """Village ids with no appointed chief of staff. Operator invariant
+    (2026-11-01): every village gets one at creation, so a chief-less
+    village means the creation hook skipped (no eligible candidate yet) or
+    a chief was lost -- a health alert, not a silent gap."""
+    have = {r.get('chiefOfVillage') for r in _roster(state)
+            if isinstance(r, dict) and r.get('villageChief')}
+    return [v.get('id') for v in ((state or {}).get('villages') or [])
+            if isinstance(v, dict) and v.get('id') and v.get('id') not in have]
+
+
 def chief_of_village(state, village_id):
     """The village chief of staff appointed for `village_id`, or None."""
     for r in _roster(state):

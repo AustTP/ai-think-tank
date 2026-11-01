@@ -140,6 +140,28 @@ def _task_fix_spirals(now, min_tasks=3):
     return {'spirals': len(spirals), 'tasks': sum(len(s) for s in spirals)}
 
 
+def _chiefless_villages(data):
+    """Village ids with no appointed chief of staff, from the snapshot's own
+    data view: villages live in the blob, but the roster is a row-extracted
+    section (never in the blob), so the chief flags are read from the
+    extracted store. Failure-swallowed: a read hiccup degrades to no signal
+    rather than breaking the snapshot."""
+    villages = [v.get('id') for v in (data.get('villages') or [])
+                if isinstance(v, dict) and v.get('id')]
+    if not villages:
+        return []
+    try:
+        with _EXTRACTED_LOCK:
+            roster_rows = _extracted_rows_load_locked(
+                'roster_agent', _EXTRACTED_CACHE['agentRoster'])
+        have = {obj.get('chiefOfVillage')
+                for _rid, (_seq, obj) in roster_rows.items()
+                if isinstance(obj, dict) and obj.get('villageChief')}
+        return [vid for vid in villages if vid not in have]
+    except Exception:
+        return []
+
+
 def compute_health_snapshot():
     # Every signal here comes from data the app already writes for other
     # reasons (kv_state, action_log, model_tiers) -- no network calls, no
@@ -158,12 +180,14 @@ def compute_health_snapshot():
     if state_row is None:
         think_tank_active, seconds_since_last_save, work_queue_size, work_queue_due_size, agents_count = False, None, 0, 0, 0
         aging_in_flight, open_escalations, bank_over_cap, bank_used, bank_cap = 0, 0, [], 0.0, 0.0
+        chiefless_villages = []
         top_failure_reasons, repair_loop_roots, stuck_cards = [], 0, 0
     else:
         blob, updated_at = state_row
         seconds_since_last_save = now - updated_at
         think_tank_active = seconds_since_last_save < HEALTH_STATE_STALE_AFTER_S
         data = json.loads(blob)
+        chiefless_villages = _chiefless_villages(data)
         work_queue = data.get('workQueue', [])
         work_queue_size = len(work_queue)
         work_queue_due_size = _count_due_work_items(work_queue, now * 1000)
@@ -347,6 +371,10 @@ def compute_health_snapshot():
         # churn) but the process is up and bound. Hitting this endpoint is itself
         # a wake request, so a "sleeping" think tank reads False here immediately.
         'dormant': _dormant(),
+        # Operator invariant (2026-11-01): every village has a chief of staff.
+        # The roster is a row-extracted section (the raw blob never carries
+        # it), so the flags are read from the extracted store, not the blob.
+        'chiefless_villages': chiefless_villages,
         'seconds_since_last_save': seconds_since_last_save,
         'work_queue_size': work_queue_size,
         'work_queue_due_size': work_queue_due_size,

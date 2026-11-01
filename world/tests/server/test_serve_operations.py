@@ -674,6 +674,29 @@ class HealthAlertsKeysTest(unittest.TestCase):
         self.assertTrue(any('half-open' in a['message'] for a in alerts))
 
 
+class VillageChiefAlertTest(unittest.TestCase):
+    """Operator invariant: every village has a chief of staff."""
+
+    def test_chiefless_villages_alert(self):
+        signals = collections.defaultdict(int, {
+            'blocked_or_failed_actions_last_hour': {},
+            'tool_volume_by_agent_last_15m': {},
+            'chiefless_villages': ['main', 'vlg-2']})
+        alerts = serve._health_alerts_for_signals(signals)
+        org = [a for a in alerts if a['category'] == 'org']
+        self.assertEqual(len(org), 1)
+        self.assertEqual(org[0]['severity'], 'warning')
+        self.assertIn('main, vlg-2', org[0]['message'])
+
+    def test_chiefed_villages_stay_quiet(self):
+        signals = collections.defaultdict(int, {
+            'blocked_or_failed_actions_last_hour': {},
+            'tool_volume_by_agent_last_15m': {},
+            'chiefless_villages': []})
+        alerts = serve._health_alerts_for_signals(signals)
+        self.assertFalse(any(a['category'] == 'org' for a in alerts))
+
+
 class NoteApiKeyFailureTest(unittest.TestCase):
     def test_block_and_log_error(self):
         health = {'svc': {'consecutive_failures': 5}}

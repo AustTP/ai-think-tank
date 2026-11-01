@@ -189,7 +189,90 @@ def create_village(state, name):
     vid = next_village_id(state)
     record = {'id': vid, 'name': name}
     villages.append(record)
+    # Operator invariant (2026-11-01): a village is born WITH its chief of
+    # staff -- the per-village deputy between the admin and this village's
+    # senior directors. Auto-picks the village's most senior existing agent
+    # (a teams-row director) when one exists; a brand-new village with no
+    # directors yet stays chief-less until an operator appoints one, and the
+    # health digest alerts on the gap until then.
+    appoint_village_chief(state, vid)
     return record
+
+
+def appoint_village_chief(state, village_id, agent_id=None):
+    """Appoint `agent_id` (or auto-pick) as `village_id`'s chief of staff:
+    the roster tier `villageChief: True` + `chiefOfVillage: <vid>` (core
+    governance), role 'chief_of_staff', reporting to the admin, with the
+    village's other senior directors re-parented under the chief. Exactly
+    one chief per village: a re-appointment clears the previous chief's
+    flags. Returns the chief id, or None when the village is unknown or no
+    eligible candidate exists."""
+    villages = state.get('villages') or []
+    if not any(v.get('id') == village_id for v in villages):
+        return None
+    roster = state.setdefault('agentRoster', [])
+    agents = state.get('agents') or {}
+    entries = {r.get('id'): r for r in roster if isinstance(r, dict) and r.get('id')}
+    admin_id = next((r.get('id') for r in roster
+                     if isinstance(r, dict) and r.get('isAdmin')), None)
+
+    def _village_of(aid):
+        return ((agents.get(aid) or {}).get('villageId')
+                or DEFAULT_VILLAGE)
+
+    # One chief per village: strip the flags from whoever holds them now.
+    previous = [e for e in entries.values()
+                if e.get('villageChief')
+                and (e.get('chiefOfVillage') or None) == (village_id or None)]
+    for e in previous:
+        e.pop('villageChief', None)
+        e.pop('chiefOfVillage', None)
+
+    chiefs_elsewhere = {e.get('id') for e in entries.values()
+                        if e.get('villageChief') and e.get('chiefOfVillage')}
+    candidate = None
+    if agent_id:
+        entry = entries.get(agent_id)
+        if entry is None or agent_id in chiefs_elsewhere \
+                or _village_of(agent_id) != village_id:
+            return None
+        candidate = agent_id
+    else:
+        # Auto: the village's most senior existing agent -- a teams-row
+        # director (the stable senior-tier marker) who belongs to this
+        # village, in teams-row order for determinism.
+        senior_dirs = [t.get('directorId') for t in (state.get('teams') or [])
+                       if isinstance(t, dict) and t.get('directorId')
+                       and _village_of(t.get('directorId')) == village_id
+                       and t.get('directorId') not in chiefs_elsewhere]
+        for aid in senior_dirs:
+            if aid in entries:
+                candidate = aid
+                break
+    if not candidate:
+        return None
+
+    entry = entries[candidate]
+    entry['villageChief'] = True
+    entry['chiefOfVillage'] = village_id
+    entry['role'] = 'chief_of_staff'
+    if admin_id and candidate != admin_id:
+        entry['director'] = admin_id
+    # Re-parent the village's other senior directors under the chief: the
+    # chief sits between the admin and this village's senior layer. Only
+    # directors whose reporting pointer is the admin (or unset) move -- a
+    # deeper tree keeps its own shape.
+    for t in (state.get('teams') or []):
+        if not isinstance(t, dict):
+            continue
+        did = t.get('directorId')
+        de = entries.get(did)
+        if not de or did == candidate or did in chiefs_elsewhere:
+            continue
+        if _village_of(did) == village_id \
+                and de.get('director') in (None, admin_id):
+            de['director'] = candidate
+    return candidate
 
 
 def village_of_agent(state, agent_id):

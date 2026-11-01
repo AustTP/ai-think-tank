@@ -38,6 +38,7 @@ from village.sim_helpers import (  # noqa: E402, F401
     size_estimate_weight,
     # Villages: the top-level identity + memory boundary.
     DEFAULT_VILLAGE,
+    appoint_village_chief,
     create_village,
     ensure_villages,
     next_village_id,

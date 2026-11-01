@@ -425,6 +425,42 @@ async def create_village_endpoint(request: Request):
     return JSONResponse({'ok': True, 'village': record})
 
 
+@app.post('/api/villages/chief')
+@_state_writer
+async def appoint_village_chief_endpoint(request: Request):
+    """Appoint (or re-appoint) a village's chief of staff (player-only).
+    {villageId} required; {agentId} optional -- omitted, the village's most
+    senior member (a teams-row director) is auto-picked. One chief per
+    village: a re-appointment replaces the previous one and re-parents the
+    village's senior directors under the new chief."""
+    authed, actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    body = await request.json()
+    import sim as _sim
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    village_id = (body.get('villageId') or '').strip()
+    agent_id = (body.get('agentId') or '').strip() or None
+    if not village_id:
+        return JSONResponse({'error': 'a villageId is required'}, status_code=400)
+    chief = _sim.appoint_village_chief(state, village_id, agent_id)
+    if chief is None:
+        if not any(v.get('id') == village_id
+                   for v in (state.get('villages') or [])):
+            return JSONResponse({'error': 'unknown village'}, status_code=404)
+        return JSONResponse(
+            {'error': 'no eligible chief for this village (agent unknown, '
+                      'in another village, or already chief elsewhere, and '
+                      'no senior director of this village is available)'},
+            status_code=409)
+    save_state_to_db(state)
+    log_action(actor or 'player', 'village_chief_appointed',
+               {'villageId': village_id, 'chief': chief}, authorized=True)
+    return JSONResponse({'ok': True, 'villageId': village_id, 'chief': chief})
+
+
 @app.post('/api/villages/assign')
 @_state_writer
 async def assign_agent_to_village(request: Request):

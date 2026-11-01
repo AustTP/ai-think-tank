@@ -449,6 +449,15 @@ def _health_alerts_for_signals(signals):
     if signals['login_failures_last_hour'] >= 5:
         alert('security', 'warning', f'{signals["login_failures_last_hour"]} failed login attempt(s) in the last hour')
 
+    # Operator invariant (2026-11-01): every village has a chief of staff.
+    # A chief-less village means the creation hook found no eligible
+    # candidate or a chief was lost -- the operator appoints one via
+    # POST /api/villages/chief; nothing self-heals this.
+    chiefless = signals.get('chiefless_villages') or []
+    if chiefless:
+        alert('org', 'warning',
+              'village(s) without a chief of staff: ' + ', '.join(chiefless))
+
     for action_name, count in signals['blocked_or_failed_actions_last_hour'].items():
         if count >= 10:
             alert('capability', 'warning', f'{count} blocked/failed "{action_name}" call(s) in the last hour')
