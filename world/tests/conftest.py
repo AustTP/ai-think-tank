@@ -92,6 +92,14 @@ _tmpdir = tempfile.mkdtemp(prefix=f'{_TMP_PREFIX}{os.getpid()}-')
 atexit.register(_remove_tmpdir, _tmpdir)
 _TEST_DB = os.path.join(_tmpdir, 'think_tank.db')
 os.environ['THINK_TANK_DB'] = _TEST_DB
+# Belt and suspenders for the Postgres DSN: db_backend._dsn() reads the repo
+# .env when THINK_TANK_DB_URL is unset, and a production DSN would send every
+# unpatched test read/write into the live world (this actually happened on
+# 2026-11-01: the .env DSN redirected a test run's fixture saves into the
+# production Postgres and clobbered the live row tables). THINK_TANK_FORCE_SQLITE
+# makes _dsn() return '' unconditionally for this process.
+os.environ['THINK_TANK_FORCE_SQLITE'] = '1'
+os.environ.pop('THINK_TANK_DB_URL', None)
 if os.path.exists(_LIVE_DB):
     _src = sqlite3.connect(_LIVE_DB)
     _dst = sqlite3.connect(_TEST_DB)

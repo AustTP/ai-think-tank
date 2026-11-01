@@ -861,12 +861,31 @@ def is_postgres():
     return bool(_dsn())
 
 
+def _test_sandboxed():
+    """True when this process must NEVER open the production database: a
+    pytest run (tests/conftest.py copies the DB and points THINK_TANK_DB at
+    the copy) or any process that sets THINK_TANK_FORCE_SQLITE explicitly.
+    This is the guard that keeps the repo-.env DSN -- a PRODUCTION pointer --
+    from silently redirecting test reads and writes into the live world:
+    when the DSN was added to .env, every unguarded test process started
+    hitting Postgres instead of its own isolated SQLite copy, and fixture
+    saves clobbered the live row tables."""
+    import os
+    if os.environ.get('THINK_TANK_FORCE_SQLITE'):
+        return True
+    import sys
+    return 'pytest' in sys.modules
+
+
 def _dsn():
     """THINK_TANK_DB_URL from the process environment, else from the repo
     .env (the project's config convention; _load_env-style parse). The file
     is read once per process: config changes need a restart, like every
-    other .env key."""
+    other .env key. Tests NEVER get the .env DSN: _test_sandboxed() forces
+    the SQLite path so a test run can never touch production."""
     import os
+    if _test_sandboxed():
+        return ''
     dsn = os.environ.get(_DSN_ENV)
     if dsn:
         return dsn
