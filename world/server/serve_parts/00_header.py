@@ -715,6 +715,25 @@ FAILURE_TYPE_LABELS = {
 DB_PATH = os.environ.get('THINK_TANK_DB') or os.path.join(THINK_TANK_DIR, 'think_tank.db')
 
 
+def _log_db_backend_banner():
+    """Say WHICH database this process will use, once, at import. On
+    2026-11-01 a test run silently talked to production Postgres (the repo
+    .env DSN) while everyone believed it was on the isolated SQLite copy --
+    the incident was only caught because /api/state served a test fixture.
+    A boot line removes the ambiguity for every process that follows."""
+    try:
+        import db_backend as _dbm
+        if _dbm.is_postgres():
+            print(f'[db] backend: postgres ({_dbm._dsn()})')
+        else:
+            print(f'[db] backend: sqlite {DB_PATH}')
+    except Exception:
+        pass
+
+
+_log_db_backend_banner()
+
+
 def _refuse_production_db_from_tests():
     """Fail loudly when a TEST process is about to open the production DB.
 
