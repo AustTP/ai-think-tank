@@ -455,7 +455,7 @@ async def budget_view(request: Request):
     budget_requests = []
     try:
         state = get_state_from_db() or {}
-        month = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
+        month = _spend_cap_period()
         ledger = _spend_ledger_read()
         usage = {}
         for key, bucket in (ledger or {}).items():
