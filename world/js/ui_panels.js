@@ -156,6 +156,19 @@ function openBoard() {
 // Real think tank status, not the static placeholder text this used to be --
 // straight off TASKS/AGENTS, the same live objects everything else reads,
 // not a separate summary someone has to remember to update.
+// Worker narration on the card face: the completion/progress note the
+// assigned worker wrote for THIS card, quoted under its line on the board
+// (the kanzo-style "agents comment as they work" affordance -- the note
+// already exists server-side; the board just never surfaced it). Pure
+// function so tests/test_ui_helpers.mjs can extract and eval the shipped
+// source instead of re-typing the logic.
+function boardNarration(t) {
+  const note = (t && t.note) ? String(t.note).trim() : '';
+  if (!note) return '';
+  const short = note.length > 140 ? note.slice(0, 139) + '\u2026' : note;
+  return `<div style="opacity:0.75;font-size:11px;margin:1px 0 4px 14px;">&ldquo;${short}&rdquo;</div>`;
+}
+
 function renderBoard() {
   loadPlanApprovals();
   const body = document.getElementById('boardBody');
@@ -164,16 +177,32 @@ function renderBoard() {
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
   const needsReview = open.filter(t => t.status === 'needs_review');
-  const inProgress = open.filter(t => t.status !== 'needs_review');
+  // The parking lot (Phase E2 lanes): a parked card waits with a bookmark and
+  // is NEVER auto-assigned -- a director must move it back to open. Showing it
+  // mixed into "In progress" made the board lie: parked cards have no worker.
+  // Parked cards get their own section (the kanzo backlog-column semantic we
+  // converged on independently) and are excluded from in-progress counts.
+  const parked = open.filter(t => t.lane === 'parking-lot');
+  const inProgress = open.filter(t => t.status !== 'needs_review' && t.lane !== 'parking-lot');
 
   const openLines = inProgress.length
     ? inProgress.map(t => {
         const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
         const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
         const lane = t.lane ? ` <span style="opacity:0.6;font-size:11px;">[${t.lane}]</span>` : '';
-        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})${lane}</div>`;
+        return `<div>&bull; ${t.title} -- ${who} (${room}, ${t.status})${lane}</div>${boardNarration(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing in progress right now.</div>';
+
+  const parkedLines = parked.length
+    ? parked.map(t => {
+        const room = ROOMS[t.room] ? ROOMS[t.room].label : t.room;
+        const wait = t.notBefore && t.notBefore > Date.now()
+          ? ` &middot; resumes ${new Date(t.notBefore).toLocaleString()}`
+          : '';
+        return `<div>&bull; ${t.title} (${room}) <span style="opacity:0.6;font-size:11px;">[parking-lot -- never auto-assigned]${wait}</span></div>${boardNarration(t)}`;
+      }).join('')
+    : '';
 
   const reviewLines = needsReview.length
     ? needsReview.map(t => {
@@ -203,7 +232,7 @@ function renderBoard() {
         // encodeURIComponent so quotes/odd chars in ids or titles can't break
         // the onclick attribute; vetoStory decodes before use.
         const btn = ` <button class="hud-btn" style="font-size:11px;padding:1px 6px;" onclick="vetoStory('${encodeURIComponent(t.id)}','${encodeURIComponent(t.title)}')">reject</button>`;
-        return `<div>&bull; ${t.title} -- ${who}${btn}</div>`;
+        return `<div>&bull; ${t.title} -- ${who}${btn}</div>${boardNarration(t)}`;
       }).join('')
     : '<div style="opacity:0.6;">Nothing completed yet.</div>';
 
@@ -268,6 +297,7 @@ function renderBoard() {
     <div style="margin-bottom:4px;"><strong>In progress (${inProgress.length})</strong></div>
     ${openLines}
     ${reviewLines ? `<div style="margin:8px 0 4px;"><strong>Awaiting peer review (${needsReview.length})</strong></div>${reviewLines}` : ''}
+    ${parkedLines ? `<div style="margin:8px 0 4px;"><strong>Parked (${parked.length})</strong></div>${parkedLines}` : ''}
     <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
     ${doneLines}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>

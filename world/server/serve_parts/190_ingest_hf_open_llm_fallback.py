@@ -791,6 +791,10 @@ AUTH_PUBLIC_PATHS = (
     # A2A Agent Card is public metadata (no secrets); the /a2a endpoint itself
     # still requires a player session or a director/admin key.
     '/.well-known/agent-card.json', '/.well-known/agent.json',
+    # MCP edge (440_mcp_edge.py): the login middleware's session cookie has no
+    # meaning for MCP clients, so the path is public HERE and self-guards with
+    # a bearer token -- fail closed when THINK_TANK_MCP_TOKEN is unset (503).
+    '/mcp',
     # Enterprise page shell: public HTML only. Its data endpoints stay
     # operator-only and enforce auth in their own handlers.
     '/admin/enterprise',

@@ -55,8 +55,10 @@ vm.createContext(context);
 vm.runInContext(`var VIEW_W = ${VIEW_W}, VIEW_H = ${VIEW_H};`, context);
 vm.runInContext(extractFunction(html, 'camXY'), context, { filename: 'index.html:camXY' });
 vm.runInContext(extractFunction(html, 'dedupActivity'), context, { filename: 'index.html:dedupActivity' });
+vm.runInContext(extractFunction(html, 'boardNarration'), context, { filename: 'ui_panels.js:boardNarration' });
 const camXY = (...args) => vm.runInContext('camXY', context)(...args);
 const dedupActivity = (...args) => vm.runInContext('dedupActivity', context)(...args);
+const boardNarration = (...args) => vm.runInContext('boardNarration', context)(...args);
 
 let passed = 0, failed = 0;
 function test(name, fn) {
@@ -121,6 +123,27 @@ test('dedupActivity: different details on the same action/agent do not merge', (
   ];
   const out = dedupActivity(entries);
   assert.equal(out.length, 2);
+});
+
+console.log('boardNarration (js/ui_panels.js, extracted)');
+
+test('boardNarration: a card with no note renders nothing', () => {
+  assert.equal(boardNarration({ title: 'x' }), '');
+  assert.equal(boardNarration({ note: '' }), '');
+  assert.equal(boardNarration({ note: '   ' }), '');
+  assert.equal(boardNarration(null), '');
+});
+
+test('boardNarration: the worker note is quoted under the card', () => {
+  const html = boardNarration({ note: 'Wrote the brief and shipped it.' });
+  assert.ok(html.includes('Wrote the brief and shipped it.'), 'the note text survives');
+  assert.ok(html.startsWith('<div'), 'the narration is its own line element');
+});
+
+test('boardNarration: a long note is truncated with an ellipsis', () => {
+  const html = boardNarration({ note: 'x'.repeat(400) });
+  assert.ok(html.includes('\u2026'), 'the ellipsis marks the cut');
+  assert.ok(html.length < 400, 'the note did not leak whole into the board');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);
