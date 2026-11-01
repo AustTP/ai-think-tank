@@ -943,11 +943,25 @@ def _grade_completed_task(state, agent_id, task, now_ms):
     evidence = _deliverable_evidence_lines(task)
     if evidence:
         instructions += '\n\n' + '\n\n'.join(evidence)
+    else:
+        # Honest absence: a task record with no deliverable content beyond the
+        # title is a legitimate 0 -- but Jev should know it is judging an empty
+        # record, not silently treat the title as the whole deliverable.
+        instructions += ('\n\nThe task record carries no deliverable content beyond '
+                         'the title itself: no deliverable text, no completion note, '
+                         'no written files, no artifact path. Grade what is actually here.')
     # Room anchors (serve's institutional-memory retrieval): what comparable
     # deliverables in this room were graded, and whether they held up. A
     # judge with real anchors grades against the room's demonstrated bar
     # instead of its own reflex. Bounded and failure-swallowed -- anchors
     # enrich the judgment, they are never a precondition for it.
+    # NB: this MUST stay a plain try/except with no else -- an else here ran
+    # whenever the anchor call merely did not raise, which appended the
+    # honest-absence line to prompts that DID carry evidence (2026-11-01
+    # regression: every graded deliverable read its own completion note and
+    # "no deliverable content" in the same prompt, and the judge honestly
+    # graded 0; grade_outcomes became all-'0' and every trailing grade read
+    # 0.0/10).
     try:
         import serve as _serve_mod
         anchors = _serve_mod._rag_room_anchors(
@@ -957,13 +971,6 @@ def _grade_completed_task(state, agent_id, task, now_ms):
             instructions += '\n\n' + '\n\n'.join(anchors)
     except Exception:
         pass
-    else:
-        # Honest absence: a task record with no deliverable content beyond the
-        # title is a legitimate 0 -- but Jev should know it is judging an empty
-        # record, not silently treat the title as the whole deliverable.
-        instructions += ('\n\nThe task record carries no deliverable content beyond '
-                         'the title itself: no deliverable text, no completion note, '
-                         'no written files, no artifact path. Grade what is actually here.')
     # Provisional record (2026-11-01 scale fix): the tick thread never waits
     # on the grader's OpenRouter round trip (measured: 12.5s of a 67s
     # 200-agent lifecycle run was synchronous Jev calls inside _task_cycle).

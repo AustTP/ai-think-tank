@@ -182,6 +182,41 @@ def _single_deliverable_goal(goal):
     return True
 
 
+_CHECKLIST_MAX_ENTRIES = 4
+
+
+def _sanitize_checklist(raw, task_type):
+    """Normalize a breakdown card's checklist into what the review grader
+    consumes: [{section, question, type}] with type in {'code','jev'},
+    bounded lengths, capped at _CHECKLIST_MAX_ENTRIES, malformed entries
+    dropped. A 'report' card loses its 'code' entries (its quality pipeline
+    is skipped -- a mechanical gate over prose is not evidence of anything
+    and would only surface UNSURE noise to the player). Returns [] when
+    nothing survives."""
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        raw_question = entry.get('question')
+        if not isinstance(raw_question, str):
+            continue  # a question that isn't text is malformed, not coerced
+        question = raw_question.strip()
+        if not question:
+            continue
+        rtype = str(entry.get('type') or 'jev').strip().lower()
+        if rtype not in ('code', 'jev'):
+            rtype = 'jev'
+        if task_type == 'report' and rtype == 'code':
+            continue
+        out.append({'section': str(entry.get('section') or '')[:40],
+                    'question': question[:200], 'type': rtype})
+        if len(out) >= _CHECKLIST_MAX_ENTRIES:
+            break
+    return out
+
+
 def _single_deliverable_item(goal, constraints):
     """One report card carrying the whole goal. The report lane already gathers
     sources and writes the file; splitting that into gather/write/save/verify
@@ -279,8 +314,16 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "share a phase run in parallel. Cards that must not run at the same time (gather before "
             "write, write before save) belong in DIFFERENT phases; only same-phase cards may overlap. "
             "A single-stage ask uses one phase (or omits phase entirely). "
+            "Give every card a short \"checklist\" of 1-3 verifiable requirements a reviewer "
+            "can check one by one. Each entry is {\"section\": \"short area\", \"question\": "
+            "\"one specific checkable requirement\", \"type\": \"code\" or \"jev\"}. Type \"code\" "
+            "means the claim is mechanically checkable by the quality pipeline (builds, tests, "
+            "lint, CI green) -- every story/spike/research card gets at least one such gate "
+            "(for example: the quality pipeline is green). Type \"jev\" means a specific "
+            "acceptance check the reviewer verifies by reading the deliverable (a requirement, "
+            "a named artifact, a stated finding). Omit the checklist on report cards. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike|research|report","phase":"short phase name or omitted","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L",' + budget_field + '}]}'
+            '{"items":[{"title":"short title","type":"story|spike|research|report","phase":"short phase name or omitted","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L","checklist":[{"section":"short area","question":"one checkable requirement","type":"code"}],' + budget_field + '}]}'
         )
         template = _workflow_match_template(state, goal, team_id)
         if template:
@@ -386,6 +429,15 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # estimate and same-priority work is ordered largest-first.
                 'sizeEstimate': s.get('sizeEstimate'),
                 'never': never,
+                # Verifiable review checklist (2026-11-01): the review-grade
+                # calibration loop (review_judge_calibration) is starved
+                # without it -- every archived task carried an empty
+                # checklist, so no anchored grade was ever recorded. The
+                # checklist rides the card into the review path, where
+                # 'code' entries become mechanical anchors and 'jev' entries
+                # become confidence-gated focused grades.
+                'checklist': _sanitize_checklist(s.get('checklist'),
+                                                 task_type),
                 'budgetUsd': card_budget,
                 # An explicit path in the goal survives onto the card so the
                 # report/spike closer writes the requested file, not a generic
@@ -928,6 +980,17 @@ def _file_failure_bug(state, sprint_id, team_id, director_id, failure, finding, 
         'userStory': user_story,
         'acceptanceCriteria': criteria,
         'never': never,
+        # Standard review checklist for auto-filed bug cards: the mechanical
+        # pipeline gate plus the regression-test requirement (the fix is only
+        # done when the original failure can be reproduced and passes).
+        'checklist': [
+            {'section': 'code health', 'question': 'The quality pipeline '
+             '(flake8, mypy, bandit, tests) is green after the fix.',
+             'type': 'code'},
+            {'section': 'regression', 'question': 'A regression test '
+             'reproduces the original failure and passes with the fix.',
+             'type': 'jev'},
+        ],
         'sizeEstimate': 'S',
         'instructions': (
             f"SPRINT FAILURE REVIEW: {failure.get('title')} failed during sprint "

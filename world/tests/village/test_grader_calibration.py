@@ -154,3 +154,68 @@ class SuspectGradesStayOutOfAverages(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GradePromptEvidence(unittest.TestCase):
+    """Regression (2026-11-01): the honest-absence line lived in a try/else
+    that fired whenever the anchors call merely did not RAISE -- so a prompt
+    that carried the completion note ALSO claimed the record had none, and
+    the judge (honestly) graded 0. Evidence and the absence line are now
+    mutually exclusive by construction."""
+
+    def _captured_prompt(self, task_over, anchors='none'):
+        s = _state()
+        captured = {}
+
+        def fake_decider(state, instructions, *args, **kwargs):
+            captured['prompt'] = instructions
+            return 8.0
+
+        with unittest.mock.patch.object(sim, '_grading_decider',
+                                        side_effect=fake_decider):
+            with unittest.mock.patch.object(
+                    serve, '_rag_room_anchors',
+                    return_value=([] if anchors == 'none'
+                                  else ['Comparable prior deliverable in this '
+                                        'room, "x" (task-9), was graded 8/10.'])):
+                sim._grade_completed_task(s, 'w1', _task(**task_over),
+                                          int(time.time() * 1000))
+                sim._grade_pending_sync(s)
+        return captured.get('prompt', '')
+
+    def test_evidence_present_never_claims_absence(self):
+        prompt = self._captured_prompt({'note': 'Wrote the page.'})
+        self.assertIn('Wrote the page.', prompt)
+        self.assertNotIn('no deliverable content', prompt)
+
+    def test_absence_line_only_on_an_empty_record(self):
+        prompt = self._captured_prompt({'note': '', 'wikiPage': '', 'instructions': ''})
+        self.assertIn('no deliverable content', prompt)
+
+    def test_evidence_and_anchors_coexist_without_absence(self):
+        prompt = self._captured_prompt({'note': 'Wrote the page.'},
+                                       anchors='some')
+        self.assertIn('Wrote the page.', prompt)
+        self.assertIn('Comparable prior deliverable', prompt)
+        self.assertNotIn('no deliverable content', prompt)
+
+    def test_anchor_outage_keeps_evidence_prompt(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError('rag down')
+        s = _state()
+        captured = {}
+
+        def fake_decider(state, instructions, *args, **kwargs):
+            captured['prompt'] = instructions
+            return 8.0
+
+        with unittest.mock.patch.object(sim, '_grading_decider',
+                                        side_effect=fake_decider):
+            with unittest.mock.patch.object(serve, '_rag_room_anchors',
+                                            side_effect=boom):
+                sim._grade_completed_task(
+                    s, 'w1', _task(note='Wrote the page.'),
+                    int(time.time() * 1000))
+                sim._grade_pending_sync(s)
+        self.assertIn('Wrote the page.', captured.get('prompt', ''))
+        self.assertNotIn('no deliverable content', captured.get('prompt', ''))
