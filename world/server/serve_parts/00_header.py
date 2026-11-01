@@ -867,7 +867,27 @@ def _db():
     # alone is on nearly every request and sim tick). Wrapping as our own
     # contextmanager keeps the same commit/rollback semantics but adds the
     # close() the stdlib one never did.
-    conn = sqlite3.connect(DB_PATH)
+    # Postgres adapter (2026-11-01): THINK_TANK_DB_URL switches the same
+    # call surface to Postgres via world/db_backend.py (SQL idiom
+    # translation, no call-site rewrites). Precedence: an explicit
+    # THINK_TANK_DB file (operator redirect, test isolation) always stays
+    # SQLite; the URL only applies when no file override is set. The import
+    # is lazy: this part file is exec'd standalone by guard harnesses
+    # before any DB access, and parts never import siblings at module level
+    # (the established pattern -- see feedback_store/fast_path).
+    global _db_backend_mod
+    if '_db_backend_mod' not in globals() or _db_backend_mod is None:
+        try:
+            import db_backend as _db_backend_mod
+        except ModuleNotFoundError:
+            if os.environ.get('THINK_TANK_DB_URL'):
+                raise
+            _db_backend_mod = False  # sentinel: SQLite-only environment
+    if _db_backend_mod and not os.environ.get('THINK_TANK_DB') \
+            and _db_backend_mod.is_postgres():
+        conn = _db_backend_mod.connect(DB_PATH)
+    else:
+        conn = sqlite3.connect(DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL')
     try:
         yield conn

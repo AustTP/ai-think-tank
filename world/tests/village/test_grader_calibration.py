@@ -88,6 +88,10 @@ class CalibrationAudit(unittest.TestCase):
         with unittest.mock.patch.object(sim, '_grading_decider',
                                         return_value=grade_value):
             sim._grade_completed_task(s, 'w1', _task(**task_over), now_ms)
+            # Two-phase contract: the real judgment is computed off the tick
+            # thread; the test seam runs the same worker batch + merge
+            # synchronously (see tests/village/conftest.py).
+            sim._grade_pending_sync(s)
         return s
 
     def test_zero_grade_on_real_artifact_is_suspect(self):

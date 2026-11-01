@@ -280,3 +280,23 @@ def _isolate_live_tree():
             setattr(serve, name, value)
         object_store.AGENTS_DIR = old_agents
         object_store.REGISTRY_PATH = old_registry
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_grader():
+    """The deliverable grader runs on a daemon thread in production; tests
+    drive the same two-phase contract synchronously via
+    sim._grade_pending_sync (the grader's own test seam), so the daemon must
+    never race a test's queue: a job popped-but-not-yet-posted between a
+    test's completion call and its sync drain would make the drain merge
+    nothing, and the daemon would fetch state from a foreign DB mid-test."""
+    import sim
+    sim._GRADING_WORKER_DISABLED = True
+    sim._grading_worker_stop.set()
+    sim._grading_worker_started = False
+    sim._pending_grades.clear()
+    sim._grade_results.clear()
+    yield
+    sim._grading_worker_stop.set()
+    sim._pending_grades.clear()
+    sim._grade_results.clear()

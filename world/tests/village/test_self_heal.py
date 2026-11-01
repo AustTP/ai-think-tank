@@ -675,6 +675,10 @@ class CoachingLoopEscalation(unittest.TestCase):
                  'room': 'pressoffice', 'title': title, 'taskType': 'code',
                  'reviewOf': None, 'teamId': team_id},
                 _NOW_MS)
+            # Two-phase contract: the real judgment is computed off the tick
+            # thread; the test seam runs the same worker batch + merge
+            # synchronously (see tests/village/conftest.py).
+            sim._grade_pending_sync(state)
 
     def test_a_low_grade_coaches_once_and_lands_on_the_next_task(self):
         state = _state()

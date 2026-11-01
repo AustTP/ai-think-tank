@@ -320,6 +320,9 @@ class GradeSuccessBranch(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_record_success') as recorder:
 
             sim._grade_completed_task(state, 'ada', self._task(), 1000)
+            # Two-phase contract: the judgment is computed off the tick
+            # thread; the seam runs the worker batch + merge synchronously.
+            sim._grade_pending_sync(state)
         sim._grading_decider = old_decider
         assert recorder.call_count == 1
         call_args = recorder.call_args

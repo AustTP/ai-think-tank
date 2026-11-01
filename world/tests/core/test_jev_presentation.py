@@ -131,6 +131,7 @@ class GradeEvidence(unittest.TestCase):
         sim._grading_decider = recorder
         try:
             sim._grade_completed_task(state, 'ada', task, 1_000_000)
+            sim._grade_pending_sync(state)
         finally:
             sim._grading_decider = old
         instructions = captured['instructions']
@@ -153,6 +154,7 @@ class GradeEvidence(unittest.TestCase):
         sim._grading_decider = recorder
         try:
             sim._grade_completed_task(state, 'ada', task, 1_000_000)
+            sim._grade_pending_sync(state)
         finally:
             sim._grading_decider = old
         self.assertIn('no deliverable content beyond the title',

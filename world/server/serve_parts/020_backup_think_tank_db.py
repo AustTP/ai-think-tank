@@ -17,16 +17,31 @@ def _backup_think_tank_db():
     stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000000) % 1000000:06d}'
     dest = os.path.join(DB_BACKUP_DIR, f'think_tank.db-{stamp}.bak')
     try:
-        src = sqlite3.connect(DB_PATH)
-        try:
-            dst = sqlite3.connect(dest)
+        if os.environ.get('THINK_TANK_DB_URL'):
+            # Postgres backend (2026-11-01): the .db file is no longer the
+            # live store; pg_dump produces the consistent snapshot instead.
+            # Custom format (-Fc) keeps the file compact and restorable with
+            # pg_restore; the .bak name is kept so the prune logic below is
+            # unchanged.
+            import subprocess
+            dsn = os.environ['THINK_TANK_DB_URL']
+            proc = subprocess.run(
+                ['pg_dump', '--dbname=' + dsn, '-Fc', '-f', dest],
+                capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f'pg_dump failed: {(proc.stderr or "")[:200]}')
+        else:
+            src = sqlite3.connect(DB_PATH)
             try:
-                with dst:
-                    src.backup(dst)
+                dst = sqlite3.connect(dest)
+                try:
+                    with dst:
+                        src.backup(dst)
+                finally:
+                    dst.close()
             finally:
-                dst.close()
-        finally:
-            src.close()
+                src.close()
     except Exception as e:
         print(f'[backup] snapshot failed: {e}', flush=True)
         return

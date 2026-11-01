@@ -43,7 +43,22 @@ def _db_path() -> str:
 
 @contextlib.contextmanager
 def _connect():
-    conn = sqlite3.connect(_db_path())
+    # Explicit file overrides (PLAN_APPROVALS_DB / CONFIRMATIONS_DB /
+    # THINK_TANK_DB, i.e. test isolation and operator redirects) always
+    # win and stay SQLite; only an unset override with THINK_TANK_DB_URL
+    # set routes this same call surface through the Postgres adapter
+    # (world/db_backend.py).
+    explicit = (os.environ.get('PLAN_APPROVALS_DB')
+                or os.environ.get('CONFIRMATIONS_DB')
+                or os.environ.get('THINK_TANK_DB'))
+    try:
+        import db_backend
+    except ModuleNotFoundError:
+        db_backend = None
+    if explicit or not (db_backend and db_backend.is_postgres()):
+        conn = sqlite3.connect(explicit or _db_path())
+    else:
+        conn = db_backend.connect(_db_path())
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('''CREATE TABLE IF NOT EXISTS plan_revisions (

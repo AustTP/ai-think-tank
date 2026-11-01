@@ -281,6 +281,7 @@ class TapeMeta(unittest.TestCase):
              unittest.mock.patch.object(sim, 'team_policy',
                                         lambda s, t, k: 0.0):
             sim._grade_completed_task(state, 'ada', task, 123)
+            sim._grade_pending_sync(state)
         entry = state['completedDeliverables'][0]
         self.assertEqual(entry['grade'], 6.0)
         self.assertEqual(entry['id'], 'task-801')

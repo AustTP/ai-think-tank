@@ -111,6 +111,10 @@ class Grading(unittest.TestCase):
         sim._grading_decider = _stub_grade(7.5)
         try:
             self._complete(state)
+            # Two-phase contract: the real judgment is computed off the tick
+            # thread; the test seam runs the same worker batch + merge
+            # synchronously (see tests/village/conftest.py).
+            sim._grade_pending_sync(state)
             self.assertEqual(len(state['completedDeliverables']), 1)
             d = state['completedDeliverables'][0]
             self.assertEqual(d['room'], 'observatory')
@@ -125,6 +129,7 @@ class Grading(unittest.TestCase):
         sim._grading_decider = _stub_grade(3.0)  # below floor 5.0
         try:
             self._complete(state)
+            sim._grade_pending_sync(state)
             plans = state['growthPlans']['ada']
             self.assertEqual(len(plans), 1)
             self.assertEqual(plans[0]['kind'], 'low_grade')
@@ -173,6 +178,7 @@ class Roadmap(unittest.TestCase):
         try:
             sim._note_completed_room(state, 'ada', {'id': 't', 'room': 'observatory',
                                                     'title': 'X', 'taskType': 'code'})
+            sim._grade_pending_sync(state)
         finally:
             sim._grading_decider = old
         sim._roadmap_step(state, sim.ROADMAP_CADENCE_MS + 1)
@@ -419,6 +425,7 @@ class RoadmapIntoRefinement(unittest.TestCase):
         try:
             sim._note_completed_room(state, 'ben', {'id': 'kg', 'room': 'observatory',
                                                     'title': 'Ledger schema', 'taskType': 'code'})
+            sim._grade_pending_sync(state)
         finally:
             sim._grading_decider = old
         state['roadmap']['observatory'] = {'priority': 2, 'lastGrade': 3.0, 'demand': 1}

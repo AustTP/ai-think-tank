@@ -98,6 +98,7 @@ class FreshnessProvenanceTests(unittest.TestCase):
             task = {'id': 't1', 'title': 'Build the parser', 'room': 'pressoffice',
                     'taskType': 'feature', 'instructions': 'make it parse'}
             sim._grade_completed_task(state, 'ada', task, 1000)
+            sim._grade_pending_sync(state)
             self.assertEqual(len(state['completedDeliverables']), 1)
             d = state['completedDeliverables'][0]
             self.assertEqual(d['title'], 'Build the parser')
