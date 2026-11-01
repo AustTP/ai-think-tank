@@ -344,6 +344,46 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Scale slices round 2 (2026-11-01): the sections that were still
+        # re-serialized into the blob on EVERY save and grow without bound
+        # (growthPlans was 1.7MB of the 4.4MB blob). Same shape and
+        # authority rule as the round-1 tables.
+        conn.execute('''CREATE TABLE IF NOT EXISTS growth_plan (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS help_signal (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS tracked_issue (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS wake_entry (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS backlog_request (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS completed_deliverable (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Durable cursor for a live feed collector. AISStream is live-only, so
         # this records the last ingested frame and the reconnect coverage gap;
         # it is a checkpoint, not a replay buffer.

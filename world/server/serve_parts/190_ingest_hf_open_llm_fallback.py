@@ -704,6 +704,14 @@ async def no_store(request: Request, call_next):
     # cache without even a network round-trip, surviving a hard
     # navigation and a fresh tab.
     global _LAST_REQUEST_TIME
+    # Read-only replica (2026-11-01): refuse every mutating method before
+    # any handler runs. Session cookies minted by the primary verify here
+    # (sessions live in the shared store), but login itself is a write, so
+    # the replica only accepts an existing cookie.
+    if READ_ONLY_MODE and request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        return JSONResponse(
+            {'error': 'read-only replica: writes are served by the primary'},
+            status_code=405)
     _LAST_REQUEST_TIME = time.time()
     # Wake-on-request (sleep-not-die): the first request to reach a DORMANT
     # server flips the think tank back awake BEFORE the handler runs, so the
@@ -959,7 +967,12 @@ async def get_state(request: Request):
     # deltas do). Healing synchronously on every read guarantees no client
     # ever sees a broken record, regardless of tick timing.
     if _heal_agent_identity(data):
-        save_state_to_db(data)
+        if READ_ONLY_MODE:
+            # The replica cannot persist the heal; serve the healed view.
+            # The primary's own per-tick heal persists the same fix.
+            pass
+        else:
+            save_state_to_db(data)
     # Per-agent keys ride along with state ONLY for the player's browser (a
     # real session), where the client uses them for attribution tags on
     # browse/execute/pipeline calls. An agent-key-authenticated caller (a

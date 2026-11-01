@@ -37,6 +37,19 @@ import zipfile
 if __name__ == '__main__':
     sys.modules.setdefault('serve', sys.modules[__name__])
 
+# Read-only replica mode (2026-11-01): THINK_TANK_READ_ONLY=1 (or
+# `serve.py --read-only`) serves reads from the shared store while the
+# primary process owns every write, background loop, and the sim. The
+# db_backend guard is the hard backstop: even a stray code path cannot
+# issue a mutating statement in this process.
+READ_ONLY_MODE = bool(os.environ.get('THINK_TANK_READ_ONLY'))
+if READ_ONLY_MODE:
+    try:
+        import db_backend as _db_backend_ro
+        _db_backend_ro.set_read_only(True)
+    except ModuleNotFoundError:
+        pass  # SQLite-only environment: nothing to guard
+
 from core.confirmations import gate as _confirmation_gate_or_response
 from core.confirmations import gate_finish as _finish_confirmation
 

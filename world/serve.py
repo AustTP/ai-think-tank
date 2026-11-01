@@ -3,6 +3,13 @@
 import faulthandler
 import signal
 import os as _os
+# --read-only (2026-11-01): start this process as the read-only replica
+# (THINK_TANK_READ_ONLY=1); reads come from the shared store, writes are
+# refused, no background loops, no sim. Parsed BEFORE the parts exec so
+# 00_header sees the flag at import.
+if any(a == '--read-only' for a in _os.sys.argv):
+    _os.environ.setdefault('THINK_TANK_READ_ONLY', '1')
+    print('[args] --read-only: replica mode (writes refused, loops off)', flush=True)
 # kill -USR1 <pid> dumps all python thread stacks to stderr (found the RSS
 # spin tonight; keep it as standing incident tooling).
 faulthandler.register(signal.SIGUSR1)
@@ -57,7 +64,10 @@ if __name__ == '__main__':
         # SELF_BASE_URL so the links hit this process, not a stale port.
         if not _load_env().get('ESCALATION_BASE_URL'):
             ESCALATION_BASE_URL = _bound_base
-    init_db()
+    if not _os.environ.get('THINK_TANK_READ_ONLY'):
+        # The replica never writes schema: the primary owns it, and the
+        # read-only statement guard would refuse this anyway.
+        init_db()
     # flush=True -- real bug hit while building this: stdout is fully
     # buffered (not line-buffered) once redirected to a file/pipe rather
     # than a real terminal, so a one-time secret like this could sit

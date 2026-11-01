@@ -734,6 +734,21 @@ EXTRACTED_SECTIONS = (
     # time. Row-extracted, a save writes only the agents whose snapshot
     # actually changed (walkers move; working agents sit still).
     ('sim:agents', 'sim_agent_snapshot', 'dict'),
+    # Round 2 (2026-11-01): the sections that dominated what remained of
+    # the blob -- growthPlans alone was 1.7MB of 4.4MB, and
+    # completedDeliverables / helpSignals grow without bound. memoryLedger
+    # stays in the blob: its entries carry no stable id, so the rower
+    # would fail closed on every save (harmless, but no win).
+    ('growthPlans', 'growth_plan', 'dict-lists'),
+    # shape notes: 'dict' rows are keyed by entry id (values must be dicts);
+    # 'dict-lists' rows are keyed by the dict key with the entry's LIST as
+    # the row blob (growthPlans maps agent id -> [plan revisions]);
+    # 'list' rows keep order via seq and require every entry to carry an id.
+    ('helpSignals', 'help_signal', 'list'),
+    ('issues', 'tracked_issue', 'dict'),
+    ('wakeQueue', 'wake_entry', 'list'),
+    ('backlogRequests', 'backlog_request', 'list'),
+    ('completedDeliverables', 'completed_deliverable', 'list'),
 )
 _EXTRACTED_LOCK = threading.Lock()
 _EXTRACTED_CACHE = {key: {'db': None, 'loaded': False, 'rows': {}}
@@ -772,12 +787,24 @@ def _merge_extracted_sections(data):
         with _EXTRACTED_LOCK:
             rows = _extracted_rows_load_locked(table, _EXTRACTED_CACHE[key])
         if not rows:
+            # An emptied (or never-populated) rowed section leaves no rows.
+            # The whole-blob replace used to keep `[]`/`{}` in place for an
+            # empty section; give readers the shape's default when neither
+            # the rows nor a legacy blob copy carries the key, so direct
+            # indexing (`state['backlogRequests']`) keeps working. A blob
+            # copy always wins (legacy authority rule).
+            if key.startswith('sim:'):
+                if isinstance(data.get('sim'), dict) \
+                        and key[4:] not in data['sim']:
+                    data['sim'][key[4:]] = [] if shape == 'list' else {}
+            elif key not in data:
+                data[key] = [] if shape == 'list' else {}
             continue
-        if shape == 'dict':
-            merged = {rid: obj for rid, (_seq, obj) in rows.items()}
-        else:
+        if shape == 'list':
             merged = [obj for _rid, (_seq, obj)
                       in sorted(rows.items(), key=lambda kv: (kv[1][0], kv[0]))]
+        else:
+            merged = {rid: obj for rid, (_seq, obj) in rows.items()}
         merged = copy.deepcopy(merged)
         if key.startswith('sim:'):
             sim = data.get('sim')
@@ -816,7 +843,8 @@ def _reconcile_extracted_sections(conn, data):
             unrowable = False
         elif not isinstance(entries, (list, dict)) or (
                 shape == 'list' and not isinstance(entries, list)) or (
-                shape == 'dict' and not isinstance(entries, dict)):
+                shape in ('dict', 'dict-lists')
+                and not isinstance(entries, dict)):
             # Present but unrowable (fail-closed): the blob keeps its copy,
             # the rows stay -- no information is lost either way.
             if rows:
@@ -825,9 +853,11 @@ def _reconcile_extracted_sections(conn, data):
         else:
             desired = {}
             unrowable = False
-            if shape == 'dict':
+            if shape in ('dict', 'dict-lists'):
                 for rid, entry in entries.items():
-                    if not isinstance(entry, dict) or not isinstance(rid, str) or not rid:
+                    if (not isinstance(rid, str) or not rid
+                            or (shape == 'dict'
+                                and not isinstance(entry, dict))):
                         unrowable = True
                         break
                     desired[rid] = (0, entry)

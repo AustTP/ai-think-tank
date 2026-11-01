@@ -67,6 +67,39 @@ def _base_state():
     }
 
 
+# Round-2 sections (2026-11-01): the remaining blob-heavyweights.
+ROUND2_TABLES = ('growth_plan', 'help_signal', 'tracked_issue',
+                 'wake_entry', 'backlog_request', 'completed_deliverable')
+ROUND2_KEYS = ('growthPlans', 'helpSignals', 'issues', 'wakeQueue',
+               'backlogRequests', 'completedDeliverables')
+
+
+def _with_round2(state):
+    state['growthPlans'] = {
+        'ada': [{'goal': 'build', 'route': 'staffed'}],
+        'ben': [{'goal': 'paint', 'route': 'staffed'}],
+    }
+    state['helpSignals'] = [
+        {'id': 'help-1', 'agentId': 'ada'},
+        {'id': 'help-2', 'agentId': 'ben'},
+    ]
+    state['issues'] = {
+        'ADA-1': {'id': 'ADA-1', 'text': 'door sticks'},
+        'BEN-2': {'id': 'BEN-2', 'text': 'window draft'},
+    }
+    state['wakeQueue'] = [
+        {'id': 'wake-2', 'at': 200},
+        {'id': 'wake-1', 'at': 100},
+    ]
+    state['backlogRequests'] = [
+        {'id': 'wrq-1', 'title': 'wire the shed'},
+    ]
+    state['completedDeliverables'] = [
+        {'id': 'task-4', 'title': 'Great parser', 'grade': 8.5},
+    ]
+    return state
+
+
 def _raw_blob():
     with serve._db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
@@ -89,7 +122,7 @@ class StateSplitTest(unittest.TestCase):
         serve.init_db()
         with serve._db() as conn:
             for table in ('roster_agent', 'live_agent', 'inbox_message',
-                          'sim_agent_snapshot'):
+                          'sim_agent_snapshot') + ROUND2_TABLES:
                 conn.execute(f'DELETE FROM {table}')
             conn.execute('DELETE FROM kv_state')
             conn.execute('DELETE FROM state_checksum')
@@ -247,3 +280,65 @@ class StateSplitTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Round2StateSplitTest(StateSplitTest):
+    """The 2026-11-01 sections: growthPlans (dict of lists), helpSignals,
+    issues, wakeQueue, backlogRequests, completedDeliverables."""
+
+    def test_round_trip_preserves_exact_shapes(self):
+        state = _with_round2(_base_state())
+        serve.save_state_to_db(copy.deepcopy(state))
+        back = serve.get_state_from_db()
+        for key in ROUND2_KEYS:
+            self.assertEqual(back[key], state[key], key)
+
+    def test_blob_drops_round2_keys_and_rows_carry_them(self):
+        serve.save_state_to_db(_with_round2(_base_state()))
+        blob = _raw_blob()
+        for key in ROUND2_KEYS:
+            self.assertNotIn(key, blob, key)
+        with serve._db() as conn:
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM growth_plan').fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM help_signal').fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM tracked_issue').fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM wake_entry').fetchone()[0], 2)
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM backlog_request').fetchone()[0], 1)
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM completed_deliverable').fetchone()[0], 1)
+
+    def test_wake_queue_order_survives_round_trip(self):
+        serve.save_state_to_db(_with_round2(_base_state()))
+        back = serve.get_state_from_db()
+        self.assertEqual([e['id'] for e in back['wakeQueue']],
+                         ['wake-2', 'wake-1'])
+
+    def test_diff_save_rewrites_only_changed_growth_plan_rows(self):
+        serve.save_state_to_db(_with_round2(_base_state()))
+        with serve._db() as conn:
+            before = dict(conn.execute(
+                'SELECT id, updated_at FROM growth_plan').fetchall())
+        time.sleep(0.02)
+        state = serve.get_state_from_db()
+        state['growthPlans']['ada'].append(
+            {'goal': 'narrower', 'route': 'staffed'})
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            after = dict(conn.execute(
+                'SELECT id, updated_at FROM growth_plan').fetchall())
+        self.assertEqual(after['ben'], before['ben'])
+        self.assertNotEqual(after['ada'], before['ada'])
+
+    def test_growth_plan_list_value_is_a_row_blob_not_a_row_value(self):
+        serve.save_state_to_db(_with_round2(_base_state()))
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT blob FROM growth_plan WHERE id = ?',
+                ('ada',)).fetchone()
+        self.assertEqual(json.loads(row[0]),
+                         [{'goal': 'build', 'route': 'staffed'}])

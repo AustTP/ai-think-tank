@@ -563,6 +563,9 @@ class CompatCursor:
         return self._execute_translated(sql, params)
 
     def executemany(self, sql, seq_of_params):
+        if _READONLY and not _READ_ONLY_OK_RE.match(sql.strip()):
+            raise sqlite3.OperationalError(
+                'read-only connection: THINK_TANK_READ_ONLY is set')
         sql2 = self._catalog.translate(sql)
         seq = []
         for params in seq_of_params:
@@ -574,6 +577,9 @@ class CompatCursor:
         catalog = self._catalog
         stripped = sql.strip()
         up = stripped.upper()
+        if _READONLY and not _READ_ONLY_OK_RE.match(stripped):
+            raise sqlite3.OperationalError(
+                'read-only connection: THINK_TANK_READ_ONLY is set')
         if up.startswith('PRAGMA'):
             m = _TABLE_INFO_RE.match(stripped)
             if m:
@@ -835,6 +841,20 @@ _DSN_ENV = 'THINK_TANK_DB_URL'
 _CATALOG = _Catalog()
 _POOL = None
 _POOL_LOCK = threading.Lock()
+_READONLY = False
+
+_READ_ONLY_OK_RE = re.compile(
+    r'\s*(SELECT|WITH|PRAGMA|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE|'
+    r'EXPLAIN)\b', re.I)
+
+
+def set_read_only(flag):
+    """Process-wide write guard for the read-only replica: every
+    non-reading statement raises before it reaches the server. Belt to the
+    middleware's suspenders -- a stray code path cannot mutate the store
+    the primary tick-writer owns."""
+    global _READ_ONLY
+    _READ_ONLY = bool(flag)
 
 
 def is_postgres():

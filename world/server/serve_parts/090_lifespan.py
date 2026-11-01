@@ -2,6 +2,14 @@
 
 @asynccontextmanager
 async def _lifespan(app):
+    if READ_ONLY_MODE:
+        # Read-only replica: no schema writes, no backfills, no seeds, no
+        # background loops, no sim. The primary owns all of that; this
+        # process serves reads from the shared store (same DB, so a session
+        # cookie minted by the primary verifies here unchanged).
+        print('[read-only] replica mode: background loops and sim disabled', flush=True)
+        yield
+        return
     try:
         _ensure_runtime_schemas()
     except Exception as e:
