@@ -42,6 +42,13 @@ def _start_breakdown(state, team_id, req_ids, scrum_master_id, now_ms, pos_offse
             continue
         if req.get('awaitingSplit'):
             continue  # the director's split review owns this one
+        # Owned shared pieces: a sharedScope'd request is claimable ONLY by
+        # the owning org's subteams named in the scope. An unrelated team
+        # must neither claim nor race it -- product work stays with its
+        # owner even in the shared lane.
+        scope = req.get('sharedScope')
+        if not owner and scope and team_id not in scope:
+            continue
         if not owner:
             req['teamId'] = team_id
             req['claimedFromShared'] = True
@@ -335,6 +342,12 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 'title': title, 'goal': goal[:200], 'instructions': instructions_text,
                 'teamId': req.get('teamId'), 'taskType': task_type,
                 'villageId': req.get('villageId'),
+                # Product ownership rides the whole cascade: cards of an
+                # owned ask stay pinned to the owning team at assignment
+                # (the worker pool is the owner's members + explicit loans;
+                # the card WAITS rather than leaking to an unrelated team).
+                'ownerTeamId': req.get('ownerTeamId'),
+                'ownerProductId': req.get('ownerProductId'),
                 # Provenance: every card a breakdown creates points back at the
                 # request that asked for it. The A2A facade reads completion back
                 # through this link instead of matching titles.

@@ -192,6 +192,13 @@ def _split_instructions(state, req, org, director_name, founding_mode='immediate
         if pc.get(key):
             pin_bits.append(f'{lead}: ' + '; '.join(pc[key]) + '.')
     pin_text = (' ' + ' '.join(pin_bits)) if pin_bits else ''
+    owned = None
+    if req.get('ownerProductId'):
+        owned = (state.get('products') or {}).get(req['ownerProductId']) or {}
+        pin_text += (f"\nOWNED WORK: this ask is about the product \"{owned.get('name') or req['ownerProductId']}\", "
+                     f"owned by team \"{req.get('ownerTeamId')}\". Every piece must stay inside your own "
+                     "org -- a \"shared\" piece means your own subteams only, first-come among them; "
+                     "the work must never leave the owning team.")
     if founding_mode == 'immediate':
         founding_text = (
             "- \"newSubdirectors\": each {\"seedWorker\": an existing member id to promote "
@@ -394,8 +401,23 @@ def _resolve_split(state, pending, now_ms, decider=None):
         new_slot = 0
         for p in raw_pieces:
             team_raw = (p.get('team') or 'own').strip()
+            owned_product_id = req.get('ownerProductId') or None
+            scope_for_child = None
             if team_raw == 'shared':
                 child_team = None
+                if owned_product_id:
+                    # Owned work shared means WITHIN the owning org only:
+                    # scope the piece to the reviewing director's own
+                    # subteams (first-come among them). A director with no
+                    # subteams has nowhere in-org to share it, so it stays
+                    # home as their own work. Never company-wide for an
+                    # owned ask -- that would hand the product to another
+                    # team.
+                    scope = list(governance.subdirectors_of(state, director_id))
+                    if scope:
+                        scope_for_child = scope
+                    else:
+                        child_team = own_team_id
             elif team_raw == 'new':
                 if mode == 'propose':
                     # Held for the parent director's approval review; filed
@@ -422,7 +444,9 @@ def _resolve_split(state, pending, now_ms, decider=None):
             child = _file_piece(state, director_id, own_team_id,
                                 (p.get('ask') or '').strip(), child_team,
                                 now_ms, constraints=req.get('playerConstraints'),
-                                priority=priority)
+                                priority=priority,
+                                owner_product_id=owned_product_id,
+                                shared_scope=scope_for_child)
             if not child:
                 continue
             child['splitFrom'] = req.get('id')
@@ -479,7 +503,8 @@ def _stage_foundations(state, founder_id, parent_req, specs, held_pieces, now_ms
             child = file_large_request(
                 state, founder_id, (p.get('ask') or '').strip(), founder_id,
                 now_ms=now_ms, constraints=parent_req.get('playerConstraints'),
-                priority=p.get('priority'))
+                priority=p.get('priority'),
+                owner_product_id=parent_req.get('ownerProductId'))
             if child:
                 child['splitFrom'] = parent_req.get('id')
                 child['splitBy'] = founder_id
@@ -496,6 +521,9 @@ def _stage_foundations(state, founder_id, parent_req, specs, held_pieces, now_ms
             'parentRequest': parent_req.get('id'),
             'piece': ({'ask': piece.get('ask'), 'priority': piece.get('priority')}
                       if piece else None),
+            # Owned work stays owned through a founding: the eventual piece
+            # (filed on approval or denial) re-stamps the owner.
+            'ownerProductId': parent_req.get('ownerProductId') or None,
             'requestedAt': now_ms, 'status': 'pending',
         }
         proposals.append(prop)
@@ -653,20 +681,30 @@ _foundation_decider = _foundation_decider_default
 
 
 def _file_piece(state, reviewer_id, own_team_id, ask, child_team, now_ms,
-                constraints=None, priority=None, notes=None):
+                constraints=None, priority=None, notes=None,
+                owner_product_id=None, shared_scope=None):
     """File one split piece as a child large-request. A piece routed to the
     reviewer's OWN subteam must not await ANOTHER split by the same reviewer
     (that would ping-pong forever): the reviewer just partitioned this ask,
     so their own subteam's breakdown ceremony is the destination. Pieces
     routed to a DIFFERENT leader keep the review stamp -- that leader
-    reviews their own piece before their team starts."""
+    reviews their own piece before their team starts.
+
+    Product ownership inherits down the cascade: an owned ask's pieces carry
+    ownerProductId/ownerTeamId so every downstream breakdown card stays
+    pinned to the owning team, and an owned 'shared' piece is scoped to the
+    reviewer's own subteams (sharedScope) -- shared never means company-wide
+    for owned work."""
     child = file_large_request(state, reviewer_id, ask, child_team,
                                now_ms=now_ms, constraints=constraints,
-                               priority=priority)
+                               priority=priority,
+                               owner_product_id=owner_product_id)
     if not child:
         return None
     if child_team and child_team == own_team_id:
         child.pop('awaitingSplit', None)
+    if shared_scope:
+        child['sharedScope'] = list(shared_scope)
     if notes:
         child['splitNotes'] = str(notes)[:200]
     return child
@@ -682,7 +720,8 @@ def _file_held_piece(state, prop, child_team, note, now_ms):
         return None
     child = _file_piece(state, prop['founder'], prop['founder'], ask,
                         child_team, now_ms, priority=piece.get('priority'),
-                        notes=note)
+                        notes=note,
+                        owner_product_id=prop.get('ownerProductId'))
     if not child:
         return None
     child['splitFrom'] = prop.get('parentRequest')

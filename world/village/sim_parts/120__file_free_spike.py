@@ -1005,14 +1005,24 @@ def _pending_breakdown_requests(state, team_id):
     purpose -- either team may pick them up; the first ceremony to convene
     claims one by stamping teamId). A request still awaiting the director's
     split review is never carded here -- the split layer owns it until the
-    director decides. Distinct from the refinement ceremony's
-    `_pending_work_requests`, which must never groom these: the two ceremonies
-    own different request kinds."""
-    return [r for r in (state.get('backlogRequests') or [])
-            if r.get('status') == 'pending' and r.get('breakdown')
-            and not r.get('awaitingSplit')
-            and (r.get('teamId') == team_id
-                 or (not r.get('teamId') and r.get('shared')))]
+    director decides. An OWNED shared piece (sharedScope) is visible only to
+    the owning org's subteams named in the scope -- owned product work must
+    never surface on an unrelated team's ceremony. Distinct from the
+    refinement ceremony's `_pending_work_requests`, which must never groom
+    these: the two ceremonies own different request kinds."""
+    out = []
+    for r in (state.get('backlogRequests') or []):
+        if r.get('status') != 'pending' or not r.get('breakdown') \
+                or r.get('awaitingSplit'):
+            continue
+        if r.get('teamId') == team_id:
+            out.append(r)
+        elif not r.get('teamId') and r.get('shared'):
+            scope = r.get('sharedScope')
+            if scope and team_id not in scope:
+                continue
+            out.append(r)
+    return out
 
 
 def _breakdown_attendees(state, req_ids, scrum_master_id, team_id):

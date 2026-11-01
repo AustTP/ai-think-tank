@@ -65,7 +65,7 @@ def _canonical_priority(priority):
 
 
 def file_large_request(state, authority_id, goal, team_id, now_ms=None, constraints=None,
-                       priority=None):
+                       priority=None, owner_product_id=None):
     """File a staffable large ask as a pending BREAKDOWN request for a team's
     breakdown ceremony to card into stories/spikes. The ask is attributed to
     the free authority who chose the team and tagged with the receiving team
@@ -154,6 +154,16 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
                     pinned[key] = cleaned[:20]
         if pinned:
             req['playerConstraints'] = pinned
+    # Product ownership: when the ask is routed to a team because that team
+    # OWNS the named product, record the binding on the request itself. The
+    # split ceremony inherits it onto every piece (an owned ask's pieces stay
+    # inside the owning org) and the assignment pin uses it to keep the work
+    # on the owning team instead of leaking to whoever happens to be idle.
+    if owner_product_id:
+        prod = (state.get('products') or {}).get(owner_product_id)
+        if prod and prod.get('teamId'):
+            req['ownerProductId'] = prod['id']
+            req['ownerTeamId'] = prod['teamId']
     state.setdefault('backlogRequests', []).append(req)
     return req
 

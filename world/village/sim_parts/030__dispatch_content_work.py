@@ -270,6 +270,13 @@ def queue_work(state, items):
             # villages; agents inherit their director's villageId). Provenance
             # for the multi-village org -- rooms are shared geometry today.
             'villageId': item.get('villageId') or None,
+            # Product ownership pin: the card belongs to the team that OWNS
+            # the product the parent ask was about. The assignment pass uses
+            # it as a HARD pool (the owning team's members + explicit loans
+            # only -- the card waits rather than leaking to an idle
+            # unrelated team), mirroring the incident on-call precedent.
+            'ownerTeamId': item.get('ownerTeamId') or None,
+            'ownerProductId': item.get('ownerProductId') or None,
             # What the card must produce. Survives refinement -> queue ->
             # assignment so the completion gate reads the explicit contract
             # (code/report/note) instead of guessing from the title.

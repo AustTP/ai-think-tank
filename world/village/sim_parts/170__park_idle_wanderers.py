@@ -663,6 +663,26 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
             team_ordered = [cid for cid in ordered if cid in team_members]
             if team_ordered:
                 ordered = team_ordered
+        # Product-ownership pin (HARD, unlike the soft team preference just
+        # above): a card whose parent ask named a product an existing team
+        # OWNS is the owning team's work. The eligible pool narrows to the
+        # owner's members + agents explicitly loaned to the owner, and when
+        # none of them is free the card WAITS -- an idle unrelated team never
+        # picks up another team's product, which is the point of ownership.
+        # Mirrors the incident on-call precedent (stay on the owning team,
+        # fall to None rather than a global round-robin) and reuses the same
+        # wait contract as the soft-preference block above.
+        owner_team = pick.get('ownerTeamId')
+        if owner_team and not one_off_routed:
+            owner_members = set(_sim_direct_reports(state, owner_team))
+            for d in (state.get('agentRoster') or []):
+                if d.get('loan') and d['loan'].get('teamId') == owner_team:
+                    owner_members.add(d['id'])
+            owned_ordered = [cid for cid in ordered if cid in owner_members]
+            if owned_ordered:
+                ordered = owned_ordered
+            else:
+                return _ASSIGN_WAIT if pick.get('issueKey') else None
         if not ordered:
             return _ASSIGN_WAIT if pick.get('issueKey') else None
         # Fault-aware routing: soft-prefer a candidate with no

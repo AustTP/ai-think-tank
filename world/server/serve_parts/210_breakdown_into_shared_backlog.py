@@ -115,7 +115,45 @@ def _breakdown_into_shared_backlog(state, goal, admin_id, constraints=None):
     return {'feature': feature, 'items': out}
 
 
-async def _dispatch_big_task(state, goal, actor, constraints=None, priority=None):
+def _owner_team_for_goal(state, goal, product_id=None):
+    """The team that OWNS the product a large ask is about, or None.
+
+    Resolution order: an explicit product id wins; otherwise a deterministic
+    case-insensitive scan -- the product whose id or name appears in the ask
+    text, longest name first so 'Flashlight Pro' wins over a hypothetical
+    'Flash'. No match (or a product whose owning team no longer exists) means
+    UNOWNED: the ask routes by availability exactly as before ownership
+    routing existed. This is a routing decision, not a planning one: the
+    owner is found BEFORE any model call, so an owned ask can never be
+    mechanically re-staffed onto a free-but-unrelated team."""
+    products = state.get('products') or {}
+    teams = {t.get('id'): t for t in (state.get('teams') or []) if t.get('id')}
+    if product_id:
+        prod = products.get(product_id)
+        if prod and prod.get('teamId') and prod['teamId'] in teams:
+            return prod, prod['teamId']
+        return None
+    text = (goal or '').lower()
+    if not text:
+        return None
+    candidates = []
+    for prod in products.values():
+        if not isinstance(prod, dict) or not prod.get('teamId'):
+            continue
+        for label in (prod.get('name'), prod.get('id')):
+            label = (label or '').strip().lower()
+            if len(label) >= 3 and label in text:
+                candidates.append((len(label), prod))
+                break
+    for _, prod in sorted(candidates, key=lambda c: -c[0]):
+        team_id = prod.get('teamId')
+        if team_id in teams:
+            return prod, team_id
+    return None
+
+
+async def _dispatch_big_task(state, goal, actor, constraints=None, priority=None,
+                             product_id=None, allow_shared=False):
     """Core routing for a large request, shared by /api/intent/assign-big-task
     and the x-mention webhook consumer loop: when EVERY existing team is
     committed to an active sprint, the ask is broken down into stories/spikes
@@ -130,9 +168,47 @@ async def _dispatch_big_task(state, goal, actor, constraints=None, priority=None
     large-request breakdown for that team's breakdown ceremony. No sprint
     record is created and no subtasks are predicted up front: the receiving
     team plans its own work, like a real org.
-    Returns (outcome, data), outcome one of 'backlogged', 'new_team',
-    'no_authority', 'no_team', 'failed', 'staffed'."""
+
+    Product ownership overrides the mechanical staffing: when the ask is
+    about a product an existing team OWNS, the request files for the
+    OWNING team -- never the shared backlog, never a fresh team, never a
+    free-but-unrelated team -- and it WAITS there if the owner is mid-sprint
+    (the breakdown convene defers during sprints by design). The owning
+    director's review (split ceremony when they lead subteams, else their
+    own team's breakdown) decides how their org does the work "down the
+    line". allow_shared=True restores the pre-ownership behavior for the
+    caller who explicitly wants cross-team help."""
     import sim as _sim
+    owner = _owner_team_for_goal(state, goal, product_id)
+    if owner and not allow_shared:
+        owner_product, owner_team = owner
+        authority = _free_authority(state)
+        if not authority:
+            authority = _wake_authority_on_request(state)
+            if authority:
+                save_state_to_db(state)
+        if not authority:
+            return 'no_authority', {}
+        now_ms = int(datetime.datetime.now(datetime.timezone.utc).timestamp() * 1000)
+        req = _sim.file_large_request(state, authority['id'], goal, owner_team,
+                                      now_ms, constraints=constraints,
+                                      priority=priority,
+                                      owner_product_id=owner_product['id'])
+        if not req:
+            return 'failed', {}
+        save_state_to_db(state)
+        log_action(actor, 'big_task_owned_route',
+                   {'goal': goal[:200], 'product': owner_product['id'],
+                    'team': owner_team, 'request': req['id'],
+                    'pinned': sorted((req.get('playerConstraints') or {}).keys())},
+                   authorized=True)
+        return 'staffed', {'admin': authority['id'],
+                           'adminName': authority.get('name'),
+                           'team': owner_team,
+                           'teamName': (_sim._team_row(state, owner_team) or {}).get('name') or owner_team,
+                           'request': req['id'],
+                           'ownerProductId': owner_product['id'],
+                           'awaitingSplit': bool(req.get('awaitingSplit'))}
     if _all_teams_busy_in_sprint(state):
         admin_id_for_new = next((d.get('id') for d in (state.get('agentRoster') or [])
                                  if d.get('isAdmin')), None)
@@ -227,10 +303,15 @@ async def intent_assign_big_task(request: Request):
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
 
     # Large-request routing is shared with the webhook consumer loop: see
-    # _dispatch_big_task (backlog breakdown / new-team / staffing).
+    # _dispatch_big_task (backlog breakdown / new-team / staffing). A
+    # productId pin routes by OWNERSHIP: the owning team gets the work even
+    # if every other team is idle; allowShared is the caller's explicit
+    # escape hatch back to the availability-based routing.
     outcome, data = await _dispatch_big_task(state, goal, player_id,
                                              constraints=constraints,
-                                             priority=priority)
+                                             priority=priority,
+                                             product_id=(body.get('productId') or '').strip() or None,
+                                             allow_shared=bool(body.get('allowShared')))
     if outcome == 'backlogged':
         return JSONResponse({'ok': True, 'backlogged': True,
                              'feature': data['feature'].get('id'),
