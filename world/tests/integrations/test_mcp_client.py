@@ -172,6 +172,47 @@ def test_unknown_server_is_an_error(fake_server):
         mcp_client.get_server('missing')
 
 
+def _minimal_registry(server_id='shipped', **over):
+    spec = {'name': server_id, 'description': 'shipped default',
+            'transport': 'stdio', 'command': ['true'], 'enabled': True}
+    spec.update(over)
+    return {'servers': {server_id: spec}}
+
+
+def test_local_override_file_adds_and_wins(tmp_path, monkeypatch):
+    path = tmp_path / 'mcp_servers.json'
+    path.write_text(json.dumps(_minimal_registry()), encoding='utf-8')
+    local = tmp_path / 'mcp_servers.local.json'
+    local.write_text(json.dumps({'servers': {
+        'shipped': dict(_minimal_registry()['servers']['shipped'],
+                        description='operator override'),
+        'host-only': _minimal_registry('host-only')['servers']['host-only'],
+    }}), encoding='utf-8')
+    monkeypatch.setattr(mcp_client, 'MCP_SERVERS_PATH', str(path))
+    mcp_client.reload_servers()
+    servers = mcp_client.list_servers()
+    assert servers['shipped']['description'] == 'operator override'
+    assert servers['host-only']['description'] == 'shipped default'
+
+
+def test_missing_local_override_file_is_the_norm(tmp_path, monkeypatch):
+    path = tmp_path / 'mcp_servers.json'
+    path.write_text(json.dumps(_minimal_registry()), encoding='utf-8')
+    monkeypatch.setattr(mcp_client, 'MCP_SERVERS_PATH', str(path))
+    mcp_client.reload_servers()
+    assert set(mcp_client.list_servers()) == {'shipped'}
+
+
+def test_malformed_local_override_file_is_an_error(tmp_path, monkeypatch):
+    path = tmp_path / 'mcp_servers.json'
+    path.write_text(json.dumps(_minimal_registry()), encoding='utf-8')
+    (tmp_path / 'mcp_servers.local.json').write_text('{ nope', encoding='utf-8')
+    monkeypatch.setattr(mcp_client, 'MCP_SERVERS_PATH', str(path))
+    mcp_client.reload_servers()
+    with pytest.raises(mcp_client.McpError):
+        mcp_client.list_servers()
+
+
 def test_registry_is_outside_the_static_served_tree():
     assert not mcp_client.MCP_SERVERS_PATH.startswith(mcp_client.WORLD_DIR + os.sep)
 

@@ -130,11 +130,26 @@ def _normalize_server(server_id, raw):
 
 def _load_registry():
     global _SERVER_CACHE, _SERVER_CACHE_KEY
+    # The registry is two layers: the shipped, tracked mcp_servers.json holds
+    # portable servers (commands resolvable from PATH), and an optional
+    # operator-local mcp_servers.local.json BESIDE it adds or overrides
+    # host-specific entries (absolute paths, machine-bound commands) without
+    # shipping them. A same-id local entry wins; a missing local file is the
+    # norm. Both files' stat feeds the cache key, so an operator edit to
+    # either invalidates the cache exactly like the shipped file does.
     try:
         stat = os.stat(MCP_SERVERS_PATH)
     except OSError:
         return {}
     key = (stat.st_mtime_ns, stat.st_size)
+    local_path = os.path.join(os.path.dirname(MCP_SERVERS_PATH),
+                              'mcp_servers.local.json')
+    local_stat = None
+    try:
+        local_stat = os.stat(local_path)
+        key = key + (local_stat.st_mtime_ns, local_stat.st_size)
+    except OSError:
+        pass
     with _SERVER_CACHE_LOCK:
         if _SERVER_CACHE is not None and _SERVER_CACHE_KEY == key:
             return _SERVER_CACHE
@@ -145,8 +160,20 @@ def _load_registry():
         raise McpError(f'could not read {os.path.basename(MCP_SERVERS_PATH)}: {exc}') from exc
     if not isinstance(data, dict) or not isinstance(data.get('servers'), dict):
         raise McpError('mcp_servers.json must contain a "servers" object')
+    raw_servers = dict(data['servers'])
+    if local_stat is not None:
+        try:
+            with open(local_path, encoding='utf-8') as handle:
+                local = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise McpError(
+                f'could not read {os.path.basename(local_path)}: {exc}') from exc
+        if not isinstance(local, dict) or not isinstance(local.get('servers'), dict):
+            raise McpError(
+                f'{os.path.basename(local_path)} must contain a "servers" object')
+        raw_servers.update(local['servers'])
     servers = {}
-    for server_id, raw in data['servers'].items():
+    for server_id, raw in raw_servers.items():
         server_id = str(server_id).strip()
         if not server_id or '/' in server_id or '\\' in server_id or server_id.startswith('.'):
             raise McpError(f'invalid MCP server id {server_id!r}')

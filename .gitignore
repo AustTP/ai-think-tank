@@ -162,8 +162,8 @@ VPS-MIGRATION.md
 # blanket: everything the tank generates under media (incident 6a5b7fc)
 library/media/
 
-# Operator-registered MCP servers (host-specific commands, like .env)
-mcp_servers.json
+# Operator-local MCP server overrides (host-specific commands, like .env)
+mcp_servers.local.json
 
 # Ephemeral agent repo-review checkouts (auto-deleted, never tracked)
 .repo-workspaces/
