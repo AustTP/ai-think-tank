@@ -173,7 +173,14 @@ function renderBoard() {
   loadPlanApprovals();
   const body = document.getElementById('boardBody');
   const open = Object.values(TASKS).filter(t => t.status !== 'done');
-  const done = Object.values(TASKS).filter(t => t.status === 'done').sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
+  // A pipeline-failed attempt is auto-closed with status 'done' ONLY so the
+  // orphan sweep never re-issues it (see _release_agent_after_failure) -- it
+  // is not shipped work. The board must not present it as a completion:
+  // split it out and label it honestly.
+  const allDone = Object.values(TASKS).filter(t => t.status === 'done');
+  const autoClosed = allDone.filter(t => t._pipelineFailedAt)
+    .sort((a, b) => (b._pipelineFailedAt || 0) - (a._pipelineFailedAt || 0)).slice(0, 3);
+  const done = allDone.filter(t => !t._pipelineFailedAt).sort((a, b) => b.createdAt - a.createdAt).slice(0, 5);
   // Peer-approval gate: a deliverable story awaiting two reviewer approvals is
   // neither "in progress" (its author finished) nor done. Show it separately.
   const needsReview = open.filter(t => t.status === 'needs_review');
@@ -236,6 +243,16 @@ function renderBoard() {
       }).join('')
     : '<div style="opacity:0.6;">Nothing completed yet.</div>';
 
+  // Auto-closed attempts: the work did NOT ship. The card's story continues
+  // as a Fix: re-issue; showing these under "Completed" made the board lie.
+  const autoClosedLines = autoClosed.length
+    ? `<div style="opacity:0.55; font-size:11px; margin-top:6px;">Auto-closed (the quality pipeline failed the attempt; the card continues as a Fix: re-issue):</div>` +
+      autoClosed.map(t => {
+        const who = AGENTS[t.assignedTo] ? AGENTS[t.assignedTo].name : t.assignedTo;
+        return `<div style="opacity:0.7;">&bull; ${t.title} -- ${who} <span style="opacity:0.7;">[auto-closed, not shipped]</span></div>`;
+      }).join('')
+    : '';
+
   // Phase E3.4 player quality-veto handler (defined after renderBoard; the
   // button onclick above references it via the global scope at click time).
   window.vetoStory = async function (encId, encTitle) {
@@ -283,7 +300,7 @@ function renderBoard() {
   // the rest of the board -- no extra endpoint. Only *done* spikes are triage-
   // able; a working one isn't finished (the endpoint 409s on it).
   const spikeTasks = Object.values(TASKS).filter(t => t.taskType === 'spike');
-  const doneSpikes = spikeTasks.filter(t => t.status === 'done');
+  const doneSpikes = spikeTasks.filter(t => t.status === 'done' && !t._pipelineFailedAt);
   const spikeLines = doneSpikes.length
     ? doneSpikes.map(t => {
         const finding = (t.note || '').split('. ')[0]; // first sentence, enough to triage by
@@ -300,6 +317,7 @@ function renderBoard() {
     ${parkedLines ? `<div style="margin:8px 0 4px;"><strong>Parked (${parked.length})</strong></div>${parkedLines}` : ''}
     <div style="margin:8px 0 4px;"><strong>Recently completed</strong></div>
     ${doneLines}
+    ${autoClosedLines ? `<div style="margin:8px 0 4px;">${autoClosedLines}</div>` : ''}
     <div style="margin:8px 0 4px;"><strong>Spikes to triage (${doneSpikes.length})</strong></div>
     ${spikeLines}
   `;
