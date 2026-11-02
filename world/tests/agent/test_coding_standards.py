@@ -220,8 +220,14 @@ class QualityPipelineSteps(unittest.TestCase):
         flake8_cmd = by_name['flake8']
         self.assertIn('--isolated', flake8_cmd)
         self.assertIn('--max-line-length=100', flake8_cmd)
-        self.assertIn('--extend-ignore=E501,E203,E128,E127,E221,E302,E303,E305,E306,E741,E731,E702,W292,W605', flake8_cmd)
-        self.assertIn('--exclude=tests .', flake8_cmd)
+        # The mirror must equal the repo config (world/setup.cfg) exactly:
+        # the drift that dropped E131/E225/E231/E701/W391 and every
+        # per-file-ignores rule is what flooded stitched *_parts fragments
+        # with F401 findings CI never sees (task-2892, DEV-111).
+        self.assertIn('--extend-ignore=E501,E203,E128,E127,E131,E221,E225,E231,E302,E303,E305,E306,E701,E741,E731,E702,W292,W391,W605', flake8_cmd)
+        self.assertIn('*/content_parts/*.py:F821,F401,E402', flake8_cmd)
+        self.assertIn('serve.py:F821', flake8_cmd)
+        self.assertIn('--exclude=tests,.selfedit_staging,.selfedit_failed .', flake8_cmd)
         self.assertEqual(by_name['mypy'], 'python -m mypy .')
         self.assertEqual(by_name['bandit'], 'python -m bandit -r . -q')
         # Total coverage across all files (not per-file) is what --cov-fail-under
@@ -305,7 +311,7 @@ class RunQualityPipeline(unittest.TestCase):
                 'results': [{'name': n, 'exitCode': 0} for n in
                             ('flake8', 'mypy', 'bandit', 'pytest-cov')]}
         with unittest.mock.patch.object(serve, '_http_json',
-                                        lambda *a, **k: resp) as fake:
+                                        lambda *a, **k: resp):
             serve._run_quality_pipeline('http://base', 'key', 'ada', 'shared', 'gate',
                                         scope_files=['app.py', 'utils.py'])
         # The fake doesn't capture the body; call the step builder directly.
@@ -338,7 +344,7 @@ class RunQualityPipeline(unittest.TestCase):
         # at the end) with --isolated so agent-written setup.cfg in the
         # sandbox cannot change lint behavior or crash the plugin loader.
         self.assertIn('--isolated', flake8_cmd)
-        self.assertTrue(flake8_cmd.endswith('--exclude=tests .'))
+        self.assertTrue(flake8_cmd.endswith('--exclude=tests,.selfedit_staging,.selfedit_failed .'))
 
     def test_red_pipeline_reports_failing_step_and_snippet(self):
         resp = {'sandboxId': 'workroom-shared', 'failedStep': 'flake8',
@@ -362,7 +368,7 @@ class RunQualityPipeline(unittest.TestCase):
                              'stderr': ('Traceback (most recent call last):\n'
                                         '  File ".../flake8/processor.py", line 49, in _import_plugins\n'
                                         '    manager.map()\n'
-                                        'PluginError: failed to load plugin custom') }]}
+                                        'PluginError: failed to load plugin custom')}]}
         result, _ = self._run(resp)
         self.assertFalse(result['ok'])
         self.assertEqual(result['failedStep'], 'flake8')

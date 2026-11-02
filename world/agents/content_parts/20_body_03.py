@@ -110,10 +110,26 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
     the host ignores stylistic codes the codebase deliberately uses (F-codes
     stay enforced). Without --isolated, a stray config in the sandbox tree
     also feeds flake8's plugin loader, which has crashed with _import_plugins
-    errors on prose-lane tasks that never should have reached this pipeline."""
+    errors on prose-lane tasks that never should have reached this pipeline.
+
+    The mirror must be COMPLETE (2026-11-02, task-2892 / DEV-111): the hand
+    copy had drifted from world/setup.cfg -- it lacked E131,E225,E231,E701,
+    W391 and every per-file-ignores rule, so the quality gate flooded the
+    repo's own stitched *_parts fragments with F401/E821/E402 findings CI
+    never sees (the sandbox runs flake8 from the workspace ROOT; the per-file
+    rules exist precisely because those fragments are stitched into one
+    module at boot). The flags below now equal the repo config exactly --
+    one source of truth, zero trust in any sandbox file."""
     _flake8_flags = (
         '--isolated --max-line-length=100 '
-        '--extend-ignore=E501,E203,E128,E127,E221,E302,E303,E305,E306,E741,E731,E702,W292,W605'
+        '--extend-ignore=E501,E203,E128,E127,E131,E221,E225,E231,E302,E303,'
+        'E305,E306,E701,E741,E731,E702,W292,W391,W605 '
+        "--per-file-ignores='*/sim_parts/*.py:F821,F401,E402,"
+        '*/serve_parts/*.py:F821,F401,E402,'
+        '*/config_parts/*.py:F821,F401,E402,'
+        '*/selfedit_parts/*.py:F821,F401,E402,'
+        '*/content_parts/*.py:F821,F401,E402,'
+        "*/bank_parts/*.py:F821,F401,E402,serve.py:F821'"
     )
     if style_lenient:
         # Recovery cards ("Help:"/"Fix:" titles) repair legacy code that
@@ -150,7 +166,7 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
                 'node --test\'')},
         ]
     return [
-        {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} --exclude=tests .'},
+        {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} --exclude=tests,.selfedit_staging,.selfedit_failed .'},
         {'name': 'mypy', 'command': 'python -m mypy .'},
         {'name': 'bandit', 'command': 'python -m bandit -r . -q'},
         {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
