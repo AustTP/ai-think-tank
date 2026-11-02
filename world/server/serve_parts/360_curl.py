@@ -531,6 +531,22 @@ async def _classify_browser_action(op, url, purpose, agent_id='unknown', work_co
     # resolved cleanly AND its host scope matches the page host being filled.
     if op in ('fill', 'fill_many', 'login', 'submit', 'click') and handle_scoped_host and (_is_allowlisted_host(host) or (work_context_trusted and _is_work_context_host(work_context, host))):
         return True, 'allow (valid player-minted login handle scoped to this vetted host)'
+    # External URL reputation (2026-11-01): a blocklist hit refuses without
+    # a Jev round trip (objective evidence), and a trusted verdict lets
+    # ordinary READS through without Jev -- the fail-closed confidence gate
+    # kept strangling legitimate fetches. Write-shaped ops never auto-allow
+    # on reputation; they keep their Jev gate, because the action-side risk
+    # (credentials, exfiltration) is Jev's to judge regardless of the host.
+    try:
+        _rep = _url_trust_browser_gate(_url_trust_verdict(url), op)
+    except Exception:  # noqa: BLE001 -- a reputation outage must not veto the gate
+        _rep = None
+    if _rep == 'deny':
+        return False, ('blocked: URL reputation flags this host '
+                       f'({_url_trust_summary(_url_trust_verdict(url))})')
+    if _rep == 'allow':
+        return True, (f'allow (URL reputation trusted: '
+                      f'{_url_trust_summary(_url_trust_verdict(url))})')
     if not OPENROUTER_API_KEY:
         return False, 'OPENROUTER_API_KEY not set'
     criteria = {

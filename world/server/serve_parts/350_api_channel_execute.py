@@ -769,12 +769,29 @@ async def api_call(request: Request):
     # paths/methods are already trusted.
     registered = _api_service_for_host(parsed.hostname) is not None
     trace_id = None
+    # External URL reputation (2026-11-01): a blocklist hit refuses for ANY
+    # method without a Jev round trip, and a trusted verdict carries
+    # GET/HEAD reads without Jev (same tier as the standing-safe read
+    # path). Writes still go to Jev even on a trusted host. On any
+    # reputation failure the gate defers to Jev exactly as before.
+    try:
+        _rep = _url_trust_http_gate(_url_trust_verdict(url), method)
+    except Exception:  # noqa: BLE001 -- a reputation outage must not veto the gate
+        _rep = None
+    if _rep == 'deny':
+        return _api_call_response(agent_id, authorized,
+                                  {'ok': False, 'allowed': False,
+                                   'reason': 'This URL was refused by URL reputation '
+                                             f'({_url_trust_summary(_url_trust_verdict(url))}).'},
+                                  url=url, method=method, purpose=purpose)
     # Standing safe domains skip Jev on READ-ONLY methods only (GET/HEAD) --
     # a POST/PUT/DELETE to a standing host still goes through Jev like any
     # other unregistered host, because standing access is a read tier, never
     # standing write surface (see STANDING_SAFE_DOMAINS).
     standing_read = method in ('GET', 'HEAD') and _is_standing_safe_host(parsed.hostname)
-    if not registered and not _is_allowlisted_host(parsed.hostname) and not standing_read and not (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
+    if not registered and not _is_allowlisted_host(parsed.hostname) and not standing_read \
+            and _rep != 'allow' \
+            and not (work_context_trusted and _is_work_context_host(work_context, parsed.hostname)):
         criteria = {
             'allow': 'The URL, method, and stated purpose look like ordinary, legal API interaction -- reading a real response, checking raw JSON/HTML, or a registered service call.'
                      + (' A request that is clearly part of, or relevant to, the agent\'s CURRENT assigned work is allowed, provided it does not fall into any blocked category.' if work_context else ''),

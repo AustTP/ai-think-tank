@@ -769,6 +769,8 @@ async def allowlist_request(request: Request):
         'allowlist request',
         f'Agent {agent_id} requests {host} be added to the player-vetted allowlist.\n'
         f'Stated purpose: {purpose or "not given"}\n\n'
+        f'URL reputation evidence (composite trust score, 2026-11-01): '
+        f'{_url_trust_summary(_url_trust_verdict(target if "://" in target else "https://" + target))}\n\n'
         f'Approving gives agents standing read+write reachability to {host} for sandboxed '
         f'scripts, AND lets them reach it without a Jev classify round trip on every call. '
         f'A director reviews this request first (the player is only emailed if the director '
