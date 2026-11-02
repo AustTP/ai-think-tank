@@ -515,6 +515,12 @@ def log_action(agent_id, action, details=None, authorized=None, trace_id=None):
     except Exception:
         # A notification can never break the action log itself.
         pass
+    try:
+        _outbound_webhook_emit(agent_id, action, details)
+    except Exception:
+        # An outbound webhook can never break the action log either; the
+        # emit itself guards against re-emitting its own delivery records.
+        pass
 
 
 # Heuristic: map each decision prompt's instruction text to a coarse kind label.
