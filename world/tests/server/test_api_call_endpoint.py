@@ -101,6 +101,7 @@ class ApiCallEndpoint(unittest.TestCase):
             unittest.mock.patch.object(serve, '_jev_quorum_decision', _allow),
             unittest.mock.patch.object(serve, '_jev_safety_gate', return_value=jev_allow),
             unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False),
+            unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None),
             unittest.mock.patch.object(serve, 'log_action'),
         ]
 

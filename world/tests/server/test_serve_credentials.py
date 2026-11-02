@@ -236,6 +236,7 @@ class ApiCallEndpointTest(unittest.TestCase):
                               return_value=work_host),
             mock.patch.object(serve, '_is_safe_public_host',
                               return_value=safe_host),
+            mock.patch.object(serve, '_url_trust_verdict', return_value=None),
             mock.patch.object(serve, '_jev_quorum_decision',
                               new=mock.AsyncMock(return_value=decision)),
             mock.patch.object(serve, '_jev_safety_gate',
