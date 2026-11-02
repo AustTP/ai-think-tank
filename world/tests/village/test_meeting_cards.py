@@ -463,6 +463,12 @@ class MeetingAssignment(unittest.TestCase):
 
 
 class MeetingExecutor(unittest.TestCase):
+    def _repo_root(self):
+        # Derive the anchor the PRODUCTION code derives: the repository root
+        # from serve's own location -- never from the pytest CWD, which
+        # differs between local runs (world/) and CI (the checkout root).
+        return os.path.dirname(os.path.dirname(os.path.abspath(serve.__file__)))
+
     def _task(self):
         return {'id': 'task-1', 'title': 'Meeting: Sprint retro',
                 'room': 'pressoffice', 'taskType': 'meeting',
@@ -635,7 +641,7 @@ class MeetingExecutor(unittest.TestCase):
         # The file is placed under the REPOSITORY ROOT (not the process CWD,
         # which launchd sets to world/) and addressed repo-root-relative --
         # the exact shape a BUSINESS-PROCESSES.md read takes in production.
-        repo_root = os.path.dirname(os.getcwd())
+        repo_root = self._repo_root()
         source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
                                       dir=repo_root)
         rel = os.path.basename(source_dir) + '/BP.md'
@@ -656,7 +662,7 @@ class MeetingExecutor(unittest.TestCase):
         # Containment: a path resolving outside the repository root is
         # refused inline (never a crash); a missing file is marked unreadable.
         source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
-                                      dir=os.getcwd())
+                                      dir=self._repo_root())
         try:
             task = self._task()
             task['instructions'] = ('Agenda: audit.\nREAD: ../../../outside.txt\n'
@@ -678,7 +684,7 @@ class MeetingExecutor(unittest.TestCase):
         # plus an OUTLINE of every heading in the FULL file, so a section
         # past the cut is never claimed missing (NORA-172 'found' that
         # BP-07 and BP-70 did not exist -- both sat beyond a 24KB cut).
-        repo_root = os.path.dirname(os.getcwd())
+        repo_root = self._repo_root()
         source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
                                       dir=repo_root)
         rel = os.path.basename(source_dir) + '/big.md'
