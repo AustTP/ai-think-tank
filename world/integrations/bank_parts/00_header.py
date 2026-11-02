@@ -828,6 +828,96 @@ def _page_budget_ledger_write(ledger):
         pass
 
 
+# ---------------------------------------------------------------------------
+# Daily external-API quotas (2026-11-01). The URL-reputation sources the
+# gates consult (world/url_trust.py) are free-tier services with hard daily
+# and per-minute limits, so their usage gets its own count-based ledger --
+# the SAME kv_pagebudget row as the page-request budget (one isolated quota
+# row; month keys '2026-11' and day keys '2026-11-02' coexist by shape),
+# keyed by UTC DAY because these quotas reset daily, not monthly:
+#   virustotal    free tier: 500 lookups/day, 4/min -> the cap defaults to
+#                 400 (a margin under 500), and the gate enforces a 15s
+#                 minimum spacing between real calls (4/min).
+#   safebrowsing  free tier: ~10k queries/day -> cap default 10000.
+# Caps are VIRUSTOTAL_DAILY_BUDGET / SAFEBROWSING_DAILY_BUDGET in .env
+# (0 = unlimited); the constants live in the url-trust serve part and are
+# read through _serve at call time, like every other cap. Exhaustion
+# DEGRADES the score (the source is skipped and the verdict notes it) --
+# a quota is never allowed to block a URL gate.
+# ---------------------------------------------------------------------------
+
+
+def _quota_day(now=None):
+    """The current UTC calendar day as a sortable string -- the rollover
+    key: a fresh UTC day starts fresh allowances for every quota service."""
+    moment = now or datetime.datetime.now(datetime.timezone.utc)
+    return moment.strftime('%Y-%m-%d')
+
+
+def _quota_used_today(service, now=None):
+    """How many calls of this quota service were consumed today (UTC)."""
+    import serve as _serve
+    ledger = _serve._page_budget_ledger_read()
+    quotas = ledger.get('__quotas__') or {}
+    bucket = quotas.get(_quota_day(now)) or {}
+    return int(bucket.get(service, 0) or 0)
+
+
+def _quota_cap(service):
+    import serve as _serve
+    if service == 'virustotal':
+        return _serve.VIRUSTOTAL_DAILY_BUDGET
+    if service == 'safebrowsing':
+        return _serve.SAFEBROWSING_DAILY_BUDGET
+    return 0
+
+
+def _quota_exhausted(service, now=None):
+    """True when today's allowance for this quota service is spent. Never
+    true when the cap is 0 (unlimited) -- a disabled cap cannot block."""
+    cap = _quota_cap(service)
+    if not cap:
+        return False
+    return _quota_used_today(service, now=now) >= cap
+
+
+@_serialized_ledger
+def _accrue_quota_call(service, now=None):
+    """Record ONE call of a quota service against TODAY's allowance.
+    Best-effort like every accrual: a ledger failure must never break the
+    real call it accounts for. Returns True when recorded within budget,
+    False when today's allowance is exhausted (the caller then SKIPS the
+    source instead of burning quota it no longer has)."""
+    import serve as _serve
+    if _quota_exhausted(service, now=now):
+        return False
+    try:
+        ledger = _serve._page_budget_ledger_read()
+        day = _quota_day(now)
+        quotas = ledger.setdefault('__quotas__', {})
+        bucket = quotas.setdefault(day, {})
+        bucket[service] = int(bucket.get(service, 0) or 0) + 1
+        _serve._page_budget_ledger_write(ledger)
+    except Exception:
+        pass  # accounting never breaks a real call
+    return True
+
+
+def _vt_spacing_ok(now=None):
+    """The 4/min community limit, enforced as a minimum 15s spacing between
+    REAL VirusTotal calls at the gate. Pessimistic timestamp written before
+    the attempt, so concurrent gate workers cannot burst past the limit."""
+    import serve as _serve
+    last = float(_serve._get_setting('__vt_last_call__', '') or 0)
+    moment = now if now is not None else time.time()
+    return moment - last >= _serve.VT_MIN_CALL_SPACING_S
+
+
+def _mark_vt_call(now=None):
+    import serve as _serve
+    _serve._set_setting('__vt_last_call__', str(now if now is not None else time.time()))
+
+
 def _page_budget_month():
     """The current UTC calendar month as a sortable string (2026-09) -- the
     rollover key: a fresh month starts a new 1000-request allowance."""

@@ -29,6 +29,15 @@ import url_trust as _url_trust
 _URL_TRUST_CACHE_SETTING = 'url_trust_cache'
 _URL_TRUST_TTL_S = 24 * 3600
 
+# Daily quota budgets for the keyed reputation sources (the Bank accrues
+# them; a spent quota DEGRADES the score, it never blocks the gate).
+# VirusTotal free tier is 500 lookups/day and 4/min -- the cap defaults to
+# 400 (a margin) and the gate spaces real calls >=15s apart. Safe Browsing
+# free tier is ~10k queries/day. 0 = unlimited.
+VIRUSTOTAL_DAILY_BUDGET = int(_load_env().get('VIRUSTOTAL_DAILY_BUDGET', '400') or 400)
+SAFEBROWSING_DAILY_BUDGET = int(_load_env().get('SAFEBROWSING_DAILY_BUDGET', '10000') or 10000)
+VT_MIN_CALL_SPACING_S = 15
+
 
 def _url_trust_summary(verdict):
     """One compact line for logs, gates, and escalation notes."""
@@ -71,6 +80,8 @@ def _url_trust_verdict(url):
     except ValueError:
         cache = {}
     entry = cache.get(host)
+    keyed_now = {'vt': bool(os.environ.get('VIRUSTOTAL_API_KEY')),
+                 'sb': bool(os.environ.get('SAFEBROWSING_API_KEY'))}
     if isinstance(entry, dict):
         try:
             # checkedAt is a UTC stamp; mktime would read it as LOCAL
@@ -78,16 +89,42 @@ def _url_trust_verdict(url):
             # TTL-expired. timegm parses it as what it is.
             stamp = calendar.timegm(time.strptime(entry.get('checkedAt', ''),
                                                   '%Y-%m-%dT%H:%M:%SZ'))
-            if time.time() - stamp < _URL_TRUST_TTL_S:
+            # A keyless process scores degraded verdicts (vt/sb None);
+            # letting one poison the cache would hide keyed evidence from
+            # keyed callers for a day. An entry is only fresh when the
+            # keyed-source availability that produced it matches NOW.
+            if time.time() - stamp < _URL_TRUST_TTL_S \
+                    and entry.get('keyed') == keyed_now:
                 return entry
         except (ValueError, OverflowError, TypeError):
             pass  # stale-shaped entry: re-score
+    vt_key = os.environ.get('VIRUSTOTAL_API_KEY') or None
+    sb_key = os.environ.get('SAFEBROWSING_API_KEY') or None
+    # The quotas are chokepoint-enforced here, the single place a keyed
+    # call can originate: a spent daily allowance or (for VirusTotal) a
+    # call inside the 15s spacing window means the source is SKIPPED this
+    # time and the verdict notes it -- degradation, never a gate block.
+    vt_allowed = bool(vt_key) and not _quota_exhausted('virustotal') and _vt_spacing_ok()
+    sb_allowed = bool(sb_key) and not _quota_exhausted('safebrowsing')
+    if vt_allowed:
+        _mark_vt_call()  # pessimistic: written before the attempt
+        _accrue_quota_call('virustotal')
+    if sb_allowed:
+        _accrue_quota_call('safebrowsing')
     verdict = _url_trust.score_url(
         url,
-        virustotal_api_key=os.environ.get('VIRUSTOTAL_API_KEY') or None,
-        safebrowsing_api_key=os.environ.get('SAFEBROWSING_API_KEY') or None)
+        virustotal_api_key=vt_key if vt_allowed else None,
+        safebrowsing_api_key=sb_key if sb_allowed else None)
+    if vt_key and not vt_allowed:
+        verdict['signals']['errors'].append(
+            'virustotal skipped: ' + ('daily budget spent'
+                                      if _quota_exhausted('virustotal')
+                                      else 'rate spacing (4/min)'))
+    if sb_key and not sb_allowed:
+        verdict['signals']['errors'].append('safebrowsing skipped: daily budget spent')
     slim = dict(verdict)
     slim['signals'] = {k: v for k, v in (verdict.get('signals') or {}).items()}
+    slim['keyed'] = keyed_now
     cache[host] = slim
     try:
         _set_setting(_URL_TRUST_CACHE_SETTING, json.dumps(cache))

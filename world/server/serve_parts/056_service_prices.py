@@ -28,6 +28,25 @@ def _service_budget(service_id):
         return {'unit': 'page_requests', 'used': _page_budget_used(),
                 'cap': PAGE_REQUEST_MONTHLY_BUDGET,
                 'enforcedBy': 'page_request_budget'}
+    if service_id == 'virustotal':
+        used = _quota_used_today('virustotal')
+        cap = VIRUSTOTAL_DAILY_BUDGET
+        return {'unit': 'url_lookups', 'used': used,
+                'cap': cap if cap else None,
+                'left': (max(0, cap - used) if cap else None),
+                'enforcedBy': 'virustotal_daily_budget',
+                'note': 'free tier: 500 lookups/day, 4/min -- the gate spaces '
+                        'real calls >=15s apart; a spent quota degrades the '
+                        'URL score, it never blocks a gate'}
+    if service_id == 'safebrowsing':
+        used = _quota_used_today('safebrowsing')
+        cap = SAFEBROWSING_DAILY_BUDGET
+        return {'unit': 'requests', 'used': used,
+                'cap': cap if cap else None,
+                'left': (max(0, cap - used) if cap else None),
+                'enforcedBy': 'safebrowsing_daily_budget',
+                'note': 'free tier: ~10k queries/day; a spent quota degrades '
+                        'the URL score, it never blocks a gate'}
     if service_id == 'apify':
         return {'unit': 'usd', 'used': round(float(_apify_spend_this_month()), 6),
                 'cap': float(APIFY_MONTHLY_BUDGET_USD),
