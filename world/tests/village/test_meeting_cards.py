@@ -247,9 +247,13 @@ class MeetingGrooming(unittest.TestCase):
         self.assertEqual(state['backlogRequests'][0]['status'], 'accepted')
 
     def test_meeting_agenda_carries_the_story_context(self):
-        # The filing's user story rides the meeting AGENDA as discussion
-        # context (the minutes stay grounded in it); the acceptance
-        # criteria -- a coded deliverable's contract -- do not.
+        # The filing's user story AND acceptance criteria both ride the
+        # meeting AGENDA: the minutes stay grounded in them. The criteria
+        # were once considered a coded deliverable's contract, but the live
+        # failure (NORA-168: a review meeting groomed with a one-line agenda
+        # produced hollow "discussion happened" minutes) showed that on a
+        # meeting card the filer's criteria ARE the agenda items the scribe
+        # must walk -- without them the scribe has nothing to deliberate.
         state = self._groom(description={
             'userStory':
                 'As a team, I want to hold a retro, so that we improve.',
@@ -257,7 +261,8 @@ class MeetingGrooming(unittest.TestCase):
                 'Given the retro, When we vote, Then actions exist.'})
         item = state['workQueue'][0]
         self.assertIn('User story', item['instructions'] or '')
-        self.assertNotIn('Acceptance criteria', item['instructions'] or '')
+        self.assertIn('Acceptance criteria', item['instructions'] or '')
+        self.assertIn('Given the retro', item['instructions'] or '')
 
     def test_meeting_agenda_carries_never_prohibitions(self):
         state = self._groom(description={'never': ['No spending decisions.']})

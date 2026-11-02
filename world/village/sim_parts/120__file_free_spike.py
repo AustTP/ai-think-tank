@@ -451,6 +451,14 @@ def _queue_refined_meeting(state, req, pending):
     story = req.get('userStory')
     if story:
         agenda += f"\n\nUser story: {story}"
+    criteria = req.get('acceptanceCriteria')
+    if criteria:
+        # The checklist IS the meeting's substance: without it the scribe
+        # receives a one-line agenda and writes filler minutes (seen live:
+        # NORA-168's hollow "discussion happened" note). Story cards already
+        # carry acceptanceCriteria onto their instructions; meetings get the
+        # same contract.
+        agenda += f"\n\nAcceptance criteria (the agenda items to walk and decide):\n{criteria}"
     never = req.get('never')
     if never:
         agenda += f"\n\nNEVER:\n{never}"
