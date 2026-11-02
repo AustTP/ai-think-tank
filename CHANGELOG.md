@@ -4,10 +4,28 @@
 
 ### Features
 
+- Outbound webhooks: the tank can notify external systems. A subscribed URL
+  with an optional shared secret receives signed POSTs (`X-Tank-Signature`:
+  sha256 HMAC over the exact body) when an action-log kind matches its event
+  patterns; delivery is one bounded POST with SSRF checks at registration and
+  every delivery.
+- The GitHub MCP server is registered (official remote server, http
+  transport, bearer auth from the existing `GITHUB_TOKEN`).
 - Ops page now has a per-agent trace feed: actions, tool calls, model replies, JEV decisions, and task plan checkpoints, with an agent selector and auto-refresh.
 
 ### Fixes
 
+- The refinement groom judge no longer bounces meeting cards: the instruction
+  claimed every card type "says story, spike, or research" while the criteria
+  correctly described a real meeting card. Three player-filed meeting cards
+  were rejected on that contradiction.
+- A task dependency is now a small DAG: `dependsOn` takes one task id or a
+  list with join semantics, cycles are pruned where the durable task record
+  is born, and the loop guard walks each surviving edge per edge so an agent
+  still blocked elsewhere is not woken by one landing edge.
+- `/api/villages/chief` returns 400 on a malformed JSON body instead of a 500.
+- `.env` values may be quoted; the server's loader strips one matching quote
+  pair, so `source .env` no longer trips on unquoted pipe characters.
 - Directors and the chief of staff can now use read-only `git_status`, `git_diff`, `git_log`, a team-scoped `task_trace`, and chief-only `find_artifact` recovery search from `live_read`.
 - Agent prose now follows the no AI slop rules: lead with the point, active voice, concrete facts, no binary contrasts, throat-clearing, importance puffery, fake endings, or recap. Outbound text strips em dashes and en dashes.
 - A director's low-confidence deny on a JEV safety gate now continues up the chain instead of ending it. Nora is tried once (immediate director and senior director dedupe), then Theo decides; only a confident deny is final.
