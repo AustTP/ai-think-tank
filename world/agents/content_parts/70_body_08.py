@@ -212,7 +212,23 @@ def _spike_file_issue_wish(finding, task, name, backlog):
 
 
 _MEETING_READ_MAX_FILES = 3
-_MEETING_READ_MAX_BYTES = 24576
+_MEETING_READ_TOTAL_BYTES = 512 * 1024
+_MEETING_READ_HEAD_BYTES = 48 * 1024
+_MEETING_READ_TAIL_BYTES = 24 * 1024
+_MEETING_HEADING_RE = re.compile(r'^(#{1,6} \S|\*\*\S)')
+
+
+def _meeting_outline(text):
+    """Heading lines with 1-based line numbers for an elided file: the
+    outline is how the scribe knows what EXISTS beyond the shown excerpt.
+    Live failure (NORA-172): a 190KB document was truncated at 24KB and the
+    panel 'found' that BP-07 and BP-70 were missing -- both sit far past the
+    cut. A heading index makes the unseen sections visible as names."""
+    lines = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        if _MEETING_HEADING_RE.match(line):
+            lines.append(f'  L{number}: {line.strip()[:110]}')
+    return '\n'.join(lines[:120])
 
 
 def _meeting_read_paths(agenda):
@@ -278,7 +294,7 @@ def _meeting_source_material(agenda):
             try:
                 with open(real, 'r', encoding='utf-8',
                           errors='replace') as handle:
-                    read = handle.read(_MEETING_READ_MAX_BYTES + 1)
+                    read = handle.read(_MEETING_READ_TOTAL_BYTES)
                 break
             except OSError:
                 read = None
@@ -298,10 +314,23 @@ def _meeting_source_material(agenda):
                 parts.append(f'--- {path}: unreadable '
                              '(No such file or directory)')
             continue
-        if len(read) > _MEETING_READ_MAX_BYTES:
-            read = (read[:_MEETING_READ_MAX_BYTES]
-                    + '\n... [truncated for the meeting prompt]')
-        parts.append(f'--- {path} ---\n{read}')
+        if len(read) > _MEETING_READ_HEAD_BYTES + _MEETING_READ_TAIL_BYTES:
+            # Oversized file: show head + tail plus an OUTLINE of every
+            # heading in the WHOLE file, so the panel can see the sections
+            # it was not shown and never claims one is missing (NORA-172).
+            outline = _meeting_outline(read)
+            read = (read[:_MEETING_READ_HEAD_BYTES]
+                    + '\n... [MIDDLE ELIDED -- large file; every heading of '
+                    'the full file is listed under OUTLINE below. A section '
+                    'you cannot see in the excerpt still EXISTS -- judge it '
+                    'only from the outline, never claim it is missing] ...\n'
+                    + read[-_MEETING_READ_TAIL_BYTES:]
+                    + ('\n\nOUTLINE (every heading in the full file):\n'
+                       + outline if outline else ''))
+            header = f'--- {path} ({_MEETING_READ_TOTAL_BYTES}-byte read cap; TRUNCATED) ---'
+        else:
+            header = f'--- {path} ---'
+        parts.append(f'{header}\n{read}')
     if not parts:
         return ''
     return ('\n\nSOURCE MATERIAL (read from the repository just now; ground '

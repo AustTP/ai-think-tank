@@ -673,6 +673,37 @@ class MeetingExecutor(unittest.TestCase):
         user = self._run_capturing_user(self._task())
         self.assertNotIn('SOURCE MATERIAL', user)
 
+    def test_oversized_read_shows_head_tail_and_full_outline(self):
+        # A large file cannot be shown whole: the scribe gets head + tail
+        # plus an OUTLINE of every heading in the FULL file, so a section
+        # past the cut is never claimed missing (NORA-172 'found' that
+        # BP-07 and BP-70 did not exist -- both sat beyond a 24KB cut).
+        repo_root = os.path.dirname(os.getcwd())
+        source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
+                                      dir=repo_root)
+        rel = os.path.basename(source_dir) + '/big.md'
+        try:
+            filler = 'x' * 200 + '\n'
+            chunks = ['## Intro\nintro text\n']
+            # Push the BP-99 heading well past the 48KB head cut.
+            while sum(len(c) for c in chunks) < 60 * 1024:
+                chunks.append(filler)
+            chunks.append('## BP-99 late section\nthe late body\n')
+            while sum(len(c) for c in chunks) < 80 * 1024:
+                chunks.append(filler)
+            with open(os.path.join(source_dir, 'big.md'), 'w',
+                      encoding='utf-8') as handle:
+                handle.write(''.join(chunks))
+            task = self._task()
+            task['instructions'] = f'Agenda: audit the doc.\nREAD: {rel}'
+            user = self._run_capturing_user(task, source_dir=source_dir)
+            self.assertIn('MIDDLE ELIDED', user)
+            self.assertIn('OUTLINE', user)
+            self.assertIn('BP-99 late section', user)
+            self.assertNotIn('never claim it is missing] ...', user[:1000])
+        finally:
+            shutil.rmtree(source_dir, ignore_errors=True)
+
 
 if __name__ == '__main__':
     unittest.main()
