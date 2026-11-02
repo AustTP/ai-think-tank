@@ -448,6 +448,9 @@ def test_sim_loop_pass_tick_errors(monkeypatch):
     monkeypatch.setattr(serve, 'save_state_to_db', lambda s: None)
     monkeypatch.setattr(serve, '_state_abort', lambda: None)
     state = sim._sim_loop_pass()
+    # The tick-phase breadcrumb rides along (2026-11-02); it is not part of
+    # the domain state under test, so pop it before the exact comparison.
+    state.pop('_tickPhase', None)
     assert state == {'x': 1, 'completionControl': state['completionControl']}
 
 

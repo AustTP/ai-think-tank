@@ -207,6 +207,7 @@ class SimEngine:
                 # same one-cell lag the per-substep rebuild already
                 # documented -- self-correcting, only cheaper.
                 tick_index = _spatial_index(agents_map)
+                _tick_phase_stamp(state, 'movement_substeps')
                 for _ in range(max(1, int(SIM_TICK_S / SIM_SUBSTEP_S))):
                     events += step_agent_movement(SIM_SUBSTEP_S, agents_map,
                                                   self._grid, doors=self._doors,
@@ -220,6 +221,7 @@ class SimEngine:
                 # (Off-duty is immediate and in-place now -- see
                 # send_agent_off_duty -- so there is no off-duty ARRIVAL event;
                 # an idle agent vanishes where she stands.)
+                _tick_phase_stamp(state, 'event_dispatch')
                 if events:
                     import serve
                     for kind, sub, aid in events:
@@ -266,6 +268,7 @@ class SimEngine:
                 # re-fires. Cadence mirrors the browser's 6s runTaskCycle.
                 if now - self._last_task_wall >= TASK_CYCLE_S:
                     self._last_task_wall = now
+                    _tick_phase_stamp(state, 'task_cycle')
                     _task_cycle(state, now=now, grid=self._grid, doors=self._doors,
                                 task_id_holder=_TASK_ID_HOLDER)
 
@@ -273,10 +276,12 @@ class SimEngine:
                 # (the reachability-gap bug). Runs AFTER movement + task cycle so
                 # it only moves genuinely idle, visible agents -- no-op once
                 # everyone is reachable.
+                _tick_phase_stamp(state, 'stranded_reconcile')
                 _reconcile_stranded_agents(state, self._grid)
                 # Covers the inverse stranding: an agent HOLDING a 'walking' task
                 # with no path (path cleared, arrival never fired). Movement skips
                 # pathless agents, so without this they freeze mid-task forever.
+                _tick_phase_stamp(state, 'walker_repair')
                 _repair_stalled_walkers(state, self._grid, self._doors, now,
                                         index=tick_index)
                 # Covers the class _repair_stalled_walkers explicitly skips: a
@@ -285,6 +290,7 @@ class SimEngine:
                 # own. Must run BEFORE the door-squatter eviction below so a
                 # released agent is parked off duty (invisible) rather than
                 # also getting relocated first.
+                _tick_phase_stamp(state, 'interaction_repair')
                 _repair_stalled_interactions(state)
         # Server-observed snapshot of every agent's spatial/activity truth.
         # Read-only for the client today; becomes the server's authoritative
@@ -416,11 +422,31 @@ def _sim_loop_pass_inner():
         # earns its recycle.
         global _LAST_TICK_WALL_EPOCH
         _LAST_TICK_WALL_EPOCH = time.time()
+        # Tick-phase breadcrumb (2026-11-02): a pure-Python spin inside one
+        # phase froze the whole tank for 38+ minutes with zero log rows and
+        # no py-spy access (macOS needs root). The autosave persists this
+        # small stamp with the state, so the NEXT freeze names its phase on
+        # the boot log instead of staying a mystery. JSON-safe (str + number
+        # only); replaced, never appended.
+
+        def _phase(name):
+            _tick_phase_stamp(state, name)
+
+        if state.get('_tickPhase', {}).get('phase') not in (None, 'done'):
+            frozen = state['_tickPhase']
+            from serve import log_action as _la
+            _la(None, 'tick_froze_at_phase',
+                {'phase': frozen.get('phase'),
+                 'frozenAtEpoch': frozen.get('at'),
+                 'heldForS': round(time.time() - float(frozen.get('at') or time.time()), 1),
+                 'tick': frozen.get('tick')})
         # Record dormancy/downtime as paused time BEFORE the tick advances
         # sim.lastTickEpochS, so stale-work aging excludes it.
         _record_tick_gap(state, int(time.time() * 1000))
+        _phase('engine_tick')
         state = _engine.tick(state)
         _LAST_TICK_WALL_EPOCH = time.time()
+        _phase('supervisor_tick')
         try:
             governance.supervisor_tick(state)
         except Exception as e:
@@ -429,6 +455,7 @@ def _sim_loop_pass_inner():
         # read-modify-write (same two-phase discipline as _content_results: the
         # model call ran on its own thread and stashed an in-memory result; this
         # pass delivers it durably). No-op when nothing finished.
+        _phase('ask_results')
         try:
             serve._apply_pending_ask_results(state)
         except Exception as e:
@@ -440,6 +467,7 @@ def _sim_loop_pass_inner():
         # re-flag the same worker every 90s forever). Cadence-gated; no-op when not
         # due. serve._peer_review_tick reads only this in-hand state + the
         # action_log (read-only), then mutates state in place.
+        _phase('peer_review')
         try:
             serve._peer_review_tick(state)
         except Exception as e:
@@ -448,6 +476,7 @@ def _sim_loop_pass_inner():
         # the shared adversarial task, complete + disable (drain the winter team
         # back to the main village). Same in-place mutation inside the single
         # read-modify-write; no-op when disabled.
+        _phase('adversarial')
         try:
             serve._adversarial_village_tick(state)
         except Exception as e:
@@ -482,10 +511,12 @@ def _sim_loop_pass_inner():
                                maxConcurrentStories=5, maxRecoveryAttempts=3,
                                retryBaseMs=30000, maxRecoveriesPerTick=2,
                                transportRecoveryAttempts=3)
+            _phase('completion_recovery')
             story_tracking.refresh(state, serve._spend_ledger_read() or {})
             completion_watchdog.step(state, now_ms, observe_only=False)
         except Exception as e:
             print(f'[sim] completion recovery error: {e}', flush=True)
+        _phase('done')  # BEFORE the save: the saved blob must carry 'done'
         serve.save_state_to_db(state)
         # Final heartbeat after a fully successful pass (tick + save); the
         # milestone stamps above already keep a heavy pass fresh, so this
@@ -781,8 +812,10 @@ def _cadence_due(state, key, cadence_ms, now_ms=None, legacy_far_future_ms=_CADE
         last = 0
     return now_ms - last >= cadence_ms
 
+
 # Phase 4 governance cadence + decision constants (ported from hiring.js /
 # firing.js / morale.js -- copied constants, not drift-prone redefinitions).
+
 HIRE_COOLDOWN_MS = 45000      # hiring.js:24
 HIRE_DURATION_MS = 8000       # hiring.js:25 (review completion now deferral)
 HIRE_COLOR_POOL = ['#f6b26b', '#76a5af', '#a4c2f4', '#d5a6bd', '#b6d7a8', '#ffe599']
@@ -881,6 +914,19 @@ STALE_WORK_MAX_REPLANS = 2              # re-queues per (title,room) before the 
 # are persisted with the state so a restart does not lose the accounting.
 SIM_PAUSE_MIN_GAP_MS = 60_000           # tick gaps shorter than this are normal jitter
 SIM_PAUSE_WINDOWS_MAX = 64              # keep the tail bounded (state is whole-blob saved)
+
+
+def _tick_phase_stamp(state, name):
+    """Tick-phase breadcrumb: the autosave persists this tiny dict with the
+    state, so a pure-Python wedge inside one phase names itself on the next
+    boot's `tick_froze_at_phase` log row (2026-11-02: a 38-minute silent
+    freeze with zero log rows and no root for py-spy). Replaced, never
+    appended; JSON-safe; O(1)."""
+    try:
+        state['_tickPhase'] = {'phase': name, 'at': round(time.time(), 3),
+                               'tick': int((state.get('sim') or {}).get('tick') or 0)}
+    except Exception:
+        pass
 
 
 def _record_tick_gap(state, now_ms):
