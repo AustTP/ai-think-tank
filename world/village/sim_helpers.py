@@ -200,9 +200,9 @@ def create_village(state, name):
 
 
 def appoint_village_chief(state, village_id, agent_id=None):
-    """Appoint `agent_id` (or auto-pick) as `village_id`'s chief of staff:
+    """Appoint `agent_id` (or auto-pick) as `village_id`'s regional manager:
     the roster tier `villageChief: True` + `chiefOfVillage: <vid>` (core
-    governance), role 'chief_of_staff', reporting to the admin, with the
+    governance), role 'regional_manager', reporting to the admin, with the
     village's other senior directors re-parented under the chief. Exactly
     one chief per village: a re-appointment clears the previous chief's
     flags. Returns the chief id, or None when the village is unknown or no
@@ -265,7 +265,12 @@ def appoint_village_chief(state, village_id, agent_id=None):
     entry = entries[candidate]
     entry['villageChief'] = True
     entry['chiefOfVillage'] = village_id
-    entry['role'] = 'chief_of_staff'
+    # 'regional_manager': the business term for the exec who runs one
+    # region and reports to the top -- renamed from the historic
+    # 'chief_of_staff' so it can never be confused with THE chief of
+    # staff (theo, the tank-wide admin). The roster flags
+    # (villageChief/chiefOfVillage) keep their historic keys.
+    entry['role'] = 'regional_manager'
     if admin_id and candidate != admin_id:
         entry['director'] = admin_id
     # Re-parent the village's other senior directors under the chief: the

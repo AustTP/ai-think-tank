@@ -196,7 +196,7 @@ class ChiefReviewFlow(unittest.TestCase):
             state, req, org, 'Skye',
             founding_mode=sim._founding_mode(state, 'skye'),
             director_id='skye')
-        self.assertIn('village chief of staff', text)
+        self.assertIn('regional manager', text)
         self.assertIn('Founding subdirectors is not your tool', text)
 
     def test_chief_routes_pieces_to_senior_teams(self):
