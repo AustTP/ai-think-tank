@@ -1,5 +1,32 @@
 
 
+def _grant_player_direct_links(question):
+    """Player-direct links are standing permission (operator direction,
+    2026-11-01): every http(s) URL the player sends through the ask lane
+    grants its host to the runtime allowlist -- the think tank may then reach
+    that host from any lane without another escalation round trip.
+    _grant_allowlist is a lock-free settings-table write (safe on the ask's
+    unlocked state snapshot), idempotent per host (only NEW hosts grant), and
+    it already refreshes the egress proxy and logs the attribution. Both ask
+    lanes (HTTP and the Telegram bridge) are the player, so the grant lives
+    in _ask_core, not in the HTTP wrapper. Returns the newly granted hosts."""
+    granted_hosts = []
+    for match in re.finditer(r'https?://[^\s\'"<>()\[\]{}]+', question):
+        candidate = match.group(0).rstrip('.,;:!?\')]}')
+        try:
+            host = (urllib.parse.urlparse(candidate).hostname or '').strip().lower()
+        except ValueError:
+            continue
+        # _effective_allowlist_domains does not see grants made earlier in
+        # THIS call, so dedupe here or one message with the same host twice
+        # grants it twice.
+        if host and host not in _effective_allowlist_domains() \
+                and host not in granted_hosts:
+            if _grant_allowlist(host, actor='player', via='player direct link'):
+                granted_hosts.append(host)
+    return granted_hosts
+
+
 def _seed_ask_approved_tools(approved_tools):
     """Normalize the ask task's approvedTools list. When the caller passed
     NOTHING (None), seed the registry gateway api_call: asks are read-shaped
@@ -66,6 +93,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     question = (question or '').strip()
     if not question:
         return {'error': 'a question is required', 'status': 400}
+    granted_hosts = _grant_player_direct_links(question)
     # Ambient free-pool scope: every model pick made while this ask runs
     # (including the tool loop's to_thread, which inherits the context) is
     # kind 'ask' -- the only kind the operator's scoped second Gemini key
@@ -485,6 +513,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'github_repo':
             tools_used.append(name)
             return _github_repo_tool(pick, args)
+        if name == 'bookmarks':
+            tools_used.append(name)
+            return _bookmarks_tool(pick, args)
         if name == 'local_file':
             tools_used.append(name)
             return _local_file_tool(pick, args)
@@ -518,7 +549,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     tools = (AGENT_ASK_TOOLS + _PULSE_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
-    tools = tools + [_GITHUB_REPO_TOOL]
+    tools = tools + [_GITHUB_REPO_TOOL, _BOOKMARKS_TOOL]
     if FILE_ACCESS_ENABLED and _effective_file_grants(state):
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
     if APP_ACCESS_ENABLED and _effective_app_grants(state):
@@ -578,7 +609,12 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
     _append_passport_decision('ask', pick, {
         'question': question[:200], 'tools': tools_used})
     from core.style import sanitize_text
-    return {'reply': sanitize_text(reply), 'agent': pick, 'tools': tools_used}
+    reply = {'reply': sanitize_text(reply), 'agent': pick, 'tools': tools_used}
+    if granted_hosts:
+        # Surfaced so the player can SEE the standing grants their links made
+        # instead of discovering them later in the action log.
+        reply['allowlistGranted'] = granted_hosts
+    return reply
 
 
 # ---------------------------------------------------------------------------
