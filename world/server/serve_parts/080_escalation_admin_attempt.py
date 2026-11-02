@@ -1104,8 +1104,28 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
                 _sim_watchdog_note_healthy(last)
             except Exception as e:
                 print(f'[sim-watchdog] healthy reset error: {e}', flush=True)
-            if last and not _dormant():
-                gap = time.time() - last
+            # Held-pass override (2026-11-02): dormancy legitimately pauses
+            # ticks, so the stamp check above is skipped while dormant -- but
+            # a pass that is still HOLDING _PASS_LOCK is never legitimate
+            # idleness: a dormant pass acquires and releases in milliseconds.
+            # A wedge inside a pass (live: two same-day freezes, 38 and 13+
+            # minutes, phase breadcrumb 'done' -- inside the save tail) used
+            # to be invisible whenever an idle window flipped _DORMANT on
+            # mid-wedge. Treat a lock held past stale_s as stale regardless
+            # of dormancy; the task.cancel + recreate below still recycles.
+            held_wedge = False
+            try:
+                held_since = float(getattr(_sim_module, '_PASS_HELD_SINCE', 0.0) or 0.0)
+                if (_sim_module._PASS_LOCK.locked() and held_since
+                        and time.time() - held_since > stale_s):
+                    held_wedge = True
+                    print(f'[sim-watchdog] pass lock held {time.time() - held_since:.0f}s '
+                          f'(> {stale_s:.0f}s); wedged pass -- recycling sim loop '
+                          f'(dormancy does not mask a held pass)', flush=True)
+            except AttributeError:
+                pass
+            if held_wedge or (last and not _dormant()):
+                gap = time.time() - (held_since if held_wedge else last)
                 if gap > stale_s:
                     print(f'[sim-watchdog] tick stale {gap:.0f}s (> {stale_s:.0f}s); recycling sim loop', flush=True)
                     task.cancel()

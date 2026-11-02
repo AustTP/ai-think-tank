@@ -894,11 +894,24 @@ def _reconcile_extracted_sections(conn, data):
     return ok
 
 
+def _save_phase(data, name):
+    """Save-path breadcrumb (2026-11-02): two same-day tank freezes wedged
+    with the tick breadcrumb at 'done' -- i.e. inside this save. Stamp the
+    finer steps onto the same _tickPhase channel so the next freeze names
+    the exact step. Best-effort; never breaks the save."""
+    try:
+        data['_tickPhase'] = {'phase': name, 'at': round(time.time(), 3),
+                              'tick': int((data.get('sim') or {}).get('tick') or 0)}
+    except Exception:
+        pass
+
+
 def save_state_to_db(data):
     # Pass 1 completion recovery: a stale whole-state save must not erase a
     # newer player recovery decision. Only tasks with newer intervention
     # history are protected; ordinary saves pass through unchanged.
     import server.state_updates as state_updates
+    _save_phase(data, 'save_read_current')
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if row:
@@ -919,6 +932,7 @@ def save_state_to_db(data):
             data = state_updates.preserve_guidance(current, data)
     # Training capture (opt-in): link task outcomes to recorded
     # interactions whenever the sim state is committed.
+    _save_phase(data, 'save_training_capture')
     training_capture.sync_outcomes(data)
     try:
         # Split completed tasks out of the blob: the archive table holds every
@@ -945,6 +959,7 @@ def save_state_to_db(data):
                     referenced.update(v for v in value if isinstance(v, str))
         if referenced:
             done = {tid: t for tid, t in done.items() if tid not in referenced}
+        _save_phase(data, 'save_archive_reconcile')
         archived_ok = _reconcile_task_archive(done) if done else True
         if done and archived_ok:
             keep = (set(tasks) - set(done))
@@ -953,6 +968,7 @@ def save_state_to_db(data):
             # Nothing to archive, or the archive table is unavailable -- keep
             # every task in the blob so nothing is ever lost.
             blob = data
+        _save_phase(data, 'save_blob_write')
         with _db() as conn:
             # Scale slices: reconcile the extracted sections (roster, live
             # agents, player inbox) in the SAME transaction as the blob write,
