@@ -572,6 +572,12 @@ def _load_env():
                         line = line.decode('utf-8', 'replace')
                     if line and not line.startswith('#') and '=' in line:
                         k, v = line.split('=', 1)
+                        # Values may be quoted for shell safety (an unquoted
+                        # SEED_ROSTER pipes through zsh's grammar and dies
+                        # with "command not found: Ada"). Standard dotenv
+                        # behavior: strip ONE matching quote pair.
+                        if len(v) >= 2 and v[0] == v[-1] and v[0] in ('"', "'"):
+                            v = v[1:-1]
                         env[k] = v
         except OSError:
             # A missing/unreadable .env is not fatal: callers treat absent

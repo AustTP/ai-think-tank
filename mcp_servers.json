@@ -58,6 +58,41 @@
         ],
         "blocked": []
       }
+    },
+    "github": {
+      "name": "GitHub (official MCP server)",
+      "description": "GitHub's official remote MCP server (api.githubcopilot.com): repo and code search, issue and pull-request read/write, gist, and notification tools. Authenticates with the operator's GITHUB_TOKEN as a bearer credential (an env reference, never a literal). Read tools run in the read tier; anything that mutates a repo goes through the commit gate like every other MCP server.",
+      "transport": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "enabled": true,
+      "auth": {
+        "type": "header_bearer",
+        "credential": {
+          "type": "env",
+          "key": "GITHUB_TOKEN"
+        }
+      },
+      "startup_timeout_s": 30,
+      "request_timeout_s": 120,
+      "max_response_bytes": 4000000,
+      "max_tools": 200,
+      "tools": {
+        "allow": [
+          "*"
+        ],
+        "read_only": [
+          "get_*",
+          "search_*",
+          "list_*",
+          "download_*",
+          "me*",
+          "notification*",
+          "*_review*",
+          "check_*"
+        ],
+        "prepare": [],
+        "blocked": []
+      }
     }
   }
 }
