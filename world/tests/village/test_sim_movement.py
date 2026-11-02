@@ -200,20 +200,51 @@ class SimServerOwnedMovement(unittest.TestCase):
     def test_cancel_at_task_releases_agent_and_marks_cancelled(self):
         # Port of tasks.js cancelTask: task -> 'cancelled', agent fully
         # released (task/path/pathTarget/respawn cleared, replan counter reset).
+        # DEV-109: the WORK no longer dies with the attempt -- the card is
+        # re-queued as a reissue that records who could not reach it.
         state = self._walking_task_state()
         task = sim._cancel_at_task(state, 'ada')
         self.assertEqual(task['id'], 'task-1')
         self.assertEqual(state['tasks']['task-1']['status'], 'cancelled')
+        self.assertEqual(state['tasks']['task-1']['_unreachableBy'], ['ada'])
         a = state['agents']['ada']
         self.assertIsNone(a['task'])
         self.assertIsNone(a['path'])
         self.assertIsNone(a['pathTarget'])
         self.assertEqual(a['replanCount'], 0)
         self.assertFalse(a.get('respawnedForTask'))
+        # The re-issued pick carries the same work plus the skip list, and a
+        # pin to the agent who just failed the walk is dropped.
+        self.assertEqual(len(state['workQueue']), 1)
+        pick = state['workQueue'][0]
+        self.assertEqual(pick['reissueOf'], 'task-1')
+        self.assertEqual(pick['title'], 't')
+        self.assertEqual(pick['room'], 'pressoffice')
+        self.assertEqual(pick['_unreachableBy'], ['ada'])
+        self.assertIsNone(pick['assignedTo'])
         # No-ops for a missing or taskless agent.
         self.assertIsNone(sim._cancel_at_task(state, 'ghost'))
         state['agents']['ben'] = {'id': 'ben', 'task': None}
         self.assertIsNone(sim._cancel_at_task(state, 'ben'))
+
+    def test_cancel_at_task_parks_after_three_distinct_unreachable_agents(self):
+        # DEV-109's churn bound: once THREE distinct agents have failed the
+        # walk, the card parks (parking-lot lane) instead of feeding a fourth
+        # walker into the same wall. The failed agent's release is unchanged.
+        state = self._walking_task_state()
+        state['tasks']['task-1']['_unreachableBy'] = ['ben', 'cal']
+        sim._cancel_at_task(state, 'ada')
+        pick = state['workQueue'][0]
+        self.assertEqual(pick['_unreachableBy'], ['ben', 'cal', 'ada'])
+        self.assertEqual(pick['lane'], 'parking-lot')
+
+    def test_cancel_at_task_does_not_requeue_a_terminal_task(self):
+        # Idempotence: a second cancel against an already-terminal task must
+        # not queue a duplicate reissue.
+        state = self._walking_task_state()
+        state['tasks']['task-1']['status'] = 'cancelled'
+        sim._cancel_at_task(state, 'ada')
+        self.assertEqual(state.get('workQueue') or [], [])
 
     def test_tick_dispatches_task_cancel_release(self):
         # REGRESSION (vela, replanCount 55,350): a walking-task agent whose walk

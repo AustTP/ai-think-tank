@@ -566,6 +566,13 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 or pick.get('taskType') == 'supervise')
     pinned = (pick.get('assignedTo') or pick.get('facilitatorId')
               or pick.get('_reassignedTo')) if pin_kind else None
+    # DEV-109: agents who already failed THIS card's walk (stuck cancel,
+    # tracked by _requeue_unreachable_work) are skipped -- a pin to one of
+    # them falls through to the round-robin instead of re-picking a body
+    # that just proved she cannot reach the room.
+    _unreachable = pick.get('_unreachableBy') or []
+    if pinned and pinned in _unreachable:
+        pinned = None
     if (pick.get('taskType') in governance.CODE_TASK_TYPES
             and not pick.get('reviewOf') and pinned
             and not governance.may_work_code(state, pinned)):
@@ -713,6 +720,16 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                 return _ASSIGN_WAIT if pick.get('issueKey') else None
         if not ordered:
             return _ASSIGN_WAIT if pick.get('issueKey') else None
+        # DEV-109: hard-skip agents who already failed this card's walk. If
+        # EVERY remaining candidate is on the list, wait -- a new candidate
+        # may come on duty or a stranded one may be respawned; feeding the
+        # same stranded body in again is exactly the churn this guard stops.
+        if _unreachable:
+            reachable = [cid for cid in ordered if cid not in _unreachable]
+            if reachable:
+                ordered = reachable
+            else:
+                return _ASSIGN_WAIT if pick.get('issueKey') else None
         # Fault-aware routing: soft-prefer a candidate with no
         # recent unfaded failure signal over the plain round-robin order --
         # same "soft preference, never a hard lock" shape as the team

@@ -211,6 +211,64 @@ def _spike_file_issue_wish(finding, task, name, backlog):
     }
 
 
+_MEETING_READ_MAX_FILES = 3
+_MEETING_READ_MAX_BYTES = 24576
+
+
+def _meeting_read_paths(agenda):
+    """The READ: directives a meeting card's agenda carries -- one `READ: <path>`
+    line per repository file the scribe must actually read. Bounded: at most
+    _MEETING_READ_MAX_FILES distinct paths; duplicates and empties dropped."""
+    paths = []
+    for line in (agenda or '').splitlines():
+        stripped = line.strip()
+        if not stripped.upper().startswith('READ:'):
+            continue
+        path = stripped[5:].strip()
+        if path and path not in paths:
+            paths.append(path)
+        if len(paths) >= _MEETING_READ_MAX_FILES:
+            break
+    return paths
+
+
+def _meeting_source_material(agenda):
+    """Expand the agenda's READ: directives into an inline SOURCE MATERIAL
+    section the scribe prompt carries. This is the meeting's document access:
+    a meeting executor is a single non-tool deliberation, so without this the
+    scribe improvises -- the live failure was a review panel inventing tables,
+    endpoints, and retry policies no code implements (task-2876). Grounding
+    rule: every claim about these files must come from this text or be flagged
+    as the panel's opinion. Fail-soft per file; paths are resolved against the
+    server process CWD (the repository root) and refused if they escape it."""
+    paths = _meeting_read_paths(agenda)
+    if not paths:
+        return ''
+    root = os.path.realpath(os.getcwd())
+    parts = []
+    for path in paths:
+        try:
+            real = os.path.realpath(os.path.join(root, path))
+            if real != root and not real.startswith(root + os.sep):
+                parts.append(f'--- {path}: refused (outside the repository)')
+                continue
+            with open(real, 'r', encoding='utf-8', errors='replace') as handle:
+                text = handle.read(_MEETING_READ_MAX_BYTES + 1)
+            if len(text) > _MEETING_READ_MAX_BYTES:
+                text = (text[:_MEETING_READ_MAX_BYTES]
+                        + '\n... [truncated for the meeting prompt]')
+            parts.append(f'--- {path} ---\n{text}')
+        except OSError as exc:
+            parts.append(f'--- {path}: unreadable '
+                         f'({getattr(exc, "strerror", None) or "error"})')
+    if not parts:
+        return ''
+    return ('\n\nSOURCE MATERIAL (read from the repository just now; ground '
+            'every claim about these files in this text, and flag anything '
+            'beyond it explicitly as the panel\'s opinion):\n\n'
+            + '\n\n'.join(parts))
+
+
 def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
     """A MEETING card: the facilitator (task['facilitatorId'], falling
     back to the assigned agent) convenes the meeting and writes the
@@ -270,7 +328,8 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
             'not summarize or compress the discussion into minutes. Do not '
             'invent facts that are not in the agenda or source.'
         )
-        user = (f"Panel: {title}\n\nAgenda and source material:\n{agenda or '(none given)'}\n\n"
+        user = (f"Panel: {title}\n\nAgenda and source material:\n{agenda or '(none given)'}"
+                f"{_meeting_source_material(agenda)}\n\n"
                 f"Facilitator: {facilitator_name}\n"
                 f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
                 'Write the full panel conversation now, with a speaker label on every turn.')
@@ -285,7 +344,8 @@ def _run_meeting_content(snapshot, agent_id, task, base_ctx=None):
             'minutes now. Follow this playbook:\n\n'
             f'{minutes_guide}'
         )
-        user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}\n\n"
+        user = (f"Meeting: {title}\n\nAgenda:\n{agenda or '(none given)'}"
+                f"{_meeting_source_material(agenda)}\n\n"
                 f"Facilitator: {facilitator_name}\n"
                 f"Attendees: {', '.join(attendee_names) or '(none)'}\n\n"
                 'Write the minutes now.')

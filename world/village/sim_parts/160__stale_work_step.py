@@ -179,6 +179,87 @@ def _requeue_paused_work(state, task, now_ms):
     }])
 
 
+def _requeue_unreachable_work(state, task, agent_id, now_ms):
+    """Re-queue a card whose ASSIGNED WALK died as a stuck cancel (DEV-109).
+
+    The old contract killed the work outright ("requeueing an unwalkable task
+    would just churn agents into the same wall") -- true for a genuinely
+    unwalkable ROOM, but the live failure was different: a STRANDED assignee
+    (zara parked at (39.9, 608), unreachable from the north rooms) was chosen
+    by round-robin again and again, and every card she drew -- including a
+    meeting card, NORA-166 -- died in a sim_cancel within seconds and was lost.
+
+    Bounded requeue: the pick carries `_unreachableBy` (agents who already
+    failed this card's walk, capped at 5) so assignment skips them; a pin to
+    the agent who just failed is dropped. After 3 distinct agents have failed
+    the walk the card parks (parking-lot lane) instead of churning a fourth
+    into the same wall -- the original contract's churn fear, honored.
+    `reissueOf` keeps this the SAME work for the card-dedup twin check."""
+    room = task.get('room') or _resolve_assignment_room(task)
+    unreachable = list(task.get('_unreachableBy') or [])
+    if agent_id and agent_id not in unreachable:
+        unreachable.append(agent_id)
+    unreachable = unreachable[:5]
+    parked = len(unreachable) >= 3
+    queue_work(state, [{
+        'title': task.get('title'),
+        'reissueOf': task.get('id'),
+        'room': room,
+        'instructions': task.get('instructions'),
+        'goal': task.get('goal'),
+        'taskType': task.get('taskType') or 'code',
+        'projectLabel': task.get('projectLabel'),
+        'priority': task.get('priority'),
+        'notBefore': now_ms,
+        'sizeEstimate': task.get('sizeEstimate'),
+        'teamId': task.get('teamId'),
+        'productId': task.get('productId'),
+        'featureId': task.get('featureId'),
+        'backlogItemId': task.get('backlogItemId'),
+        'sprintId': task.get('sprintId'),
+        'reviewOf': task.get('reviewOf'),
+        'reviewAuthorId': task.get('reviewAuthorId'),
+        'checklist': task.get('checklist') or [],
+        'incident': task.get('incident'),
+        'dependsOn': task.get('dependsOn'),
+        'distill': task.get('distill'),
+        'kbClass': task.get('kbClass'),
+        'budgetMs': task.get('budgetMs'),
+        'budgetBand': task.get('budgetBand'),
+        'budgetUsd': task.get('budgetUsd'),
+        'moonshot': task.get('moonshot'),
+        # Three distinct agents could not walk here: stop the churn, park the
+        # card for operator promotion instead of feeding a fourth walker in.
+        'lane': 'parking-lot' if parked else task.get('lane'),
+        'playerAuthored': task.get('playerAuthored'),
+        'approvedTools': list(task.get('approvedTools') or []),
+        'attendees': task.get('attendees') or [],
+        'facilitatorId': task.get('facilitatorId'),
+        # A pin to the agent who just failed the walk would re-pick her: drop
+        # exactly that pin (any other pin -- reviewer, on-call -- survives).
+        'assignedTo': (None if task.get('assignedTo') == agent_id
+                       else task.get('assignedTo')),
+        'pipelineStep': task.get('pipelineStep'),
+        'adversarialTaskId': task.get('adversarialTaskId'),
+        'villageId': task.get('villageId'),
+        'userStory': task.get('userStory'),
+        'acceptanceCriteria': task.get('acceptanceCriteria'),
+        'never': task.get('never'),
+        'sourcePaths': task.get('sourcePaths'),
+        'reportPath': task.get('reportPath'),
+        'issueKey': task.get('issueKey'),
+        'requestId': task.get('requestId'),
+        'sequence': task.get('sequence'),
+        'phaseIndex': task.get('phaseIndex'),
+        'deliverable': task.get('deliverable'),
+        'directRoute': task.get('directRoute'),
+        'directedTo': task.get('directedTo'),
+        '_reassignedTo': task.get('_reassignedTo'),
+        '_unreachableBy': unreachable,
+    }])
+    return parked
+
+
 def _sm_replan_stale_work(state, task, now_ms):
     """Terminal re-plan: route a repeatedly-stale card to the owning team's
     scrum master as a work-request, and make refinement due on the next pass so

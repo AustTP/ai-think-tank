@@ -395,17 +395,22 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
 
 def _cancel_at_task(state, agent_id):
     """Port of tasks.js cancelTask (tasks.js:1197): an agent whose task-walk is
-    genuinely impossible gives up -- task marked 'cancelled', agent fully
-    released (task/path/respawn cleared) so she goes idle and is available for
-    the next assignment instead of looping forever on a route that can't work.
+    genuinely impossible gives up -- agent fully released (task/path/respawn
+    cleared) so she goes idle and is available for the next assignment instead
+    of looping forever on a route that can't work.
     This is the dispatch half of the movement 'cancel' event (previously logged
     and dropped, leaving the agent stuck -- vela, replanCount 55,350), and the
     terminal release for _repair_stalled_walkers' unreachable cases. Unlike
     finish_task/_release_agent_gated it does NOT bump approvals or record a
-    completed room -- a gave-up walk is not shipped work. Mirrors the JS: the
-    cancelled task is NOT requeued (a human can re-file it; requeueing an
-    unwalkable task would just churn agents into the same wall). Idempotent,
-    pure on `state`. Returns the cancelled task (or None)."""
+    completed room -- a gave-up walk is not shipped work.
+    The attempt's task record is marked 'cancelled' as before, BUT the work
+    itself no longer dies with it (DEV-109: zara, stranded south, drew three
+    cards -- including a meeting card, NORA-166 -- and each died here, lost).
+    The card is re-queued as a reissue carrying `_unreachableBy` so assignment
+    skips the agents who already failed the walk; after 3 distinct failed
+    agents it parks (parking-lot lane) instead of churning a fourth. See
+    _requeue_unreachable_work. Idempotent, pure on `state`. Returns the
+    cancelled task (or None)."""
     agents = state.get('agents') or {}
     a = agents.get(agent_id)
     if not a:
@@ -413,8 +418,20 @@ def _cancel_at_task(state, agent_id):
     task_id = a.get('task')
     tasks = state.get('tasks') or {}
     task = tasks.get(task_id) if task_id else None
-    if task:
+    if task and task.get('status') not in ('cancelled', 'done', 'failed'):
         task['status'] = 'cancelled'
+        unreachable = list(task.get('_unreachableBy') or [])
+        if agent_id not in unreachable:
+            unreachable.append(agent_id)
+        task['_unreachableBy'] = unreachable[:5]
+        parked = _requeue_unreachable_work(state, task, agent_id,
+                                           int(time.time() * 1000))
+        from serve import log_action
+        log_action(None, 'task_requeued_unreachable' if not parked
+                   else 'task_parked_unreachable',
+                   {'taskId': task_id, 'agent': agent_id,
+                    'unreachableBy': unreachable, 'parked': parked},
+                   authorized=True)
     a['task'] = None
     a['path'] = None
     a['pathIndex'] = 0

@@ -396,7 +396,8 @@ def _groups_look_like_gwt(text):
 def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
                description='', story_points=None, title=None, now_ms=None,
                assigned_to=None, lane=None, attendees=None,
-               facilitator_id=None, approved_tools=None, deliverable=None):
+               facilitator_id=None, approved_tools=None, deliverable=None,
+               source_files=None):
     """File a JIRA-style issue for team_id. Returns the issue record dict, or
     None if a required field is missing (team_id / issue_type / summary /
     feature / reporter_id), the issue type is unknown, or the team is unknown.
@@ -500,6 +501,12 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         # backlogRequests -> refinement -> queue -> task round trip.
         'attendees': _normalize_attendees(attendees),
         'facilitatorId': (facilitator_id or '').strip() or None,
+        # MEETING document access: repository-relative files the meeting's
+        # scribe must actually read (emitted as READ: agenda lines at
+        # grooming, expanded to inline source material by the meeting
+        # executor). Without this the scribe improvises -- the live failure
+        # was a review panel inventing infrastructure no code implements.
+        'sourceFiles': _normalize_source_files(source_files),
     }
     state.setdefault('issues', {})[key] = issue
     # Feed the backlog pipe: a backlogRequests record the refinement ceremony
@@ -548,6 +555,9 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         # _resolve_refinement's meeting branch).
         'attendees': _normalize_attendees(attendees),
         'facilitatorId': (facilitator_id or '').strip() or None,
+        # Same round trip as the issue record: the meeting groomer emits
+        # these as READ: agenda lines (see _queue_refined_meeting).
+        'sourceFiles': _normalize_source_files(source_files),
     }
     state.setdefault('backlogRequests', []).append(req)
     # Kick this team's refinement to be immediately due (next pass), not

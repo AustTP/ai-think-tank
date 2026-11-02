@@ -459,6 +459,13 @@ def _queue_refined_meeting(state, req, pending):
         # carry acceptanceCriteria onto their instructions; meetings get the
         # same contract.
         agenda += f"\n\nAcceptance criteria (the agenda items to walk and decide):\n{criteria}"
+    for source_path in (req.get('sourceFiles') or [])[:5]:
+        # Document access: each filed source file becomes a READ: directive the
+        # meeting executor expands to inline source material (see
+        # _meeting_source_material) -- the scribe reads the real file instead
+        # of improvising its contents (live failure: task-2876 invented
+        # tables, endpoints, and retry policies no code implements).
+        agenda += f"\nREAD: {source_path}"
     never = req.get('never')
     if never:
         agenda += f"\n\nNEVER:\n{never}"

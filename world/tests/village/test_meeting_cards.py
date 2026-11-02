@@ -141,6 +141,29 @@ class MeetingIssueFiling(unittest.TestCase):
         self.assertIsNone(req['attendees'])
         self.assertIsNone(req['facilitatorId'])
 
+    def test_file_issue_normalizes_source_files(self):
+        # Document access for meeting scribes (DEV-109 follow-on, task-2876):
+        # the filing's sourceFiles are deduplicated in order, capped at 5,
+        # non-strings dropped, and ride BOTH the issue record and the backlog
+        # request (the groomer emits them as READ: agenda lines).
+        state = _seed()
+        issue = sim.file_issue(
+            state, 'dev', 'meeting', 'Sprint retro', 'DEV', 'ben',
+            now_ms=1000,
+            source_files=['BUSINESS-PROCESSES.md', 'BUSINESS-PROCESSES.md',
+                          '  docs/notes.md  ', 7, '', 'a.md', 'b.md',
+                          'c.md', 'd.md', 'e.md', 'f.md'])
+        self.assertEqual(issue['sourceFiles'],
+                         ['BUSINESS-PROCESSES.md', 'docs/notes.md',
+                          'a.md', 'b.md', 'c.md'])
+        req = state['backlogRequests'][0]
+        self.assertEqual(req['sourceFiles'], issue['sourceFiles'])
+        # Absent filings carry None, not an empty list.
+        issue2 = sim.file_issue(state, 'dev', 'meeting', 'Retro two',
+                                'DEV', 'ben', now_ms=2000)
+        self.assertIsNone(issue2['sourceFiles'])
+        self.assertIsNone(state['backlogRequests'][1]['sourceFiles'])
+
     def test_file_issue_rejects_unknown_issue_type(self):
         state = _seed()
         self.assertIsNone(
@@ -268,6 +291,17 @@ class MeetingGrooming(unittest.TestCase):
         state = self._groom(description={'never': ['No spending decisions.']})
         self.assertIn('NEVER', state['workQueue'][0]['instructions'] or '')
 
+    def test_meeting_agenda_carries_read_directives(self):
+        # Document access: each filed source file becomes a READ: line the
+        # meeting executor expands to inline source material, so the scribe
+        # audits the real document instead of improvising its contents
+        # (task-2876 invented tables, endpoints, and retry policies).
+        state = self._groom(source_files=['BUSINESS-PROCESSES.md',
+                                          'docs/notes.md'])
+        agenda = state['workQueue'][0]['instructions'] or ''
+        self.assertIn('READ: BUSINESS-PROCESSES.md', agenda)
+        self.assertIn('READ: docs/notes.md', agenda)
+
     def test_meeting_grooming_prices_the_meeting_tier(self):
         state = self._groom()
         self.assertEqual(state['workQueue'][0]['budgetUsd'], 0.10)
@@ -365,6 +399,45 @@ class MeetingAssignment(unittest.TestCase):
         self.assertEqual(task['facilitatorId'], 'ada')
         self.assertEqual(task['attendees'], ['dev', 'ben'])
         self.assertFalse(state['agents']['ada']['offDuty'])
+
+    def test_assign_due_item_skips_agents_who_failed_the_walk(self):
+        # DEV-109: a card re-queued after a stuck-walk cancel carries
+        # _unreachableBy. A pin to one of those agents is dropped to the
+        # round-robin; the round-robin itself never re-picks them.
+        state = _seed()
+        state['agents']['ada']['offDuty'] = True
+        pick = {'title': 'Meeting: Sprint retro', 'room': 'pressoffice',
+                'taskType': 'meeting', 'facilitatorId': 'ada',
+                'attendees': ['dev', 'ben'],
+                'instructions': 'Convene the retro and write the minutes.',
+                'teamId': 'dev', 'notBefore': None,
+                '_unreachableBy': ['ada']}
+        grid, doors = sim._load_outdoor_geometry()
+        with mock.patch.object(sim, 'find_path',
+                               return_value=[{'x': 0, 'y': 0}]):
+            task = sim._assign_due_item(state, pick, True, grid, doors, 1000,
+                                        task_id_holder=[0])
+        self.assertIsNotNone(task)
+        # The pin to ada (unreachable) was dropped: ben is assignable instead
+        # -- ada stays off-duty because she was never woken for it.
+        self.assertEqual(task['assignedTo'], 'ben')
+        self.assertTrue(state['agents']['ada']['offDuty'])
+
+    def test_assign_due_item_waits_when_every_candidate_failed_the_walk(self):
+        state = _seed()
+        pick = {'title': 'Meeting: Sprint retro', 'room': 'pressoffice',
+                'taskType': 'meeting', 'facilitatorId': 'ada',
+                'attendees': ['dev', 'ben'],
+                'instructions': 'Convene the retro and write the minutes.',
+                'teamId': 'dev', 'notBefore': None,
+                '_unreachableBy': ['ben', 'ada', 'dev']}
+        grid, doors = sim._load_outdoor_geometry()
+        result = sim._assign_due_item(state, pick, True, grid, doors, 1000,
+                                      task_id_holder=[0])
+        # A non-issueKey pick yields None (the caller keeps it queued and
+        # retries); no task is created and nobody is woken into the wall.
+        self.assertIsNone(result)
+        self.assertEqual(state['tasks'], {})
 
     def test_meeting_completion_files_no_followup(self):
         # A meeting's minutes ARE the deliverable: completing one must
@@ -526,6 +599,74 @@ class MeetingExecutor(unittest.TestCase):
                 state, 'ada', {'taskType': 'meeting', 'room': 'pressoffice'})
         meeting_run.assert_called_once()
         workroom_run.assert_not_called()
+
+
+    def _run_capturing_user(self, task, source_dir=None):
+        """Run the meeting executor and return the user prompt's content,
+        with the process CWD temporarily moved into `source_dir` so READ:
+        paths resolve inside the (real) repository-root containment check."""
+        calls = []
+
+        def fake_call(model, messages, max_tokens):
+            calls.append((model, messages, max_tokens))
+            return _completion(_MINUTES)
+
+        previous_cwd = os.getcwd()
+        if source_dir is not None:
+            os.chdir(source_dir)
+        try:
+            with mock.patch.object(content._serve, '_task_budget_exhausted',
+                                   return_value=False), \
+                 mock.patch.object(content._serve, '_resolve_model_tier',
+                                   return_value='test-tier'), \
+                 mock.patch.object(content._serve, '_call_openrouter_sync',
+                                   side_effect=fake_call), \
+                 mock.patch.object(sim, '_store_content_result'):
+                content._run_meeting_content(_seed(), 'ada', task)
+        finally:
+            os.chdir(previous_cwd)
+        self.assertEqual(len(calls), 1)
+        return calls[0][1][1]['content']
+
+    def test_read_directive_expands_to_inline_source(self):
+        # The meeting's document access: a READ: line in the agenda makes the
+        # scribe prompt carry the REAL file text, so the panel audits the
+        # document instead of inventing it (task-2876's fabricated findings).
+        source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
+                                      dir=os.getcwd())
+        try:
+            doc = os.path.join(source_dir, 'BP.md')
+            with open(doc, 'w', encoding='utf-8') as handle:
+                handle.write('## BP-73 webhooks\nOne bounded POST, no retries.')
+            task = self._task()
+            task['instructions'] = 'Agenda: audit the doc.\nREAD: BP.md'
+            user = self._run_capturing_user(task, source_dir=source_dir)
+            self.assertIn('SOURCE MATERIAL', user)
+            self.assertIn('--- BP.md ---', user)
+            self.assertIn('One bounded POST, no retries.', user)
+        finally:
+            shutil.rmtree(source_dir, ignore_errors=True)
+
+    def test_read_directive_refuses_escape_and_marks_unreadable(self):
+        # Containment: a path resolving outside the repository root is
+        # refused inline (never a crash); a missing file is marked unreadable.
+        source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
+                                      dir=os.getcwd())
+        try:
+            task = self._task()
+            task['instructions'] = ('Agenda: audit.\nREAD: ../outside.txt\n'
+                                    'READ: missing.md')
+            user = self._run_capturing_user(task, source_dir=source_dir)
+            self.assertIn('SOURCE MATERIAL', user)
+            self.assertIn('refused (outside the repository)', user)
+            self.assertIn('unreadable', user)
+            self.assertNotIn('--- ../outside.txt ---', user)
+        finally:
+            shutil.rmtree(source_dir, ignore_errors=True)
+
+    def test_no_read_directives_leaves_the_prompt_alone(self):
+        user = self._run_capturing_user(self._task())
+        self.assertNotIn('SOURCE MATERIAL', user)
 
 
 if __name__ == '__main__':

@@ -70,6 +70,24 @@ def _normalize_attendees(attendees):
     return None
 
 
+def _normalize_source_files(source_files):
+    """Normalize a meeting card's document-access list: repository-relative
+    paths the scribe must read, deduplicated in given order, capped at 5.
+    Non-strings and empties dropped; anything else is None."""
+    if not isinstance(source_files, (list, tuple)):
+        return None
+    out = []
+    for entry in source_files:
+        if not isinstance(entry, str):
+            continue
+        path = entry.strip()
+        if path and path not in out:
+            out.append(path)
+        if len(out) >= 5:
+            break
+    return out or None
+
+
 def _meeting_team_members(state, team_id):
     """The owning team's people: its director, its scrum master, and the
     director's direct reports -- the same pool the team's own ceremonies

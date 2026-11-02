@@ -305,6 +305,18 @@ def queue_work(state, items):
             'reportPath': item.get('reportPath') or None,
             # Phase E addendum: a peer-rejected fix returns to the original author.
             'assignedTo': item.get('assignedTo') or None,
+            # Re-issue provenance (stale/credit-paused/unreachable sweeps
+            # re-issue the same card): survives the round trip so the new task
+            # traces to the original and dedup can see the link. Same class of
+            # whitelist gap as 'distill'/'checklist'.
+            'reissueOf': item.get('reissueOf') or None,
+            # DEV-109: agents who already failed this card's walk (stuck
+            # cancel, tracked by _requeue_unreachable_work). Assignment skips
+            # them so a stranded body is never re-picked into the same wall.
+            '_unreachableBy': list(item.get('_unreachableBy') or []),
+            # Sprint rollover pin (a re-planned card's fresh owner) -- consumed
+            # by _assign_due_item's pin logic, so it must survive the round trip.
+            '_reassignedTo': item.get('_reassignedTo') or None,
             # An explicit lead/player pin: the named worker is the owner, so
             # _assign_due_item wakes them and waits rather than round-robins.
             'directedTo': bool(item.get('directedTo')),
