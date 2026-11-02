@@ -248,13 +248,19 @@ class GovernanceEscalationGap(SimIsolation):
         self.assertTrue(sim._sm_replan_stale_work(state, task, 1_000_000))
         self.assertEqual(state['backlogRequests'][0]['filedBy'], 'd1')
 
-    def test_sm_replan_stale_work_dedup_drops(self):
+    def test_sm_replan_stale_work_dedup_annotates_and_routes(self):
+        # Same live finding as the help-signal dedup: the pending request is
+        # usually the one that born the failing card; annotate, never drop.
         state = {'teams': [{'id': 't1', 'directorId': 'd1'}],
                  'products': {'prd-1': {'teamId': 't1'}},
                  'backlogRequests': [{'status': 'pending', 'room': 'pressoffice',
                                       'title': 'Wedged card'}]}
-        task = {'room': 'pressoffice', 'productId': 'prd-1', 'title': 'Wedged card'}
-        self.assertFalse(sim._sm_replan_stale_work(state, task, 1_000_000))
+        task = {'room': 'pressoffice', 'productId': 'prd-1', 'title': 'Wedged card',
+                'id': 'task-9'}
+        self.assertTrue(sim._sm_replan_stale_work(state, task, 1_000_000))
+        self.assertEqual(len(state['backlogRequests']), 1)
+        self.assertEqual(state['backlogRequests'][0]['_staleReplan'],
+                         [{'task': 'task-9', 'at': 1_000_000}])
 
     # --- _sm_help_stuck_worker -----------------------------------------------
     def test_sm_help_stuck_worker_bad_room(self):
@@ -268,13 +274,36 @@ class GovernanceEscalationGap(SimIsolation):
         self.assertTrue(sim._sm_help_stuck_worker(state, task, 1_000_000))
         self.assertEqual(state['backlogRequests'][0]['filedBy'], 'd1')
 
-    def test_sm_help_stuck_worker_dedup_drops(self):
+    def test_sm_help_stuck_worker_dedup_annotates_and_routes(self):
+        # Found live 2026-11-02: an identical PENDING request is usually the
+        # one that BORN the failing card, and the dedup swallowed the help
+        # signal -- every worker_stuck_help row in the log had routed=False.
+        # The signal must SURVIVE the dedup as an annotation on the pending
+        # request, with the refinement kicked so the SM convenes now.
         state = {'teams': [{'id': 't1', 'directorId': 'd1'}],
                  'products': {'prd-1': {'teamId': 't1'}},
                  'backlogRequests': [{'status': 'pending', 'room': 'pressoffice',
                                       'title': 'Stuck card'}]}
-        task = {'room': 'pressoffice', 'productId': 'prd-1', 'title': 'Stuck card'}
-        self.assertFalse(sim._sm_help_stuck_worker(state, task, 1_000_000))
+        task = {'room': 'pressoffice', 'productId': 'prd-1', 'title': 'Stuck card',
+                'id': 'task-9', 'assignedTo': 'piper'}
+        self.assertTrue(sim._sm_help_stuck_worker(state, task, 1_000_000))
+        self.assertEqual(len(state['backlogRequests']), 1)  # no duplicate filed
+        flagged = state['backlogRequests'][0]['_stuckHelp']
+        self.assertEqual(flagged, [{'agent': 'piper', 'at': 1_000_000, 'task': 'task-9'}])
+
+    def test_sm_help_stuck_worker_annotation_caps_at_three(self):
+        state = {'teams': [{'id': 't1', 'directorId': 'd1'}],
+                 'backlogRequests': [{'status': 'pending', 'room': 'pressoffice',
+                                      'title': 'Stuck card',
+                                      '_stuckHelp': [{'agent': 'a', 'at': 1, 'task': 'x'},
+                                                     {'agent': 'b', 'at': 2, 'task': 'x'},
+                                                     {'agent': 'c', 'at': 3, 'task': 'x'}]}]}
+        task = {'room': 'pressoffice', 'teamId': 't1', 'title': 'Stuck card',
+                'id': 'task-9', 'assignedTo': 'piper'}
+        self.assertTrue(sim._sm_help_stuck_worker(state, task, 4_000_000))
+        history = state['backlogRequests'][0]['_stuckHelp']
+        self.assertEqual(len(history), 3)
+        self.assertEqual(history[-1], {'agent': 'piper', 'at': 4_000_000, 'task': 'task-9'})
 
     # --- _worker_stuck_help_signal -------------------------------------------
     def test_worker_stuck_help_signal_missing_agent(self):

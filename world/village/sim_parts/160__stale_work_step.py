@@ -279,11 +279,22 @@ def _sm_replan_stale_work(state, task, now_ms):
     filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
     if not filer:
         filer = team.get('directorId') or team.get('id')
+    title = (task.get('title') or 'stale work')[:120]
+    # Same dedup blind spot as _sm_help_stuck_worker (found live 2026-11-02):
+    # an identical PENDING request is often the one that born the card; the
+    # dedup must not swallow the re-plan signal, it must annotate.
+    for r in (state.get('backlogRequests') or []):
+        if (r.get('status') == 'pending' and r.get('room') == room
+                and r.get('title') and title.lower() == r['title'].lower()):
+            history = r.setdefault('_staleReplan', [])
+            history.append({'task': task.get('id') or '', 'at': int(now_ms)})
+            del history[:-3]
+            kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
+            return True
     reason = ('Swept as stale in-flight work after repeated re-issues; the scrum '
               'master decides whether this still needs doing. '
               'ABS_REPLAN: this card no longer resolves on its own.')
-    if not file_work_request(state, filer, (task.get('title') or 'stale work')[:120],
-                             room, reason=reason):
+    if not file_work_request(state, filer, title, room, reason=reason):
         return False
     kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
     return True
@@ -307,11 +318,29 @@ def _sm_help_stuck_worker(state, task, now_ms):
     filer = _escalation_scrum_master_for(state, team.get('directorId') or team.get('id'))
     if not filer:
         filer = team.get('directorId') or team.get('id')
+    title = (task.get('title') or 'stuck work')[:120]
+    # An identical PENDING request already on the board is usually the very
+    # request that BORN the card this worker is failing on (found live
+    # 2026-11-02: every worker_stuck_help row in the log had routed=False --
+    # the pending verify request deduped its own card's help signal away, and
+    # three verify cards cycled with no SM involvement). Dropping the signal
+    # is right for spam, wrong for the information: the SM must learn the
+    # worker is stuck. Annotate the pending request instead of dropping, then
+    # kick the refinement so the SM's ceremony convenes NOW.
+    for r in (state.get('backlogRequests') or []):
+        if (r.get('status') == 'pending' and r.get('room') == room
+                and r.get('title') and title.lower() == r['title'].lower()):
+            history = r.setdefault('_stuckHelp', [])
+            history.append({'agent': task.get('assignedTo') or '',
+                            'at': int(now_ms),
+                            'task': task.get('id') or ''})
+            del history[:-3]
+            kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
+            return True
     reason = ('A worker is stuck: repeated content-execution failures on this card. '
               'The scrum master decides whether this still needs doing, or whether '
               'the worker needs help / a different assignment.')
-    if not file_work_request(state, filer, (task.get('title') or 'stuck work')[:120],
-                             room, reason=reason):
+    if not file_work_request(state, filer, title, room, reason=reason):
         return False
     kick_refinement_now(state, team.get('directorId') or team.get('id'), now_ms)
     return True
