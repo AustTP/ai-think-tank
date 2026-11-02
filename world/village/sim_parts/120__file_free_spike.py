@@ -661,7 +661,9 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                         'is the same work; accept only if it is genuinely new.')
         except Exception:
             pass  # retrieval is a hint; a failure never blocks grooming
-        instructions += (" Turn it into a real card (the card type says story, spike, or research) "
+        instructions += (f" Turn it into a real card (the card type is {card_type}; "
+                         "a meeting card schedules a real meeting with the named "
+                         "attendees -- it is a legitimate deliverable, not filler) "
                          "or groom it back to the requester because it's not ready / not needed / "
                          "doesn't fit the roadmap (reject). "
                          + ABSOLUTE_ZERO_SCOPING_GUIDANCE)
