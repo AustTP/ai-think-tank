@@ -845,9 +845,15 @@ def _extract_youtube_frames(url, vid, seconds_list):
     for seconds in seconds_list:
         rel = _youtube_frame_rel(vid, seconds)
         target = _safe_library_path(rel)
+        data = None
         if target and os.path.isfile(target):
-            with open(target, 'rb') as fh:
-                frames[seconds] = fh.read()
+            try:
+                with open(target, 'rb') as fh:
+                    data = fh.read()
+            except OSError:
+                data = None
+        if data:  # a zero-byte file is NOT a captured frame -- re-capture
+            frames[seconds] = data
         else:
             missing.append(seconds)
     if not missing:
@@ -890,7 +896,12 @@ def _extract_youtube_frames(url, vid, seconds_list):
             if target:
                 try:
                     os.makedirs(os.path.dirname(target), exist_ok=True)
-                    _write_file(target, data)
+                    # BINARY write: _write_file is text-mode and a bytes body
+                    # would raise inside f.write, leaving a zero-byte file
+                    # that then poisons the cache (the next call would "reuse"
+                    # the empty file as a captured frame).
+                    with open(target, 'wb') as fh:
+                        fh.write(data)
                 except Exception:
                     pass  # filing is best-effort; the frame still returns
             frames[seconds] = data
@@ -994,6 +1005,44 @@ async def youtube_frames(request: Request):
                {'videoId': vid, 'captured': sum(1 for f in out_frames if f.get('captured')),
                 'reviewed': reviewed}, authorized=authorized)
     return JSONResponse({'ok': True, 'url': url, 'videoId': vid, 'frames': out_frames})
+
+
+@app.post('/api/vision-describe')
+async def vision_describe(request: Request):
+    """The general agent-callable vision tool: one image, one question, the
+    vision tier's honest description. Resolves the tier server-side (agents
+    never need a model slug), applies the same anti-instruction guard as the
+    player-photo review, and rate-limits + agent-key-verifies like every
+    other agent endpoint. Body: {agentId, imageBase64, question?}. The
+    response is {ok, reply} or {ok: false, note} -- a failed call is a
+    finding to report, never a reason to invent what the image shows."""
+    body = await request.json()
+    agent_id = body.get('agentId', 'unknown')
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'vision-describe'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is not True:
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    image_b64 = (body.get('imageBase64') or '').strip()
+    if not image_b64:
+        return JSONResponse({'error': 'imageBase64 is required (raw base64 PNG bytes)'}, status_code=400)
+    # Accept a data URL too, since screenshot tools sometimes return one.
+    if image_b64.startswith('data:'):
+        image_b64 = image_b64.split(',', 1)[-1]
+    try:
+        data = base64.b64decode(image_b64, validate=True)
+    except Exception:
+        return JSONResponse({'error': 'imageBase64 is not valid base64'}, status_code=400)
+    if not data or len(data) > 12 * 1024 * 1024:
+        return JSONResponse({'error': 'image is empty or over the 12 MiB cap'}, status_code=400)
+    question = (body.get('question') or '').strip()[:500]
+    ok, text = await asyncio.to_thread(_vision_describe_frame, data, question, 'an agent-supplied image')
+    log_action(agent_id, 'vision_describe',
+               {'bytes': len(data), 'ok': ok, 'question': question[:120]},
+               authorized=True)
+    if ok:
+        return JSONResponse({'ok': True, 'reply': text})
+    return JSONResponse({'ok': False, 'note': text})
 
 
 @app.get('/api/sandbox-backups')

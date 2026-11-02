@@ -4,6 +4,7 @@
 # parsing/capping, library-file caching (no re-download when frames exist),
 # the fail-closed frame results (None never becomes a described frame), and
 # the endpoint's validation paths.
+import base64
 import os
 import sys
 import tempfile
@@ -146,3 +147,112 @@ class FramesEndpointValidation(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VisionDescribeEndpoint(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        serve.init_db()
+
+    def _post(self, body, key='k'):
+        import asyncio
+
+        class Req:
+            def __init__(self, payload):
+                self._payload = payload
+                self.headers = {'X-Agent-Key': key}
+
+            async def json(self):
+                return self._payload
+        return asyncio.run(serve.vision_describe(Req(body)))
+
+    def test_requires_image_and_agent_key(self):
+        with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True):
+            resp = self._post({'agentId': 'theo'})
+        self.assertEqual(resp.status_code, 400)
+        with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=False):
+            resp = self._post({'agentId': 'theo', 'imageBase64': 'AAAA'})
+        self.assertEqual(resp.status_code, 401)
+
+    def test_bad_base64_rejected_before_any_model_call(self):
+        with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, '_vision_describe_frame',
+                                        side_effect=AssertionError('model must not be called')):
+            resp = self._post({'agentId': 'theo', 'imageBase64': 'not-base64!'})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_data_url_prefix_is_stripped_and_reply_returned(self):
+        png = base64.b64encode(b'PNGBYTES').decode()
+        with unittest.mock.patch.object(serve, 'check_rate_limit', return_value=True), \
+             unittest.mock.patch.object(serve, 'verify_agent_key', return_value=True), \
+             unittest.mock.patch.object(serve, '_vision_describe_frame',
+                                        return_value=(True, 'a dark nav bar')) as vd:
+            resp = self._post({'agentId': 'theo', 'imageBase64': 'data:image/png;base64,' + png})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.body and __import__('json').loads(resp.body).get('reply'),
+                         'a dark nav bar')
+        self.assertEqual(vd.call_args[0][0], b'PNGBYTES')
+
+
+class ExtractedFramesAreFiledIntact(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self._lib = unittest.mock.patch.object(
+            serve, '_safe_library_path',
+            side_effect=lambda rel: os.path.join(self.tmp, 'library', rel))
+        self._lib.start()
+        self.addCleanup(self._lib.stop)
+        self.addCleanup(self._cleanup)
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_frame_bytes_land_on_disk_untouched(self):
+        # Regression: the first cut filed frames through the text-mode
+        # _write_file helper -- f.write(bytes) raised inside the try, leaving
+        # zero-byte files that the cache then treated as captured frames.
+        vid = '1v7ldJiyH-Y'
+        png = b'\x89PNG-fake-bytes-123'
+
+        def fake_run(cmd, capture_output, timeout):
+            if '-o' in cmd:  # yt-dlp: materialize its -o output template
+                with open(cmd[cmd.index('-o') + 1].replace('%(ext)s', 'mp4'), 'wb') as fh:
+                    fh.write(b'FAKEVIDEO')
+            elif '-ss' in cmd:
+                with open(cmd[-1], 'wb') as fh:  # ffmpeg's output path is last
+                    fh.write(png)
+            class P:
+                returncode = 0
+            return P()
+
+        def fake_bin(names):
+            return '/bin/true'
+
+        real_isfile = os.path.isfile
+
+        def fake_isfile(path):
+            return path.endswith('video.mp4') or real_isfile(path)
+        with unittest.mock.patch.object(serve, '_find_local_bin', side_effect=fake_bin), \
+             unittest.mock.patch.object(serve.subprocess, 'run', side_effect=fake_run), \
+             unittest.mock.patch.object(serve.os.path, 'isfile', side_effect=fake_isfile):
+            frames = serve._extract_youtube_frames('https://youtu.be/' + vid, vid, [33])
+        self.assertEqual(frames[33], png)
+        disk = open(os.path.join(self.tmp, 'library', serve._youtube_frame_rel(vid, 33)), 'rb').read()
+        self.assertEqual(disk, png)
+
+    def test_zero_byte_filed_frame_is_not_treated_as_cached(self):
+        # A zero-byte frame on disk must be re-captured, not reused.
+        vid = '1v7ldJiyH-Y'
+        target = os.path.join(self.tmp, 'library', serve._youtube_frame_rel(vid, 60))
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        open(target, 'wb').close()  # zero bytes
+
+        def fake_bin(names):
+            return None  # no tools -> missing frames record None
+        with unittest.mock.patch.object(serve, '_find_local_bin', side_effect=fake_bin):
+            frames = serve._extract_youtube_frames('https://youtu.be/' + vid, vid, [60])
+        self.assertEqual(frames, {60: None})
