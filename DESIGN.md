@@ -146,6 +146,21 @@ never stored separately. Scrum masters are designated per-team and required
 only when the team reaches `SCRUM_MASTER_MIN_TEAM_SIZE` (default 4); smaller
 teams run with the director standing in as facilitator.
 
+### Village tier (regional VP)
+
+A village is the top-level identity and memory boundary; the default village is
+`main`. Each village has one appointed authority, the **regional VP** (role
+`regional_vp`; state keys keep the historic names `villageChief: True` +
+`chiefOfVillage: <villageId>`; the appointing route stays
+`/api/villages/chief`). A regional VP sits between the chief of staff and the
+village's senior directors: the VP reviews the village's large asks, routes
+pieces to its senior teams, and re-parents the village's senior directors when
+appointed. The tier is installed at village creation, backfilled on the tick
+when a village has none, and renamed twice in one day as the org language
+settled (village chief of staff -> regional manager -> regional VP). Tier
+membership is the teams row (`isVillageChief`-style marker), so the emergent
+subdirector classification stays correct as VPs are added.
+
 ---
 
 ## 4. Simulation and Task Lifecycle
@@ -184,17 +199,29 @@ epoch timestamp, fails closed on anything unparseable, rejects past times, and
 caps the horizon at 366 days so a misparsed date can't sit in the queue for
 years.
 
-### Dependency-gated scheduling
+### Task dependencies (the DAG)
 
 A queued item (or a scheduled research topic / one-off) can carry a
-`dependsOn` / `depends_on_task` task id: even once its `notBefore` time
-passes, the item is NOT assigned until the referenced task reaches `done`
-in the durable task mirror (`_work_item_dependency_met`). The dependency
-not landing is "not work yet" — the idle gate treats a gated item as not
-due, so the think tank spends nothing waiting, and the assignment loop never
-hands a gated card to an agent. Landing a task auto-clears any
-dependency-blocks keyed on it, so a composed "run X once the dependency
-ships" pipeline resolves itself without a manual kick.
+`dependsOn` / `depends_on_task`: either a single task id (the historic chain
+form, read back unchanged) or a list of ids. Even once its `notBefore` time
+passes, the item is NOT assigned until EVERY referenced task has reached
+`done` in the durable task mirror (`_work_item_dependency_met` — join
+semantics, which is what makes the structure a DAG rather than a chain). A
+dependency not landing is "not work yet": the idle gate treats a gated item
+as not due, so the think tank spends nothing waiting, and the assignment loop
+never hands a gated card to an agent. A failed predecessor never releases a
+join — only `done` lands.
+
+The durable task record is the only place an edge is born
+(`_prune_task_dep_cycles` in the task-creation path): self-edges are dropped,
+and any edge that would close a directed cycle is pruned (the walker
+`_dependency_would_cycle` traverses the normalized graph, so historic
+single-id records participate). A pruned join is still a scheduled card; a
+deadlock is not. `queue_once` and `POST /api/intent/schedule-once` accept
+`dependsOnTask` as one id or a list. Landing a task auto-clears
+dependency-blocks keyed on it (`_auto_clear_dependency_blocks`), and the
+loop guard walks each surviving edge separately so an agent still blocked on
+another story's dependency is not woken by one landing edge.
 
 ### Idle gate
 
@@ -254,6 +281,22 @@ with a risk floor of 1.0 (`blocked command`, `blocked pipeline step`) are
 HUMAN-ONLY — skipped before any JEV call. Resolvable kinds get JEV with a
 15-minute cooldown between re-asks and a 6-attempt cap before they join the
 human-only pool. Fixes the prior 204,000-request escalation storm.
+
+### URL reputation pre-gate
+
+Before JEV classifies a browser or `api_call` request to an external URL, the
+tank consults OUTSIDE opinion: RDAP registration age, the URLhaus abuse feed,
+VirusTotal, and Google Safe Browsing. The composite lands in three bands —
+`trusted` (old domain, clean feeds; plain GETs pass without JEV),
+`checkable` (too new or no keyed sources armed; the JEV gate decides as
+before), and `untrusted` (flagged feed or flagged scan; the request is
+refused). Writes never ride reputation — a trusted URL's POST still sees the
+full JEV gate. Verdicts cache 24 hours per host, keyed by whether the caller
+held keys, so a keyless probe cannot inherit a keyed verdict or vice versa.
+The keyed lookups are budgets, not free: Bank-accounted, day-keyed quotas
+(VirusTotal 400/day with >=15s spacing, Safe Browsing 10,000/day) that SKIP
+a source for the rest of the UTC day when spent — the score degrades
+gracefully and the verdict notes the skipped source.
 
 ---
 
@@ -537,6 +580,12 @@ Usage the provider cannot price is recorded as unresolved, and
 `UNPRICED_USAGE_POLICY=block` (the default) holds that task's model budget
 until an operator resolves the receipt.
 
+The URL-reputation lookups sit in the same accounting but on their own
+day-keyed call quotas (`VIRUSTOTAL_DAILY_BUDGET`, `SAFEBROWSING_DAILY_BUDGET`)
+rather than the monthly dollar cap: they are free-tier APIs whose scarce
+resource is calls per day, not dollars. A spent quota skips its source for
+the remainder of the UTC day.
+
 ---
 
 ## 9. Security Architecture
@@ -560,6 +609,25 @@ Session-based auth (PBKDF2 password hash, HttpOnly cookie) for the player.
 Agent-key HMAC for agent-server calls. `/api/chat` requires either a valid
 session OR a valid agent key (so server-to-server loopback works).
 
+### Outbound webhooks
+
+The inbound webhook channels have an outbound mirror. A webhook is one
+subscribed URL with an optional shared secret and a list of event patterns
+(case-insensitive substrings of action-log kinds; a bare `*` matches
+everything, an empty list matches nothing). When an action-log kind matches,
+the tank POSTs `application/json` (`kind`, `at`, `agent`, `details`) with
+`X-Tank-Event: <kind>` and, when a secret is set,
+`X-Tank-Signature: sha256=<hex hmac-sha256(body, secret)>` over the exact
+posted bytes — the receiver authenticates without trusting the transport.
+Delivery is one bounded POST (5s timeout, 64KB body cap, 8-webhook fan-out),
+no retries: a retry loop on the action-log hot path would turn a slow
+receiver into an outage of the logger. Targets must resolve to public hosts
+(the SSRF resolution primitive at registration AND at every delivery, since
+DNS is not stable). Delivery records are logged under self-kinds the emit
+skips, so an echoing receiver cannot recurse the tank into itself. The
+registry lives in the settings table and the API returns `hasSecret`, never
+the secret.
+
 ---
 
 ## 10. Data Model (key tables)
@@ -578,6 +646,14 @@ session OR a valid agent key (so server-to-server loopback works).
 | `sessions` | Player login sessions | 7-day expiry |
 | `stm_sessions` / `stm_messages` | Conversation STM per Telegram chat (rolling summary + per-turn rows, §15) | Expire with the session (`STM_TTL_HOURS`) |
 | `ltm_memories` | Typed long-term memories distilled from the conversation (§15) | Forever (global to the player) |
+
+State-blob stores that are not tables: `bookmarks` (the shared link library,
+global plus per-team), `knowledge_sources` (append-only truths and read-only
+template repositories, global plus per-team), and the settings-table key
+`outbound_webhooks` (the outbound subscription registry; secrets stored,
+never returned). The URL-reputation verdict cache (`url_trust_cache`) also
+lives in the settings table, keyed per host with a 24-hour TTL and a
+keyed/kid-stamped entry.
 
 ---
 
@@ -948,14 +1024,15 @@ the 12-senior cap) the walls, in the order they break:
    of a rebuild per path search) buy headroom but do not remove the wall.
 3. **The admin's span.** Solved by ORG DESIGN (operator direction,
    2026-11-01): twelve senior directors ALL TOGETHER — the cap is global,
-   not per village — and per-village chiefs of staff (an appointed
-   authority tier: `villageChief: True` + `chiefOfVillage: <villageId>`,
-   `director` = the admin) sitting between theo and each village's senior
-   directors. Growth beyond 12 senior directors is a new village with its
-   own chief, never a 13th senior director. A chief reviews large asks by
+   not per village — and per-village regional VPs (the appointed
+   authority tier: role `regional_vp`, state keys keep the historic names
+   `villageChief: True` + `chiefOfVillage: <villageId>`, `director` = the
+   admin) sitting between theo and each village's senior directors. Growth
+   beyond 12 senior directors is a new village with its own VP, never a 13th
+   senior director. A VP reviews large asks by
    routing pieces to their village's senior teams; founding subdirectors
-   is not the chief's tool (senior directors grow layers below
-   themselves). A chief's team-leading children are senior directors by
+   is not the VP's tool (senior directors grow layers below
+   themselves). A VP's team-leading children are senior directors by
    definition — the teams row is the tier marker, so the emergent
    subdirector classification stays correct as chiefs are added.
 4. **Model throughput.** 1,000 agents' decisions, ceremonies, and reviews

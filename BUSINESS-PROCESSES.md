@@ -59,6 +59,39 @@ Three source documents were used:
 This is a dated change record. Git history carries commit detail; this section
 states only what changed in the operating model.
 
+**2026-11-02**
+
+- Task dependencies became a DAG: `dependsOn` accepts one task id or a list, a
+  gated card releases only when EVERY predecessor lands, and self-edges plus
+  closing edges are pruned where the durable task record is born. See BP-07.
+- A URL reputation score sits in front of the JEV classify gate for browser and
+  `api_call` requests: RDAP domain age, URLhaus, VirusTotal, and Safe Browsing,
+  banded trusted / checkable / untrusted. Trusted reads pass without JEV;
+  untrusted requests are refused; writes never ride reputation. See BP-70 and
+  BP-52.
+- The keyed reputation sources are Bank-accounted, day-keyed quotas:
+  VirusTotal 400/day with at least 15s between calls, Safe Browsing 10,000/day.
+  A spent quota skips its source for the rest of the UTC day and the verdict
+  notes the skipped source.
+- The ask lane auto-allowlists links the player sends for the reply task, and a
+  shared bookmarks library (global plus per-team) is curated by the player and
+  admin agents. See BP-71.
+- Knowledge sources: append-only truth documents and read-only template
+  repositories (GitHub repos or granted local folders), global or per-team,
+  registered by the player or an admin agent. See BP-72.
+- Outbound webhooks: a subscription registry that POSTs signed action-log
+  records to external receivers. See BP-73.
+- The village authority tier is renamed regional VP (role `regional_vp`). The
+  appointing route `/api/villages/chief` and the `villageChief` /
+  `chiefOfVillage` state keys keep their historic names.
+- The shipped MCP registry is restored with an operator-local override layer
+  (`mcp_servers.local.json`, gitignored), a read-only GitHub repo tool joins
+  the toolset, and GitHub's official remote MCP server is registered,
+  bearer-authenticated by `GITHUB_TOKEN`.
+- `/api/villages/chief` returns 400 on a malformed body instead of a 500.
+- `.env` values may be quoted; the server's loader strips one matching quote
+  pair, so `source .env` no longer trips on unquoted pipe characters.
+
 **2026-10-25**
 
 - Large requests now pass a durable plan approval gate before any filing or
@@ -416,7 +449,10 @@ Owner request
 | BP-67 | Agent trace visibility | Ops page request | On demand | Ops page | Per-agent timeline |
 | BP-68 | Agent writing style | Every prose model call | Per call | Serve | Plain text without slop or dash marks |
 | BP-69 | Read-only live project inspection | Director or chief ask | On demand | Serve | Bounded code, git, and task evidence |
-
+| BP-70 | URL reputation pre-gate | Browser or api_call to an external URL | Per URL | Reputation scorer, Bank quotas | Verdict band, 24h cache entry, quota ledger |
+| BP-71 | Bookmarks library | Player seed or agent ask | On demand | Player, admin agents | Shared links, global plus per-team |
+| BP-72 | Knowledge sources | Player or admin registration | On demand | Player, admin agents | Truth documents, template pointers |
+| BP-73 | Outbound webhooks | Matching action-log kind | Per event | Serve | Signed POST, delivery record |
 ## 4. Core delivery processes
 
 ### BP-01 Player request intake and routing
@@ -633,7 +669,9 @@ on gated work.
 **Due checks.**
 
 - `notBefore` must have passed.
-- `dependsOn` / `depends_on_task` must be `done` in the durable task mirror.
+- `dependsOn` / `depends_on_task` (one task id or a list) must ALL be `done` in
+  the durable task mirror -- join semantics. The durable task record prunes
+  self-edges and closing edges at birth, so no gated card waits on a cycle.
 - Tier throttling may defer low-value work.
 - Reading-lane work waits for its lane to be free.
 - A team in an active sprint gets its own items first.
@@ -2127,12 +2165,30 @@ approval.
 - A browse call conflicts with an active VPN exit and is refused.
 - Status polling and exit inventory are operator-visible.
 
-**Controls.** SSRF, redirect re-check, category policy, allowlist, JEV, isolated
+**URL reputation (2026-11-02).**
+
+- Before the category gate classifies an external URL, the tank consults
+  outside reputation: RDAP domain age, the URLhaus abuse feed, VirusTotal, and
+  Google Safe Browsing, combined into one verdict: `trusted`, `checkable`, or
+  `untrusted`.
+- A `trusted` verdict lets a plain GET through without JEV; `checkable`
+  defers to the normal gate; `untrusted` refuses. Writes never ride
+  reputation: POST/PUT/DELETE and anything state-changing always sees the
+  full gate.
+- Verdicts cache 24 hours per host, stamped by whether the caller held keys,
+  so a keyless probe cannot inherit a keyed verdict or the reverse.
+- The keyed sources are quotas, not free: VirusTotal 400/day with at least
+  15s between calls, Safe Browsing 10,000/day, both day-keyed in the Bank's
+  budget accounting. A spent quota skips its source for the rest of the UTC
+  day; the score degrades to the remaining sources and the verdict notes it.
+
+**Controls.** SSRF, redirect re-check, category policy, allowlist, URL reputation, JEV, isolated
 network, egress proxy, temporary egress grants, per-agent browser profile,
 Safari cookie sync, read-only social policy, VPN conflict check.
 
 **Records.** `browse_policy.json`, egress grants, action log, decision tape,
-`safari-cookies.json`, browser profile directory.
+`safari-cookies.json`, browser profile directory, `url_trust_cache` settings
+entries.
 
 ### BP-52.1 Owner-identity data and retention
 
@@ -3095,6 +3151,149 @@ chief-only artifact search, no secret access, audit row.
 
 **Records.** Action log `live_read` entries. No new table.
 
+### BP-70 URL reputation pre-gate
+
+**Last checked:** 2026-11-02
+
+**Purpose.** Let clean reads through the egress gate without burning JEV
+calls, and refuse requests to URLs the outside world already flags, while
+keeping every write fully gated.
+
+**Trigger.** A browser action or `api_call` targets an external URL that is
+not already allowlisted.
+
+**Steps.**
+
+1. The composite scorer (`world/url_trust.py`) consults, in order: RDAP
+   registration age (old domains score toward trusted), the URLhaus abuse
+   feed, VirusTotal, and Google Safe Browsing.
+2. The result is banded `trusted`, `checkable`, or `untrusted`. `trusted`
+   requires a real domain-age signal; a missing or unparseable age can only
+   produce `checkable` or `untrusted`, never `trusted`.
+3. A `trusted` band auto-allows a plain GET. `untrusted` refuses the request
+   and logs it. `checkable` falls through to the JEV classify gate exactly as
+   before this process existed.
+4. Writes never ride reputation: any state-changing method sees the full JEV
+   gate regardless of band.
+5. The verdict caches for 24 hours per host in the settings table
+   (`url_trust_cache`), stamped with whether the caller held keys, so a
+   keyless probe cannot inherit a keyed verdict or the reverse.
+6. Keyed sources are day-keyed Bank-accounted quotas (VirusTotal 400/day,
+   at least 15s spacing; Safe Browsing 10,000/day). A spent quota skips its
+   source until the next UTC day; the score uses what remains and the
+   verdict says which sources were skipped.
+
+**Controls.** Fail-closed bands, keyed-stamp cache separation, day-keyed
+quotas, write-never-rides-reputation, existing SSRF and allowlist gates
+unchanged and still applied first.
+
+**Records.** `url_trust_cache` settings entries, quota ledger, action log,
+decision tape for everything that still reaches JEV.
+
+### BP-71 Bookmarks library
+
+**Last checked:** 2026-11-02
+
+**Purpose.** A shared link library the tank curates together, so trusted
+starting points survive individual tasks and conversations.
+
+**Trigger.** The player seeds or curates; agents read through the ask lane.
+
+**Steps.**
+
+1. The player (or an admin agent through the endpoint) adds, lists, and
+   deletes bookmarks through `/api/bookmarks`. Storage is the state blob;
+   the library stays in the dozens, not the thousands.
+2. Each bookmark carries a scope: `global`, or a team id. Global bookmarks
+   are visible to every team; team bookmarks to that team.
+3. Agents reach the same store through the `bookmarks` ask-lane tool: they
+   read global plus their own team's links and add or delete links for teams
+   they belong to. Admin agents act as the player's delegate on globals.
+4. URLs are validated as real http(s) links with a usable host at every
+   write.
+5. A link the player sends inside an ask-lane request is auto-allowlisted
+   for that reply task, so a conversation never stalls on the egress gate.
+
+**Controls.** Player-or-admin endpoint gate, tool-side team scoping, URL
+shape validation, action-log rows.
+
+**Records.** `bookmarks` state list, action log.
+
+### BP-72 Knowledge sources
+
+**Last checked:** 2026-11-02
+
+**Purpose.** Give teams shared grounding material: documents the team treats
+as sources of truth, and template repositories to build around, without
+letting either decay into unattributed edits.
+
+**Trigger.** The player or an admin agent registers a source; agents read
+and append through the ask lane.
+
+**Steps.**
+
+1. Registration (`POST /api/knowledge`) takes a kind (`truth` or
+   `template`), a scope (`global` or a team id), and an origin: a GitHub
+   repo URL, a local folder that sits INSIDE a player-granted file scope, or
+   inline seed text.
+2. Truth documents are append-only. Agents add attributed entries with their
+   agent id and a timestamp; nobody rewrites an existing entry.
+3. Templates are read-only pointers: agents study the template's structure
+   and build AROUND it in their own workspace; the template itself stays
+   pristine.
+4. Agents list, read, and append through the `knowledge` ask-lane tool.
+   They see global sources plus their own team's.
+5. GitHub origins must be exactly a repo URL; local origins are refused
+   unless the real path sits inside a granted file scope.
+
+**Controls.** Player-or-admin registration gate, scope validation,
+grant-scoped local origins, append-only truths with attribution, read-only
+templates.
+
+**Records.** `knowledge_sources` state list (entries carry `appends`),
+action log.
+
+### BP-73 Outbound webhooks
+
+**Last checked:** 2026-11-02
+
+**Purpose.** Notify external systems when the tank does something they care
+about, without a polling integration, while keeping the notify path unable
+to harm the tank.
+
+**Trigger.** An action-log kind matches a registered webhook's event
+patterns.
+
+**Steps.**
+
+1. The player or an admin agent registers a webhook through
+   `POST /api/webhooks`: a URL, an optional shared secret, and event
+   patterns (case-insensitive substrings of action-log kinds; a bare `*`
+   matches everything; an empty list matches nothing, which is the safe
+   default for a new subscriber).
+2. When an action lands whose kind matches, the tank POSTs
+   `application/json` (`kind`, `at`, `agent`, `details`) with
+   `X-Tank-Event: <kind>` and, when a secret is set,
+   `X-Tank-Signature: sha256=<hex hmac-sha256(body, secret)>` over the exact
+   posted bytes.
+3. Delivery is one bounded POST: 5s timeout, 64KB body cap (oversized
+   details are truncated and marked), at most 8 webhooks per event, and no
+   retries. The registry is read through a short TTL cache so the common
+   no-webhooks case stays cheap on the action-log hot path.
+4. Every target must resolve to a public host. The SSRF check runs at
+   registration and again at every delivery, because DNS is not stable.
+5. Delivery results are logged as `webhook_delivery` /
+   `webhook_delivery_failed`; the emit skips those kinds, so a receiver
+   that echoes the tank's events cannot recurse the tank into itself.
+6. `POST /api/webhooks/{id}/test` delivers a sample event so the operator
+   can verify a receiver end to end; a 2xx means the receiver accepted the
+   signed POST.
+
+**Controls.** Player-or-admin gate, SSRF public-host check (double-checked
+per delivery), HMAC signing, fan-out and size caps, no-retry policy,
+self-kind recursion guard, secrets stored but never returned (`hasSecret`).
+
+**Records.** Settings key `outbound_webhooks`, action log.
 
 ## 11. Player and operator processes
 
@@ -3544,7 +3743,11 @@ rather than gate-integrity questions.
 | Pipeline step cap | `world/serve.py` | 64 steps per run |
 | Pipeline job cap | `world/serve.py` | 256 concurrent jobs |
 | Transport ceiling | `world/core/runtime_limits.py` | 3,600 seconds |
-
+| `VIRUSTOTAL_API_KEY`, `SAFEBROWSING_API_KEY` | `.env` | URL-reputation keyed sources; blank leaves RDAP age and URLhaus |
+| `VIRUSTOTAL_DAILY_BUDGET`, `SAFEBROWSING_DAILY_BUDGET` | `.env` | 400 and 10,000 per UTC day; day-keyed quota ledger, VirusTotal spacing at least 15s |
+| `mcp_servers.json` | repo root | Shipped MCP registry (REA, GitHub official remote MCP); `mcp_servers.local.json` sits beside it, overrides by id, and is gitignored |
+| Outbound webhooks | settings key `outbound_webhooks` | Subscribed URL, optional secret, event patterns; secrets stored, never returned |
+| `.env` quoting | `.env` | Values may be quoted; the loader strips one matching quote pair |
 ## 19. Appendix C: process to code map
 
 | Process | Primary code |
@@ -3555,7 +3758,7 @@ rather than gate-integrity questions.
 | BP-04 | `sim._breakdown_step`, `_resolve_breakdown` |
 | BP-05 | `sim.spawn_new_team_for_request` |
 | BP-06 | `sim.queue_sprint`, `sprint_progress`, `close_sprint` |
-| BP-07 | `sim.pick_next_due_index`, `_assign_due_item`, `on_call_agent` |
+| BP-07 | `sim.pick_next_due_index`, `_assign_due_item`, `on_call_agent`, `sim._normalize_dep_ids`, `sim._work_item_dependency_met`, `sim._prune_task_dep_cycles` |
 | BP-08 | `sim._task_cycle`, `content._server_content_dispatcher`, `code_workspaces`, `staged_work`, `work_reuse`, `completion_watchdog`, `transport_recovery`, `repeat_work` |
 | BP-09 | `sim._enter_peer_review`, `_peer_gate_should_close`, `_sweep_stuck_gates`, `review_quality.artifact_checks`, `url_evidence.citation_errors` |
 | BP-10 | `serve._classify_failure`, `_record_failure`, `sim._send_back_after_failure`, `repeat_work`, `transport_recovery`, `review_quality.clean_vote_errors` |
@@ -3600,7 +3803,7 @@ rather than gate-integrity questions.
 | BP-49 | `sim.request_player_input`, `request_player_input_verdict`, `resolve_player_ask` |
 | BP-50 | `serve` credential endpoints, `mint_capability_handle`, `resolve_capability_handle`, `config._load_credential_access`, `tank_accounts.py`, `totp.py` |
 | BP-51 | `serve._validate_api_service_spec`, `_approve_api_service_proposal` |
-| BP-52 | `serve` browse, curl, execute, egress, VPN code, `_browser_profile_dir`, `_sync_safari_cookies` |
+| BP-52 | `serve` browse, curl, execute, egress, VPN code, `_browser_profile_dir`, `_sync_safari_cookies`, `serve._url_trust_verdict` |
 | BP-53 | `serve` grant endpoints, `config.get_grants_config`, `world/grants.json` |
 | BP-54 | `serve.wrap_external_content`, `verify_boundary_intact` |
 | BP-55 | `serve._prune_logs`, `_backup_loop`, `_verify_decision_tape`, `save_state_to_db`, `state_updates.preserve_guidance`, `theo_policy.TheoPolicy` |
@@ -3618,7 +3821,10 @@ rather than gate-integrity questions.
 | BP-67 | `serve_parts/425_ops_traces.py`, `serve_parts/430_jev_model_get.py` pulse route, `agents/pulse_ui.py` |
 | BP-68 | `serve_parts/130_run_browser_act_sync.py`, `core/style.py`, `plain_writing.json` |
 | BP-69 | `serve.supervisor_live_read`, `content._make_supervisor_live_read_executor`, `serve._ask_core` |
-
+| BP-70 | `serve._url_trust_verdict`, `world/url_trust.py`, `bank._accrue_quota_call` |
+| BP-71 | `serve._normalize_bookmark_url`, bookmarks ask tool, `/api/bookmarks` |
+| BP-72 | `serve._normalize_knowledge_origin`, knowledge ask tool, `/api/knowledge` |
+| BP-73 | `serve._outbound_webhook_emit`, `serve._deliver_webhook`, `/api/webhooks` |
 ## 20. Appendix D: review checklist
 
 Use this list when reviewing the document and the process.
