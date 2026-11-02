@@ -3822,9 +3822,9 @@ rather than gate-integrity questions.
 | BP-68 | `serve_parts/130_run_browser_act_sync.py`, `core/style.py`, `plain_writing.json` |
 | BP-69 | `serve.supervisor_live_read`, `content._make_supervisor_live_read_executor`, `serve._ask_core` |
 | BP-70 | `serve._url_trust_verdict`, `world/url_trust.py`, `bank._accrue_quota_call` |
-| BP-71 | `serve._normalize_bookmark_url`, bookmarks ask tool, `/api/bookmarks` |
-| BP-72 | `serve._normalize_knowledge_origin`, knowledge ask tool, `/api/knowledge` |
-| BP-73 | `serve._outbound_webhook_emit`, `serve._deliver_webhook`, `/api/webhooks` |
+| BP-71 | `serve._normalize_bookmark_url`, bookmarks ask tool, the bookmarks endpoints |
+| BP-72 | `serve._normalize_knowledge_origin`, knowledge ask tool, the knowledge endpoints |
+| BP-73 | `serve._outbound_webhook_emit`, `serve._deliver_webhook`, the webhook endpoints |
 ## 20. Appendix D: review checklist
 
 Use this list when reviewing the document and the process.
