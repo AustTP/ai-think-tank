@@ -1,7 +1,10 @@
 # Think Tank Business Processes
 
-Status: review draft, code-checked 2026-10-25
+Status: review draft, code-checked 2026-11-02
 Date: 2026-10-25
+Freshness: per section. A "Last checked" date records the last review pass for
+THAT section; sections absent from the 2026-10-26..2026-11-02 change log were
+last checked 2026-10-25 and may lag the code.
 Owner: operator (the player)
 Scope: the operating processes of the AI think tank as implemented in this repository
 
@@ -2786,6 +2789,11 @@ fail closed. An `emergency` changeType may use a 1-hour minimum, is loud
 veto unchanged. Constitution Rule 9 names the lane and warns that labeling
 routine work as emergency is a Rule 12 violation.
 
+**Missed windows fail closed (2026-11-02).** A window the owner never acts on
+does not auto-apply: the firing sweep marks an approved window whose slot has
+passed as `missed` and logs `dormancy_window_missed`; nothing lands. The
+requester re-requests closer to a new window.
+
 **Purpose.** Give the think tank a governed path to improve its OWN code:
 propose a precise splice, pass independent review and sandboxed validation,
 and land it only while the tank is asleep, through an operator-approved
@@ -3985,6 +3993,16 @@ rather than gate-integrity questions.
     returned it indirectly, the report is rejected. The safe failure is a
     rejection, but the review should check that the tool ledger captures every
     URL the report is allowed to cite.
+20. **Supervision levels 4 and 5 are identical.** The code has no separate
+    patience parameter above level 4; level 5 adds nothing and the document
+    says so. Either collapse the scale to 0-4 or give level 5 distinct
+    behavior. (Panel finding, NORA-173 review, 2026-11-02.)
+21. **"Per key" in the roles matrix.** The change-request row's key-holder
+    column reads "Per key", which could be read as granting a key holder
+    change-request approval authority. The code says otherwise: the
+    two-person rule is always the implementer's director plus the chief of
+    staff, and a key grant never satisfies it. State that plainly in the
+    matrix row. (Panel finding, NORA-173 review, 2026-11-02.)
 
 ## 17. Appendix A: glossary
 
