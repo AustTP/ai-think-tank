@@ -60,6 +60,14 @@ class Bands(unittest.TestCase):
         self.assertEqual(v['band'], 'trusted')
         self.assertEqual(v['score'], 90)
 
+    def test_float_age_from_rdap_still_reaches_trusted(self):
+        # Regression (2026-11-02 live check): RDAP ages computed via
+        # time.mktime are FLOATS; isinstance(x, int) rejected every real
+        # age and kept even old corroborated-clean domains at 'unknown'.
+        v = url_trust.score_url('https://docs.example.org/guide',
+                                rdap_age_days=3243.0, urlhaus_hit=False)
+        self.assertEqual(v['band'], 'trusted')
+
     def test_no_evidence_at_all_is_unknown(self):
         v = url_trust.score_url('https://mystery.example',
                                 rdap_age_days=None, urlhaus_hit=None)

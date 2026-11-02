@@ -125,7 +125,9 @@ def _rdap_domain_age_days(host):
                 and event.get('eventDate'):
             try:
                 created = time.strptime(str(event['eventDate'])[:10], '%Y-%m-%d')
-                return max(0, (time.mktime(time.gmtime()) - time.mktime(created)) // 86400)
+                # mktime returns floats; float floor-division yields a
+                # float, and the band logic below keys off integer ages.
+                return int(max(0, (time.mktime(time.gmtime()) - time.mktime(created)) // 86400))
             except (ValueError, OverflowError, TypeError):
                 return None
     return None
@@ -292,7 +294,10 @@ def score_url(url, virustotal_api_key=None, safebrowsing_api_key=None,
     vt = verdict['signals']['virustotal']
     vt_one_hit = bool(vt and vt['malicious'] == 1)
     vt_clean_support = bool(vt and vt['malicious'] == 0 and vt['harmless'] >= 3)
-    old_enough = isinstance(rdap_age_days, int) and rdap_age_days >= 365
+    # Ages may arrive as floats (mktime math, JSON round-trips through
+    # the cache): accept any real number, never a None.
+    old_enough = isinstance(rdap_age_days, (int, float)) and not isinstance(rdap_age_days, bool) \
+        and rdap_age_days >= 365
 
     if hard_bad:
         verdict['band'] = 'bad'
