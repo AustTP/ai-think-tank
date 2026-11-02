@@ -768,6 +768,234 @@ async def youtube_transcript(request: Request):
                          'source': source, 'filed': filed_path})
 
 
+# ---------------------------------------------------------------------------
+# YouTube frame capture + vision review (2026-11-02, the player's ask). The
+# transcript tool tells agents what was SAID; the operator's per-project UI
+# work needs what was SHOWN. Ruth's spike on the Tiny Software Factories
+# video proved the gap: the sandbox has no yt-dlp/ffmpeg and its browser
+# egress to YouTube failed (ERR_TUNNEL_CONNECTION_FAILED), so no frame was
+# ever captured or vision-reviewed. The HOST has both tools (yt-dlp 2026.08.19,
+# ffmpeg) and youtube.com is already in BROWSE_ALLOWLIST_DOMAINS -- so this
+# endpoint captures frames server-side, files them into the shared Library,
+# and (by default) runs each through the vision tier the same way the
+# player-photo review does. The sandbox never needs network egress for this.
+# ---------------------------------------------------------------------------
+YOUTUBE_FRAMES_MAX = 12
+YOUTUBE_FRAMES_REVIEW_MAX = 6
+_YTDLP_BIN_CANDIDATES = ('yt-dlp', '/opt/anaconda3/bin/yt-dlp', '/usr/local/bin/yt-dlp')
+_FFMPEG_BIN_CANDIDATES = ('ffmpeg', '/usr/local/bin/ffmpeg', '/opt/anaconda3/bin/ffmpeg')
+
+
+def _find_local_bin(names):
+    for name in names:
+        if os.path.sep in name:
+            if os.path.isfile(name):
+                return name
+        else:
+            found = shutil.which(name)
+            if found:
+                return found
+    return None
+
+
+def _youtube_frames_dir_rel(vid):
+    return os.path.join('media', 'frames', vid)
+
+
+def _youtube_frame_rel(vid, seconds):
+    return os.path.join(_youtube_frames_dir_rel(vid), f'{int(seconds)}s.png')
+
+
+def _parse_frame_timestamps(raw):
+    """Accept seconds as numbers or '90'/'90s'/'1m30s' strings; return a
+    sorted, deduped list of non-negative int seconds, capped at
+    YOUTUBE_FRAMES_MAX. Malformed entries are dropped, not fatal."""
+    out = set()
+    for item in (raw or [])[:YOUTUBE_FRAMES_MAX * 4]:
+        try:
+            if isinstance(item, (int, float)) and item >= 0:
+                out.add(int(item))
+                continue
+            text = str(item).strip().lower()
+            if not text:
+                continue
+            if re.fullmatch(r'\d+', text):
+                out.add(int(text))
+                continue
+            if re.fullmatch(r'\d+s', text):
+                out.add(int(text[:-1]))
+                continue
+            match = re.fullmatch(r'(?:(\d+)m)?(?:(\d+)s)?', text)
+            if match and (match.group(1) or match.group(2)):
+                out.add(int(match.group(1) or 0) * 60 + int(match.group(2) or 0))
+        except (TypeError, ValueError):
+            continue
+    return sorted(out)[:YOUTUBE_FRAMES_MAX]
+
+
+def _extract_youtube_frames(url, vid, seconds_list):
+    """Capture one PNG per requested timestamp. Frames already filed in the
+    Library are reused without any download (cache). Otherwise yt-dlp
+    downloads ONE <=720p copy into a private temp dir and ffmpeg seeks each
+    frame out of it; the temp dir is always removed. Returns
+    {seconds: png_bytes or None} -- a missing entry's None means that frame
+    failed and must be reported as failed, never guessed."""
+    frames = {}
+    missing = []
+    for seconds in seconds_list:
+        rel = _youtube_frame_rel(vid, seconds)
+        target = _safe_library_path(rel)
+        if target and os.path.isfile(target):
+            with open(target, 'rb') as fh:
+                frames[seconds] = fh.read()
+        else:
+            missing.append(seconds)
+    if not missing:
+        return frames
+    ytdlp = _find_local_bin(_YTDLP_BIN_CANDIDATES)
+    ffmpeg = _find_local_bin(_FFMPEG_BIN_CANDIDATES)
+    if not ytdlp or not ffmpeg:
+        for seconds in missing:
+            frames[seconds] = None
+        return frames
+    tmp = tempfile.mkdtemp(prefix='yt-frames-')
+    try:
+        proc = subprocess.run(
+            [ytdlp, '--no-playlist', '-f',
+             'bv*[height<=720][ext=mp4]/b[height<=720]/b',
+             '-o', os.path.join(tmp, 'video.%(ext)s'), url],
+            capture_output=True, timeout=900)
+        video_path = None
+        for name in sorted(os.listdir(tmp)):
+            if name.startswith('video.'):
+                video_path = os.path.join(tmp, name)
+                break
+        if proc.returncode != 0 or not video_path:
+            for seconds in missing:
+                frames[seconds] = None
+            return frames
+        for seconds in missing:
+            out_path = os.path.join(tmp, f'frame-{seconds}.png')
+            seek = subprocess.run(
+                [ffmpeg, '-y', '-ss', str(seconds), '-i', video_path,
+                 '-frames:v', '1', '-vf', 'scale=1280:-2', out_path],
+                capture_output=True, timeout=120)
+            if seek.returncode != 0 or not os.path.isfile(out_path):
+                frames[seconds] = None
+                continue
+            with open(out_path, 'rb') as fh:
+                data = fh.read()
+            rel = _youtube_frame_rel(vid, seconds)
+            target = _safe_library_path(rel)
+            if target:
+                try:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    _write_file(target, data)
+                except Exception:
+                    pass  # filing is best-effort; the frame still returns
+            frames[seconds] = data
+        return frames
+    except Exception:
+        for seconds in missing:
+            frames.setdefault(seconds, None)
+        return frames
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _vision_describe_frame(png_bytes, question, source_label):
+    """One vision-tier pass over one frame. Same guard rails as the
+    player-photo review: the anti-instruction guard, honest-gap instruction,
+    and a bounded reply. Returns (ok, text)."""
+    slug = _vision_tier_slug()
+    if not slug:
+        return False, 'vision model tier not available'
+    prompt = (
+        VISION_ANTI_INSTRUCTION_GUARD + '\n'
+        'You are reviewing ONE frame captured from a video the player asked '
+        'this system to study. Describe exactly what is visible: UI layout, '
+        'panels, nav bars, buttons, text, colors, and any interaction state. '
+        'Transcribe legible text exactly. Only report what is actually '
+        'visible; if the frame is black, buffering, or shows no UI, say that '
+        f'instead of guessing. Source: {source_label}.'
+        + (f'\nExtra focus: {question}' if question else '')
+    )
+    messages = [{'role': 'user', 'content': [
+        {'type': 'text', 'text': prompt},
+        {'type': 'image_url',
+         'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(png_bytes).decode()}},
+    ]}]
+    try:
+        result = _call_openrouter_sync(slug, messages, 900)
+        reply = (result.get('choices') or [{}])[0].get('message', {}).get('content') or ''
+    except Exception as e:
+        return False, f'vision call failed: {e}'
+    if not reply.strip():
+        return False, 'vision call returned no reply'
+    return True, reply.strip()[:6000]
+
+
+@app.post('/api/youtube-frames')
+async def youtube_frames(request: Request):
+    """Capture frames of a YouTube video at given timestamps, file them to
+    library/media/frames/{video_id}/, and (default) run each through the
+    vision tier. Body: {agentId, url, timestamps, question?, review?,
+    includeImages?}. Responses carry the library path + SHA-256 for every
+    frame and the vision text for reviewed ones; base64 bodies only on
+    request, so the default response stays small."""
+    body = await request.json()
+    agent_id = body.get('agentId', 'unknown')
+    url = (body.get('url') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'youtube-frames'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    authorized = verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
+    if not _is_youtube_url(url):
+        return JSONResponse({'error': 'a valid youtube.com or youtu.be URL is required'}, status_code=400)
+    vid = _youtube_video_id(url)
+    if not vid:
+        return JSONResponse({'error': 'could not resolve a video id from that URL'}, status_code=400)
+    seconds_list = _parse_frame_timestamps(body.get('timestamps'))
+    if not seconds_list:
+        return JSONResponse({'error': 'timestamps must be a non-empty list of seconds'}, status_code=400)
+    want_review = body.get('review', True)
+    review_budget = seconds_list[:YOUTUBE_FRAMES_REVIEW_MAX] if want_review else []
+    log_action(agent_id, 'youtube_frames', {'url': url, 'videoId': vid,
+                                            'timestamps': seconds_list,
+                                            'review': bool(want_review)},
+               authorized=authorized)
+    frames = await asyncio.to_thread(_extract_youtube_frames, url, vid, seconds_list)
+    if not any(data for data in frames.values()):
+        return JSONResponse({'error': 'no frame could be captured (download or seek failed)'},
+                            status_code=502)
+    question = (body.get('question') or '').strip()[:500]
+    out_frames = []
+    reviewed = 0
+    for seconds in seconds_list:
+        data = frames.get(seconds)
+        if not data:
+            out_frames.append({'timestamp': seconds, 'captured': False,
+                               'libraryPath': _youtube_frame_rel(vid, seconds)})
+            continue
+        entry = {'timestamp': seconds, 'captured': True,
+                 'libraryPath': _youtube_frame_rel(vid, seconds),
+                 'sha256': hashlib.sha256(data).hexdigest(),
+                 'bytes': len(data)}
+        if seconds in review_budget:
+            ok, text = _vision_describe_frame(
+                data, question, f'YouTube video {vid} at {seconds}s')
+            entry['visionOk'] = ok
+            entry['visionReview'] = text
+            reviewed += 1 if ok else 0
+        if body.get('includeImages'):
+            entry['imageBase64'] = base64.b64encode(data).decode()
+        out_frames.append(entry)
+    log_action(agent_id, 'youtube_frames_done',
+               {'videoId': vid, 'captured': sum(1 for f in out_frames if f.get('captured')),
+                'reviewed': reviewed}, authorized=authorized)
+    return JSONResponse({'ok': True, 'url': url, 'videoId': vid, 'frames': out_frames})
+
+
 @app.get('/api/sandbox-backups')
 async def sandbox_backups(sandboxId: str):
     if not _SANDBOX_ID_RE.match(sandboxId or ''):
