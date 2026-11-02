@@ -15,6 +15,24 @@
 
 ### Fixes
 
+- Meeting scribes now read the real documents: issue filings carry
+  `sourceFiles` (normalized, capped at 5), the groomed agenda emits a
+  `READ:` line per file, and the meeting executor inlines the actual file
+  text (repository-root anchored, containment-checked, head+tail with a
+  full heading outline when a file exceeds the excerpt) into the scribe
+  prompt. A review panel was inventing tables, endpoints, and retry
+  policies no code implements; three review cycles later the panel quotes
+  line numbers and marks the elided boundary instead of fabricating.
+- A stuck-walk cancel no longer destroys the card: the requeue carries
+  `_unreachableBy`, assignment drops a pin to a failed walker and the
+  round-robin skips failed ones, and after three distinct failed agents
+  the card parks for operator promotion. A stranded agent (parked at the
+  map's south edge) had three cards die in seconds each, including a
+  lost meeting card. `queue_work` also stopped silently dropping
+  `reissueOf`/`_unreachableBy`/`_reassignedTo` from re-issued cards.
+- Meeting agendas now carry the filing's acceptance criteria, not just
+  the user story and never-block: the agenda builder dropped them, so
+  panels received "the agenda items to walk" without the items.
 - The refinement groom judge no longer bounces meeting cards: the instruction
   claimed every card type "says story, spike, or research" while the criteria
   correctly described a real meeting card. Three player-filed meeting cards
