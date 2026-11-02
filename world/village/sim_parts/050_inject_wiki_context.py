@@ -299,7 +299,12 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'skillReview': bool((extra or {}).get('skillReview')),
         'distill': bool((extra or {}).get('distill')),
         'kbClass': (extra or {}).get('kbClass') or None,
-        'dependsOn': (extra or {}).get('dependsOn') or None,
+        # The DAG edge list, normalized + cycle-pruned at the only
+        # place a durable task edge is born: a self-edge is dropped,
+        # and any edge whose addition would close a directed cycle in
+        # the task graph is dropped (a waiting-on-itself task is a
+        # deadlock that would otherwise hold two cards forever).
+        'dependsOn': _prune_task_dep_cycles(state, task_id, (extra or {}).get('dependsOn')) or None,
         'budgetMs': (extra or {}).get('budgetMs'),
         'sizeEstimate': (extra or {}).get('sizeEstimate'),
         'reviewOf': (extra or {}).get('reviewOf'),

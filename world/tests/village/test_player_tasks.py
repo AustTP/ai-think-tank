@@ -84,7 +84,7 @@ class PlayerTaskAssignment(PlayerTaskBase):
         item = sim.queue_once(state, 'Draft the Q3 narrative', 10 ** 12,
                               assigned_to='player', depends_on_task='task-42')
         self.assertEqual(item['assignedTo'], 'player')
-        self.assertEqual(item['dependsOn'], 'task-42')
+        self.assertEqual(item['dependsOn'], ['task-42'])
 
     def test_player_card_is_assigned_to_the_player_not_an_agent(self):
         state = self._state()

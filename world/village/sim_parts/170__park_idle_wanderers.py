@@ -421,8 +421,13 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
         'lane': task['lane'],
     })
     depends_line = ''
-    if task['dependsOn']:
-        depends_line = f"\n\nNote: this task waits on '{task['dependsOn']}' being done before it starts."
+    _dep_list = _normalize_dep_ids(task.get('dependsOn'))
+    if len(_dep_list) == 1:
+        depends_line = f"\n\nNote: this task waits on '{_dep_list[0]}' being done before it starts."
+    elif _dep_list:
+        depends_line = ('\n\nNote: this task waits on ALL of: '
+                        + ', '.join(f"'{d}'" for d in _dep_list)
+                        + ' being done before it starts.')
     _queue_player_email(
         state, 'player_task',
         f"[AI Think Tank] A task is waiting on YOU: {title}",

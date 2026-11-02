@@ -678,7 +678,10 @@ def _cascade_rereview(state, reopened_task_id, now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     reopened = 0
     for task in (state.get('tasks') or {}).values():
-        if not isinstance(task, dict) or task.get('dependsOn') != reopened_task_id:
+        # DAG edges: the reopened task may be ONE of several predecessors
+        # (a join), so release on membership in the normalized list.
+        if not isinstance(task, dict) \
+                or reopened_task_id not in _normalize_dep_ids(task.get('dependsOn')):
             continue
         if task.get('status') != 'done':
             continue

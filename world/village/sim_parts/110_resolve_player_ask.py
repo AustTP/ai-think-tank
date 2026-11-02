@@ -642,7 +642,10 @@ def _block_step(state, now, now_ms):
             if not issue.get('blockedKind'):
                 issue['blockedKind'] = c.get('kind')
             if c.get('dependsOnTask'):
-                issue['dependsOnTask'] = c.get('dependsOnTask')
+                # Normalize to the DAG edge-list form (str or list in,
+                # clean list out) so the release matchers below compare
+                # membership against one shape.
+                issue['dependsOnTask'] = _normalize_dep_ids(c.get('dependsOnTask')) or None
         else:
             issue['unblockedAt'] = now_ms
             issue['blockedBy'] = None
@@ -715,7 +718,7 @@ def _auto_clear_dependency_blocks(state, completed_task_id, now_ms=None):
     # (a) Cards already committed blocked on this dependency.
     for issue in (state.get('issues') or {}).values():
         if (issue.get('blocked') and issue.get('blockedKind') == 'stuck_on_agent'
-                and issue.get('dependsOnTask') == completed_task_id):
+                and completed_task_id in _normalize_dep_ids(issue.get('dependsOnTask'))):
             if _file_block_change(state, issue['key'], False, 'auto',
                                   'unblock_landed',
                                   f"dependency task {completed_task_id} landed",
@@ -747,7 +750,7 @@ def _auto_clear_dependency_blocks(state, completed_task_id, now_ms=None):
     for c in list(changes):
         if (c.get('state') == 'pending'
                 and c.get('kind') == 'stuck_on_agent'
-                and c.get('dependsOnTask') == completed_task_id):
+                and completed_task_id in _normalize_dep_ids(c.get('dependsOnTask'))):
             changes.remove(c)
             clears += 1
     return clears

@@ -77,8 +77,8 @@ class QueueOnceDependency(unittest.TestCase):
         at_ms = int(time.time() * 1000) + 3600_000
         item = sim.queue_once(state, "Deploy after landing", at_ms, depends_on_task="task-9")
         self.assertIsNotNone(item)
-        self.assertEqual(item["dependsOn"], "task-9")
-        self.assertEqual(state["workQueue"][0]["dependsOn"], "task-9")
+        self.assertEqual(item["dependsOn"], ["task-9"])
+        self.assertEqual(state["workQueue"][0]["dependsOn"], ["task-9"])
 
     def test_queue_once_defaults_no_dependency(self):
         state = {"workQueue": []}
@@ -356,7 +356,7 @@ class IntentScheduleOnceEndpointDependency(unittest.TestCase):
                                json={"title": "Deploy", "at": future,
                                      "dependsOnTask": "task-9"})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(state["workQueue"][0]["dependsOn"], "task-9")
+        self.assertEqual(state["workQueue"][0]["dependsOn"], ["task-9"])
 
 
 class PipelinesCreateEndpointDependency(unittest.TestCase):

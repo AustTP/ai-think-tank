@@ -184,7 +184,7 @@ class DependencyPath(unittest.TestCase):
         rec = st['issues'][issue['key']]
         self.assertIs(rec['blocked'], True)
         self.assertEqual(rec['blockedKind'], 'stuck_on_agent')
-        self.assertEqual(rec['dependsOnTask'], 'task-5')
+        self.assertEqual(rec['dependsOnTask'], ['task-5'])
         # task-5 lands -> auto-unblock filed -> SM commits False.
         cleared = sim._auto_clear_dependency_blocks(st, 'task-5',
                                                     now_ms=_NOW_MS + 20_000)

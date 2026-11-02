@@ -584,7 +584,9 @@ def queue_once(state, title, at_ms, room=None, instructions=None, task_type=None
         'goal': goal or None,
         'priority': normalize_priority(priority),
         'projectLabel': project_label or None,
-        'dependsOn': depends_on_task or None,
+        # The DAG edge list: a single task id or a list -- both forms
+        # accepted, normalized here so the gate reads one shape.
+        'dependsOn': (_normalize_dep_ids(depends_on_task) or None),
         'assignedTo': assigned_to or None,
         'lane': lane,
     }
@@ -807,16 +809,80 @@ def _dependency_landed(state, task_id):
     return isinstance(t, dict) and t.get('status') == 'done'
 
 
-def _work_item_dependency_met(state, item):
-    """True when a queue item's dependency (item['dependsOn']) has landed --
-    i.e. the referenced task reached 'done' in the durable mirror. An item
-    with no dependency is always met. pick_next_due_index / think_tank_has_work
-    use this to keep a gated card IN the queue (never assigned, never abandoned
-    on the attempts cap) until its dependency actually ships."""
-    dep = item.get('dependsOn')
-    if not dep:
+def _normalize_dep_ids(value):
+    """The task DAG's edge list. The historic form is ONE task id (a
+    chain); the DAG form is a LIST of task ids (fan-in joins: an item
+    waits until EVERY predecessor lands). Accepts either, returns a
+    de-duplicated, order-preserving list of non-empty ids."""
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    out = []
+    for v in value:
+        v = (v or '').strip() if isinstance(v, str) else ''
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def _dependency_would_cycle(state, own_task_id, dep_ids):
+    """True when adding the edges own_task_id -> dep_ids would close a
+    directed cycle in the durable task graph (a task waiting directly or
+    transitively on itself can never be dispatched -- a deadlock). Edges
+    are read from the task mirror's 'dependsOn' (normalized, so historic
+    single-id records participate too). Unknown ids are treated as
+    acyclic: they may name tasks that do not exist yet."""
+    deps = _normalize_dep_ids(dep_ids)
+    if own_task_id and own_task_id in deps:
         return True
-    return _dependency_landed(state, dep)
+    tasks = state.get('tasks') or {}
+    seen = set()
+    stack = list(deps)
+    while stack:
+        tid = stack.pop()
+        if tid == own_task_id:
+            return True          # the walk came back to the new edge's owner
+        if tid in seen:
+            continue
+        seen.add(tid)
+        t = tasks.get(tid)
+        if isinstance(t, dict):
+            stack.extend(_normalize_dep_ids(t.get('dependsOn')))
+    return False
+
+
+def _prune_task_dep_cycles(state, own_task_id, dep_value):
+    """The write-side cycle guard for the task DAG, at the only place a
+    durable task edge is born (the task record in _inject). Drops
+    self-edges, then drops dependency edges one at a time -- worst
+    offender first -- until the remaining edge set closes no directed
+    cycle. Returns the surviving list (possibly empty). A dropped edge is
+    logged: a pruned join is still a scheduled card, a deadlock is not."""
+    deps = _normalize_dep_ids(dep_value)
+    deps = [d for d in deps if d != own_task_id]
+    dropped = []
+    while _dependency_would_cycle(state, own_task_id, deps) and deps:
+        # Drop the LAST edge (the newest ask) -- first-added edges are the
+        # senior intent; re-check after each drop.
+        dropped.append(deps.pop())
+    if dropped:
+        print(f'[task-dag] pruned cyclic dependency edges for {own_task_id}: '
+              f'{dropped} (kept {deps})', flush=True)
+    return deps
+
+
+def _work_item_dependency_met(state, item):
+    """True when EVERY task id in the item's dependency edge list has
+    landed ('done' in the durable mirror) -- join semantics, the DAG
+    upgrade over the historic single-edge chain. An item with no
+    dependency is always met. pick_next_due_index / think_tank_has_work
+    use this to keep a gated card IN the queue (never assigned, never
+    abandoned on the attempts cap) until its dependencies actually ship."""
+    deps = _normalize_dep_ids(item.get('dependsOn'))
+    if not deps:
+        return True
+    return all(_dependency_landed(state, dep) for dep in deps)
 
 
 def _band_for_work_item(item):

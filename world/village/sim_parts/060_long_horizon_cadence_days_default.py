@@ -425,7 +425,8 @@ def _check_schedules(state, now, now_ms):
         # while it waits, so the crawl fires on the first pass AFTER the
         # dependency lands (same marker-held-while-gated rule as the content
         # gates below) instead of silently burning a cadence cycle.
-        if topic.get('dependsOnTask') and not _dependency_landed(state, topic['dependsOnTask']):
+        deps = _normalize_dep_ids(topic.get('dependsOnTask'))
+        if deps and not all(_dependency_landed(state, d) for d in deps):
             continue
         previous_run_at = topic.get('lastRunAt') or 0
         topic['lastRunAt'] = now_ms
@@ -574,7 +575,8 @@ def _check_pipelines(state, now_ms):
         # lands (no marker advance, so the run fires on the first pass after it
         # does). A MID-RUN pipeline keeps firing its remaining steps: the
         # dependency gates the run's start, not its tail.
-        if p.get('dependsOnTask') and not _dependency_landed(state, p['dependsOnTask']) \
+        p_deps = _normalize_dep_ids(p.get('dependsOnTask'))
+        if p_deps and not all(_dependency_landed(state, d) for d in p_deps) \
                 and (not p.get('lastRunAt') or step_index >= len(steps)):
             continue
         # Pipeline run complete (all steps fired) and waiting out the cadence
