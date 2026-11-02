@@ -632,17 +632,22 @@ class MeetingExecutor(unittest.TestCase):
         # The meeting's document access: a READ: line in the agenda makes the
         # scribe prompt carry the REAL file text, so the panel audits the
         # document instead of inventing it (task-2876's fabricated findings).
+        # The file is placed under the REPOSITORY ROOT (not the process CWD,
+        # which launchd sets to world/) and addressed repo-root-relative --
+        # the exact shape a BUSINESS-PROCESSES.md read takes in production.
+        repo_root = os.path.dirname(os.getcwd())
         source_dir = tempfile.mkdtemp(prefix='think tank-read-test-',
-                                      dir=os.getcwd())
+                                      dir=repo_root)
+        rel = os.path.basename(source_dir) + '/BP.md'
         try:
             doc = os.path.join(source_dir, 'BP.md')
             with open(doc, 'w', encoding='utf-8') as handle:
                 handle.write('## BP-73 webhooks\nOne bounded POST, no retries.')
             task = self._task()
-            task['instructions'] = 'Agenda: audit the doc.\nREAD: BP.md'
+            task['instructions'] = f'Agenda: audit the doc.\nREAD: {rel}'
             user = self._run_capturing_user(task, source_dir=source_dir)
             self.assertIn('SOURCE MATERIAL', user)
-            self.assertIn('--- BP.md ---', user)
+            self.assertIn(f'--- {rel} ---', user)
             self.assertIn('One bounded POST, no retries.', user)
         finally:
             shutil.rmtree(source_dir, ignore_errors=True)
@@ -654,13 +659,13 @@ class MeetingExecutor(unittest.TestCase):
                                       dir=os.getcwd())
         try:
             task = self._task()
-            task['instructions'] = ('Agenda: audit.\nREAD: ../outside.txt\n'
+            task['instructions'] = ('Agenda: audit.\nREAD: ../../../outside.txt\n'
                                     'READ: missing.md')
             user = self._run_capturing_user(task, source_dir=source_dir)
             self.assertIn('SOURCE MATERIAL', user)
             self.assertIn('refused (outside the repository)', user)
             self.assertIn('unreadable', user)
-            self.assertNotIn('--- ../outside.txt ---', user)
+            self.assertNotIn('--- ../../../outside.txt ---', user)
         finally:
             shutil.rmtree(source_dir, ignore_errors=True)
 

@@ -232,6 +232,26 @@ def _meeting_read_paths(agenda):
     return paths
 
 
+def _meeting_source_roots():
+    """Anchor directories a meeting's READ: paths may resolve against, most
+    likely first: the repository root (derived from the serve module's own
+    location -- serve.py lives at <repo>/world/serve.py, so the root is two
+    levels up) and then the process CWD (which launchd sets to <repo>/world,
+    where data/ and fast_lanes.json live). Containment is checked per anchor
+    at read time, so a path is only ever read inside one of these roots."""
+    roots = []
+    serve_file = getattr(_serve, '__file__', None)
+    if serve_file:
+        repo_root = os.path.dirname(os.path.dirname(
+            os.path.abspath(serve_file)))
+        if repo_root and os.path.isdir(repo_root):
+            roots.append(repo_root)
+    cwd = os.getcwd()
+    if cwd not in roots:
+        roots.append(cwd)
+    return roots
+
+
 def _meeting_source_material(agenda):
     """Expand the agenda's READ: directives into an inline SOURCE MATERIAL
     section the scribe prompt carries. This is the meeting's document access:
@@ -239,28 +259,49 @@ def _meeting_source_material(agenda):
     scribe improvises -- the live failure was a review panel inventing tables,
     endpoints, and retry policies no code implements (task-2876). Grounding
     rule: every claim about these files must come from this text or be flagged
-    as the panel's opinion. Fail-soft per file; paths are resolved against the
-    server process CWD (the repository root) and refused if they escape it."""
+    as the panel's opinion. Fail-soft per file; a path is resolved against
+    each anchor root and refused if it escapes all of them."""
     paths = _meeting_read_paths(agenda)
     if not paths:
         return ''
-    root = os.path.realpath(os.getcwd())
+    roots = [os.path.realpath(root) for root in _meeting_source_roots()]
     parts = []
     for path in paths:
-        try:
-            real = os.path.realpath(os.path.join(root, path))
-            if real != root and not real.startswith(root + os.sep):
-                parts.append(f'--- {path}: refused (outside the repository)')
+        read = None
+        for root in roots:
+            try:
+                real = os.path.realpath(os.path.join(root, path))
+            except OSError:
                 continue
-            with open(real, 'r', encoding='utf-8', errors='replace') as handle:
-                text = handle.read(_MEETING_READ_MAX_BYTES + 1)
-            if len(text) > _MEETING_READ_MAX_BYTES:
-                text = (text[:_MEETING_READ_MAX_BYTES]
-                        + '\n... [truncated for the meeting prompt]')
-            parts.append(f'--- {path} ---\n{text}')
-        except OSError as exc:
-            parts.append(f'--- {path}: unreadable '
-                         f'({getattr(exc, "strerror", None) or "error"})')
+            if real != root and not real.startswith(root + os.sep):
+                continue
+            try:
+                with open(real, 'r', encoding='utf-8',
+                          errors='replace') as handle:
+                    read = handle.read(_MEETING_READ_MAX_BYTES + 1)
+                break
+            except OSError:
+                read = None
+                continue
+        if read is None:
+            # Distinguish the two failure shapes the panel must tell apart:
+            # a refused escape vs a path that simply is not there. A path
+            # that escaped EVERY anchor is refused; one contained in an
+            # anchor but missing is unreadable.
+            escaped_everywhere = all(
+                not os.path.realpath(os.path.join(root, path)).startswith(
+                    root + os.sep)
+                for root in roots)
+            if escaped_everywhere:
+                parts.append(f'--- {path}: refused (outside the repository)')
+            else:
+                parts.append(f'--- {path}: unreadable '
+                             '(No such file or directory)')
+            continue
+        if len(read) > _MEETING_READ_MAX_BYTES:
+            read = (read[:_MEETING_READ_MAX_BYTES]
+                    + '\n... [truncated for the meeting prompt]')
+        parts.append(f'--- {path} ---\n{read}')
     if not parts:
         return ''
     return ('\n\nSOURCE MATERIAL (read from the repository just now; ground '
