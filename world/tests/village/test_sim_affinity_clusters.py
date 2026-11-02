@@ -650,15 +650,18 @@ class CoachingCluster(SimIsolation):
         self.assertEqual(state['backlogRequests'][0]['filedBy'], 'd1')
 
     def test_sm_replan_stale_work_dup_pending(self):
-        # 8968: a duplicate pending request -> no re-plan filed.
+        # 8968, revised live 2026-11-02: the duplicate pending request gets
+        # a bounded _staleReplan annotation and the re-plan still routes.
         state = {'products': {'prod-1': {'teamId': 'team-1'}},
                  'teams': [{'id': 'team-1', 'directorId': 'd1'}],
                  'backlogRequests': [{'status': 'pending', 'room': 'observatory',
                                       'title': 'stale'}]}
-        self.assertFalse(sim._sm_replan_stale_work(state, {'title': 'stale',
-                                                           'room': 'observatory',
-                                                           'productId': 'prod-1'},
-                                                   1_000_000))
+        task = {'title': 'stale', 'room': 'observatory', 'productId': 'prod-1',
+                'id': 'task-7'}
+        self.assertTrue(sim._sm_replan_stale_work(state, task, 1_000_000))
+        self.assertEqual(len(state['backlogRequests']), 1)
+        self.assertEqual(state['backlogRequests'][0]['_staleReplan'],
+                         [{'task': 'task-7', 'at': 1_000_000}])
 
     def test_sm_help_stuck_worker_bad_room(self):
         # 8981: a card in a non-valued room isn't routed.
@@ -676,15 +679,20 @@ class CoachingCluster(SimIsolation):
         self.assertEqual(state['backlogRequests'][0]['filedBy'], 'd1')
 
     def test_sm_help_stuck_worker_dup_pending(self):
-        # 8996: a duplicate pending request -> not routed.
+        # 8996, revised live 2026-11-02: a duplicate pending request no
+        # longer DROPS the signal -- it annotates the pending request with
+        # the stuck context and routes (the SM's ceremony kicks now). The
+        # dedup's job is preventing a second REQUEST, not hiding stuck-news.
         state = {'products': {'prod-1': {'teamId': 'team-1'}},
                  'teams': [{'id': 'team-1', 'directorId': 'd1'}],
                  'backlogRequests': [{'status': 'pending', 'room': 'observatory',
                                       'title': 'hard'}]}
-        self.assertFalse(sim._sm_help_stuck_worker(state, {'title': 'hard',
-                                                           'room': 'observatory',
-                                                           'productId': 'prod-1'},
-                                                   1_000_000))
+        task = {'title': 'hard', 'room': 'observatory', 'productId': 'prod-1',
+                'id': 'task-7', 'assignedTo': 'piper'}
+        self.assertTrue(sim._sm_help_stuck_worker(state, task, 1_000_000))
+        self.assertEqual(len(state['backlogRequests']), 1)
+        self.assertEqual(state['backlogRequests'][0]['_stuckHelp'],
+                         [{'agent': 'piper', 'at': 1_000_000, 'task': 'task-7'}])
 
     def test_worker_stuck_help_signal_unknown_agent(self):
         # 9017: no agent record for the failing worker -> no signal.
