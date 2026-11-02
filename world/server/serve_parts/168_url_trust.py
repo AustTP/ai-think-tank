@@ -19,6 +19,7 @@
 # (VIRUSTOTAL_API_KEY / SAFEBROWSING_API_KEY), same convention as
 # TAVILY_API_KEY -- unset means that source is simply absent and the
 # score degrades, it never blocks.
+import calendar
 import json
 import time
 import urllib.parse
@@ -72,8 +73,11 @@ def _url_trust_verdict(url):
     entry = cache.get(host)
     if isinstance(entry, dict):
         try:
-            stamp = time.mktime(time.strptime(entry.get('checkedAt', ''),
-                                              '%Y-%m-%dT%H:%M:%SZ'))
+            # checkedAt is a UTC stamp; mktime would read it as LOCAL
+            # time and a UTC-hosted server would see every fresh entry as
+            # TTL-expired. timegm parses it as what it is.
+            stamp = calendar.timegm(time.strptime(entry.get('checkedAt', ''),
+                                                  '%Y-%m-%dT%H:%M:%SZ'))
             if time.time() - stamp < _URL_TRUST_TTL_S:
                 return entry
         except (ValueError, OverflowError, TypeError):

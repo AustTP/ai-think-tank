@@ -29,7 +29,8 @@ def _verdict(band, host='good.example'):
             'signals': {'ageDays': 2800 if band == 'trusted' else None,
                         'urlhaus': band == 'bad', 'safebrowsing': False,
                         'virustotal': None, 'heuristics': [], 'errors': []},
-            'checkedAt': '2026-11-01T00:00:00Z'}
+            'checkedAt': __import__('time').strftime('%Y-%m-%dT%H:%M:%SZ',
+                                            __import__('time').gmtime())}
 
 
 class BrowserGate(unittest.IsolatedAsyncioTestCase):
