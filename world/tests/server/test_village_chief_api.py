@@ -46,6 +46,23 @@ class VillageChiefEndpoint(unittest.TestCase):
             r = TestClient(serve.app).post('/api/villages/chief', json=body)
         return r, save, log
 
+    def test_malformed_body_is_400(self):
+        # An empty or non-JSON body must 400, not crash as a 500.
+        state = _state()
+        with mock.patch.object(serve, 'verify_session', return_value=True), \
+             mock.patch.object(serve, '_operator_gate',
+                               return_value=(True, 'theo')), \
+             mock.patch.object(serve, '_state_begin', return_value=state), \
+             mock.patch.object(serve, '_state_abort'):
+            client = TestClient(serve.app)
+            r = client.post('/api/villages/chief', content=b'not json',
+                            headers={'content-type': 'application/json'})
+            r2 = client.post('/api/villages/chief', content=b'',
+                             headers={'content-type': 'application/json'})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertEqual(r2.status_code, 400, r2.text)
+        self.assertIn('malformed body', r.json()['error'])
+
     def test_auto_picks_the_village_director(self):
         state = _state()
         r, save, log = self._post(state, {'villageId': 'main'})

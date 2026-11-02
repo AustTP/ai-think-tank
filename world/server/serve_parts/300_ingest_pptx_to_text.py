@@ -436,7 +436,10 @@ async def appoint_village_chief_endpoint(request: Request):
     authed, actor = _operator_gate(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
     import sim as _sim
     state = _state_begin()
     if not state:
