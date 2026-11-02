@@ -687,14 +687,14 @@ async def _pipeline_execute_locked(request: Request, body: dict):
                             'stdout': '', 'stderr': '(skipped: no .py files in sandbox)',
                             'timedOut': False})
             continue
-        allowed, reason = await _classify_command(command, f'CI/CD pipeline step "{name}"', agent_id)
+        allowed, reason, block_kind = await _classify_command(command, f'CI/CD pipeline step "{name}"', agent_id)
         if not allowed:
             # Same supervisor-override path as /api/execute, per step.
             overridden, override_note = await _supervisor_override_decision(
                 agent_id, f'pipeline step "{name}"', command, f'CI/CD pipeline step "{name}"', reason, EXECUTE_BLOCK_CATEGORIES)
             if not overridden:
-                log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
-                results.append({'name': name, 'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+                log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'blocked', 'reason': reason, 'blockKind': block_kind, 'supervisorNote': override_note}, authorized=authorized)
+                results.append({'name': name, 'allowed': False, 'reason': reason, 'blockKind': block_kind, 'supervisorNote': override_note})
                 _finish_confirmation(confirmation_id, 'failed', f'blocked step {name}')
                 sync_prototypes(agent_id, sandbox_dir)
                 return JSONResponse({'sandboxId': sandbox_id, 'results': results, 'failedStep': name})

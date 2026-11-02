@@ -687,7 +687,7 @@ class AccessRequestEndpoint(unittest.TestCase):
 class ClassifyCommand(unittest.TestCase):
     def test_missing_key_fails_closed(self):
         with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', None):
-            allowed, reason = asyncio.run(serve._classify_command('echo hi', 'test', 'ada'))
+            allowed, reason, kind = asyncio.run(serve._classify_command('echo hi', 'test', 'ada'))
         self.assertFalse(allowed)
         self.assertEqual(reason, 'OPENROUTER_API_KEY not set')
 
@@ -695,7 +695,7 @@ class ClassifyCommand(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision', _jev()), \
              unittest.mock.patch.object(serve, '_jev_safety_gate', return_value=True):
-            allowed, reason = asyncio.run(serve._classify_command('echo hi', 'runs a test', 'ada'))
+            allowed, reason, kind = asyncio.run(serve._classify_command('echo hi', 'runs a test', 'ada'))
         self.assertTrue(allowed)
         self.assertEqual(reason, 'allow')
 
@@ -703,7 +703,7 @@ class ClassifyCommand(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision', _jev(decision='block', confidence=0.99)), \
              unittest.mock.patch.object(serve, '_jev_safety_gate', return_value=False):
-            allowed, reason = asyncio.run(serve._classify_command('rm -rf /', 'cleanup', 'ada'))
+            allowed, reason, kind = asyncio.run(serve._classify_command('rm -rf /', 'cleanup', 'ada'))
         self.assertFalse(allowed)
         self.assertEqual(reason, 'block')
 
@@ -714,7 +714,7 @@ class ClassifyCommand(unittest.TestCase):
         with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                         side_effect=AssertionError('model should not run')):
-            allowed, reason = asyncio.run(serve._classify_command(
+            allowed, reason, kind = asyncio.run(serve._classify_command(
                 'cat ' + os.path.expanduser('~') + '/secret.txt', 'read a file', 'ada'))
         self.assertFalse(allowed)
         self.assertIn('host filesystem', reason)

@@ -91,9 +91,18 @@ def _runtime_grants():
 
 
 def is_allowed(host):
-    if (host or '').lower() in ALLOWED_HOSTS:
+    # Suffix matching, same rule serve.py's _is_allowlisted_host applies to
+    # BROWSE_ALLOWLIST_DOMAINS (found live 2026-11-02: youtube.com was
+    # allowlisted while the browser CONNECTed to www.youtube.com -- the exact
+    # match refused the tunnel with 403 and the sandbox browser could never
+    # reach a domain the rest of the system considered reachable). The two
+    # layers must agree or the allowlist is a lie. Exact hits stay first on
+    # the hot path; the suffix scan only runs on a miss.
+    host = (host or '').lower().strip()
+    if host in ALLOWED_HOSTS or host in _runtime_grants():
         return True
-    return (host or '').lower() in _runtime_grants()
+    return (any(host.endswith('.' + d) for d in ALLOWED_HOSTS)
+            or any(host.endswith('.' + d) for d in _runtime_grants()))
 
 
 # Real constraint, found while auditing this for a possible GET-only

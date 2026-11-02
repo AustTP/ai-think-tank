@@ -729,7 +729,7 @@ async def execute(request: Request):
         {'command': command, 'purpose': purpose})
     if confirmation_error:
         return confirmation_error
-    allowed, reason = await _classify_command(command, purpose, agent_id)
+    allowed, reason, block_kind = await _classify_command(command, purpose, agent_id)
     if not allowed:
         # Blocked by Jev: the agent's supervisor (a NON-Jev model) gets one
         # autonomous review before the block is final. Overrides are logged
@@ -742,8 +742,12 @@ async def execute(request: Request):
             # and adapts. Access/API-key needs go through /api/allowlist/request
             # or /api/api-service/request, which DO escalate (only those need the
             # player's grant).
-            log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
-            return JSONResponse({'allowed': False, 'reason': reason, 'supervisorNote': override_note})
+            log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'blocked', 'reason': reason, 'blockKind': block_kind, 'supervisorNote': override_note}, authorized=authorized)
+            # blockKind lets the agent-side executors react by kind: only a
+            # real 'policy' denial burns a one-strike; 'unsure' means
+            # rephrase and retry; 'unavailable' means the classifier was
+            # down -- retry later, no strike.
+            return JSONResponse({'allowed': False, 'reason': reason, 'blockKind': block_kind, 'supervisorNote': override_note})
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)

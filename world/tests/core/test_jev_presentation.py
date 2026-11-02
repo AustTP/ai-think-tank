@@ -460,7 +460,7 @@ class RoleFraming(unittest.TestCase):
             # is_model_circuit_broken is patched because earlier tests in the
             # full suite trip the process-global breaker; in isolation it
             # would be closed either way.
-            allowed, reason = asyncio.run(drive())
+            allowed, reason, _kind = asyncio.run(drive())
         self.assertTrue(allowed, f'blocked with reason: {reason}')
         instructions = captured['choice']['instructions']
         self.assertIn('worker (Assistant to Nora)', instructions)

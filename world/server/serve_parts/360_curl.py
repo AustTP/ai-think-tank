@@ -505,10 +505,18 @@ def _git_read_only_command(text):
 
 
 async def _classify_command(command, purpose, agent_id='unknown'):
+    """Returns (allowed, reason, blockKind). blockKind distinguishes WHY a
+    command was refused so callers can react differently: 'policy' is a real
+    denial (deterministic refusal or a confident Jev block) -- a one-strike
+    offense; 'unsure' means Jev could not reach the confidence floor and the
+    agent should rephrase or retry; 'unavailable' means the classifier itself
+    was down -- retryable later, never an accusation. Callers that treat every
+    False as a denial turn a transient classifier outage or a timid score
+    into a burned strike (ruth's frame-capture probe, 2026-11-02)."""
     # Fails closed, same direction as browsing and for the same reason:
     # an unreachable classifier is not consent to run something unvetted.
     if not OPENROUTER_API_KEY:
-        return False, 'OPENROUTER_API_KEY not set'
+        return False, 'OPENROUTER_API_KEY not set', 'unavailable'
     criteria = {
         'allow': 'Ordinary development/CI work -- running tests, building, linting, installing from a well-known package registry, writing/reading files inside the working directory.',
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
@@ -518,7 +526,7 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     # Never for a decoded wrapper: the ORIGINAL base64 wrapper is what would
     # run, and this pre-approval only ever saw the decoded text.
     if not reviewed['decoded'] and _git_read_only_command(reviewed['text']):
-        return True, 'allow'
+        return True, 'allow', None
 
     # Deterministic host-path refusal before the model is asked. The sandbox
     # mounts the task directory at /workspace and has its own ephemeral /tmp;
@@ -533,7 +541,7 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         return False, ('blocked: the command references a host filesystem path outside the sandbox. '
                        'Use /workspace, or the sandbox\'s own /tmp. The sandbox cannot see the '
                        'host filesystem at all -- for org-level stats (task counts, spend) use '
-                       'the state_records tool with op=stats instead.')
+                       'the state_records tool with op=stats instead.'), 'policy'
     instructions = (f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\n'
                     f'Stated reason: {purpose or "not given"}\n'
                     'The sandbox is a container: /workspace is the task directory and its /tmp is '
@@ -555,17 +563,19 @@ async def _classify_command(command, purpose, agent_id='unknown'):
     decision, confidence, cost, trace_id = await _jev_quorum_decision(instructions, criteria, kind='cmd_allow')
     if not _jev_safety_gate(agent_id, 'execute_classify', 'This command', command, purpose, decision, confidence, cost, None, trace_id):
         if decision not in ('allow', 'approve'):
-            return False, decision or 'classifier unavailable or gave no answer'
+            return False, decision or 'classifier unavailable or gave no answer', (
+                'policy' if decision == 'block' else 'unavailable')
         # Low-confidence allow blocked. The old message was just
         # "unsure (Jev confidence 0.16), escalated" -- agents saw a score
         # with no reason and no fix. Name what Jev blocks and what to do.
         _cats = '; '.join(EXECUTE_BLOCK_CATEGORIES)
-        return False, (f'Jev was not confident enough to approve this command '
-                       f'(confidence {confidence:.2f}, needed {_effective_safety_confidence():.2f}). '
-                       f'Jev blocks: {_cats}. If your command is ordinary work, rephrase the stated '
-                       f'purpose to say exactly what work task it serves, or simplify the command '
-                       f'so its intent is clearer. Do not retry the same command unchanged.')
-    return True, 'allow'
+        reason = (f'Jev was not confident enough to approve this command '
+                  f'(confidence {confidence:.2f}, needed {_effective_safety_confidence():.2f}). '
+                  f'Jev blocks: {_cats}. If your command is ordinary work, rephrase the stated '
+                  f'purpose to say exactly what work task it serves, or simplify the command '
+                  f'so its intent is clearer. Do not retry the same command unchanged.')
+        return False, reason, 'unsure'
+    return True, 'allow', None
 
 
 # browser_act is a REAL headed-browser form interaction running inside the

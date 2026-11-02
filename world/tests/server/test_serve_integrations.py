@@ -792,7 +792,7 @@ class _ClassifyCommandJev(unittest.TestCase):
              unittest.mock.patch.object(serve, '_send_escalation_email_sync') as mock_email, \
              unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
              unittest.mock.patch.object(serve, '_save_escalations') as mock_save:
-            allowed, reason = asyncio.run(go())
+            allowed, reason, _kind = asyncio.run(go())
         return allowed, reason, mock_save
 
     def test_confident_allow_runs(self):
@@ -842,9 +842,10 @@ class ReadOnlyGitPreapproval(unittest.TestCase):
                         'git branch', 'git tag -l', 'git config --get user.name',
                         'git remote -v', 'git stash list',
                         'git -C sub log -3'):
-            allowed, reason = self._classified(command)
+            allowed, reason, kind = self._classified(command)
             self.assertTrue(allowed, f'{command} should be pre-approved')
             self.assertEqual(reason, 'allow')
+            self.assertIsNone(kind)
 
     def test_write_shaped_and_compound_git_still_needs_jev(self):
         # Anything that is not a single pure read-only git invocation falls
@@ -862,9 +863,11 @@ class ReadOnlyGitPreapproval(unittest.TestCase):
             with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
                  unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
                                             return_value={'answers': {'choice': {'choice': 'block', 'confidence': 0.99, 'probabilities': {}}}}) as mock_call:
-                asyncio.run(go())
+                allowed, reason, kind = asyncio.run(go())
             self.assertTrue(mock_call.called,
                             f'{command} must be sent to the classifier, not pre-approved')
+            self.assertFalse(allowed)
+            self.assertEqual(kind, 'policy', msg=command)
 
 
 class ResearchContentExecutor(unittest.TestCase):

@@ -123,6 +123,23 @@ class OneStrikePerTool(unittest.TestCase):
         self.assertIn('already blocked', second.lower())
         http_mock.assert_called_once()
 
+    def test_unsure_and_unavailable_blocks_do_not_strike(self):
+        # Calibrated strike (2026-11-02): only a 'policy' denial burns the
+        # one strike. 'unsure' (Jev below the confidence floor) and
+        # 'unavailable' (classifier down) are retryable states -- ruth's
+        # spike lost its whole execute lane to a blocked probe. A MISSING
+        # blockKind (old response shape) still strikes, as before.
+        for kind, strikes in (('unsure', False), ('unavailable', False), (None, True)):
+            struck = set()
+            executor = content._make_spike_sandbox_executor('cora', 'key-123', 'spike-1', struck_tools=struck)
+            with unittest.mock.patch.object(serve, '_http_json',
+                                            return_value={'allowed': False, 'reason': 'r',
+                                                          'blockKind': kind}):
+                reply = executor('execute_script', {'command': 'git log', 'purpose': 'p'})
+            self.assertEqual('execute_script' in struck, strikes, msg=kind)
+            if not strikes:
+                self.assertIn('NOT a strike', reply, msg=kind)
+
     def test_strikes_are_per_tool_not_global(self):
         # A browse_page strike must NOT block execute_script -- one-strike
         # is per SERVICE/tool (matching the framework's own naming), not a blanket

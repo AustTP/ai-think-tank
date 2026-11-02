@@ -753,8 +753,23 @@ def _make_spike_sandbox_executor(agent_id, agent_key, sandbox_id, struck_tools=N
         if not isinstance(result, dict):
             return 'Could not run that command (unexpected response).'
         if result.get('allowed') is False:
-            if struck_tools is not None:
+            # Calibrated strike (2026-11-02): only a real policy denial burns
+            # the one strike. 'unsure' (Jev below the confidence floor) and
+            # 'unavailable' (classifier down) are retryable states -- ruth's
+            # spike lost its whole execute lane to a probe the supervisor
+            # itself would have approved. A missing blockKind is an old
+            # response shape; treat it as a policy denial as before.
+            kind = result.get('blockKind') or 'policy'
+            if kind == 'policy' and struck_tools is not None:
                 struck_tools.add('execute_script')
+            if kind == 'unsure':
+                return (f"Command blocked: {result.get('reason', 'not approved')} "
+                        "[NOT a strike -- Jev was unsure. Rephrase the purpose to say "
+                        "exactly what work task the command serves, or simplify it, then retry]")
+            if kind == 'unavailable':
+                return (f"Command blocked: {result.get('reason', 'not approved')} "
+                        "[NOT a strike -- the classifier was unavailable. Wait a moment "
+                        "and retry; if it keeps failing, route around with another tool]")
             return (f"Command blocked: {result.get('reason', 'not approved')} "
                     "[ONE-STRIKE: this was a policy denial -- do not retry execute_script with a "
                     "similar command, try a genuinely different approach]")
