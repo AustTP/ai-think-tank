@@ -516,6 +516,9 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
         if name == 'bookmarks':
             tools_used.append(name)
             return _bookmarks_tool(pick, args)
+        if name == 'knowledge':
+            tools_used.append(name)
+            return _knowledge_tool(pick, args)
         if name == 'local_file':
             tools_used.append(name)
             return _local_file_tool(pick, args)
@@ -549,7 +552,7 @@ async def _ask_core(state, question, agent_id_hint=None, location=None, max_toke
 
     tools = (AGENT_ASK_TOOLS + _PULSE_TOOLS + [_TREG_X_TRENDING_TOOL, _TREG_LINKEDIN_SEARCH_TOOL]
             + (SECURITY_TEST_TOOLS if is_security_test_role else []))
-    tools = tools + [_GITHUB_REPO_TOOL, _BOOKMARKS_TOOL]
+    tools = tools + [_GITHUB_REPO_TOOL, _BOOKMARKS_TOOL, _KNOWLEDGE_TOOL]
     if FILE_ACCESS_ENABLED and _effective_file_grants(state):
         tools = tools + [_LOCAL_FILE_TOOL, _READ_STORE_TOOL]
     if APP_ACCESS_ENABLED and _effective_app_grants(state):
