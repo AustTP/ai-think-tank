@@ -200,6 +200,16 @@ class BookmarkEndpoints(unittest.TestCase):
                               {'url': 'https://x.example'}, actor='dana')
         self.assertEqual(r.status_code, 403)
 
+    def test_admin_agent_can_seed_a_global_bookmark(self):
+        # The tool grants admins global add/delete; the endpoint must not be
+        # stricter than the tool it mirrors (theo seeds via API with his key).
+        r, save = self._post(_state(), '/api/bookmarks',
+                             {'url': 'https://idealab.ai', 'scope': 'global'},
+                             actor='theo')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['created'], True)
+        self.assertEqual(save.call_count, 1)
+
     def test_unknown_team_scope_is_404(self):
         r, _save = self._post(_state(), '/api/bookmarks',
                               {'url': 'https://x.example', 'scope': 'nope'})

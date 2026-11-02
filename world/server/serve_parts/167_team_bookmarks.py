@@ -218,12 +218,10 @@ async def list_bookmarks_endpoint(request: Request):
 @app.post('/api/bookmarks')
 @_state_writer
 async def add_bookmark_endpoint(request: Request):
-    """Player-only bookmark add. Body: {url, title?, scope='global'|teamId}."""
+    """Player-or-admin bookmark add. Body: {url, title?, scope='global'|teamId}."""
     authed, actor = _operator_gate(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
-    if actor != 'player':
-        return JSONResponse({'error': 'player session required to curate bookmarks'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -231,6 +229,10 @@ async def add_bookmark_endpoint(request: Request):
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    # The player session OR an admin agent curates -- exactly the tool's
+    # rule; the endpoint must not be stricter than the tool it mirrors.
+    if actor != 'player' and not _agent_is_admin(actor, state):
+        return JSONResponse({'error': 'only the player or an admin agent can curate bookmarks'}, status_code=403)
     scope = (body.get('scope') or 'global').strip()
     if scope != 'global' and not any(t.get('id') == scope
                                      for t in (state.get('teams') or [])):
@@ -251,12 +253,10 @@ async def add_bookmark_endpoint(request: Request):
 @app.post('/api/bookmarks/delete')
 @_state_writer
 async def delete_bookmark_endpoint(request: Request):
-    """Player-only bookmark delete. Body: {id}."""
+    """Player-or-admin bookmark delete. Body: {id}."""
     authed, actor = _operator_gate(request)
     if not authed:
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
-    if actor != 'player':
-        return JSONResponse({'error': 'player session required to curate bookmarks'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
@@ -265,6 +265,8 @@ async def delete_bookmark_endpoint(request: Request):
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    if actor != 'player' and not _agent_is_admin(actor, state):
+        return JSONResponse({'error': 'only the player or an admin agent can curate bookmarks'}, status_code=403)
     found = next((b for b in (state.get('bookmarks') or [])
                   if b.get('id') == bookmark_id), None)
     if not found:
@@ -272,6 +274,6 @@ async def delete_bookmark_endpoint(request: Request):
     state['bookmarks'] = [b for b in state.get('bookmarks') or []
                           if b.get('id') != bookmark_id]
     save_state_to_db(state)
-    log_action('player', 'bookmark_deleted',
+    log_action(actor or 'player', 'bookmark_deleted',
                {'id': bookmark_id, 'scope': found.get('scope')}, authorized=True)
     return JSONResponse({'ok': True, 'deleted': bookmark_id})
