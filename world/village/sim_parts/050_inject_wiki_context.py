@@ -427,10 +427,21 @@ def _cancel_at_task(state, agent_id):
         parked = _requeue_unreachable_work(state, task, agent_id,
                                            int(time.time() * 1000))
         from serve import log_action
+        # Walk-death diagnostics (DEV-109 follow-up): the static reachability
+        # of the agent's position does NOT explain every stuck cancel --
+        # positions that test fully reachable still die mid-route, so the
+        # movement bookkeeping at death is the evidence a real fix needs.
         log_action(None, 'task_requeued_unreachable' if not parked
                    else 'task_parked_unreachable',
                    {'taskId': task_id, 'agent': agent_id,
-                    'unreachableBy': unreachable, 'parked': parked},
+                    'room': task.get('room'),
+                    'unreachableBy': unreachable, 'parked': parked,
+                    'at': {'x': a.get('x'), 'y': a.get('y'),
+                           'pathTarget': a.get('pathTarget'),
+                           'pathIndex': a.get('pathIndex'),
+                           'pathLen': len(a.get('path') or []),
+                           'stuckTimer': a.get('stuckTimer'),
+                           'replanCount': a.get('replanCount')}},
                    authorized=True)
     a['task'] = None
     a['path'] = None
