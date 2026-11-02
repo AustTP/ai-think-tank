@@ -65,6 +65,7 @@ class ClassifyBrowserAction(unittest.TestCase):
 
     def test_read_op_on_allowlisted_host_skips_jev(self):
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision') as jev, \
              unittest.mock.patch.object(serve, '_jev_safety_gate') as gate:
@@ -82,6 +83,7 @@ class ClassifyBrowserAction(unittest.TestCase):
         # work_context_trusted=True (player-authored provenance); an
         # agent-authored story's own text never gets it.
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision') as jev, \
              unittest.mock.patch.object(serve, '_jev_safety_gate') as gate:
@@ -100,6 +102,7 @@ class ClassifyBrowserAction(unittest.TestCase):
         # the story text is a laundering vector, not a player-vetted allowlist.
         # The named host still goes through the full story-aware Jev classify.
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('allow', 0.99, 0.0, 'trace'))) as jev, \
@@ -120,6 +123,7 @@ class ClassifyBrowserAction(unittest.TestCase):
         # Relevance is judged against the work, not self-claimed: a host the
         # player never named still gets the full Jev classify.
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('allow', 0.99, 0.0, 'trace'))) as jev, \
@@ -138,6 +142,7 @@ class ClassifyBrowserAction(unittest.TestCase):
         # Submit is the consequential op -- the allowlist covers the domain's
         # content judgment, not every form submission on it.
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('allow', 0.99, 0.0, 'trace'))) as jev, \
@@ -149,6 +154,7 @@ class ClassifyBrowserAction(unittest.TestCase):
 
     def test_non_allowlisted_read_still_goes_through_jev(self):
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('allow', 0.99, 0.0, 'trace'))) as jev, \
@@ -160,6 +166,7 @@ class ClassifyBrowserAction(unittest.TestCase):
 
     def test_blocked_decision_fails_closed(self):
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('block', 0.99, 0.0, 'trace'))), \
@@ -170,6 +177,7 @@ class ClassifyBrowserAction(unittest.TestCase):
 
     def test_unsure_decision_fails_closed(self):
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              unittest.mock.patch.object(serve, '_jev_quorum_decision',
                                       new=unittest.mock.AsyncMock(return_value=('unsure', 0.5, 0.0, 'trace'))), \
@@ -180,6 +188,7 @@ class ClassifyBrowserAction(unittest.TestCase):
 
     def test_no_openrouter_key_fails_closed(self):
         with unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', set()), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', ''):
             allowed, reason = asyncio.run(serve._classify_browser_action(
                 'goto', 'https://example.com/', 'look', 'cora'))
@@ -426,6 +435,7 @@ class RunBrowserActSync(unittest.TestCase):
              unittest.mock.patch.object(serve, 'PROXY_CONTAINER', 'proxy-c'), \
              unittest.mock.patch.object(serve, 'PROXY_PORT', 8899), \
              unittest.mock.patch.object(serve, 'BROWSE_ALLOWLIST_DOMAINS', {'dreyx.com'}), \
+             unittest.mock.patch.object(serve, '_url_trust_verdict', return_value=None), \
              unittest.mock.patch.object(serve, '_is_allowlisted_host', return_value=False), \
              unittest.mock.patch.object(serve, '_grant_egress_host') as grant, \
              unittest.mock.patch.object(serve, '_revoke_egress_host') as revoke, \
