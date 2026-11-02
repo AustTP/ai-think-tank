@@ -749,13 +749,22 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         elif exec_data.get('timedOut'):
             _block_reason = 'the command timed out before the execution service returned'
         else:
-            _block_reason = exec_data.get('reason') or exec_data.get('detail') or (
-                # Consultant finding 2026-10-27: an empty refusal reason
-                # failed Help cards with no actionable detail. Surface what
-                # the wrapper does know -- the refused command -- instead of
-                # the bare boilerplate.
+            # Consultant finding 2026-10-27: an empty refusal reason failed
+            # Help cards with no actionable detail. Surface what the wrapper
+            # does know -- the refused command -- instead of the bare
+            # boilerplate. Live case 2026-11-02: a 429 rate-limit body
+            # carries `error`, not `reason`/`detail`, so the gate saw
+            # "refused the command without a reason" while the real story
+            # was the sliding-window throttle (three verify attempts in two
+            # minutes). Surface rate limits and every other error field by
+            # name; a retry after the window is the actual remedy.
+            _block_reason = (exec_data.get('reason') or exec_data.get('detail')
+                             or exec_data.get('error') or (
                 f'the execution service refused the command without a reason '
-                f'(command: {str(command)[:200]})')
+                f'(command: {str(command)[:200]})'))
+            if exec_data.get('resourceHold'):
+                _block_reason += (f' -- resource hold, retry after '
+                                  f'{exec_data.get("retryAfterS") or 15}s')
         store_result(task.get('id'),
                                           {'note': f"blocked: {_block_reason}",
                                            'command': command, 'ok': False, 'tier': tier_slug,

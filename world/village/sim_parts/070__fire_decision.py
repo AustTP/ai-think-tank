@@ -512,6 +512,11 @@ def _queue_peer_repair(state, parent, rationale=None):
     item = {
         'title': 'Fix: ' + str(parent.get('title') or tid),
         'room': parent.get('room') or 'pressoffice',
+        # teamId must survive a repair: every team-routed mechanism (worker
+        # stuck-help, stale-work re-plan) resolves the OWNING team from the
+        # task. Found live 2026-11-02: a Fix re-card without teamId made its
+        # worker_stuck_help signal unroutable (routed=False, 'no team').
+        'teamId': parent.get('teamId'),
         'taskType': parent.get('taskType') or 'code',
         'deliverable': parent.get('deliverable'),
         # Lane markers must survive a repair. Distill/skill-review cards are
@@ -1001,6 +1006,9 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     queue_work(state, [{
         'title': f'Fix: {task.get("title")}',
         'room': task.get('room'),
+        # Same teamId-survival rule as the peer-repair card above: without it
+        # the re-card's help/stale signals cannot find the owning team.
+        'teamId': task.get('teamId'),
         'instructions': instructions,
         'goal': task.get('projectLabel') or task.get('goal'),
         'projectLabel': task.get('projectLabel') or task.get('title'),

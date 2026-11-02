@@ -337,3 +337,37 @@ class GovernanceEscalationGap(SimIsolation):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FixRecardCarriesTeamId(unittest.TestCase):
+    """Fix: re-cards must carry the parent's teamId: every team-routed
+    mechanism (worker stuck-help, stale-work re-plan) resolves the owning
+    team from the TASK, and a re-card without teamId made its help signal
+    unroutable (live 2026-11-02: task-3002, routed=False, 'no team')."""
+
+    def test_peer_repair_card_carries_team_id(self):
+        parent = {'id': 'task-1', 'title': 'Story A', 'room': 'pressoffice',
+                  'teamId': 'dev', 'status': 'failed', 'peerReviews': [],
+                  'assignedTo': 'piper'}
+        state = {'teams': [{'id': 'dev', 'directorId': 'giles'}],
+                 'agents': {'piper': {'id': 'piper'}},
+                 'workQueue': [], 'tasks': {}}
+        item = sim._queue_peer_repair(state, parent, rationale='fix it')
+        self.assertIsNotNone(item)
+        self.assertEqual(item['teamId'], 'dev')
+
+    def test_pipeline_failure_recard_carries_team_id(self):
+        task = {'id': 'task-9', 'title': 'Story B', 'room': 'pressoffice',
+                'teamId': 'dev', 'taskType': 'code'}
+        state = {'teams': [{'id': 'dev', 'directorId': 'giles'}]}
+        captured = []
+        original = sim.queue_work
+
+        def capture(s, items):
+            captured.extend(items)
+        sim.queue_work = capture
+        try:
+            sim._send_back_after_failure(state, task, 'gate failed', is_infra=False)
+        finally:
+            sim.queue_work = original
+        self.assertEqual(captured[0]['teamId'], 'dev')
