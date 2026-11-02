@@ -659,7 +659,7 @@ class PipelineEndpointTests(unittest.TestCase):
                  mock.patch.object(serve, '_sandbox_has_python_files',
                                    return_value=True), \
                  mock.patch.object(serve, '_classify_command',
-                                   mock.AsyncMock(return_value=(True, 'ok'))), \
+                                   mock.AsyncMock(return_value=(True, 'ok', None))), \
                  mock.patch.object(serve, '_snapshot_sandbox'), \
                  mock.patch.object(serve, '_run_in_sandbox_sync',
                                    return_value={'exitCode': 0,

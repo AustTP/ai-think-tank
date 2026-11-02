@@ -110,7 +110,7 @@ class PipelineEndpoint(unittest.TestCase):
         self.sbx = tempfile.mkdtemp(prefix='gap-f-sandbox-')
         self.addCleanup(shutil.rmtree, self.sbx, ignore_errors=True)
 
-    def _post(self, body, classify=(True, 'allow'), rate=True, exec_enabled=True,
+    def _post(self, body, classify=(True, 'allow', None), rate=True, exec_enabled=True,
               results=None):
         patchers = [
             unittest.mock.patch.object(serve, 'EXECUTION_ENABLED', exec_enabled),
@@ -164,7 +164,7 @@ class PipelineEndpoint(unittest.TestCase):
 
     def test_blocked_step_stops_pipeline(self):
         r = self._post({'agentId': 'eli', 'steps': self._steps()},
-                       classify=(False, 'blocked: network access'))
+                       classify=(False, 'blocked: network access', 'policy'))
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual(body['failedStep'], 'clone')

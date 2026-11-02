@@ -293,7 +293,7 @@ class AddHandleTest(unittest.TestCase):
 
 
 class ExecuteTest(unittest.TestCase):
-    def _call(self, body, classify=(True, ''), override=(False, 'no')):
+    def _call(self, body, classify=(True, '', None), override=(False, 'no')):
         req = mock.Mock()
         req.json = mock.AsyncMock(return_value=body)
         req.headers = {'X-Agent-Key': 'k'}
@@ -331,7 +331,7 @@ class ExecuteTest(unittest.TestCase):
         with mock.patch.object(serve, '_SANDBOX_ID_RE',
                                mock.MagicMock(match=lambda s: True)):
             res = self._call({'command': 'rm'},
-                             classify=(False, 'r'),
+                             classify=(False, 'r', 'policy'),
                              override=(True, 'ok'))
         self.assertTrue(json.loads(res.body)['allowed'])
 

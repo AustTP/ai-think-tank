@@ -23,7 +23,7 @@ from test_cov_gap_serve_helpers import (  # noqa: E402
 
 
 class PipelineTest(unittest.TestCase):
-    def _call(self, body, has_py=False, classify=(True, ''), override=None,
+    def _call(self, body, has_py=False, classify=(True, '', None), override=None,
               run=None):
         req = mock.Mock()
         req.json = mock.AsyncMock(return_value=body)
@@ -63,7 +63,7 @@ class PipelineTest(unittest.TestCase):
                          has_py=False)
         self.assertIn('skipped', json.loads(res.body)['results'][0]['stderr'])
         res = self._call({'steps': [{'name': 'x', 'command': 'rm'}]},
-                         classify=(False, 'bad'),
+                         classify=(False, 'bad', 'policy'),
                          override=(True, 'ok'))
         self.assertTrue(json.loads(res.body)['results'][0]['allowed'])
 
