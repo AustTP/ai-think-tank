@@ -428,6 +428,82 @@ async def access_request(request: Request):
     return JSONResponse({'approved': True, 'capability': capability, 'expiresAt': expires_at, 'untilStoryComplete': story_scoped, 'durationS': None if story_scoped else TEMP_ACCESS_DURATION_S, 'taskId': task_id})
 
 
+_GIT_READ_ONLY_SUBS = frozenset({
+    # Subcommands that are read-only for every argument shape (the JEV
+    # criteria's "ordinary development work" -- reading your own repo).
+    'status', 'log', 'diff', 'show', 'blame', 'grep', 'ls-files',
+    'ls-remote', 'rev-parse', 'describe', 'shortlog', 'count-objects',
+    'cat-file', 'check-ignore', 'merge-base', 'archive',
+})
+# Subcommands whose DEFAULT form is a read (a list), but which take a write
+# action from the wrong argument. STRICT: only their list flags, no extra
+# tokens (an extra token on branch/tag is a refname to create or delete).
+_GIT_LIST_FLAG_SUBS = {
+    'branch': frozenset({'-a', '-v', '-vv', '-r', '--list', '--all',
+                         '--remotes', '--merged', '--no-merged',
+                         '--contains', '--no-contains', '--points-at',
+                         '--show-current'}),
+    'tag': frozenset({'-l', '--list'}),
+    'worktree': frozenset({'list'}),
+    'stash': frozenset({'list'}),
+}
+# Read-flag-first subs: the first argument must be a read flag, and the rest
+# are the key/name being READ (`git config --get user.name`) -- a write needs
+# a bare `key value` form with no leading read flag, which fails this shape.
+_GIT_READ_FLAG_FIRST_SUBS = {
+    'config': frozenset({'--get', '--get-all', '--get-regexp', '--list', '-l'}),
+    'remote': frozenset({'-v', '--verbose', 'get-url'}),
+}
+_GIT_GLOBAL_FLAGS = frozenset({'-p', '--paginate', '--no-pager'})
+# A single pure git command only: chaining, piping, or redirecting would run
+# (or write) something this pre-approval never looked at.
+_GIT_SHELL_META = (';', '&', '|', '`', '$(', '<', '>', '\n', '\r')
+
+
+def _git_read_only_command(text):
+    """True when `text` is ONE plain read-only git invocation.
+
+    Deterministic pre-approval ahead of the JEV classifier (2026-11-02): a
+    plain `git log` for a documentation task was blocked at confidence 0.42
+    against the 0.50 floor -- ordinary dev reading kept tripping the same
+    gate that guards exfiltration. Reading your own repository is not in any
+    block category; these commands get the same treatment as the host-path
+    refusal above (a deterministic decision the model never has to make).
+    Anything compound, redirected, piped, base64-wrapped, or write-shaped
+    still goes to JEV as before."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or any(meta in stripped for meta in _GIT_SHELL_META):
+        return False
+    tokens = stripped.split()
+    if not tokens or tokens[0] != 'git':
+        return False
+    rest = tokens[1:]
+    while rest and rest[0] in _GIT_GLOBAL_FLAGS:
+        rest = rest[1:]
+    if rest and rest[0] == '-C':
+        if len(rest) < 2:
+            return False
+        rest = rest[2:]
+    if not rest:
+        return False
+    sub = rest[0]
+    if sub in _GIT_READ_ONLY_SUBS:
+        return True
+    list_flags = _GIT_LIST_FLAG_SUBS.get(sub)
+    if list_flags:
+        for arg in rest[1:]:
+            if arg in list_flags or arg.startswith('--sort='):
+                continue
+            return False
+        return True
+    read_flags = _GIT_READ_FLAG_FIRST_SUBS.get(sub)
+    if read_flags:
+        return bool(rest[1:]) and rest[1] in read_flags
+    return False
+
+
 async def _classify_command(command, purpose, agent_id='unknown'):
     # Fails closed, same direction as browsing and for the same reason:
     # an unreachable classifier is not consent to run something unvetted.
@@ -438,6 +514,12 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
     }
     reviewed = review_target(command)
+    # Deterministic read-only-git pre-approval before the model is asked.
+    # Never for a decoded wrapper: the ORIGINAL base64 wrapper is what would
+    # run, and this pre-approval only ever saw the decoded text.
+    if not reviewed['decoded'] and _git_read_only_command(reviewed['text']):
+        return True, 'allow'
+
     # Deterministic host-path refusal before the model is asked. The sandbox
     # mounts the task directory at /workspace and has its own ephemeral /tmp;
     # a host home path is never ordinary work. This also keeps the read path

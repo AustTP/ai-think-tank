@@ -817,6 +817,56 @@ class _ClassifyCommandJev(unittest.TestCase):
         save_called.assert_not_called()
 
 
+class ReadOnlyGitPreapproval(unittest.TestCase):
+    # Deterministic pre-approval ahead of the JEV classifier in
+    # _classify_command: plain read-only git (the criteria's own "ordinary
+    # development work") must not depend on a model's confidence score --
+    # a plain `git log` was blocked at 0.42 against the 0.50 floor.
+    @classmethod
+    def setUpClass(cls):
+        serve.init_db()
+
+    def _classified(self, command):
+        async def go():
+            return await serve._classify_command(command, 'read repo history')
+        # JEV must NEVER be reached for a pre-approved command: the
+        # classifier mock raises, so any model call fails the test.
+        with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        side_effect=AssertionError('JEV reached')):
+            return asyncio.run(go())
+
+    def test_plain_read_only_git_runs_without_jev(self):
+        for command in ('git log --oneline -5', 'git status --porcelain',
+                        'git diff HEAD~1', 'git show abc123 --stat',
+                        'git branch', 'git tag -l', 'git config --get user.name',
+                        'git remote -v', 'git stash list',
+                        'git -C sub log -3'):
+            allowed, reason = self._classified(command)
+            self.assertTrue(allowed, f'{command} should be pre-approved')
+            self.assertEqual(reason, 'allow')
+
+    def test_write_shaped_and_compound_git_still_needs_jev(self):
+        # Anything that is not a single pure read-only git invocation falls
+        # through to the classifier as before (asserted by JEV being called;
+        # the classifier's own fail-closed except would swallow an exception
+        # probe, so count calls instead).
+        for command in ('git branch -D main', 'git tag v1', 'git config user.name bot',
+                        'git remote add origin https://x.test', 'git checkout main',
+                        'git push origin main', 'git stash drop',
+                        'git log && echo pwned', 'git log | tee out.txt',
+                        'git log > out.txt', 'echo hi && git status',
+                        'status'):
+            async def go():
+                return await serve._classify_command(command, 'misc')
+            with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
+                 unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                            return_value={'answers': {'choice': {'choice': 'block', 'confidence': 0.99, 'probabilities': {}}}}) as mock_call:
+                asyncio.run(go())
+            self.assertTrue(mock_call.called,
+                            f'{command} must be sent to the classifier, not pre-approved')
+
+
 class ResearchContentExecutor(unittest.TestCase):
     # Phase 3 slice 2: the research content executor runs the real crawl > save
     # > chat > Library-write pipeline on a background thread, then stashes its
