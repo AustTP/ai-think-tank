@@ -121,7 +121,8 @@ class CacheAndSummary(unittest.TestCase):
 
         def fake_score(url, **kw):
             calls.append(url)
-            return verdict
+            import copy
+            return copy.deepcopy(verdict)
 
         setting = {}
         with mock.patch.object(serve, '_get_setting',
@@ -134,6 +135,29 @@ class CacheAndSummary(unittest.TestCase):
         self.assertEqual(calls, ['https://cached.example/a'])
         self.assertEqual(first['band'], 'trusted')
         self.assertEqual(second['band'], 'trusted')
+
+    def test_keyless_verdict_cannot_poison_a_keyed_caller(self):
+        # A process WITHOUT the keys writes a degraded entry; a keyed
+        # caller must re-score rather than trust it for a day.
+        setting = {}
+        degraded = _verdict('unknown')
+        degraded['signals']['virustotal'] = None
+        with mock.patch.object(serve, '_get_setting',
+                               side_effect=lambda key, default='': setting.get(key, default)), \
+             mock.patch.object(serve, '_set_setting',
+                               side_effect=lambda key, val: setting.__setitem__(key, val)), \
+             mock.patch.dict('os.environ', {}, clear=False):
+            serve.os.environ.pop('VIRUSTOTAL_API_KEY', None)
+            serve.os.environ.pop('SAFEBROWSING_API_KEY', None)
+            with mock.patch.object(serve._url_trust, 'score_url',
+                                   return_value=degraded):
+                serve._url_trust_verdict('https://poison.example/a')
+            serve.os.environ['VIRUSTOTAL_API_KEY'] = 'k'
+            with mock.patch.object(serve._url_trust, 'score_url',
+                                   return_value=_verdict('trusted')) as fresh:
+                out = serve._url_trust_verdict('https://poison.example/b')
+        self.assertEqual(out['band'], 'trusted')
+        fresh.assert_called_once()
 
 
 if __name__ == '__main__':

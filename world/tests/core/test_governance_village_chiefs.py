@@ -48,7 +48,7 @@ def test_auto_pick_prefers_a_senior_director_of_the_village():
     entry = next(r for r in s['agentRoster'] if r['id'] == 'd1')
     assert entry['villageChief'] is True
     assert entry['chiefOfVillage'] == 'main'
-    assert entry['role'] == 'regional_manager'
+    assert entry['role'] == 'regional_vp'
     assert entry['director'] == 'theo'  # reports to the admin
 
 

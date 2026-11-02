@@ -61,7 +61,7 @@ class VillageChiefEndpoint(unittest.TestCase):
         entry = next(e for e in state['agentRoster'] if e['id'] == 'dana')
         self.assertTrue(entry['villageChief'])
         self.assertEqual(entry['chiefOfVillage'], 'main')
-        self.assertEqual(entry['role'], 'regional_manager')
+        self.assertEqual(entry['role'], 'regional_vp')
         self.assertNotIn('chiefOfVillage', state['villages'][0])
 
     def test_unknown_village_is_404(self):

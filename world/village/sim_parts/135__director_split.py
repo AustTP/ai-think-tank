@@ -214,14 +214,14 @@ def _split_instructions(state, req, org, director_name, founding_mode='immediate
                      "org -- a \"shared\" piece means your own subteams only, first-come among them; "
                      "the work must never leave the owning team.")
     if director_id and governance.is_village_chief(state, director_id):
-        # A village regional manager reviews at the senior tier: their tools
+        # A village regional VP reviews at the senior tier: their tools
         # are ROUTING (pieces to their village's senior teams), not
         # founding -- every founding turns a worker into a manager, and the
         # chief's direct reports are senior directors, not workers to
         # convert. Senior directors found subdirector layers below
         # themselves in their own reviews.
         founding_text = (
-            "- You are the regional manager (RM) of your village: route pieces to your senior "
+            "- You are the regional VP of your village: route pieces to your senior "
             "directors' teams (the org list above) and say why each team "
             "fits. Founding subdirectors is not your tool -- your direct "
             "reports are senior directors, not workers to convert; a senior "

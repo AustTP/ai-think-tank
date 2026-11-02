@@ -428,7 +428,7 @@ async def create_village_endpoint(request: Request):
 @app.post('/api/villages/chief')
 @_state_writer
 async def appoint_village_chief_endpoint(request: Request):
-    """Appoint (or re-appoint) a village's regional manager (player-only).
+    """Appoint (or re-appoint) a village's regional VP (player-only).
     {villageId} required; {agentId} optional -- omitted, the village's most
     senior member (a teams-row director) is auto-picked. One chief per
     village: a re-appointment replaces the previous one and re-parents the

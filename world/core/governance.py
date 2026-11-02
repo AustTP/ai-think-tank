@@ -77,7 +77,7 @@ SUBDIRECTOR_LAYER_MAX = 6
 
 def team_director_ids(state):
     """Ids that hold a teams row -- the senior directors, whatever tier they
-    report to (the admin today, a village regional manager on the sharded
+    report to (the admin today, a village regional VP on the sharded
     org). Holding a teams row is the STABLE marker of the senior tier: the
     reporting pointer above them may change as chiefs of staff are added,
     but a teams row means "this agent owns a team" at every tier."""
@@ -87,7 +87,7 @@ def team_director_ids(state):
 
 def village_chief_ids(state):
     """Village chiefs of staff (operator direction, 2026-11-01): the
-    per-village regional managers sitting between the one global chief of staff
+    per-village regional VPs sitting between the one global chief of staff
     (the admin) and that village's senior directors. An explicit roster
     tier -- `villageChief: True` + `chiefOfVillage: <villageId>` -- not an
     emergent one: unlike subdirectors (middle management grown from the
@@ -115,7 +115,7 @@ def villages_without_chief(state):
 
 
 def chief_of_village(state, village_id):
-    """The village regional manager appointed for `village_id`, or None."""
+    """The village regional VP appointed for `village_id`, or None."""
     for r in _roster(state):
         if isinstance(r, dict) and r.get('villageChief') \
                 and (r.get('chiefOfVillage') or None) == (village_id or None):
