@@ -788,12 +788,17 @@ def _agent_still_blocked(state, agent_id, except_task_id=None):
         if not (issue.get('blocked')
                 and issue.get('blockedKind') == 'stuck_on_agent'):
             continue
-        dep = issue.get('dependsOnTask')
-        if dep == except_task_id:
-            continue
-        requester = _dependency_requester(state, issue.get('key'), dep)
-        if requester == agent_id:
-            return True
+        # DAG edges: the issue's dependency may be a list (a join). Walk each
+        # edge separately -- skip only the edge that just landed, and report
+        # still-blocked if ANY surviving edge is the agent's own wait. The
+        # requester lookup compares raw filed ids (block-change records keep
+        # the historic single-id form), not the normalized list.
+        for dep in _normalize_dep_ids(issue.get('dependsOnTask')):
+            if dep == except_task_id:
+                continue
+            requester = _dependency_requester(state, issue.get('key'), dep)
+            if requester == agent_id:
+                return True
     return False
 
 
