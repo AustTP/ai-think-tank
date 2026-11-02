@@ -92,6 +92,164 @@ states only what changed in the operating model.
 - `.env` values may be quoted; the server's loader strips one matching quote
   pair, so `source .env` no longer trips on unquoted pipe characters.
 
+**2026-11-01**
+
+- Org structure: every village gets an appointed authority (twice renamed in
+  one day, settling on regional VP, role `regional_vp`), installed at village
+  creation and backfilled on the tick so the first village self-installs. The
+  senior-director layer became a shared, availability-aware tier: every
+  director without a director of her own, plus top-level team directors, can
+  stand in for the admin, and the first AVAILABLE senior is picked. A
+  subdirector layer emerged as middle management (reports to a director who
+  leads people, rebalances at 3+ direct workers, ceiling of 6, promoted via
+  the player). Subdirector foundings require the parent director's approval.
+- Large asks that name a product an existing team OWNS now route to the
+  owning team and wait there if it is mid-sprint; the split ceremony consults
+  the owning director's line and inherited pieces carry the ownership scope.
+- Scale readiness: the roster, live agents, and the player inbox left the
+  whole-state blob into per-row tables; the active-agent cap rose from 25 to
+  81 (policy can go to 1,000); an operator switch (`scaleTierWorkers`, off by
+  default) can pin plain workers' non-code calls to the sublow band without
+  JEV escalation. Anti-entropy card dedup refuses a second open card under
+  the same normalized title; the operator can force.
+- A broadcast primitive delivers one operator note to many mailboxes without
+  ever becoming work.
+- The board grew a parked column, worker narration on the card face, a
+  Markdown export of live world state, and a read-only MCP edge.
+- Breakdown gained phase plans: a prep-then-build ask tags every card with a
+  phase and the assignment barrier holds later-phase cards until every
+  earlier-phase card is done.
+- Escalations walk the requester's own reporting chain rung by rung, then the
+  senior layer, then the chief of staff, instead of jumping to the senior
+  tier; an escalation nobody acted on within six hours expires with a player
+  warning; no Telegram ping when the chain itself can decide.
+- Health checks moved to every 12 hours on the operator file (aligned with
+  the 12h alert-dedup window); the in-process snapshot loop is unchanged.
+- Memory grew four organs: sprint close auto-writes a team wiki page, judged
+  deliverables distill typed work-learnings into agent long-term memory,
+  RAG indexes are village-scoped, and the prior-incident runbook retrieves
+  the most relevant incident instead of the last one. Institutional-memory
+  retrieval merged semantic hits under the keyword matches for library
+  search, escalations, and grader anchors.
+- The database backend can be Postgres via `THINK_TANK_DB_URL` (the live tank
+  migrated; 67 tables verified), with a repeatable migration script, a boot
+  banner naming the backend, a read-only replica mode, and pg_dump backups.
+  The tank's state got an integrity layer: a state checksum verified at boot,
+  action-log parity rows every 64 entries, and the decision-tape HMAC chain
+  surfaced as a health signal. An enterprise posture and audit surface
+  reports what is actually configured, read-only.
+- Every product team keeps what it learned: see BP-76 (workflow templates)
+  and the change-log lines above for grading and memory.
+
+**2026-10-31**
+
+- The south village regenerates as schematic-native data with flood-fill
+  verified reachability; village capacity is policy (12 top-level teams per
+  village, the admin's aide cluster and subdirector sub-teams excluded);
+  founding the next village is the senior-most directors' job through the
+  `generate_village` tool, self-gated on the cap.
+- Scale slices landed: agentRoster / live agents / playerInbox became
+  per-row tables; card dedup refused twin open cards; a broadcast primitive
+  delivered operator notes; the subdirector layer emerged; workers can be
+  pinned to the sublow band; a grade at or below 1.0 on a task with real
+  artifact evidence is annotated `gradeSuspect` and never triggers coaching.
+- Grading: the all-zeros judge regression was fixed (the honest-absence line
+  fired on every prompt that carried a completion note), the calibration
+  loop now receives a checklist with every breakdown card, and a band-router
+  trainer writes a correlational spend model with honest-limits notes.
+
+**2026-10-30**
+
+- Model tiers: the low band holds an absolute evaluation-score floor
+  (`model_bands.json` `min_score`, default 30); the sublow band resolves the
+  free pool first; Gemini free keys ride Google's per-model daily allowance
+  with per-model rpd caps. An argon band was pinned for operator audio work.
+- The ask lane carries the real date in the prompt, seeds the `api_call`
+  commit grant when no explicit tool list is passed, forces the registry tool
+  on live-data questions, announces truncated previews loudly, and documents
+  verified query syntaxes.
+- Vault credentials unwrap through the api_call gateway; TomTom rides the
+  generic registry.
+- The draft desk pilot: the tank PREPARES short grounded local posts and the
+  OPERATOR decides each from Telegram; nothing is ever posted by the tank.
+  See BP-75.
+- Telegram operator messages now wake a dormant tank and reset the idle
+  clock. See BP-59.
+- The wake trigger measures capable supply, not raw supply: idle bystanders
+  no longer suppress the off-duty wake for cards nobody awake is eligible
+  for. See BP-59.
+- The sim gained a pile-up guard and progress heartbeats after a profile
+  found 378 overlapping passes starving operator HTTP.
+
+**2026-10-29**
+
+- The api-call registry grew the signal-source services (TomTom, Ticketmaster
+  Discovery after Eventbrite retired, Overpass, Redfin) and feed/channel
+  seeds moved to JSON. See BP-51.
+- The tick cadence was restored to 1s after the event-loop starvation fix
+  landed; whole-state deepcopy left the save path.
+
+**2026-10-28**
+
+- Tier-0/1/2 operational findings: the sim pile-up guard, the telegram wake,
+  truncated-preview announcements, the ask date stamp, and the api_call grant
+  seed. See the 2026-10-30 entry for the surviving rules.
+- Grading became evidence-based: the judged artifact (not just its title) is
+  presented to JEV, decision-tape appends are serialized (39 chain breaks
+  were a two-writer race), a calibration ledger rates only the 0-10 buckets,
+  and tape decisions feed a nightly, eval-gated retrain for the groom
+  cascade that must beat the majority-class baseline before it publishes.
+  See BP-21 and BP-22.
+- Rank-differentiated JEV: workers are judged on task scope, directors on
+  team stewardship, the chief of staff on org-wide authority, and each
+  escalation rung gets its own vantage point. See BP-47 and BP-48.
+- Institutional memory: the tank can now find its own past work through a
+  hashed sparse retrieval layer over the Library and archived deliverables.
+  See BP-40.
+- Workflow templates: scrum masters learn and reuse card templates from
+  single-deliverable goals, run weekly, evaluated against the next cards.
+  See BP-76.
+
+**2026-10-27**
+
+- External watches went from one-way to a listening tank: a GitHub watch
+  loop turns CI failures and new issues on the watched repo into asks, OSV.dev
+  dependency audits surface as health alerts, a dead-man switch pages the
+  owner when the pings stop, free-model discovery diffs the OpenRouter
+  catalog, and provider status feeds are scanned for incident keywords. (The
+  bot-law watch later retired on 2026-11-01.) See BP-56.
+- Change requests got a runway: every dormancy-window change must be
+  scheduled at least 24 hours ahead (owner veto needs a real review
+  opportunity) and no more than 7 days out; an `emergency` changeType may use
+  a 1-hour minimum but is loud (logged and Telegram-announced) and keeps the
+  supervisor review and owner veto. Constitution Rule 9 names the lane. See
+  BP-60.
+- The integrity layer, access lattice, and fire-parity verdict landed: a torn
+  or edited state blob is stashed and alerted rather than booted, the access
+  lattice answers can-actor-X-do-action-Y fail-closed, and an irreversible
+  fire now takes a second opinion from a different provider before it
+  executes. See BP-53 and BP-55.
+- The free-tier provider pool is governable: directors disable a provider for
+  their team, the chief of staff for all teams, and a paid-low-tier switch
+  plus an evaluation-score quality floor keep the pool honest. Circuit
+  breakers open for 900s for free providers. See BP-42.
+- Tier escalation reviews: director and senior-director escalations use the
+  mid tier, the chief of staff uses the high tier. See BP-48.
+
+**2026-10-26**
+
+- Facilitation: three open stuck cards require a scrum master for a small
+  team unless the director explicitly owns facilitation, and two of the last
+  five closed sprints missing the retrospective count toward the lean-team
+  trigger. See BP-19.
+- Laptop capacity is governed by village: sandbox CPU, memory, pids, and
+  timeouts moved to deployment.json, and a lease governor exposes live usage
+  and director-editable limits per village, with media and GPU work capped
+  at one host job at a time. See BP-53.
+- Prose deliverables are reviewed as prose: note and report cards carry the
+  text through review, and a fix subtask re-arms its gate.
+- Task ids mint monotonically so retired ids are never reused.
+
 **2026-10-25**
 
 - Large requests now pass a durable plan approval gate before any filing or
@@ -255,7 +413,7 @@ list a process reader needs in hand.
 | Model tier refresh | Every 2 hours | `serve.MODEL_TIER_REFRESH_INTERVAL_S` |
 | Tier price watch | Every 30 minutes | `serve.TIER_PRICE_WATCH_INTERVAL_S` |
 | Idle dormancy poll | 30s when armed by `--max-idle-minutes` | `serve._idle_shutdown_loop` |
-| Health snapshot | Every 300s | `serve.HEALTH_CHECK_INTERVAL_S` |
+| Health snapshot | Continuous | `serve.HEALTH_CHECK_INTERVAL_S`; external checks every 12h on the operator file |
 | Peer help-signal pass | Every 90s | `serve.PEER_REVIEW_INTERVAL_S` |
 | Director escalation loop | Every 30s | `serve.DIRECTOR_APPROVAL_INTERVAL_S` |
 | Log prune | Every 6h, retention 7 days, 50k rows per run | `serve.LOG_PRUNE_INTERVAL_S` |
@@ -435,7 +593,7 @@ Owner request
 | BP-53 | File and app grants | Owner grants or revokes | On demand | Owner | Scoped file and app access |
 | BP-54 | Prompt-injection boundaries | External content enters | Per call | Serve | Wrapped content, verification |
 | BP-55 | Audit, retention, backups | Continuous | Hourly and 6-hourly | Serve | Logs, tape, snapshots |
-| BP-56 | Health monitoring | Continuous | 300s | Serve | Alerts, digest |
+| BP-56 | Health monitoring | Continuous | Snapshot 300s, external checks 12h | Serve | Alerts, digest |
 | BP-57 | Player feedback | Owner rates a report | On demand | Owner, sim | Rating, agent feedback |
 | BP-58 | Peer help signals | Peer help-signal pass | 90s | Serve, director | Help signal to a director |
 | BP-59 | Dormancy and wake | Idle with the flag armed | 30s poll | Serve | Dormant flag, wake on request |
@@ -453,11 +611,20 @@ Owner request
 | BP-71 | Bookmarks library | Player seed or agent ask | On demand | Player, admin agents | Shared links, global plus per-team |
 | BP-72 | Knowledge sources | Player or admin registration | On demand | Player, admin agents | Truth documents, template pointers |
 | BP-73 | Outbound webhooks | Matching action-log kind | Per event | Serve | Signed POST, delivery record |
-## 4. Core delivery processes
+| BP-74 | Fast lanes | Continuous | Always on | Fast-lane process | Lane audit chain entries |
+| BP-75 | Draft desk | Operator Telegram command or nightly hook | Per draft | Operator, drafting executor | Pending/posted/skipped ledger |
+| BP-76 | Workflow templates | Breakdown match; weekly learning | Per goal, weekly | Scrum masters | Learned template set |## 4. Core delivery processes
 
 ### BP-01 Player request intake and routing
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Ask-lane mechanics (2026-10-30).** The ask prompt carries the real date so
+answers stop stamping "as of" a stale month; a truncated preview is announced
+loudly so the model never counts what it cannot see; an ask with no explicit
+tool list seeds the `api_call` commit grant (the registry is the metered,
+fail-closed gateway); and the registry tool is forced on live-data questions.
+Player-authored cards never ride the groom cascade (BP-03).
 
 **Purpose.** Turn one free-text owner message into one correctly owned piece of
 work.
@@ -540,7 +707,20 @@ repeats it, so the weekly allowance can be traced without trusting the prose.
 
 ### BP-03 Backlog refinement
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Anti-entropy dedup (2026-11-01).** `queue_work` and `queue_once` refuse to
+open a second card while an open twin exists under the same normalized
+title; re-request markers peel and the operator can force. Refusals log as
+`card_dedup_blocked`. Learned card templates (BP-76) are matched at
+refinement, so a single-deliverable goal that matches a learned template
+files as its template's cards.
+
+**Player-authored cards never ride the groom cascade (2026-10-30).** The
+Naive Bayes groom cascade learned a reject-bias and killed operator-directed
+filings without any model reading them; player-authored requests now always
+get the real JEV judge, and the tape dilutes the bias as real judged
+outcomes accumulate.
 
 **Purpose.** Groom raw requests into stories a team can actually execute.
 
@@ -569,7 +749,14 @@ decision tape.
 
 ### BP-04 Large-request breakdown
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Phase plans (2026-11-01).** A prep-then-build ask gets first-class
+orchestration: the breakdown decider tags each card with a phase, and the
+assignment barrier holds every later-phase card until EVERY earlier-phase
+card is done while same-phase cards run in parallel. A multi-phase plan
+replaces the strict serial sequence; a single-phase or untagged plan keeps
+the legacy gather -> write -> save race protection.
 
 **Purpose.** Turn a large, staffable ask into sized stories and spikes.
 
@@ -1102,7 +1289,15 @@ two-reviewer gate, consultation, JEV with deterministic fallback.
 
 ### BP-21 Coaching and growth
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Grading fixes (2026-10-31).** The judge now sees the actual judged
+artifact, not just the title (the all-zeros regression is fixed); a grade at
+or below 1.0 on a task record carrying real artifact evidence is annotated
+`gradeSuspect`, excluded from trailing-grade averages, and never triggers
+coaching; the calibration loop receives a checklist with every breakdown
+card; and the band-router trainer writes a correlational spend model with
+honest-limits notes (no counterfactuals -- deltas are operator hypotheses).
 
 **Trigger.** A task's trailing grade falls below the floor.
 
@@ -1611,7 +1806,11 @@ ownership, player-only grant API.
 
 ### BP-39 Skill publishing
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Transcript-review policy (2026-10-30).** A skill distilled from a
+transcript review needs operator-nominated sources and a "so what" section
+before it publishes.
 
 **Trigger.** A spike or review produces a reusable method.
 
@@ -1632,7 +1831,14 @@ ownership, player-only grant API.
 
 ### BP-40 Conversation memory
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Org memory (2026-11-01).** Sprint close auto-writes a team-scoped wiki
+page (what landed, what carried over, velocity); a judged deliverable
+distills typed work-learnings into the agent's long-term memory, redacted
+and cadence-bounded, recalled on the agent's next task; RAG indexes are
+village-scoped; and institutional retrieval merges semantic hits under the
+keyword matches for library search, escalation prompts, and grader anchors.
 
 **Scope.** The Telegram bridge and the public `/api/intent/ask` lane. The public
 lane keys memory by agent (`player-ask:<agent>`) or by `player-ask:any` when no
@@ -1704,7 +1910,15 @@ filter, redaction, consolidation cap, TTL.
 
 ### BP-42 Bank ledger and budget gates
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Free-pool governance (2026-10-27).** Directors can disable a free provider
+for their own team and the chief of staff for all teams (global wins); the
+paid-low-tier switch can block the low band's paid leg so the pool can be
+tested with no paid safety net; the free auto-pick enforces an
+evaluation-score floor; free-provider circuit breakers open for 900s (paid
+keeps 300s); and Gemini free keys ride Google's per-model daily allowance
+with per-model rpd caps.
 
 **Purpose.** Attribute every dollar to a service and stop spend at the cap.
 
@@ -1950,7 +2164,7 @@ cache.
 
 ### BP-48 Escalation and delegated approval
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
 
 **Purpose.** Let a director resolve routine approvals while keeping high-risk
 decisions human-only.
@@ -1962,8 +2176,18 @@ creates an escalation with kind, question, and note.
 
 - Risk floor 1.0: human-only. The director loop skips it. The owner gets an
   email link.
-- Delegable kinds: the senior-most director decides on the 30-second loop.
-  If the director gives up, the admin gets one pass before the owner is asked.
+- Delegable kinds walk the requester's own reporting chain rung by rung
+  (immediate rungs first), then the available-first senior layer, then the
+  chief of staff, on the 30-second loop. At village scale a deep worker's
+  escalation reaches her own subdirector layer before anyone senior hears
+  about it; only an escalation every rung hesitated on climbs.
+- Each rung is judged against its own rank framing (task scope, team
+  stewardship, org-wide authority) and hands UP when unsure rather than
+  denying. Director and senior reviews use the mid model tier; the chief of
+  staff uses the high tier.
+- If the escalation loop exhausts, the admin gets one pass before the owner
+  is asked. An escalation nobody acted on within six hours expires with a
+  player warning instead of expiring silently.
 
 **Delegated decision.**
 
@@ -2034,7 +2258,11 @@ issue `blocked` and `needsInput`, `player_ask_dropped` action.
 
 ### BP-50 Credential vault and capability handles
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Revocation bites (2026-10-30).** Gated credential reads honor
+`status=removed`: a revoked credential is refused at read time, not just
+hidden from lists.
 
 **Purpose.** Let an agent use a service without ever holding its secret.
 
@@ -2103,7 +2331,13 @@ login fields, player-only TOTP actions, single-use code grants.
 
 ### BP-51 API service proposals
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Catalog growth (2026-10-29 onward).** The registry gained the signal-source
+services (TomTom, Ticketmaster Discovery after Eventbrite retired, Overpass,
+Redfin), arXiv export, Crossref, Semantic Scholar, and Wayback; vault
+credentials unwrap through the api_call gateway; and machine-computed
+structure lines and loud truncation markers protect every JSON preview.
 
 **Steps.**
 
@@ -2231,7 +2465,13 @@ device check-ins, `tank_accounts`.
 
 ### BP-53 File and app grants
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Village resource governor (2026-10-26).** Laptop capacity is governed by
+village: sandbox CPU, memory, pids, and timeouts moved to deployment.json, a
+lease governor exposes live usage and director-editable limits at the
+village resources endpoint, and media and GPU work is capped at one host job
+at a time by default.
 
 **Purpose.** Give the owner a working control surface for what agents may
 touch on the local machine. BP-38 describes enforcement during tool use; this
@@ -2359,9 +2599,20 @@ kept. The retention value remains operator-settable in `operator_policy.json`.
 
 ### BP-56 Health monitoring
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
 
-**Trigger.** Every 300 seconds.
+**Trigger.** The in-process snapshot loop stays continuous. The external
+health checks run every 12 hours on the operator file
+(`healthCheckIntervalS` 300 -> 43,200), aligned with the 12h alert-dedup
+window, so a new warning can sit unnoticed for up to 12 hours and the
+digest writes at the check cadence.
+
+**Inbound watches (2026-10-27).** Health is no longer the only listener: a
+GitHub watch loop turns CI failures and new issues on `GITHUB_WATCH_REPO`
+into asks, OSV.dev dependency audits surface as alerts, a dead-man switch
+pages the owner when its 5-minute pings stop, free-model discovery diffs
+the OpenRouter catalog, and provider status feeds are scanned for incident
+keywords. The bot-law watch retired on 2026-11-01.
 
 **Steps.**
 
@@ -2472,7 +2723,12 @@ that distinction clear if the signal data is ever surfaced in a review.
 
 ### BP-59 Dormancy and wake
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Wake triggers (2026-10-30).** Telegram operator messages wake a dormant tank
+and reset the idle clock; the wake trigger measures CAPABLE supply, so idle
+bystanders no longer suppress the off-duty wake for cards nobody awake is
+eligible for.
 
 **Purpose.** Stop all spend and churn when nobody is around, without giving up
 the port, the wake path, or the security sweeps.
@@ -2520,7 +2776,15 @@ telemetry never produces work (BP-33).
 
 ### BP-60 Code self-edits and dormancy windows
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-02
+
+**Change-request runway (2026-10-27).** Every dormancy-window change request
+must be scheduled at least 24 hours before its window (the owner's veto link
+needs a real review opportunity) and no more than 7 days out; both bounds
+fail closed. An `emergency` changeType may use a 1-hour minimum, is loud
+(logged and Telegram-announced), and keeps the supervisor review and owner
+veto unchanged. Constitution Rule 9 names the lane and warns that labeling
+routine work as emergency is a Rule 12 violation.
 
 **Purpose.** Give the think tank a governed path to improve its OWN code:
 propose a precise splice, pass independent review and sandboxed validation,
@@ -3294,6 +3558,96 @@ per delivery), HMAC signing, fan-out and size caps, no-retry policy,
 self-kind recursion guard, secrets stored but never returned (`hasSecret`).
 
 **Records.** Settings key `outbound_webhooks`, action log.
+### BP-74 Fast lanes
+
+**Last checked:** 2026-11-02
+
+**Purpose.** Run latency-sensitive, always-on work OUTSIDE the simulation
+loop in a separate process, so a slow model call can never stall the tank.
+
+**Trigger.** Continuous. Lanes are declared in `fast_lanes.json` and
+instantiated from a small safety-audited type registry at startup; unknown
+types are rejected visibly at boot.
+
+**Steps.**
+
+1. The lane process binds 127.0.0.1 on its own port, reads its lane
+   declarations from JSON, and writes its own audit chain keyed by its own
+   secret (single-flusher-thread, so the tape-append race class is designed
+   out).
+2. Shipped types: `http_watch` (GET-only observation of declared targets,
+   rate-limited, optional LLM analysis; bug-bounty recon is this type with a
+   program and in-scope targets declared, and an empty scope idles loudly
+   and never guesses targets) and `paper_markets` (simulated fills against
+   public spot prices, with hard caps in code -- max trades/day, max
+   notional -- and NO order-placement path to any exchange).
+3. Bounty-lane work dispatches only declared commands to a declared VPS over
+   pinned-host-key ssh (StrictHostKeyChecking, BatchMode, bounded
+   timeouts); it never runs in a container and never from the home IP.
+4. A kill-switch file pauses every lane instantly.
+5. The lane model client is one pinned provider with hard deadlines: fail
+   fast, no roulette.
+
+**Controls.** JSON-declared scope, typed registry with visible rejection,
+kill switch, hard caps in code, pinned ssh host keys, own-port localhost
+binding, own audit chain, no exchange order path.
+
+**Records.** `fast_lanes.json`, the lane audit chain, dispatch and result
+receipts.
+
+### BP-75 Draft desk
+
+**Last checked:** 2026-11-02
+
+**Purpose.** The tank PREPARES short social posts; the OPERATOR decides
+every one. Nothing is ever posted by the tank: 'post' is a ledger entry
+only, and the operator's personal account is untouchable.
+
+**Trigger.** A Telegram command from the allowlisted operator, or the
+nightly draft-generation hook.
+
+**Steps.**
+
+1. 'draft' generates 0-2 short grounded local-area posts (numbers over
+   vibes, tool-grounded with an inline source, at most 280 characters).
+   Nothing clearing the bar creates NOTHING: an empty desk is the default.
+2. 'drafts' lists pending drafts. Each carries its grounding and source.
+3. 'post <id>' marks the draft POSTED -- a ledger entry the operator acts
+   on themselves. 'skip <id>' discards it.
+4. Draft commands parse BEFORE lane classification, so a draft decision is
+   never mistaken for a request.
+
+**Controls.** Operator-only commands, hard no-post guarantee, ground-and-
+source bar, empty-by-default desk, ledger-only posting.
+
+**Records.** The draft-desk table (pending, posted, skipped), action log.
+
+### BP-76 Workflow templates
+
+**Last checked:** 2026-11-02
+
+**Purpose.** Let scrum masters learn what a well-formed card set looks like
+for a repeated kind of goal, and reuse it instead of re-deriving breakdowns.
+
+**Trigger.** Goal matching at breakdown; learning runs weekly.
+
+**Steps.**
+
+1. When a goal's breakdown closes, the owning scrum master can learn a
+   template from the resulting card set. Single-deliverable goals learn a
+   single-card template; spike and report deliverables are unified in the
+   template grammar.
+2. A later goal that matches a learned template files its cards from the
+   template, so the same kind of work decomposes the same way every time.
+3. Learning runs weekly and is evaluated against the next cards; the
+   workflow-template API lists and manages the learned set.
+4. Templates are proposals, not law: a director's review still applies to
+   every filed card.
+
+**Controls.** Scrums-master authorship, weekly eval-gated learning,
+director review unchanged, API-gated management.
+
+**Records.** The workflow-templates table, action log.
 
 ## 11. Player and operator processes
 
@@ -3748,6 +4102,13 @@ rather than gate-integrity questions.
 | `mcp_servers.json` | repo root | Shipped MCP registry (REA, GitHub official remote MCP); `mcp_servers.local.json` sits beside it, overrides by id, and is gitignored |
 | Outbound webhooks | settings key `outbound_webhooks` | Subscribed URL, optional secret, event patterns; secrets stored, never returned |
 | `.env` quoting | `.env` | Values may be quoted; the loader strips one matching quote pair |
+| `THINK_TANK_DB_URL` | `.env` | Postgres DSN; absent means SQLite. `THINK_TANK_FORCE_SQLITE` pins SQLite for tools and tests |
+| `COMPLETION_PROVENANCE_GATE` | `.env` | Plain research cards must anchor the report to fetched sources |
+| `scaleTierWorkers`, `maxActiveAgents` | `world/operator_policy.json` | Worker cheap-band pin (default off); active-agent cap 81, JSON bound 1,000 |
+| `maxTeamsPerVillage` | `world/operator_policy.json` | 12 top-level teams per village; subdirector sub-teams excluded |
+| `AUDIT_RETENTION_DAYS`, `DEPLOYMENT_ID` | `.env` | Enterprise audit export retention (365) and deployment identity |
+| `fast_lanes.json` | repo root | Declares the fast-lane process's lanes; kill switch `data/fast-kill` |
+| `GITHUB_WATCH_REPO`, `DEADMAN_PING_URL` | `.env` | GitHub watch loop and dead-man switch for the external watches |
 ## 19. Appendix C: process to code map
 
 | Process | Primary code |
@@ -3825,7 +4186,9 @@ rather than gate-integrity questions.
 | BP-71 | `serve._normalize_bookmark_url`, bookmarks ask tool, the bookmarks endpoints |
 | BP-72 | `serve._normalize_knowledge_origin`, knowledge ask tool, the knowledge endpoints |
 | BP-73 | `serve._outbound_webhook_emit`, `serve._deliver_webhook`, the webhook endpoints |
-## 20. Appendix D: review checklist
+| BP-74 | `world/server/fast_path.py`, `fast_lanes.json` |
+| BP-75 | `serve._draft_desk_create`, the draft-desk endpoints |
+| BP-76 | `world/village/sim_parts/135_workflow_templates.py`, `world/server/serve_parts/428_workflow_templates_api.py` |## 20. Appendix D: review checklist
 
 Use this list when reviewing the document and the process.
 
