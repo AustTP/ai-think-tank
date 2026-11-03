@@ -118,7 +118,8 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
             return {'reply': 'UNKNOWN: none. PLAN: read wiki, distill. RISK: drift.'}
 
         with unittest.mock.patch.object(serve, '_http_json', fake_http_json), \
-             unittest.mock.patch.dict(os.environ, {'HYBRID_MODE': 'auto'}):
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'auto'}):
             base_ctx = {}
             content._hybrid_prepare({}, 'ruth', task, base_ctx)
         # the latent pass used the bypass flag so /api/chat will not echo it
@@ -135,7 +136,8 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
             return {'reply': 'PLAN: x'}
 
         with unittest.mock.patch.object(serve, '_http_json', fake_http_json), \
-             unittest.mock.patch.dict(os.environ, {'HYBRID_MODE': 'auto'}):
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'auto'}):
             content._hybrid_prepare({}, 'ruth', task, {})
             content._hybrid_prepare({}, 'ruth', task, {})
         self.assertEqual(len(calls), 1)
@@ -149,7 +151,8 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
             return {'reply': 'PLAN: x'}
 
         with unittest.mock.patch.object(serve, '_http_json', fake_http_json), \
-             unittest.mock.patch.dict(os.environ, {'HYBRID_MODE': 'off'}):
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'off'}):
             content._hybrid_prepare({}, 'ruth', task, {})
         self.assertEqual(len(calls), 0)
 
@@ -178,14 +181,15 @@ class ChatBridgeInjection(unittest.TestCase):
         req = unittest.mock.Mock()
         req.json = unittest.mock.AsyncMock(return_value=body)
         req.headers = {'X-Agent-Key': 'k'}
-        env = {'HYBRID_MODE': hybrid_mode, 'OPENROUTER_API_KEY': openrouter}
+        env = {'HYBRID_MODE': hybrid_mode}
         captured = {}
 
         def fake_call_openrouter_sync(model, messages, max_tokens, best_of=1):
             captured['messages'] = messages
             return {'choices': [{'message': {'content': 'ok'}}]}
 
-        with unittest.mock.patch.dict(os.environ, env), \
+        with unittest.mock.patch.dict(os.environ, {'OPENROUTER_API_KEY': openrouter}), \
+             unittest.mock.patch.object(serve, '_load_env', lambda: dict(env)), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', openrouter, create=True), \
              unittest.mock.patch.object(serve, 'verify_session', lambda c: False), \
              unittest.mock.patch.object(serve, 'verify_agent_key', lambda a, k: True), \

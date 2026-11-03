@@ -48,7 +48,11 @@ _HYBRID_LAST_PLAN_AT = {}            # (agent_id, task_id) -> epoch
 
 
 def _hybrid_enabled():
-    return os.environ.get('HYBRID_MODE', 'off') != 'off'
+    # .env flags in this codebase are read through _load_env() at call time
+    # (it returns a dict; os.environ is NOT populated from .env -- only
+    # process-exported vars live there). Default 'off' so a deploy without
+    # the flag stays inert.
+    return str(_serve._load_env().get('HYBRID_MODE', 'off')).strip().lower() != 'off'
 
 
 def _hybrid_task_eligible(task):
@@ -220,7 +224,7 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
     _serve.log_action(agent_id, 'hybrid_mode',
                       {'decision': 'latent', 'task': task.get('id'),
                        'step': 'plan', 'chars': len(notes),
-                       'policy': os.environ.get('HYBRID_MODE', 'off')},
+                       'policy': _serve._load_env().get('HYBRID_MODE', 'off')},
                       authorized=True)
     return notes
 

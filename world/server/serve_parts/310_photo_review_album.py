@@ -587,7 +587,7 @@ async def chat(request: Request):
     # injected block is server-authored from the agent's own memory file.
     _hy_task = body.get('taskId')
     if (_hy_task and agent_id and not body.get('hybridBypass')
-            and os.environ.get('HYBRID_MODE', 'off') != 'off'):
+            and str(_load_env().get('HYBRID_MODE', 'off')).strip().lower() != 'off'):
         _hy_path = os.path.join(LIBRARY_DIR, 'hybrid', agent_id,
                                 f'{_hy_task}.md')
         try:
