@@ -338,9 +338,6 @@ class OnboardCeremonyB(SimIsolation):
         sim._resolve_onboard_meeting(state, onboard, now_ms=1_000_000)
         self.assertNotIn('_pendingOnboard', state)
 
-
-if __name__ == '__main__':
-    unittest.main()
     def test_positionless_visible_agent_is_parked_by_tick(self):
         # The self-recovery sweep: an agent already poisoned in a saved state
         # (visible, no x/y) is parked by the engine tick instead of killing
@@ -373,3 +370,45 @@ if __name__ == '__main__':
         # 'pos' (positionless) must never be walked; no candidate qualified.
         self.assertIsNone(result)
         self.assertNotIn('pairWith', state['agents']['pos'])
+
+    def test_door_mouth_loiterer_parked_even_with_work_queued(self):
+        # 2026-11-02: 40 fully-idle agents stood at the pressoffice door mouth
+        # for hours while work was queued (the ordinary park gate only fires
+        # on an empty queue), jamming every assignment walk into the room.
+        # A long-standing loiterer must park even with work queued; a fresh
+        # arrival at the mouth must not; the nearest few stay; off-map agents
+        # are untouched.
+        grid, doors = sim._load_outdoor_geometry()
+        if not grid or not doors or 'pressoffice' not in doors:
+            self.skipTest('pressoffice geometry unavailable')
+        door = doors['pressoffice']
+        mx = door['x'] + door['w'] / 2
+        my = door['y'] + door['h'] + 4
+        old = int(time.time() * 1000) - 20 * 60 * 1000
+        state = {'agentRoster': [{'id': 'old'}, {'id': 'new'}, {'id': 'keeper'},
+                                 {'id': 'admin', 'isAdmin': True}],
+                 'agents': {
+            'old': {'id': 'old', 'x': mx, 'y': my + 60, 'visible': True,
+                    'offDuty': False, 'busy': False, 'task': None,
+                    'inRoom': None, '_loiterSinceMs': old},
+            'new': {'id': 'new', 'x': mx, 'y': my + 60, 'visible': True,
+                    'offDuty': False, 'busy': False, 'task': None, 'inRoom': None},
+            'keeper': {'id': 'keeper', 'x': mx, 'y': my + 8, 'visible': True,
+                       'offDuty': False, 'busy': False, 'task': None, 'inRoom': None},
+            'admin': {'id': 'admin', 'x': mx, 'y': my + 60, 'visible': True,
+                      'offDuty': False, 'busy': False, 'task': None, 'inRoom': None},
+        }}
+        parked = sim._disperse_door_mouth_loiterers(state, doors)
+        self.assertGreaterEqual(parked, 1)
+        self.assertTrue(state['agents']['old']['offDuty'])
+        self.assertFalse(state['agents']['old']['visible'])
+        self.assertFalse(state['agents']['new']['offDuty'],
+                         'a fresh arrival must not park before the age gate')
+        self.assertFalse(state['agents']['keeper']['offDuty'],
+                         'the nearest few to the door are exempt')
+        self.assertFalse(state['agents']['admin']['offDuty'],
+                         'admins are never parked')
+
+
+if __name__ == '__main__':
+    unittest.main()

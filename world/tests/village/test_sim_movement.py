@@ -320,3 +320,40 @@ class SimServerOwnedMovement(unittest.TestCase):
         self.assertIsNone(post['agents']['ada']['task'],
                           'a post-respawn unreachable walker is released')
         self.assertEqual(post['tasks']['task-1']['status'], 'cancelled')
+
+    def test_repair_walker_uses_approach_offset_when_canonical_blocked(self):
+        # 2026-11-02 live failure: 40 idle agents clotted in front of the
+        # pressoffice door made the canonical approach cell unreachable for
+        # EVERYONE (find_path None even from the open field), so the repair
+        # gave up, the task requeued as a new card, and the loop re-carded
+        # forever. The repair must try offsets BESIDE the approach before
+        # giving up: fake find_path to refuse the canonical target but accept
+        # an offset, and expect a path whose target is one of the offsets.
+        state = {'sim': {'owner': 'server'},
+                 'agents': {'ada': {'id': 'ada', 'x': 510, 'y': 368,
+                                    'dir': 'south', 'visible': True, 'busy': False,
+                                    'task': 'task-1', 'inRoom': None, 'offDuty': False,
+                                    'path': [], 'pathIndex': 0, 'pathTarget': None,
+                                    'stuckTimer': 0, 'replanCount': 0}},
+                 'tasks': {'task-1': {'id': 'task-1', 'title': 't', 'room': 'pressoffice',
+                                      'status': 'walking', 'assignedTo': 'ada'}}}
+        grid, doors = sim._load_outdoor_geometry()
+        canonical = None
+        real_find_path = sim.find_path
+
+        def fake_find_path(sx, sy, tx, ty, aid, agents, grid, index=None,
+                           pick_free=None):
+            door = doors['pressoffice']
+            cx, cy = door['x'] + door['w'] / 2, door['y'] + door['h'] + 4
+            if abs(tx - cx) < 1 and abs(ty - cy) < 1:
+                return None  # canonical approach: body-jammed
+            return [{'x': sx, 'y': sy}, {'x': tx, 'y': ty}]
+
+        with unittest.mock.patch.object(sim, 'find_path', fake_find_path):
+            sim._repair_stalled_walkers(state, grid, doors)
+        a = state['agents']['ada']
+        self.assertTrue(a.get('path'), 'offset fallback must route the walker')
+        door = doors['pressoffice']
+        cy = door['y'] + door['h'] + 4
+        self.assertAlmostEqual(a['pathTarget']['y'], cy)
+        self.assertNotEqual(a['pathTarget']['x'], door['x'] + door['w'] / 2)

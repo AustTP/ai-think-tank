@@ -1,3 +1,6 @@
+import time
+
+
 def _park_idle_wanderers(state):
     """An agent is only woken by task assignment or the waking
     intents -- but a woken agent who is never *assigned* (e.g. the queue
@@ -37,6 +40,87 @@ def _park_idle_wanderers(state):
         a['stuckTimer'] = 0
         a['replanCount'] = 0
         parked += 1
+    return parked
+
+
+_DOOR_LOITER_RADIUS = 90
+_DOOR_LOITER_MIN_MS = 15 * 60 * 1000     # standing 15+ minutes at a mouth
+_DOOR_LOITER_PARK_PER_PASS = 8           # bounded work per sweep
+_DOOR_LOITER_KEEP_NEAR = 3               # the nearest N stay (they may be queued to enter)
+
+
+def _disperse_door_mouth_loiterers(state, doors=None, now_ms=None):
+    """Park fully-idle agents who have stood at a DOOR MOUTH far too long,
+    even while work is queued (2026-11-02).
+
+    The trigger case: 40 fully-idle agents clotted in a column in front of
+    the pressoffice door (10 at the same coordinates). The existing park rule
+    only fires when the queue is EMPTY, so with work queued these lingered
+    forever; every assignment into that room failed its walk because their
+    bodies jammed the approach corridor, tasks requeued as new cards every
+    ~27s, and the clot only grew. A loiterer is visible + fully idle + within
+    the radius of some door mouth, and has been so for _DOOR_LOITER_MIN_MS
+    (stamped on _loiterSinceMs the first sweep sees her). Parking her honors
+    the player's standing visibility rule ("only scheduled or active agents
+    appear") and frees the mouth; assignment re-wakes her on demand, with a
+    walk that now succeeds because the mouth is clear. The nearest
+    _DOOR_LOITER_KEEP_NEAR to a door are exempt -- they are plausibly the
+    next assignees. Bounded per sweep so the tick stays cheap."""
+    agents = state.get('agents')
+    if not isinstance(agents, dict) or not agents:
+        return 0
+    roster = state.get('agentRoster') or []
+    if not roster:
+        return 0
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
+    idle = []
+    for d in roster:
+        if d.get('isAdmin'):
+            continue
+        a = agents.get(d.get('id'))
+        if not isinstance(a, dict) or a.get('offDuty') or not a.get('visible'):
+            continue
+        if not _is_fully_idle(a, a.get('inRoom')):
+            continue
+        if a.get('_mailAwake'):
+            continue
+        idle.append((d.get('id'), a))
+    if not idle:
+        return 0
+    door_list = [v for v in (doors or {}).values() if isinstance(v, dict)]
+    parked = 0
+    for aid, a in idle:
+        x, y = a.get('x'), a.get('y')
+        if x is None or y is None:
+            continue
+        near = None
+        for door in door_list:
+            mx = door['x'] + door['w'] / 2
+            my = door['y'] + door['h'] + 4
+            if abs(x - mx) <= _DOOR_LOITER_RADIUS and abs(y - my) <= _DOOR_LOITER_RADIUS:
+                near = (abs(x - mx) + abs(y - my))
+                break
+        if near is None:
+            a.pop('_loiterSinceMs', None)   # moved away; restart the clock next time
+            continue
+        since = a.get('_loiterSinceMs')
+        if since is None:
+            a['_loiterSinceMs'] = now_ms
+            continue
+        if now_ms - since < _DOOR_LOITER_MIN_MS:
+            continue
+        parked += 1
+        a['offDuty'] = True
+        a['visible'] = False
+        a['path'] = None
+        a['pathIndex'] = 0
+        a['pathTarget'] = None
+        a['pathActive'] = False
+        a['stuckTimer'] = 0
+        a['replanCount'] = 0
+        a.pop('_loiterSinceMs', None)
+        if parked >= _DOOR_LOITER_PARK_PER_PASS:
+            break
     return parked
 
 

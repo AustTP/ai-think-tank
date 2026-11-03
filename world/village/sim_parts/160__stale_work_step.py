@@ -630,6 +630,15 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     if not think_tank_has_work(state, now_ms):
         _park_idle_wanderers(state)
         return state
+    # Work IS queued: the ordinary park gates stay closed (by design), but a
+    # door-mouth clot must still disperse -- 40 idle statues jamming one
+    # approach made every assignment into that room fail its walk and
+    # re-card forever (2026-11-02). Bounded, age-gated, nearest-few exempt.
+    try:
+        _grid_probe, _doors_probe = _load_outdoor_geometry()
+        _disperse_door_mouth_loiterers(state, _doors_probe, now_ms)
+    except Exception:
+        pass
 
     # Load geometry once per call for this pass (cheap; the movement tick has
     # its own cached copy via self in SimEngine.tick).

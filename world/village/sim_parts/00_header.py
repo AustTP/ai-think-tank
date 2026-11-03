@@ -875,6 +875,11 @@ def _reconcile_stranded_agents(state, grid):
 
 
 _WALKER_REPAIR_RETRY_MS = 2000
+# Beside-the-approach offsets for walker repair (2026-11-02): a clotted
+# door mouth makes the canonical approach cell unreachable for everyone;
+# the repair then routes the walker to a spot BESIDE the approach instead
+# of giving up (first success wins; mirrors PAIR_WALK_OFFSETS).
+_DOOR_APPROACH_OFFSETS = (-56, 56, -112, 112, -168, 168)
 
 
 def _repair_stalled_walkers(state, grid, doors, now_ms=None, index=None):
@@ -945,6 +950,29 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None, index=None):
         tx = door['x'] + door['w'] / 2
         ty = door['y'] + door['h'] + 4
         path = find_path(a['x'], a['y'], tx, ty, aid, agents, grid, index=index)
+        target = {'x': tx, 'y': ty}
+        if not path:
+            # Approach-offset fallback (2026-11-02): the live tank clotted 40
+            # fully-idle agents in a column in front of the pressoffice door
+            # (10 of them at the SAME coordinates), and every assignment into
+            # that room then failed its walk -- the canonical approach cell's
+            # corridor was wall-to-wall bodies, so find_path returned None for
+            # EVERYONE (even from the open field), the repair gave up, the
+            # task requeued as a NEW card, and the loop re-carded every ~27s
+            # all day (the stuck-walk cluster at (510, 286-368)). The door
+            # mouth has width: try the offsets beside the approach before
+            # giving up, exactly like _recruit_pair_navigator's own
+            # PAIR_WALK_OFFSETS loop. First offset that routes wins.
+            for dx in _DOOR_APPROACH_OFFSETS:
+                ox = tx + dx
+                if ox < 0:
+                    continue
+                opath = find_path(a['x'], a['y'], ox, ty, aid, agents, grid,
+                                  index=index)
+                if opath:
+                    path = opath
+                    target = {'x': ox, 'y': ty}
+                    break
         if not path:
             # A fresh BFS from her spot finds no route at all -- JS's exact
             # "give up" condition ("Even a fresh spot can't reach it", reached
@@ -960,7 +988,7 @@ def _repair_stalled_walkers(state, grid, doors, now_ms=None, index=None):
             continue
         a['path'] = path
         a['pathIndex'] = 0
-        a['pathTarget'] = {'x': tx, 'y': ty}
+        a['pathTarget'] = target
         a['stuckTimer'] = 0
         a['replanCount'] = 0
     return state
