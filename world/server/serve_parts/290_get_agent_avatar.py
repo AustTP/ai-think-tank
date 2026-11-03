@@ -1,5 +1,8 @@
 
 
+from fastapi.concurrency import run_in_threadpool
+
+
 @app.get('/api/avatar/{agent_id}/{filename}')
 async def get_agent_avatar(agent_id: str, filename: str):
     """Serve one of an agent's generated avatar orientations. Public art (no
@@ -84,24 +87,16 @@ async def read_agent_file(agentId: str, path: str, request: Request):
     return JSONResponse({'agentId': agentId, 'path': path, 'content': content})
 
 
-@app.get('/api/library/search')
-async def search_library(q: str, request: Request):
-    # Real gap an agent's own retrospective named directly: the Library
-    # was a flat, unsearchable file list -- finding relevant prior work
-    # meant already knowing its exact path. A plain case-insensitive
-    # substring search over real file contents (not an embedding index --
-    # the Library is small enough that this is genuinely sufficient, same
-    # "don't reach for a heavier tool than the problem needs" reasoning
-    # as the decay-scored memory system) with a real snippet of context
-    # around each match, not just a filename hit.
-    query = (q or '').strip()
-    if not query:
-        return JSONResponse({'error': 'q is required'}, status_code=400)
-    requester = _resolve_requester(request)
-    allowed = _requester_villages(requester)
-    # ONE state read per request, shared by the keyword path and the
-    # semantic merge below (the blob is very large; two reads per search
-    # doubled an already-heavy request).
+def _library_search_sync(query, allowed):
+    """The blocking body of /api/library/search, run OFF the event loop.
+
+    Found live 2026-11-02 via kill -USR1 faulthandler stacks: this endpoint
+    was async def and called get_state_from_db() (twice) plus _rag_search
+    inline ON THE LOOP -- _rag_search alone parses ~80 MB of stored
+    embeddings per call (6612 rows x ~12 KB of vec JSON), which froze the
+    whole tank (sim tick, watchdog, every other request) for as long as the
+    parse took. Everything blocking lives here; the async handler awaits it
+    through starlette's threadpool."""
     state = get_state_from_db()
     matches = _library_search_matches(query, allowed=allowed, state=state)
     # Semantic layer over the same query (385_rag_institutional): the
@@ -114,7 +109,6 @@ async def search_library(q: str, request: Request):
     # path's -- a walk of the whole library inside a hot endpoint starves
     # the event loop under agent traffic.
     try:
-        state = get_state_from_db()
         seen = {m.get('path') for m in matches}
         for hit in _rag_search(query, k=6, sources=('library', 'deliverable')):
             if hit['source'] == 'library':
@@ -133,6 +127,25 @@ async def search_library(q: str, request: Request):
                 break
     except Exception:
         pass  # retrieval is a bonus layer; a failure never blocks the search
+    return matches
+
+
+@app.get('/api/library/search')
+async def search_library(q: str, request: Request):
+    # Real gap an agent's own retrospective named directly: the Library
+    # was a flat, unsearchable file list -- finding relevant prior work
+    # meant already knowing its exact path. A plain case-insensitive
+    # substring search over real file contents (not an embedding index --
+    # the Library is small enough that this is genuinely sufficient, same
+    # "don't reach for a heavier tool than the problem needs" reasoning
+    # as the decay-scored memory system) with a real snippet of context
+    # around each match, not just a filename hit.
+    query = (q or '').strip()
+    if not query:
+        return JSONResponse({'error': 'q is required'}, status_code=400)
+    requester = _resolve_requester(request)
+    allowed = _requester_villages(requester)
+    matches = await run_in_threadpool(_library_search_sync, query, allowed)
     return JSONResponse({'query': query, 'matches': matches[:50]})
 
 

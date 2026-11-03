@@ -258,6 +258,30 @@ def _rag_index_pass(budget=60):
             'pending': max(0, len(pending) - done)}
 
 
+_VEC_PARSE_CACHE = {}
+_VEC_PARSE_CACHE_MAX = 8192
+
+
+def _vec_parsed(vec_raw):
+    """Parse one stored embedding vector, memoized by its raw JSON text
+    (2026-11-02). _rag_search re-parsed EVERY row's vector per search --
+    ~6612 rows x ~12 KB of JSON, ~80 MB parsed on every library search.
+    The stored text for a doc only changes when the doc is re-indexed, so
+    the parse result is stable; a bounded cache makes repeat searches
+    pay for the changed rows only. Off the hot path's event loop since
+    search_library moved to run_in_threadpool, but the CPU cost itself
+    was worth killing."""
+    if not vec_raw:
+        return {}
+    if vec_raw in _VEC_PARSE_CACHE:
+        return _VEC_PARSE_CACHE[vec_raw]
+    dvec = {int(k): v for k, v in json.loads(vec_raw).items()}
+    if len(_VEC_PARSE_CACHE) >= _VEC_PARSE_CACHE_MAX:
+        _VEC_PARSE_CACHE.clear()
+    _VEC_PARSE_CACHE[vec_raw] = dvec
+    return dvec
+
+
 def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
                 village=None):
     """Ranked semantic hits over the index: cosine similarity (the vectors
@@ -289,7 +313,7 @@ def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
     for source, ref, title, room, text, vec_raw in rows:
         try:
             # json.dumps stringifies dict keys; the embeddings were ints.
-            dvec = {int(k): v for k, v in (json.loads(vec_raw) if vec_raw else {}).items()}
+            dvec = _vec_parsed(vec_raw)
         except Exception:
             continue
         if not dvec:

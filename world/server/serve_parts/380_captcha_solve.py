@@ -696,6 +696,9 @@ async def jev_inference(request: Request):
     })
 
 
+from fastapi.concurrency import run_in_threadpool
+
+
 @app.post('/api/execute')
 async def execute(request: Request):
     # Real sandboxed execution for the Work Room -- real
@@ -793,9 +796,16 @@ async def execute(request: Request):
             _run_in_sandbox_sync, sandbox_dir, command, limits=_lease)
     finally:
         resources.GOVERNOR.release(_lease['id'])
-    log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut'], 'villageId': _village, 'resourceClass': _class}, authorized=authorized)
-    _finish_confirmation(confirmation_id, 'executed')
-    sync_prototypes(agent_id, sandbox_dir)
+    # The post-run tail (DB log write, confirmation update, prototype sync)
+    # runs OFF the event loop (2026-11-02): found live via kill -USR1
+    # faulthandler stacks -- an async endpoint calling log_action -> _db()
+    # inline stalls the whole tank (sim tick, watchdog, all requests) for as
+    # long as the DB round-trip takes, which on a slow link froze the loop.
+    def _execute_tail():
+        log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'purpose': purpose, 'decision': 'allowed', 'exitCode': result['exitCode'], 'timedOut': result['timedOut'], 'villageId': _village, 'resourceClass': _class}, authorized=authorized)
+        _finish_confirmation(confirmation_id, 'executed')
+        sync_prototypes(agent_id, sandbox_dir)
+    await run_in_threadpool(_execute_tail)
     return JSONResponse({'allowed': True, 'sandboxId': sandbox_id, **result})
 
 
