@@ -173,6 +173,35 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
         # and no memory file was written
         self.assertFalse(content._hybrid_memory_digest('ruth', task['id']))
 
+    def test_no_reply_error_body_is_reported_not_none(self):
+        # The chat endpoint can succeed without a reply (it returns an error
+        # body from a dead pool). The latent-failed row must say WHY: the
+        # response's keys and its error field. Live 2026-11-03 the rows read
+        # error 'None' because the success-path `_plan_err = None` reset in
+        # the else clause clobbered the capture made inside the try.
+        task = _fresh_task(distill=True)
+        rows = []
+
+        def error_body_http_json(*a, **k):
+            return {'error': 'free pool exhausted'}
+
+        with unittest.mock.patch.object(serve, '_http_json', error_body_http_json), \
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'auto'}), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append((a, k))):
+            digest = content._hybrid_prepare({}, 'ruth', task, {})
+
+        self.assertEqual(digest, '')
+        self.assertEqual(len(rows), 1)
+        row = rows[0][0][2]
+        self.assertEqual(row.get('decision'), 'latent-failed')
+        err = row.get('error') or ''
+        self.assertIn('replyKeys', err)
+        self.assertIn('free pool exhausted', err)
+        # and no memory file was written
+        self.assertFalse(content._hybrid_memory_digest('ruth', task['id']))
+
     def test_cooldown_prevents_repeat_passes(self):
         task = _fresh_task(distill=True)
         calls = []

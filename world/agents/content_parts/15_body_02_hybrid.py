@@ -205,6 +205,7 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
                 + (f'\nINSTRUCTIONS:\n{instructions}\n' if instructions else '')
                 + (f'\nACCEPTANCE:\n{acceptance}\n' if acceptance else '')
                 + (f'\nPRIOR WORKING NOTES (yours):\n{prior}\n' if prior else ''))
+    _plan_err = None
     try:
         r = _serve._http_json('POST', base, '/api/chat',
                               {'model': tier,
@@ -215,12 +216,6 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
                                'taskId': task.get('id'),
                                'hybridBypass': True}, key)
         notes = (r.get('reply') or '').strip() if isinstance(r, dict) else ''
-        if not notes and isinstance(r, dict):
-            # No exception but no reply either: the chat endpoint returned an
-            # error body (e.g. {'error': ...} from a dead pool). Capture it
-            # so the latent-failed row says WHY instead of 'None'.
-            _plan_err = {'replyKeys': sorted(r.keys()),
-                         'error': str(r.get('error') or '')[:120]}
     except Exception as _exc:
         # NOT 'except ... as _plan_err': Python unbinds the as-name when the
         # except block exits, which would leave _plan_err undefined exactly
@@ -228,7 +223,16 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
         notes = ''
         _plan_err = repr(_exc)
     else:
-        _plan_err = None
+        if not notes and isinstance(r, dict):
+            # No exception but no reply either: the chat endpoint returned an
+            # error body (e.g. {'error': ...} from a dead pool). Capture it
+            # so the latent-failed row says WHY instead of 'None'. This lives
+            # in the else clause because the earlier in-try placement was
+            # clobbered by the unconditional `_plan_err = None` reset that
+            # also ran on the success path (live 2026-11-03: rows read
+            # error 'None' for every dead-pool latent attempt).
+            _plan_err = {'replyKeys': sorted(r.keys()),
+                         'error': str(r.get('error') or '')[:120]}
     if not notes:
         # A failed pre-pass must be visible: without this row a free-pool
         # outage looks exactly like 'the protocol never ran' (the live
