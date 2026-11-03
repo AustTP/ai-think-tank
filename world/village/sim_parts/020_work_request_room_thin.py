@@ -664,6 +664,24 @@ def _apply_content_result(state, task, result, now_ms=None):
     # pipeline" wording, no grade penalty (see leo's round-3 review).
     if result.get('infra'):
         task['_infraFailure'] = True
+    # Workspace handoff to the next attempt (2026-11-03, DEV-136/137): a FAILED
+    # staged coding attempt leaves its work as a checkpoint -- staged_work
+    # deliberately keeps failed changes out of the story workspace -- but only
+    # the transport-recovery path (transport_recovery.py) recorded that
+    # checkpoint on the parent. A quality-gate failure went through HERE
+    # instead, so the next fix pass staged a FRESH tree, could not see the
+    # files the author wrote ('sed: can't read tests/test_perproject.py'), and
+    # burned itself on a phantom. Record the failed stage on the story task
+    # (fix passes read parent['lastFailedWorkspace'] to resume it), and clear
+    # it on publish so a stale checkpoint is never resumed against an advanced
+    # workspace (Stage's baseDigest guard would reject it anyway).
+    _ws_task = task
+    if task.get('reviewOf'):
+        _ws_task = (state.get('tasks') or {}).get(task['reviewOf']) or task
+    if result.get('codePublished'):
+        _ws_task.pop('lastFailedWorkspace', None)
+    elif result.get('stagedWorkspace') and not result.get('ok'):
+        _ws_task['lastFailedWorkspace'] = result['stagedWorkspace']
     # Gap: a spike's FULL findings only ever
     # lived in the Library file -- task.note is deliberately kept lean (a
     # short pointer, "see the Library entry just filed"), by design (see the

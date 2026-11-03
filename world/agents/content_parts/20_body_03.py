@@ -194,10 +194,20 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         else:
             _mypy_step = {'name': 'mypy',
                           'command': "echo 'only test files written -- skipping mypy'"}
+        # bandit mirrors mypy's exclusion: test files legitimately `assert`
+        # (B101 assert_used is Medium-severity, live on task-5846's gate), and
+        # security scanning is for the delivered implementation.
+        _bandit_files = _mypy_files
+        if _bandit_files:
+            _bandit_step = {'name': 'bandit',
+                            'command': 'python -m bandit -q ' + ' '.join(_bandit_files)}
+        else:
+            _bandit_step = {'name': 'bandit',
+                            'command': "echo 'only test files written -- skipping bandit'"}
         return [
             {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} {_scoped}'},
             _mypy_step,
-            {'name': 'bandit', 'command': f'python -m bandit -q {_scoped}'},
+            _bandit_step,
             _pytest_step,
             {'name': 'node-syntax', 'command': (
                 'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
