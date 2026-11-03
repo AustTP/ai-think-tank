@@ -97,9 +97,18 @@ def prepare(state, task, root):
         directory = os.path.join(root,sandbox)
         os.makedirs(directory,exist_ok=True)
         # Same third-party stub and test security configuration as legacy work.
+        # The root conftest is sandbox-only (the real repo has none): a bare
+        # `pytest` in a staged workspace sweeps world/tests, whose conftest
+        # imports serve and cannot run here (three fix tasks died identically
+        # on 2026-11-03, task-5930..5932). Ignoring the base tree's own test
+        # dirs in COLLECTION keeps every sandbox pytest run scoped to the
+        # author's work while the host gate stays untouched.
         for name, contents in {
             'mypy.ini':'[mypy]\n\n[mypy-pandas.*]\nignore_missing_imports = True\n',
             '.bandit':'[bandit]\nexclude = ./tests\n',
+            'conftest.py':(
+                'collect_ignore_glob = ["world/*", "library/*", "datasets/*", '
+                '"evals/*", "sandboxes/*", "agents/*", "think-tank-db-backups/*", ".git/*"]\n'),
         }.items():
             try:
                 with open(os.path.join(directory,name),'x',encoding='utf-8') as stream:
