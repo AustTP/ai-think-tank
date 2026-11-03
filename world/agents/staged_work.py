@@ -24,6 +24,18 @@ class Stage:
             if path.resolve().parent != self.root:
                 raise ValueError('Workspace must remain inside the sandbox root.')
         self.original.mkdir(parents=True, exist_ok=True)
+        if workspace.startswith(('story-', 'project-')) and not (self.original / 'conftest.py').exists():
+            # Sandbox-only pytest guard (2026-11-03, task-5930..5932): a bare
+            # `pytest` in a staged workspace sweeps the base tree's own test
+            # dirs, whose conftest imports serve and cannot run in the
+            # network-disabled sandbox. Ignoring them in COLLECTION keeps
+            # every sandbox pytest run scoped to the author's work; the
+            # author's tests/ directory stays collectible and the host repo
+            # (which has no root conftest) is untouched.
+            (self.original / 'conftest.py').write_text(
+                'collect_ignore_glob = ["world/*", "library/*", "datasets/*", '
+                '"evals/*", "sandboxes/*", "agents/*", "think-tank-db-backups/*", ".git/*"]\n',
+                encoding='utf-8')
         for directory, dirs, files in os.walk(self.original):
             if any(Path(directory, name).is_symlink() for name in dirs + files):
                 raise ValueError('Staged work does not follow symbolic links.')
