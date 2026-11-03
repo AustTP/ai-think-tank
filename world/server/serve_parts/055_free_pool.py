@@ -604,7 +604,13 @@ def _freepool_ready(ep, band):
             return False
     if ep.get('api_key_env') and not (_load_env().get(ep['api_key_env']) or '').strip():
         return False
-    if _api_key_is_broken(ep['service']):
+    # Key health is tracked per KEY, not per service name: two endpoints may
+    # share a service while carrying different keys (gemini-free vs
+    # gemini-free-key3), and one key's quota failures must not take the
+    # other key's endpoint down with it.
+    if _api_key_is_broken(
+            f"{ep['service']}:{ep['api_key_env']}" if ep.get('api_key_env')
+            else ep['service']):
         return False
     if is_model_circuit_broken(f'@freepool:{band}:{ep["name"]}'):
         return False

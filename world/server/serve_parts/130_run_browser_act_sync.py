@@ -485,6 +485,21 @@ _api_key_health: dict[str, dict[str, object]] = {}  # service -> {'consecutive_f
 _api_key_health_lock = threading.Lock()
 
 
+def _provider_key_scope(provider):
+    """The key-health scope for a provider: service name plus its key env,
+    e.g. 'gemini:GEMINI_API_KEY_3'. Two endpoints may share one service name
+    while carrying DIFFERENT keys (gemini-free vs gemini-free-key3, live
+    2026-11-03); keying health by the bare service let one key's quota 403s
+    block the other key's endpoint for the whole cooldown -- exactly the
+    'one service blowing its limits stops the other free models' coupling.
+    Providers without a key env fall back to the bare service name."""
+    if not isinstance(provider, dict):
+        return 'unknown'
+    service = str(provider.get('service') or 'unknown')
+    key_env = str(provider.get('api_key_env') or '').strip()
+    return f'{service}:{key_env}' if key_env else service
+
+
 def _api_key_is_broken(service):
     """True if the service must be skipped (call should fail fast). Mirrors
     is_model_circuit_broken: CLOSED normally; once the auth-failure streak
@@ -923,7 +938,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         record_model_result(model, success=False)
         if e.code in (401, 403):
             if free_route and is_custom:
-                _note_api_key_failure(provider['service'], e.code)
+                _note_api_key_failure(_provider_key_scope(provider), e.code)
             elif not is_custom and not free_route:
                 _note_api_key_failure('openrouter', e.code)
         for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
@@ -975,7 +990,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
     if not is_custom:
         _note_api_key_success('openrouter')
     elif free_route:
-        _note_api_key_success(provider['service'])
+        _note_api_key_success(_provider_key_scope(provider))
     return result
 
 
@@ -1142,7 +1157,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
         record_model_result(model, success=False)
         if e.code in (401, 403):
             if free_route and is_custom:
-                _note_api_key_failure(provider['service'], e.code)
+                _note_api_key_failure(_provider_key_scope(provider), e.code)
             elif not is_custom and not free_route:
                 _note_api_key_failure('openrouter', e.code)
         for slug in _free_pool_fallback_slugs(model, _fallback_depth, _tried):
@@ -1194,5 +1209,5 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     if not is_custom:
         _note_api_key_success('openrouter')
     elif free_route:
-        _note_api_key_success(provider['service'])
+        _note_api_key_success(_provider_key_scope(provider))
     return result

@@ -702,6 +702,40 @@ class FreePoolBreakerTests(_CallLayerBase):
         self.assertAlmostEqual(free_left, serve.FREE_POOL_CIRCUIT_COOLDOWN_S, delta=5)
         self.assertAlmostEqual(paid_left, serve.CIRCUIT_BREAKER_COOLDOWN_S, delta=5)
 
+    def test_key_health_is_scoped_per_key_not_per_service(self):
+        # Two endpoints may share one service name while carrying DIFFERENT
+        # keys (live pool: gemini-free on GEMINI_API_KEY vs gemini-free-key3
+        # on GEMINI_API_KEY_3). One key blowing its limit (403-on-quota)
+        # must block only that key's endpoint -- the other key has its own
+        # quota and must keep serving. Live 2026-11-03 key health was keyed
+        # by the bare service name, so one gemini key's failures took both
+        # gemini endpoints down for the whole cooldown.
+        ep_a = {'name': 'svc-a', 'service': 'groq', 'base_url': 'https://x.test',
+                'model': 'm-a', 'api_key_env': 'KEY_A', 'price_per_m': 0,
+                'rpm': 30, 'rpd': 0, 'tpm': 0, 'pool_key': 'svc-a'}
+        ep_b = dict(ep_a, name='svc-b', model='m-b', api_key_env='KEY_B',
+                    pool_key='svc-b')
+        # The base class patches _api_key_is_broken to always-False for the
+        # call-layer tests; this test IS about the real breaker, so restore it.
+        for p in list(self.patches):
+            if getattr(p, 'attribute', '') == '_api_key_is_broken':
+                p.stop()
+        with serve._api_key_health_lock:
+            serve._api_key_health.clear()
+        try:
+            serve._note_api_key_failure('groq:KEY_B', 403)
+            serve._note_api_key_failure('groq:KEY_B', 403)  # threshold = 2
+            self.assertTrue(serve._api_key_is_broken('groq:KEY_B'))
+            self.assertFalse(serve._api_key_is_broken('groq:KEY_A'))
+            with unittest.mock.patch.object(
+                    serve, '_load_env',
+                    return_value={'KEY_A': 'a', 'KEY_B': 'b'}):
+                self.assertTrue(serve._freepool_ready(ep_a, 'low'))
+                self.assertFalse(serve._freepool_ready(ep_b, 'low'))
+        finally:
+            with serve._api_key_health_lock:
+                serve._api_key_health.clear()
+
 
 _GEMINI_LISTING = {'models': [
     {'name': 'models/gemini-3.5-flash', 'supportedGenerationMethods': ['generateContent']},
