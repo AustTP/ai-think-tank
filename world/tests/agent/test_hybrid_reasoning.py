@@ -186,6 +186,7 @@ class ChatBridgeInjection(unittest.TestCase):
             return {'choices': [{'message': {'content': 'ok'}}]}
 
         with unittest.mock.patch.dict(os.environ, env), \
+             unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', openrouter, create=True), \
              unittest.mock.patch.object(serve, 'verify_session', lambda c: False), \
              unittest.mock.patch.object(serve, 'verify_agent_key', lambda a, k: True), \
              unittest.mock.patch.object(serve, '_input_guard_violation', lambda m: None), \
