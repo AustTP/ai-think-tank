@@ -292,6 +292,16 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
             _capture_token = training_capture.CURRENT.set(
                 training_capture.metadata(snapshot, agent_id, task.get('id')))
         try:
+            # Materialize base_ctx BEFORE the hybrid pre-pass (2026-11-02
+            # live-fire bug): the dispatch path arrives with base_ctx=None,
+            # and _hybrid_prepare's isinstance guard then silently returned
+            # -- no eligibility check, no decision row, no memory -- which
+            # made the whole protocol look inert while every executor kept
+            # working. A real dict also means the executor can actually
+            # READ base_ctx['hybridMemory'] (the working-memory handoff the
+            # pre-pass exists to provide).
+            if not isinstance(base_ctx, dict):
+                base_ctx = {}
             # Hybrid reasoning pre-pass (15_body_02_hybrid, from arxiv
             # 2610.18861): decide the mode, run the private planning pass on
             # eligible lanes, and hand the compiled working memory to the

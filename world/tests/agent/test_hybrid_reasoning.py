@@ -127,6 +127,24 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
         self.assertIn('PLAN', base_ctx['hybridMemory'])
         self.assertIn('PLAN', content._hybrid_memory_digest('ruth', task['id']))
 
+    def test_none_base_ctx_still_decides_and_logs(self):
+        # The 2026-11-02 live-fire bug: the dispatch path arrived with
+        # base_ctx=None and the isinstance guard silently skipped EVERYTHING
+        # -- no eligibility check, no decision row, no memory. A None
+        # base_ctx must still produce the mode decision and its log row.
+        task = _fresh_task(taskType='review')
+        rows = []
+        with unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append((a, k))), \
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'auto'}):
+            content._hybrid_prepare({}, 'ruth', task, None)
+        self.assertEqual(len(rows), 1)
+        args, _k = rows[0]
+        self.assertEqual(args[1], 'hybrid_mode')
+        self.assertEqual(args[2].get('decision'), 'text')
+        self.assertEqual(args[2].get('reason'), 'type-review')
+
     def test_failed_latent_pass_is_logged_not_silent(self):
         # A dead chat endpoint (e.g. a broken free pool) must produce a
         # 'latent-failed' hybrid_mode row, otherwise the outage looks

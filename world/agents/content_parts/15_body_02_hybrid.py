@@ -254,7 +254,11 @@ def _hybrid_prepare(snapshot, agent_id, task, base_ctx):
     benefit. base_ctx['hybridMemory'] is also set for executors that want
     the digest directly."""
     if not isinstance(base_ctx, dict):
-        return
+        # Defensive: proceed with a local dict so the mode decision is still
+        # made and logged even if a caller forgets to materialize base_ctx.
+        # (The dispatcher now materializes it -- this guard remains so a
+        # stray None can never again silently skip the whole protocol.)
+        base_ctx = {}
     base_ctx['hybridMemory'] = _hybrid_memory_digest(agent_id, task.get('id'))
     if not _hybrid_enabled():
         return
