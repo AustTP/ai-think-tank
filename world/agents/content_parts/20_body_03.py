@@ -631,6 +631,15 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
             result = {'ok': False,
                       'note': 'Staged coding failed; existing workspace preserved: ' + str(error)}
             if stage is not None:
+                # The failure path (transport death mid-loop) must checkpoint
+                # too: resume validation needs the .repair.json manifest, and
+                # without it the next pass silently stages a fresh tree and
+                # the mid-run writes are lost even though the stage dir still
+                # exists on disk (live: task-5934's heredoc module).
+                try:
+                    stage.checkpoint()
+                except Exception:
+                    pass
                 result['stagedWorkspace'] = stage.id
                 result['resumedFromWorkspace'] = stage.resumed_from
         sim._store_content_result(task.get('id'), result)
