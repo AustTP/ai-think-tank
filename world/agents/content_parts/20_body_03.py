@@ -153,11 +153,23 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # not a coverage source. bandit takes positional targets (its -f
         # is --format, not a file flag). The unscoped path below keeps the
         # whole-project measure for full-tree work.
-        _cov_flags = ' '.join(f'--cov={f}' for f in scope_files)
         # Coverage is scoped to the same files as lint when scope_files is
         # given, so a one-file story in a worktree that also holds the base
         # tree's files is not failed by --cov-fail-under=90 on the OTHER
-        # files' coverage. Each file is a repeated --cov= flag.
+        # files' coverage. Source specs are MODULE NAMES, not file paths: a
+        # file-path spec measured nothing (11 tests passed, "No data to
+        # report", live on task-5917) because coverage matches the IMPORTED
+        # module's name, and a directory spec pulls the whole base tree in
+        # (13846 statements, 0.40%). For each written file pass both plausible
+        # import names -- dotted (world.project_ui) and top-level (project_ui,
+        # how pytest.ini's pythonpath=world imports resolve); an unimportable
+        # candidate is harmless (verified: both styles coexist at 100%).
+        _cov_names = set()
+        for _f in scope_files:
+            if _f.endswith('.py'):
+                _cov_names.add(_f[:-3].replace('/', '.'))
+                _cov_names.add(_f.split('/')[-1][:-3])
+        _cov_flags = ' '.join(f'--cov={n}' for n in sorted(_cov_names))
         # pytest-cov must ALSO constrain COLLECTION: coverage flags only set
         # the measured sources, so without positional test paths pytest swept
         # the whole staged tree (live: task-5841 died loading

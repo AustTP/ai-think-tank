@@ -345,9 +345,13 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('skipping pytest-cov', pytest_cmd)
         steps2 = content._quality_pipeline_steps(['app.py', 'utils.py', 'tests/test_app.py'])
         pytest_cmd2 = next(s['command'] for s in steps2 if s['name'] == 'pytest-cov')
-        self.assertIn('--cov=app.py', pytest_cmd2)
-        self.assertIn('--cov=utils.py', pytest_cmd2)
+        # Source specs are MODULE NAMES (both dotted and top-level forms):
+        # file-path specs measured nothing ("No data to report" with tests
+        # passing, live task-5917) and directory specs pull the whole tree in.
+        self.assertIn('--cov=app', pytest_cmd2)
+        self.assertIn('--cov=utils', pytest_cmd2)
         self.assertNotIn('--cov=.', pytest_cmd2)  # not whole-tree
+        self.assertNotIn('--cov=app.py', pytest_cmd2)
         self.assertTrue(pytest_cmd2.startswith('python -m pytest tests/test_app.py '))
 
     def test_unscoped_pipeline_runs_on_whole_sandbox(self):
