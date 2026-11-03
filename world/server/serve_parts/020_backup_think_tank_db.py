@@ -683,13 +683,8 @@ def _reconcile_task_archive(done):
     # (so the caller may safely omit done tasks from the blob); False when the
     # table is missing, so the caller must keep them in the blob.
     with _TASK_ARCHIVE_LOCK:
-        _t0 = time.monotonic()
         cached = _task_archive_load_locked()
-        _t1 = time.monotonic()
         changed = {tid: t for tid, t in done.items() if cached.get(tid) != t}
-        _t2 = time.monotonic()
-        print(f'[save-archive] done={len(done)} load_ms={int((_t1-_t0)*1000)} '
-              f'compare_ms={int((_t2-_t1)*1000)} changed={len(changed)}', flush=True)
         if not changed:
             return True
         now = time.time()
@@ -908,14 +903,6 @@ def _save_phase(data, name):
     finer steps onto the same _tickPhase channel so the next freeze names
     the exact step. Best-effort; never breaks the save."""
     try:
-        print(f'[save-stamp] {name}', flush=True)
-        prev = data.get('_savePhaseAt')
-        now = time.monotonic()
-        if prev is not None and now - prev > 0.3:
-            print(f'[save-phase-delta] {data.get("_savePhaseName")} -> {name}: '
-                  f'{now - prev:.2f}s', flush=True)
-        data['_savePhaseAt'] = now
-        data['_savePhaseName'] = name
         data['_tickPhase'] = {'phase': name, 'at': round(time.time(), 3),
                               'tick': int((data.get('sim') or {}).get('tick') or 0)}
     except Exception:

@@ -457,14 +457,24 @@ def _sim_loop_pass_inner():
         def _phase(name):
             _tick_phase_stamp(state, name)
 
-        if state.get('_tickPhase', {}).get('phase') not in (None, 'done'):
+        _frozen_phase = (state.get('_tickPhase') or {}).get('phase')
+        if _frozen_phase not in (None, 'done'):
             frozen = state['_tickPhase']
-            from serve import log_action as _la
-            _la(None, 'tick_froze_at_phase',
-                {'phase': frozen.get('phase'),
-                 'frozenAtEpoch': frozen.get('at'),
-                 'heldForS': round(time.time() - float(frozen.get('at') or time.time()), 1),
-                 'tick': frozen.get('tick')})
+            _held_s = round(time.time() - float(frozen.get('at') or time.time()), 1)
+            # Only a GENUINELY stale stamp is a freeze signal. The saved blob
+            # copies _tickPhase at the save_archive_reconcile stamp (the blob
+            # view is built from data at that moment), so every healthy tick
+            # re-reads that one stale stamp from the DB with heldForS ~= one
+            # save interval -- 139 noise rows in 10 minutes on 2026-11-03.
+            # A real wedge is minutes long (the 38-minute 2026-11-02 freeze);
+            # 15s of held time cannot be one tick interval at any cadence.
+            if _held_s >= 15.0:
+                from serve import log_action as _la
+                _la(None, 'tick_froze_at_phase',
+                    {'phase': frozen.get('phase'),
+                     'frozenAtEpoch': frozen.get('at'),
+                     'heldForS': _held_s,
+                     'tick': frozen.get('tick')})
         # Record dormancy/downtime as paused time BEFORE the tick advances
         # sim.lastTickEpochS, so stale-work aging excludes it.
         _record_tick_gap(state, int(time.time() * 1000))
