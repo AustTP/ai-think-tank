@@ -40,7 +40,8 @@ def queue(state, task, result, now_ms):
     if any(q.get('reviewOf') == parent['id'] and q.get('taskType') not in ('review', 'qa')
            for q in state.get('workQueue', [])):
         return False
-    max_attempts = int(control.get('transportRecoveryAttempts') or 3)
+    max_attempts = int(control.get('transportRecoveryAttempts')
+                       or (6 if coding else 3))
     retry = parent.setdefault('transportRecovery', {'attempts': 0, 'history': []})
     if retry['attempts'] >= max_attempts:
         parent.update(status='blocked', manualAttention=True,
