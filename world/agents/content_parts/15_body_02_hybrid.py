@@ -215,9 +215,23 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
                                'taskId': task.get('id'),
                                'hybridBypass': True}, key)
         notes = (r.get('reply') or '').strip() if isinstance(r, dict) else ''
-    except Exception:
+    except Exception as _exc:
+        # NOT 'except ... as _plan_err': Python unbinds the as-name when the
+        # except block exits, which would leave _plan_err undefined exactly
+        # on the failure path we are trying to report.
         notes = ''
+        _plan_err = repr(_exc)
+    else:
+        _plan_err = None
     if not notes:
+        # A failed pre-pass must be visible: without this row a free-pool
+        # outage looks exactly like 'the protocol never ran' (the live
+        # 2026-11-02 confusion -- zero hybrid rows while the pool's circuits
+        # were broken made the silent design indistinguishable from a bug).
+        _serve.log_action(agent_id, 'hybrid_mode',
+                          {'decision': 'latent-failed', 'task': task.get('id'),
+                           'step': 'plan', 'error': str(_plan_err)[:200]},
+                          authorized=True)
         return ''
     _hybrid_memory_append(agent_id, task, notes, step='plan')
     _hybrid_embed_memory(agent_id, task, notes)

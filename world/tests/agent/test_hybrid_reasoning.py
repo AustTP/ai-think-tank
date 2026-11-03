@@ -127,6 +127,33 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
         self.assertIn('PLAN', base_ctx['hybridMemory'])
         self.assertIn('PLAN', content._hybrid_memory_digest('ruth', task['id']))
 
+    def test_failed_latent_pass_is_logged_not_silent(self):
+        # A dead chat endpoint (e.g. a broken free pool) must produce a
+        # 'latent-failed' hybrid_mode row, otherwise the outage looks
+        # exactly like 'the protocol never ran' (2026-11-02 live confusion).
+        task = _fresh_task(distill=True)
+        rows = []
+
+        def failing_http_json(*a, **k):
+            raise RuntimeError('circuit broken')
+
+        with unittest.mock.patch.object(serve, '_http_json', failing_http_json), \
+             unittest.mock.patch.object(serve, '_load_env',
+                                        lambda: {'HYBRID_MODE': 'auto'}), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append((a, k))):
+            content._hybrid_prepare({}, 'ruth', task, {})
+
+        self.assertEqual(len(rows), 1)
+        args, kwargs = rows[0]
+        # log_action(agent_id, action, details, authorized=...)
+        self.assertEqual(args[0], 'ruth')
+        self.assertEqual(args[1], 'hybrid_mode')
+        row = args[2]
+        self.assertEqual(row.get('task'), task['id'])
+        # and no memory file was written
+        self.assertFalse(content._hybrid_memory_digest('ruth', task['id']))
+
     def test_cooldown_prevents_repeat_passes(self):
         task = _fresh_task(distill=True)
         calls = []
