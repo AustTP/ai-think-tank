@@ -101,7 +101,11 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
     in unrelated files, and --cov-fail-under=90 measures just the touched
     files (a one-file story in a worktree that also holds the base tree's
     files must not be failed by the OTHER files' coverage). The unscoped path
-    keeps the whole-project total-coverage measure for full-tree deliverables.
+    skips mypy/bandit/pytest-cov entirely: the staged workspace holds the
+    whole base tree, whose scripts/ and world/tests/ are not valid targets
+    inside a network-disabled sandbox (missing stubs, conftest that imports
+    serve, nested .bandit collisions). The host gate (world/tests/run_all.sh)
+    runs none of these three tools at all; CI measures real coverage there.
     JS steps already no-op when no JS files exist.
 
     flake8 runs with `--isolated` and the host's setup.cfg flags mirrored on
@@ -150,6 +154,29 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # is --format, not a file flag). The unscoped path below keeps the
         # whole-project measure for full-tree work.
         _cov_flags = ' '.join(f'--cov={f}' for f in scope_files)
+        # Coverage is scoped to the same files as lint when scope_files is
+        # given, so a one-file story in a worktree that also holds the base
+        # tree's files is not failed by --cov-fail-under=90 on the OTHER
+        # files' coverage. Each file is a repeated --cov= flag.
+        # pytest-cov must ALSO constrain COLLECTION: coverage flags only set
+        # the measured sources, so without positional test paths pytest swept
+        # the whole staged tree (live: task-5841 died loading
+        # world/tests/conftest.py, whose `import serve` cannot run in a
+        # network-disabled sandbox, and the multi-minute whole-suite grind
+        # cascaded into pipeline timeouts on the fix tasks). The author's own
+        # test files are the positionals; pythonpath from pytest.ini then
+        # resolves their imports. A task that wrote implementation without
+        # tests has nothing to measure -- skip the step (python_delivery.check
+        # already forces tests/test_*.py for python_task work upstream).
+        _test_files = [f for f in scope_files
+                       if f.split('/')[-1].startswith('test_')]
+        if _test_files:
+            _pytest_step = {'name': 'pytest-cov',
+                            'command': (f'python -m pytest {" ".join(_test_files)} '
+                                        f'{_cov_flags} --cov-fail-under=90 -q')}
+        else:
+            _pytest_step = {'name': 'pytest-cov',
+                            'command': "echo 'no test_*.py written -- skipping pytest-cov'"}
         # mypy runs on implementation files only, with followed imports kept
         # silent: tests commonly import the module through a sys.path hack,
         # which makes mypy see one file under two module names ("Source file
@@ -171,7 +198,7 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
             {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} {_scoped}'},
             _mypy_step,
             {'name': 'bandit', 'command': f'python -m bandit -q {_scoped}'},
-            {'name': 'pytest-cov', 'command': f'python -m pytest {_cov_flags} --cov-fail-under=90 -q'},
+            _pytest_step,
             {'name': 'node-syntax', 'command': (
                 'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
                 'if [ -z "$files" ]; then echo "no JS files -- skipping"; exit 0; fi; '
@@ -195,7 +222,10 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} --exclude=tests,.selfedit_staging,.selfedit_failed .'},
         {'name': 'mypy', 'command': "echo 'no .py written by this task -- skipping mypy'"},
         {'name': 'bandit', 'command': "echo 'no .py written by this task -- skipping bandit'"},
-        {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
+        # pytest-cov unscoped has the same whole-tree problem (testpaths sweep
+        # world/tests, whose conftest cannot import serve in the sandbox), so
+        # it skips too: the host gate measures real coverage in CI, not here.
+        {'name': 'pytest-cov', 'command': "echo 'no .py written by this task -- skipping pytest-cov'"},
         # JS half of the gate (wrq-8: vanilla-JS engine). node --check parses
         # every .js/.mjs WITHOUT executing (pure syntax); node --test runs the
         # *.test.mjs suites the agents write (built-in node:test runner). Both

@@ -236,9 +236,9 @@ class QualityPipelineSteps(unittest.TestCase):
         # wrote no Python, where skipping matches the prompt's promise.
         self.assertIn('skipping mypy', by_name['mypy'])
         self.assertIn('skipping bandit', by_name['bandit'])
-        # Total coverage across all files (not per-file) is what --cov-fail-under
-        # expresses: pytest-cov fails only when the AGGREGATE falls below 90.
-        self.assertEqual(by_name['pytest-cov'], 'python -m pytest --cov=. --cov-fail-under=90 -q')
+        # Unscoped pytest-cov skips too (same whole-tree collection problem;
+        # the host gate measures real coverage in CI, not in the sandbox).
+        self.assertIn('skipping pytest-cov', by_name['pytest-cov'])
         # JS half of the gate (wrq-8 vanilla-JS engine): node --check parses
         # every .js/.mjs (syntax only, never executes); node --test runs the
         # *.test.mjs suites. Both self-skip green when no JS is present.
@@ -336,12 +336,19 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('utils.py', bandit_cmd)
         self.assertNotIn('-f app.py', bandit_cmd)
         self.assertNotIn('-r .', bandit_cmd)  # not whole-tree
-        # pytest-cov is scoped to the same files (repeated --cov= flags, one
-        # per file) so --cov-fail-under=90 measures just the touched files.
+        # pytest-cov with NO test files in scope skips (nothing to measure);
+        # with test files it constrains COLLECTION too -- coverage flags alone
+        # still let pytest sweep the whole tree (live: task-5841 died loading
+        # world/tests/conftest.py, whose `import serve` cannot run here), so
+        # the author's test files are the positionals next to the --cov flags.
         pytest_cmd = next(s['command'] for s in steps if s['name'] == 'pytest-cov')
-        self.assertIn('--cov=app.py', pytest_cmd)
-        self.assertIn('--cov=utils.py', pytest_cmd)
-        self.assertNotIn('--cov=.', pytest_cmd)  # not whole-tree
+        self.assertIn('skipping pytest-cov', pytest_cmd)
+        steps2 = content._quality_pipeline_steps(['app.py', 'utils.py', 'tests/test_app.py'])
+        pytest_cmd2 = next(s['command'] for s in steps2 if s['name'] == 'pytest-cov')
+        self.assertIn('--cov=app.py', pytest_cmd2)
+        self.assertIn('--cov=utils.py', pytest_cmd2)
+        self.assertNotIn('--cov=.', pytest_cmd2)  # not whole-tree
+        self.assertTrue(pytest_cmd2.startswith('python -m pytest tests/test_app.py '))
 
     def test_unscoped_pipeline_runs_on_whole_sandbox(self):
         steps = content._quality_pipeline_steps(None)
