@@ -976,7 +976,9 @@ def save_state_to_db(data):
             # transaction leaves the blob carrying the legacy copies with an
             # empty row table; a crash after it leaves rows authoritative with
             # no blob copy. Either state reads correctly.
+            _save_phase(data, 'save_extracted_sections')
             extracted_ok = _reconcile_extracted_sections(conn, data)
+            _save_phase(data, 'save_blob_serialize')
             if extracted_ok:
                 blob = {k: v for k, v in blob.items() if k not in extracted_ok}
                 for nkey in extracted_ok:
@@ -989,6 +991,7 @@ def save_state_to_db(data):
                         if isinstance(sim_blob, dict) and nkey[4:] in sim_blob:
                             blob['sim'] = {k: v for k, v in sim_blob.items()
                                            if k != nkey[4:]}
+            _save_phase(data, 'save_insert')
             conn.execute(
                 'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
@@ -996,7 +999,9 @@ def save_state_to_db(data):
             )
             # Integrity pair (015): the checksum row must commit atomically
             # with the blob it covers.
+            _save_phase(data, 'save_checksum')
             _state_checksum_write(conn, json.dumps(blob))
+        _save_phase(data, 'save_committed')
         try:
             sync_agent_directories(data, throttle=True)
         except Exception as e:
