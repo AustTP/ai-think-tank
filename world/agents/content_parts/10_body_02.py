@@ -292,6 +292,15 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
             _capture_token = training_capture.CURRENT.set(
                 training_capture.metadata(snapshot, agent_id, task.get('id')))
         try:
+            # Hybrid reasoning pre-pass (15_body_02_hybrid, from arxiv
+            # 2610.18861): decide the mode, run the private planning pass on
+            # eligible lanes, and hand the compiled working memory to the
+            # executor. Best-effort by contract -- a hybrid failure must
+            # never break the dispatch that follows it.
+            try:
+                _hybrid_prepare(snapshot, agent_id, task, base_ctx)
+            except Exception as _hybrid_err:
+                print(f'[hybrid] prepare failed: {_hybrid_err}', flush=True)
             executor(snapshot, agent_id, task, base_ctx)
         finally:
             if _capture_token is not None:

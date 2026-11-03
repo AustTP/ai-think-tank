@@ -574,6 +574,38 @@ async def chat(request: Request):
                     'snippet': violation['snippets']},
                    authorized=authorized)
         return JSONResponse({'error': 'Blocked by input guard (potential prompt injection)'}, status_code=400)
+    # Hybrid working-memory bridge (2026-11-02, from arxiv 2610.18861): if
+    # the calling agent keeps private working memory for this task
+    # (library/hybrid/<agent>/<task>.md, written by the latent pre-pass in
+    # content_parts), prepend its distilled digest as a SYSTEM message so
+    # every later call for the task starts from the agent's own distilled
+    # thinking instead of re-deriving it in verbose in-context text. The
+    # file is the interface -- no request flag and no state read needed;
+    # one os.path.isfile per call. hybridBypass skips injection (the latent
+    # pre-pass itself must not see its own output echoed back). Injected
+    # AFTER the input guard: the guard scans the CALLER's messages; the
+    # injected block is server-authored from the agent's own memory file.
+    _hy_task = body.get('taskId')
+    if (_hy_task and agent_id and not body.get('hybridBypass')
+            and os.environ.get('HYBRID_MODE', 'off') != 'off'):
+        _hy_path = os.path.join(LIBRARY_DIR, 'hybrid', agent_id,
+                                f'{_hy_task}.md')
+        try:
+            with open(_hy_path, encoding='utf-8', errors='replace') as _hy_f:
+                _hy_digest = _hy_f.read(2000)
+        except OSError:
+            _hy_digest = ''
+        if _hy_digest.strip():
+            messages = list(messages) + [{
+                'role': 'system',
+                'content': ('Private working memory for this task '
+                            '(your own distilled notes, not part of the '
+                            'conversation; consult it, do not re-derive):\n'
+                            + _hy_digest),
+            }]
+            log_action(agent_id, 'hybrid_memory_injected',
+                       {'task': _hy_task, 'chars': len(_hy_digest)},
+                       authorized=authorized)
     # 300 was sized for a short in-character 1:1 reply -- real gap:
     # assignBigTask()'s structured multi-subtask JSON breakdown got
     # silently truncated mid-response by this same cap, producing invalid
