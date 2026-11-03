@@ -707,7 +707,7 @@ def _review_harness(monkeypatch, *, repairs=None, doc=False):
     monkeypatch.setattr(content._serve, '_safe_library_path', lambda p: p)
     monkeypatch.setattr(content, '_agent_name', lambda s, a: 'Cora')
     monkeypatch.setattr(content, '_review_sandbox_id', lambda *a: 'sb')
-    monkeypatch.setattr(content, '_gather_unified_context', lambda *a: '')
+    monkeypatch.setattr(content, '_gather_unified_context', lambda *a, **k: '')
     monkeypatch.setattr(content, '_run_quality_pipeline',
                         lambda *a, **k: {'ok': True, 'note': 'green'})
     monkeypatch.setattr(content, '_review_screenshot',

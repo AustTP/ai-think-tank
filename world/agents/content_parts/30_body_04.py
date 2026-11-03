@@ -178,7 +178,19 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     # so the reviewer reads the exact tree the author wrote, not the shared one.
     sandbox_id = _review_sandbox_id(snapshot, task, agent_id)
     review_parent = (snapshot.get('tasks') or {}).get(task.get('reviewOf')) or {}
-    context = _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, backlog)
+    # The story's own files are SUBDIRECTORY paths (world/, tests/) the
+    # top-level sandbox glob never reaches -- reviewers kept reporting "the
+    # sandbox contains only health.py" while the implementation sat unread
+    # (DEV-139's reviews, 2026-11-03). Put the story's written and changed
+    # files first in the context so the reviewer reads the actual code.
+    story_files = [p for p in ((review_parent.get('writtenPy') or [])
+                               + (review_parent.get('writtenJs') or [])
+                               + (review_parent.get('changedPaths') or []))
+                   if isinstance(p, str)]
+    seen_files = set()
+    story_files = [p for p in story_files if not (p in seen_files or seen_files.add(p))]
+    context = _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, backlog,
+                                      priority_files=story_files)
     parent_deliverable = str((review_parent or {}).get('deliverable') or '').strip().lower()
     is_prose_review = (parent_deliverable in ('note', 'report')
                        or (review_parent or {}).get('taskType') in ('spike', 'report', 'task'))

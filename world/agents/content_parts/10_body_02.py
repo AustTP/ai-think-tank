@@ -775,12 +775,27 @@ def _format_page_probe_result(data):
     return '\n'.join(lines)
 
 
-def _get_sandbox_context(base, key, agent_id, sandbox_id):
+def _get_sandbox_context(base, key, agent_id, sandbox_id, priority_files=None):
     """Port of tasks.js getSandboxContext: read every real *.html *.js *.css
     *.py *.md in the sandbox, skipping whole oversized files once an accumulate
     budget is spent (never truncate mid-file), so serve.py's own _serve.SANDBOX_MAX_OUTPUT
-    cap is never hit."""
-    command = ("budget=15000; total=0; for f in *.html *.js *.css *.py *.md; do [ -f \"$f\" ] || continue; "
+    cap is never hit. priority_files (repo-relative paths) are read FIRST with
+    the same budget: the story's own code lives in subdirectories (world/,
+    tests/) the top-level glob never reaches, which is why reviewers kept
+    reporting 'the sandbox contains only health.py' while the implementation
+    sat unread in world/ (DEV-139's reviews, 2026-11-03)."""
+    prio_cmd = ''
+    prio = [p for p in (priority_files or [])
+            if isinstance(p, str) and p and not p.startswith('/')
+            and '..' not in p.split('/') and len(p) <= 200]
+    if prio:
+        listed = ' '.join('"%s"' % p for p in prio)
+        prio_cmd = ('for f in %s; do [ -f "$f" ] || continue; '
+                    'sz=$(wc -c < "$f"); '
+                    'if [ $((total + sz)) -gt $budget ]; then echo "--- $f --- (skipped, over context budget)"; continue; fi; '
+                    'echo "--- $f ---"; cat "$f"; total=$((total + sz)); done; ' % listed)
+    command = ("budget=15000; total=0; " + prio_cmd +
+               "for f in *.html *.js *.css *.py *.md; do [ -f \"$f\" ] || continue; "
                "sz=$(wc -c < \"$f\"); if [ $((total + sz)) -gt $budget ]; then echo \"--- $f --- (skipped, over context budget)\"; continue; fi; "
                "echo \"--- $f ---\"; cat \"$f\"; total=$((total + sz)); done")
     data = _serve._http_json('POST', base, '/api/execute',
@@ -804,13 +819,14 @@ def _search_library_files(base, key, agent_id, query):
     return []
 
 
-def _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, topic):
+def _gather_unified_context(snapshot, base, key, agent_id, sandbox_id, topic, priority_files=None):
     """Port of world.js gatherUnifiedContext: sandbox files + Library search +
     the agent's recent mailbox, assembled into one context blob. The mailbox
     block reads the snapshot's real mailbox when available. Deliberately skips
     the markMailRead side effect -- that only clears a live-browser HUD counter;
     the server executor has no such counter to clear."""
-    sandbox = _get_sandbox_context(base, key, agent_id, sandbox_id)
+    sandbox = _get_sandbox_context(base, key, agent_id, sandbox_id,
+                                   priority_files=priority_files)
     library_matches = _search_library_files(base, key, agent_id, topic) if topic else []
     full_agent = (snapshot.get('agents') or {}).get(agent_id)
     recent_mail = (full_agent or {}).get('mailbox') or [] if isinstance((full_agent or {}).get('mailbox'), list) else []
