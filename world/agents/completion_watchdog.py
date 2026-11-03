@@ -109,7 +109,13 @@ def step(state, now_ms=None, observe_only=True):
                 and not (task.get('_peerGate') or {}).get('escalated')):
             task['status'] = status = 'repairing'
         if (not observe_only and task.get('investigationOf')
-                and status in ('repairing', 'investigating') and not active and not queued):
+                and status in ('repairing', 'investigating') and not active and not queued
+                # A code-class story's approval gate (requiredApprovals) must
+                # never be bypassed by a recovered report: DEV-150's v14 story
+                # closed 'done' with 0/2 approvals while its reviews were
+                # send-backing on real defects (2026-11-03). Only stories
+                # without an approval requirement may complete this way.
+                and not int((task.get('_peerGate') or {}).get('requiredApprovals') or 0)):
             completed_repairs = [t for t in children if (t.get('reviewOf') == task['id'] or t.get('investigationOf') == task['id'])
                                  and t.get('status') == 'done' and t.get('libraryPath')
                                  and t.get('taskType') not in ('review', 'qa')]
