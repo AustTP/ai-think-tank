@@ -9,13 +9,16 @@ FROM python:3.12-slim
 #   docker build -t ai-think-tank-work-sandbox world/sandbox
 # serve.py SANDBOX_IMAGE points at it.
 # flake8's own deps (pycodestyle/pyflakes/mccabe) are pinned too: an
-# unconstrained reinstall of flake8==6.0.0 can pull newer plugin packages that
-# crash inside flake8's _import_plugins loader before any lint runs, which
-# surfaced as unfixable pipeline failures on tasks the agent never controlled.
+# unconstrained reinstall can pull plugin packages that crash inside flake8's
+# _import_plugins loader before any lint runs, which surfaced as unfixable
+# pipeline failures on tasks the agent never controlled. 7.1.1/2.12.1/3.2.0
+# mirror requirements.txt: flake8 6.0.0 + Python 3.12 misparses PEP-701
+# f-strings and flagged E201/E202/E713 false positives inside plain string
+# text (DEV-135 reviews, 2026-11-03), so the image must lint like the host.
 RUN python -m pip install --no-cache-dir \
-    flake8==6.0.0 \
-    pycodestyle==2.10.0 \
-    pyflakes==3.0.1 \
+    flake8==7.1.1 \
+    pycodestyle==2.12.1 \
+    pyflakes==3.2.0 \
     mccabe==0.7.0 \
     mypy==1.8.0 \
     bandit==1.9.4 \
@@ -54,14 +57,12 @@ RUN apt-get update && apt-get install -y ca-certificates curl gnupg \
 # autopep8: agents reach for `python -m autopep8 --in-place ...` to auto-fix
 # the flake8 E/W errors the gate rejects on. It was not in the image, so every
 # attempt burned a review cycle on "No module named autopep8" before the agent
-# could hand-fix the file. 2.0.4 is the only release whose dependency range
-# still accepts pycodestyle==2.10.0 (flake8 6.0.0's hard pin): 2.1.2+ require
-# pycodestyle>=2.11, which would either ResolutionImpossible against the pin
-# or silently upgrade pycodestyle and crash flake8's plugin loader (the
-# _import_plugins failure this file's header already documents). Placed AFTER
-# the node layer on purpose: this RUN reuses the cached flake8/mypy/bandit/
-# pytest/chromium layers above and only executes this one pip install, instead
-# of invalidating the whole build.
-RUN python -m pip install --no-cache-dir autopep8==2.0.4 pycodestyle==2.10.0 black==24.10.0
+# could hand-fix the file. 2.3.1 is the line whose dependency range accepts
+# pycodestyle==2.12.1 (flake8 7.1.1's pin, matching requirements.txt); older
+# 2.0.x pins require pycodestyle<2.11 and would fight the upgraded stack.
+# Placed AFTER the node layer on purpose: this RUN reuses the cached
+# flake8/mypy/bandit/pytest/chromium layers above and only executes this one
+# pip install, instead of invalidating the whole build.
+RUN python -m pip install --no-cache-dir autopep8==2.3.1 pycodestyle==2.12.1 black==24.10.0
 
 WORKDIR /workspace

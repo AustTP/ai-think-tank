@@ -34,7 +34,7 @@ def ensure_table(conn, table):
         created_at REAL NOT NULL,
         expires_at REAL NOT NULL
     )''')
-    conn.execute(f'CREATE INDEX IF NOT EXISTS {index} ON {table}(agent_id)')
+    conn.execute('CREATE INDEX IF NOT EXISTS %s ON %s(agent_id)' % (index, table))
 
 
 def insert(conn, table, row):

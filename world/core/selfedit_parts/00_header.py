@@ -83,17 +83,21 @@ The self-modification contract (operator decisions, locked 2026-10-18):
     unverifiable proposal never touches the file tree.
 """
 
-import difflib
+# These are exec'd into one shared namespace: later fragments use names this
+# header imports (see setup.cfg's per-file-ignores rationale). Some are only
+# consumed by sibling fragments, so flake8 7 running without that config file
+# in scope flags them; noqa keeps the deliberate imports lint-clean anywhere.
+import difflib  # noqa: F401 (used by a later selfedit fragment)
 import hashlib
-import json
+import json  # noqa: F401 (used by a later selfedit fragment)
 import os
 import secrets
-import shlex
+import shlex  # noqa: F401 (used by a later selfedit fragment)
 import shutil
 import sqlite3
 import subprocess
 import sys
-import threading
+import threading  # noqa: F401 (used by a later selfedit fragment)
 import time
 
 import core.governance as governance

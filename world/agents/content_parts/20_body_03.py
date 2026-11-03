@@ -721,15 +721,97 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
             return False
 
         _opens, _closes, balanced = _heredoc_balance(command)
-        if balanced:
-            break
-        attempts += 1
-        messages.append({'role': 'assistant', 'content': command})
-        messages.append({'role': 'user',
-                         'content': 'You were cut off before finishing. Continue EXACTLY where you left off -- do not repeat anything you '
-                                    'already wrote, do not restart the heredoc or add a new one, just output the rest of the raw file content '
-                                    'and the closing EOF line(s).'})
-    # Loop exits via `balanced` (the normal case) or by exhausting the
+        if not balanced:
+            attempts += 1
+            messages.append({'role': 'assistant', 'content': command})
+            messages.append({'role': 'user',
+                             'content': 'You were cut off before finishing. Continue EXACTLY where you left off -- do not repeat anything you '
+                                        'already wrote, do not restart the heredoc or add a new one, just output the rest of the raw file content '
+                                        'and the closing EOF line(s).'})
+            continue
+        # Balanced heredoc: execute inside the loop so a bash syntax error can
+        # earn an in-lane correction instead of burning a transport-recovery
+        # strike (DEV-135 freeze, 2026-11-03: three identical malformed-command
+        # retries exhausted transport recovery and froze the story with nothing
+        # written -- the model never saw its own stderr).
+
+        _hb()
+        exec_data = _serve._http_json('POST', base, '/api/execute',
+                               {'agentId': agent_id, 'command': command,
+                                'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
+        if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
+            if not isinstance(exec_data, dict):
+                _block_reason = 'no response from the execution service'
+            elif exec_data.get('timedOut'):
+                _block_reason = 'the command timed out before the execution service returned'
+            else:
+                # Consultant finding 2026-10-27: an empty refusal reason failed
+                # Help cards with no actionable detail. Surface what the wrapper
+                # does know -- the refused command -- instead of the bare
+                # boilerplate. Live case 2026-11-02: a 429 rate-limit body
+                # carries `error`, not `reason`/`detail`, so the gate saw
+                # "refused the command without a reason" while the real story
+                # was the sliding-window throttle (three verify attempts in two
+                # minutes). Surface rate limits and every other error field by
+                # name; a retry after the window is the actual remedy.
+                _block_reason = (exec_data.get('reason') or exec_data.get('detail')
+                                 or exec_data.get('error') or (
+                    f'the execution service refused the command without a reason '
+                    f'(command: {str(command)[:200]})'))
+                if exec_data.get('resourceHold'):
+                    _block_reason += (f' -- resource hold, retry after '
+                                      f'{exec_data.get("retryAfterS") or 15}s')
+            store_result(task.get('id'),
+                                              {'note': f"blocked: {_block_reason}",
+                                               'command': command, 'ok': False, 'tier': tier_slug,
+                                               # Item 2: the block reason rides the result channel
+                                               # into sim._apply_content_result, where it lands in the
+                                               # author's feedback buffer and shows up on the next
+                                               # dispatch's perception block.
+                                               'feedback': (f'Your command was blocked before running: '
+                                                            f'{_block_reason}.')})
+            return False
+        ok = bool(exec_data.get('exitCode') == 0 and not exec_data.get('timedOut'))
+        result = {'ok': ok, 'exitCode': exec_data.get('exitCode'), 'command': command, 'tier': tier_slug}
+        if not ok:
+            _err_probe = (exec_data.get('stderr') or '').strip()
+            if (_is_command_syntax_error(_err_probe)
+                    and repair_rounds < MAX_CODE_REPAIR_ROUNDS):
+                repair_rounds += 1
+                attempts = 0
+                balanced = False
+                messages.append({'role': 'assistant', 'content': command})
+                messages.append({'role': 'user', 'content': (
+                    'Your command died with a bash syntax error before anything ran:\n'
+                    + '\n'.join(_err_probe.splitlines()[-4:])
+                    + '\nNothing was executed. Reply with ONLY one bare shell command that writes the same files: '
+                      'a heredoc with a QUOTED delimiter (cat > path << \'EOF\' ... EOF) or one structured edit '
+                      'object. Never place raw JSON outside a heredoc or fence; quote every delimiter.')})
+                command = ''
+                continue
+        if not ok:
+            # Include a snippet of stdout/stderr so the author can see WHY the
+            # command failed, not just the exit code. Mirrors the spike sandbox
+            # executor's behavior (which already returns stdout/stderr to the
+            # model) -- the coding path was dropping them, leaving agents with
+            # "exited non-zero (code 2)" and no root cause.
+            _err_snip = (exec_data.get('stderr') or '').strip()
+            _out_snip = (exec_data.get('stdout') or '').strip()
+            _detail_parts = []
+            if _err_snip:
+                _detail_parts.append('stderr: ' + '\n'.join(_err_snip.splitlines()[-6:]))
+            if _out_snip:
+                _detail_parts.append('stdout: ' + '\n'.join(_out_snip.splitlines()[-6:]))
+            _detail = (' | '.join(_detail_parts) if _detail_parts else 'no output captured')
+            store_result(task.get('id'),
+                                              {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
+                                                       f'timed out: {bool(exec_data.get("timedOut"))} | {_detail}',
+                                               'command': command, 'ok': False, 'tier': tier_slug,
+                                               'syntaxFailure': _is_command_syntax_error(_err_snip)})
+            return False
+        break  # executed successfully; fall through to the integrity checks
+
+    # Loop exits via `balanced`+break (the normal case) or by exhausting the
     # continuation attempts -- the truncated-heredoc failure is handled HERE
     # so the loop's own exhausted-exit arc is a reachable, tested path.
     if not balanced:
@@ -737,65 +819,6 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                                           {'note': f'generation still looked truncated after {CODE_CONTINUATION_ATTEMPTS} '
                                                    f'continuation attempt(s) ({_opens} heredoc(s) opened, {_closes} closed) -- not executed',
                                            'ok': False, 'tier': tier_slug})
-        return False
-
-    _hb()
-    exec_data = _serve._http_json('POST', base, '/api/execute',
-                           {'agentId': agent_id, 'command': command,
-                            'purpose': f'Coding task: {backlog_item}', 'sandboxId': sandbox_id}, key)
-    if not isinstance(exec_data, dict) or not exec_data.get('allowed'):
-        if not isinstance(exec_data, dict):
-            _block_reason = 'no response from the execution service'
-        elif exec_data.get('timedOut'):
-            _block_reason = 'the command timed out before the execution service returned'
-        else:
-            # Consultant finding 2026-10-27: an empty refusal reason failed
-            # Help cards with no actionable detail. Surface what the wrapper
-            # does know -- the refused command -- instead of the bare
-            # boilerplate. Live case 2026-11-02: a 429 rate-limit body
-            # carries `error`, not `reason`/`detail`, so the gate saw
-            # "refused the command without a reason" while the real story
-            # was the sliding-window throttle (three verify attempts in two
-            # minutes). Surface rate limits and every other error field by
-            # name; a retry after the window is the actual remedy.
-            _block_reason = (exec_data.get('reason') or exec_data.get('detail')
-                             or exec_data.get('error') or (
-                f'the execution service refused the command without a reason '
-                f'(command: {str(command)[:200]})'))
-            if exec_data.get('resourceHold'):
-                _block_reason += (f' -- resource hold, retry after '
-                                  f'{exec_data.get("retryAfterS") or 15}s')
-        store_result(task.get('id'),
-                                          {'note': f"blocked: {_block_reason}",
-                                           'command': command, 'ok': False, 'tier': tier_slug,
-                                           # Item 2: the block reason rides the result channel
-                                           # into sim._apply_content_result, where it lands in the
-                                           # author's feedback buffer and shows up on the next
-                                           # dispatch's perception block.
-                                           'feedback': (f'Your command was blocked before running: '
-                                                        f'{_block_reason}.')})
-        return False
-    ok = bool(exec_data.get('exitCode') == 0 and not exec_data.get('timedOut'))
-    result = {'ok': ok, 'exitCode': exec_data.get('exitCode'), 'command': command, 'tier': tier_slug}
-    if not ok:
-        # Include a snippet of stdout/stderr so the author can see WHY the
-        # command failed, not just the exit code. Mirrors the spike sandbox
-        # executor's behavior (which already returns stdout/stderr to the
-        # model) -- the coding path was dropping them, leaving agents with
-        # "exited non-zero (code 2)" and no root cause.
-        _err_snip = (exec_data.get('stderr') or '').strip()
-        _out_snip = (exec_data.get('stdout') or '').strip()
-        _detail_parts = []
-        if _err_snip:
-            _detail_parts.append('stderr: ' + '\n'.join(_err_snip.splitlines()[-6:]))
-        if _out_snip:
-            _detail_parts.append('stdout: ' + '\n'.join(_out_snip.splitlines()[-6:]))
-        _detail = (' | '.join(_detail_parts) if _detail_parts else 'no output captured')
-        store_result(task.get('id'),
-                                          {'note': f'execution exited non-zero (code {exec_data.get("exitCode")}), '
-                                                   f'timed out: {bool(exec_data.get("timedOut"))} | {_detail}',
-                                           'command': command, 'ok': False, 'tier': tier_slug,
-                                           'syntaxFailure': _is_command_syntax_error(_err_snip)})
         return False
 
     # ---- The four mechanical integrity checks (mirror runCodingTask) ----

@@ -925,7 +925,7 @@ def _guess_link_target_html(base, key, agent_id, sandbox_id, js_file):
         return 'index.html'
     data = _serve._http_json('POST', base, '/api/execute',
                       {'agentId': agent_id,
-                       'command': f'[ -f "{base_name}.html" ] && echo yes || echo no',
+                       'command': ('[ -f "%s.html" ] && echo yes || echo no' % base_name),
                        'purpose': f'Checking whether {js_file} has a same-named HTML page to link into.',
                        'sandboxId': sandbox_id}, key)
     if isinstance(data, dict) and data.get('allowed') and 'yes' in (data.get('stdout') or ''):
