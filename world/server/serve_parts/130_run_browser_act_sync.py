@@ -848,6 +848,20 @@ def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
 
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                                reasoning_override=None, _tried=None):
+    # A BARE tier string ('@freepool:low', two segments) is a band name, not
+    # a postable model id (2026-11-02 live bug: POSTing it verbatim earns
+    # OpenRouter's 400 'not a valid model', the fallback generator sees
+    # len(parts) != 3 so band=None skips every candidate, and the consumed
+    # HTTPError body surfaced as {"error": ""} with status 400). Expand to
+    # the band's current slug exactly as _resolve_model_tier would, so every
+    # caller that names a band -- /api/chat bodies, the hybrid pre-pass,
+    # anything else -- gets the same pool-leg selection executors get.
+    if isinstance(model, str) and model.startswith('@freepool:') \
+            and model.count(':') == 1:
+        band = model.split(':', 1)[1]
+        resolved = _slug_for_band(band)
+        if resolved and resolved != model:
+            model = resolved
     provider = _model_provider_for(model)
     is_custom = bool(provider and provider.get('is_custom'))
     free_route = bool(provider and provider.get('free'))
