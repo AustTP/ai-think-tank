@@ -596,6 +596,28 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
                     before_manifest = _tree_manifest(str(stage.original))
                     after_manifest = _tree_manifest(str(stage.directory))
                     problem = _deliverable_problem(before_manifest, after_manifest)
+                if not problem and getattr(_serve.config, 'ALLOW_WORKSPACE_SYNC', False):
+                    # Every changed non-init .py file must be attributable to a
+                    # writtenPy channel (cat > extraction or a parsed structured
+                    # edit). A freehand base64 python -c write is invisible to
+                    # both, so its code ships with every Python gate step
+                    # silently skipped -- the reviews that caught DEV-147's
+                    # syntax-broken test file only worked because they ran the
+                    # tests OUTSIDE the gate. Fail the publish instead and tell
+                    # the author which channel to use.
+                    _py_changed = sorted(
+                        p for p in set(before_manifest) | set(after_manifest)
+                        if before_manifest.get(p) != after_manifest.get(p)
+                        and p.endswith('.py')
+                        and not os.path.basename(p).startswith('__init__'))
+                    _unattributed = sorted(set(_py_changed)
+                                           - set(result.get('writtenPy') or []))
+                    if _unattributed:
+                        problem = ('Python files were written through a channel the '
+                                   'quality gate cannot attribute ('
+                                   + ', '.join(_unattributed[:5]) + '). Write every .py '
+                                   "file with `cat > path << 'EOF'` or one structured "
+                                   'edit object so the pipeline can check it.')
                 if problem:
                     stage.checkpoint()
                     result['ok'] = False
