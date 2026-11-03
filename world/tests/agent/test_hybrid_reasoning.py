@@ -108,7 +108,7 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
         serve.LIBRARY_DIR = self._old_library
         content._HYBRID_LAST_PLAN_AT.clear()
 
-    def test_eligible_task_gets_private_notes_in_base_ctx(self):
+    def test_eligible_task_returns_digest_for_the_dispatcher(self):
         task = _fresh_task(distill=True)
         captured = {}
 
@@ -120,11 +120,12 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_http_json', fake_http_json), \
              unittest.mock.patch.object(serve, '_load_env',
                                         lambda: {'HYBRID_MODE': 'auto'}):
-            base_ctx = {}
-            content._hybrid_prepare({}, 'ruth', task, base_ctx)
+            # base_ctx is the perception STRING by contract; the digest comes
+            # back as the RETURN value for the dispatcher to fold into it.
+            digest = content._hybrid_prepare({}, 'ruth', task, 'You are ruth.')
         # the latent pass used the bypass flag so /api/chat will not echo it
         self.assertTrue(captured['body'].get('hybridBypass'))
-        self.assertIn('PLAN', base_ctx['hybridMemory'])
+        self.assertIn('PLAN', digest)
         self.assertIn('PLAN', content._hybrid_memory_digest('ruth', task['id']))
 
     def test_none_base_ctx_still_decides_and_logs(self):

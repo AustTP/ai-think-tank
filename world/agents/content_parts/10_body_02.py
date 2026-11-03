@@ -292,23 +292,25 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
             _capture_token = training_capture.CURRENT.set(
                 training_capture.metadata(snapshot, agent_id, task.get('id')))
         try:
-            # Materialize base_ctx BEFORE the hybrid pre-pass (2026-11-02
-            # live-fire bug): the dispatch path arrives with base_ctx=None,
-            # and _hybrid_prepare's isinstance guard then silently returned
-            # -- no eligibility check, no decision row, no memory -- which
-            # made the whole protocol look inert while every executor kept
-            # working. A real dict also means the executor can actually
-            # READ base_ctx['hybridMemory'] (the working-memory handoff the
-            # pre-pass exists to provide).
-            if not isinstance(base_ctx, dict):
-                base_ctx = {}
             # Hybrid reasoning pre-pass (15_body_02_hybrid, from arxiv
             # 2610.18861): decide the mode, run the private planning pass on
-            # eligible lanes, and hand the compiled working memory to the
-            # executor. Best-effort by contract -- a hybrid failure must
-            # never break the dispatch that follows it.
+            # eligible lanes, and fold the compiled working memory into the
+            # perception string every executor already reads (base_ctx is a
+            # perception STRING by contract -- _build_agent_perception
+            # returns markdown and executors do `context_summary = base_ctx
+            # or ''`). A dict here would clobber that contract: the
+            # 2026-11-02 v0 wire-up mutated base_ctx as a dict and the
+            # 7cd0f76 materialization turned non-dict perceptions into {},
+            # blanking every executor's situational awareness for ~5h.
+            # Best-effort by contract -- a hybrid failure must never break
+            # the dispatch that follows it.
             try:
-                _hybrid_prepare(snapshot, agent_id, task, base_ctx)
+                _hy_digest = _hybrid_prepare(snapshot, agent_id, task, base_ctx)
+                if _hy_digest and isinstance(_hy_digest, str):
+                    base_ctx = ((base_ctx or '') +
+                                '\n\n[Private working memory for this task '
+                                '(your own earlier private plan -- consult it, '
+                                'do not quote it)]\n' + _hy_digest)
             except Exception as _hybrid_err:
                 print(f'[hybrid] prepare failed: {_hybrid_err}', flush=True)
             executor(snapshot, agent_id, task, base_ctx)

@@ -257,26 +257,20 @@ def _hybrid_prepare(snapshot, agent_id, task, base_ctx):
     pre-pass is the paper's 'think latently before acting through text':
     the notes land in working memory, and /api/chat injects them into every
     later call for this task -- so the executors need no changes at all to
-    benefit. base_ctx['hybridMemory'] is also set for executors that want
-    the digest directly."""
-    if not isinstance(base_ctx, dict):
-        # Defensive: proceed with a local dict so the mode decision is still
-        # made and logged even if a caller forgets to materialize base_ctx.
-        # (The dispatcher now materializes it -- this guard remains so a
-        # stray None can never again silently skip the whole protocol.)
-        base_ctx = {}
-    base_ctx['hybridMemory'] = _hybrid_memory_digest(agent_id, task.get('id'))
+    benefit. Returns the compiled digest (or '') so the dispatcher can fold
+    it into the perception string every executor already reads."""
     if not _hybrid_enabled():
-        return
+        return ''
     eligible, reason = _hybrid_task_eligible(task)
     if not eligible:
         _serve.log_action(agent_id, 'hybrid_mode',
                           {'decision': 'text', 'task': task.get('id'),
                            'reason': reason}, authorized=True)
-        return
+        return ''
     base = _serve.SELF_BASE_URL
     key = _serve.get_or_create_agent_key(agent_id)
     notes = _hybrid_latent_plan(snapshot, agent_id, task, base, key)
     if notes:
-        base_ctx['hybridMemory'] = _hybrid_memory_digest(agent_id, task.get('id'))
+        return _hybrid_memory_digest(agent_id, task.get('id'))
+    return ''
 
