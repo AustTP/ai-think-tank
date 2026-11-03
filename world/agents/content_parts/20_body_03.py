@@ -487,8 +487,22 @@ def _deliverable_problem(before, candidate):
     """Return a reason the candidate tree is not a deliverable, or None.
     A story must add or modify at least one file. A deletion-only change is
     refused: the live incident was an agent deleting its own page and the
-    pipeline reviewing the empty tree."""
+    pipeline reviewing the empty tree. An added-or-modified non-init .py file
+    that is EMPTY is refused too: an empty module once passed this gate
+    (DEV-139's task-5858 shipped world/project_ui.py as 0 bytes while the
+    Python steps were skipped) and every downstream test died on
+    AttributeError; the manifest stores sha256(content), so the empty-file
+    digest identifies it without re-reading the tree."""
+    _empty_digest = hashlib.sha256(b'').hexdigest()
     changed = [p for p, digest in candidate.items() if before.get(p) != digest]
+    emptied = [p for p, pdigest in candidate.items()
+               if before.get(p) != pdigest and p.endswith('.py')
+               and not os.path.basename(p).startswith('__init__')
+               and pdigest == _empty_digest]
+    if emptied:
+        return ('the candidate change writes an empty module: '
+                + ', '.join(sorted(emptied)[:5])
+                + ' -- write the implementation, not a 0-byte file')
     deleted = [p for p in before if p not in candidate]
     if changed:
         return None
@@ -692,6 +706,7 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         system_prompt += '\n' + python_delivery.GUIDANCE
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
     command = ''
+    structured_paths = []
     attempts = 0
     repair_rounds = 0
     probe_rounds = 0
@@ -778,7 +793,16 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
         # stripping; a continuation is raw mid-file text by definition.
         if attempts == 0:
             try:
-                command = __import__('core.structured_edits', fromlist=['*']).command(reply)
+                _sed_module = __import__('core.structured_edits', fromlist=['*'])
+                _sed_data = _sed_module._load(reply)
+                command = _sed_module.command(reply)
+                # The structured-edit runner writes files through a base64
+                # python -c blob, so command-text extraction (`cat >`) cannot
+                # see those paths. Record them here and merge below, or a
+                # structured-edit task's Python steps silently skip and a
+                # green gate blesses unverified code (live: task-5858).
+                structured_paths = [e['path'] for e in (_sed_data.get('edits') or [])
+                                    if isinstance(e, dict) and isinstance(e.get('path'), str)]
             except Exception:
                 command = reply.strip().replace('```bash', '').replace('```sh', '').replace('```', '').strip()
         else:
@@ -908,7 +932,8 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
 
     # ---- The four mechanical integrity checks (mirror runCodingTask) ----
     written = _extract_written_js_files(command)
-    written_py = _extract_written_python_files(command)
+    written_py = sorted(set(_extract_written_python_files(command))
+                        | set(structured_paths))
     if written:
         unlinked = _find_unlinked_js_files(base, key, agent_id, sandbox_id, written)
         if unlinked:
