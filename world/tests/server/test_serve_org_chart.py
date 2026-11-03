@@ -588,6 +588,17 @@ class ReportCrossWrite(unittest.TestCase):
         }
         state['reports'] = [report]
         serve.save_state_to_db(state)
+        # The mirror now runs on a daemon thread (2026-11-02) and SKIPS when
+        # another mirror run still holds _DIR_SYNC_LOCK -- a prior test's slow
+        # mirror can therefore legally starve this save's sync. Wait for the
+        # lock to go idle, then run the sync inline for a deterministic
+        # assertion.
+        self.assertTrue(serve._DIR_SYNC_LOCK.acquire(timeout=15),
+                        'mirror thread did not finish in 15s')
+        try:
+            serve.sync_agent_directories(state, throttle=False)
+        finally:
+            serve._DIR_SYNC_LOCK.release()
         target_md = os.path.join(serve.AGENTS_DIR, 'nadia', 'reports', 'report-1-1234-nadia.md')
         self.assertTrue(os.path.isfile(target_md), 'report must land in the SUBJECT\'s reports dir')
         with open(target_md) as f:
