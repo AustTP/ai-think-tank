@@ -228,8 +228,14 @@ class QualityPipelineSteps(unittest.TestCase):
         self.assertIn('*/content_parts/*.py:F821,F401,E402', flake8_cmd)
         self.assertIn('serve.py:F821', flake8_cmd)
         self.assertIn('--exclude=tests,.selfedit_staging,.selfedit_failed .', flake8_cmd)
-        self.assertEqual(by_name['mypy'], 'python -m mypy .')
-        self.assertEqual(by_name['bandit'], 'python -m bandit -r . -q')
+        # Unscoped mypy/bandit SKIP (2026-11-03, task-5839): the staged
+        # workspace holds the whole base tree, so `mypy .` failed on scripts/*
+        # import paths that assume world/ as cwd and `bandit -r .` collided
+        # with dozens of nested .bandit files -- pre-existing findings the
+        # author can never touch. The unscoped path only runs when the task
+        # wrote no Python, where skipping matches the prompt's promise.
+        self.assertIn('skipping mypy', by_name['mypy'])
+        self.assertIn('skipping bandit', by_name['bandit'])
         # Total coverage across all files (not per-file) is what --cov-fail-under
         # expresses: pytest-cov fails only when the AGGREGATE falls below 90.
         self.assertEqual(by_name['pytest-cov'], 'python -m pytest --cov=. --cov-fail-under=90 -q')
@@ -527,6 +533,10 @@ class CodingExecutorQualityGate(unittest.TestCase):
                     return {'allowed': True, 'stdout': '', 'exitCode': 0}
                 if command.startswith('for f in *.html *.js'):
                     return {'allowed': True, 'stdout': '', 'exitCode': 0}
+                if 'PYEXISTS:' in command:
+                    # The scope-existence probe (2026-11-03): in this scenario
+                    # the heredoc write DID land, so app.py is really there.
+                    return {'allowed': True, 'stdout': 'PYEXISTS:app.py', 'exitCode': 0}
                 return {'allowed': True, 'exitCode': write_exit, 'timedOut': False,
                         'stdout': '', 'reason': None}
             return {'error': f'unexpected {method} {path}'}

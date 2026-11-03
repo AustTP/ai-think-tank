@@ -150,9 +150,26 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # is --format, not a file flag). The unscoped path below keeps the
         # whole-project measure for full-tree work.
         _cov_flags = ' '.join(f'--cov={f}' for f in scope_files)
+        # mypy runs on implementation files only, with followed imports kept
+        # silent: tests commonly import the module through a sys.path hack,
+        # which makes mypy see one file under two module names ("Source file
+        # found twice under different module names", live on task-5837), and
+        # default follow-imports drags base-tree files into the verdict whose
+        # missing stubs (websockets, PIL) a network-disabled sandbox can never
+        # install (live: scripts/browser_record.py:710). Real type errors in
+        # the author's own implementation still fail the step.
+        _mypy_files = [f for f in scope_files
+                       if not f.split('/')[-1].startswith('test_')]
+        if _mypy_files:
+            _mypy_step = {'name': 'mypy',
+                          'command': ('python -m mypy --follow-imports=silent '
+                                      '--ignore-missing-imports ' + ' '.join(_mypy_files))}
+        else:
+            _mypy_step = {'name': 'mypy',
+                          'command': "echo 'only test files written -- skipping mypy'"}
         return [
             {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} {_scoped}'},
-            {'name': 'mypy', 'command': f'python -m mypy {_scoped}'},
+            _mypy_step,
             {'name': 'bandit', 'command': f'python -m bandit -q {_scoped}'},
             {'name': 'pytest-cov', 'command': f'python -m pytest {_cov_flags} --cov-fail-under=90 -q'},
             {'name': 'node-syntax', 'command': (
@@ -165,10 +182,19 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
                 '{ echo "no JS test files -- skipping"; exit 0; }; '
                 'node --test\'')},
         ]
+    # Unscoped mypy/bandit are structurally invalid in a staged workspace: it
+    # holds the whole base tree (scripts/ import paths assume world/ as cwd,
+    # dozens of nested .bandit files collide under -r ., and the network-
+    # disabled sandbox cannot install stubs), so both fail on pre-existing
+    # findings the author can never touch (live: task-5839's scripts/*
+    # import-not-found flood). The unscoped path only runs when the task
+    # wrote no Python (JS/HTML-only work), where the prompt already promises
+    # "the Python pipeline is trivially green" -- so both steps skip, the
+    # same way the JS steps skip when no JS exists.
     return [
         {'name': 'flake8', 'command': f'python -m flake8 {_flake8_flags} --exclude=tests,.selfedit_staging,.selfedit_failed .'},
-        {'name': 'mypy', 'command': 'python -m mypy .'},
-        {'name': 'bandit', 'command': 'python -m bandit -r . -q'},
+        {'name': 'mypy', 'command': "echo 'no .py written by this task -- skipping mypy'"},
+        {'name': 'bandit', 'command': "echo 'no .py written by this task -- skipping bandit'"},
         {'name': 'pytest-cov', 'command': 'python -m pytest --cov=. --cov-fail-under=90 -q'},
         # JS half of the gate (wrq-8: vanilla-JS engine). node --check parses
         # every .js/.mjs WITHOUT executing (pure syntax); node --test runs the
@@ -273,6 +299,25 @@ def _run_quality_pipeline(base, key, agent_id, sandbox_id, purpose, scope_files=
     _quality_pipeline_steps). Passing checks are content-addressed and reused
     until the workspace or the step set changes; long runs are polled as a
     background job instead of holding one 300s HTTP request open."""
+    if scope_files:
+        # Scope lists come from `cat >` matches in the author's command text,
+        # or (for reviews) from the parent story's persisted writtenPy -- names
+        # the command MENTIONED, not files that verifiably landed. A fix run in
+        # a workspace where the earlier write never landed got mypy's "can't
+        # read file" and a red pipeline on a phantom (live: task-5838). Probe
+        # existence and gate on what is really there.
+        _probe = ' ; '.join('[ -f "%s" ] && echo PYEXISTS:%s' % (f, f) for f in scope_files)
+        _probe_data = _serve._http_json('POST', base, '/api/execute',
+                               {'agentId': agent_id, 'command': _probe,
+                                'purpose': 'Checking which scoped files exist before the quality pipeline',
+                                'sandboxId': sandbox_id}, key)
+        _probe_out = (_probe_data.get('stdout') or '') if isinstance(_probe_data, dict) else ''
+        _existing = [f for f in scope_files if ('PYEXISTS:' + f) in _probe_out]
+        if not _existing:
+            return {'ok': False, 'failedStep': 'scope', 'results': [],
+                    'note': ('none of the scoped files exist in this workspace ('
+                             + ', '.join(scope_files) + ') -- the write did not land')}
+        scope_files = _existing
     steps = _quality_pipeline_steps(scope_files, style_lenient)
     resolved_sandbox = _serve._village_sandbox_id(agent_id, sandbox_id)
     sandbox_dir = _serve._sandbox_dir_for(resolved_sandbox)
