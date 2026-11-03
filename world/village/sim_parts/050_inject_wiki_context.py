@@ -178,10 +178,29 @@ def appear_from_outskirts(state, agent_id, doors=None, grid=None):
             grid = None
     if grid is not None:
         agents_map = state.get('agents') or {}
-        occupied = [{'x': v['x'], 'y': v['y']} for v in agents_map.values()
-                    if isinstance(v, dict) and v.get('visible') and v.get('id') != agent_id]
+        # Positionless-visible agents (2026-11-02): a previous wake whose grid
+        # load failed left an agent visible with NO x/y, and every later wake's
+        # occupied-scan then raised KeyError('x') on her -- which the sim loop's
+        # guard turned into '[sim] loop error: KeyError('x')' on EVERY tick: the
+        # tank ticks nothing until restarted. Scan with .get and skip the
+        # positionless; they are not obstacles (they occupy nothing).
+        occupied = [{'x': v.get('x'), 'y': v.get('y')} for v in agents_map.values()
+                    if isinstance(v, dict) and v.get('visible')
+                    and v.get('id') != agent_id
+                    and v.get('x') is not None and v.get('y') is not None]
         spot = pick_free_spot(grid, avoid_points=occupied)
+    else:
+        spot = None
+    if spot is not None:
         a['x'], a['y'] = spot['x'], spot['y']
+    else:
+        # NEVER leave a visible agent without a position (2026-11-02): a
+        # positionless visible agent breaks every bare x/y reader downstream
+        # (pair navigation, collision boxes, the occupied scan above). If no
+        # spot could be produced, keep her OFF DUTY instead of half-spawned;
+        # the next wake retries with a working grid.
+        a['offDuty'] = True
+        a['visible'] = False
 
 
 def _spawn_at_room_door(state, agent_id, room, agents, grid, doors):

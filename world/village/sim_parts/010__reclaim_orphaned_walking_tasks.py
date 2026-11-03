@@ -155,6 +155,31 @@ class SimEngine:
         sim['lastTickEpochS'] = now
         sim['owner'] = sim.get('owner', 'client')  # 'server' once Phase 2 owns movement
 
+        # Positionless-agent heal (2026-11-02): a visible agent with NO x/y
+        # (born by a wake whose outdoor grid failed to load) breaks every bare
+        # position reader in the tick -- the live failure was KeyError('x')
+        # from pair navigation, which the loop's BaseException guard converted
+        # into '[sim] loop error: KeyError('x')' on EVERY pass: the tank ticks
+        # nothing until restarted. The producer is fixed in
+        # appear_from_outskirts (never half-spawn) and pair navigation now
+        # skips such candidates; this sweep parks any that still exist so the
+        # tank self-recovers without a restart. Cheap: a flag check per agent,
+        # gated on the same every-N cadence as the identity heal.
+        self._pos_heal_age = getattr(self, '_pos_heal_age', 0) + 1
+        if self._pos_heal_age >= 8:
+            self._pos_heal_age = 0
+            _agents_map = state.get('agents') or {}
+            for _aid, _a in list(_agents_map.items()):
+                if (isinstance(_a, dict) and _a.get('visible')
+                        and _a.get('x') is None and _a.get('y') is None):
+                    _a['offDuty'] = True
+                    _a['visible'] = False
+                    _a['task'] = None
+                    _a['busy'] = False
+                    print(f'[sim] parked positionless agent {_aid} '
+                          '(visible without x/y; wakes only after a clean re-appear)',
+                          flush=True)
+
         # Identity self-heal, gated (2026-11-01 scale fix; see __init__):
         # the per-tick invariant the heal originally provided is preserved by
         # re-running it on any roster-size change (a stale autosave that

@@ -160,6 +160,14 @@ def _recruit_pair_navigator(state, driver_id, task, can_wake_off_duty, grid, doo
         return None
     if nav.get('offDuty'):
         appear_from_outskirts(state, nav_id, doors)
+    # A candidate that is visible but positionless (a prior wake whose grid
+    # load failed) must not be walked: nav['x'] would raise KeyError('x') and
+    # -- via the sim loop's BaseException guard -- kill EVERY tick with
+    # '[sim] loop error' until a restart. Skip her and let the round-robin
+    # pick someone else next dispatch.
+    if nav.get('x') is None or nav.get('y') is None:
+        rr['pair'] = (pointer + 1) % max(1, len(ordered))
+        return None
     room = task.get('room')
     door = (doors or {}).get(room)
     if not door:

@@ -53,12 +53,20 @@ class SpawnWakeCluster(SimIsolation):
         sim.appear_from_outskirts({'agents': {}}, 'ghost')
 
     def test_appear_from_outskirts_geometry_load_failure(self):
+        # Healed contract (2026-11-02, NORA-182 session): a wake WITHOUT
+        # geometry used to leave the agent visible with NO x/y -- and every
+        # later bare x/y reader (pair navigation's nav['x'], the occupied
+        # scan) raised KeyError('x'), which the sim loop's guard turned into
+        # '[sim] loop error: KeyError('x')' on EVERY tick: the tank ticked
+        # nothing until restarted. A wake without a spot now fails CLEANLY:
+        # the agent stays off duty and invisible; the next wake retries.
         state = {'agents': {'ada': {'id': 'ada'}}}
         with unittest.mock.patch.object(
                 sim, '_load_outdoor_geometry', side_effect=RuntimeError('boom')):
             sim.appear_from_outskirts(state, 'ada')
-        self.assertFalse(state['agents']['ada']['offDuty'])
-        self.assertTrue(state['agents']['ada']['visible'])
+        self.assertTrue(state['agents']['ada']['offDuty'])
+        self.assertFalse(state['agents']['ada']['visible'])
+        self.assertIsNone(state['agents']['ada'].get('x'))
 
     def test_spawn_at_room_door_missing_agent(self):
         sim._spawn_at_room_door({'agents': {}}, 'ghost', 'observatory', {}, None, {})
@@ -333,3 +341,35 @@ class OnboardCeremonyB(SimIsolation):
 
 if __name__ == '__main__':
     unittest.main()
+    def test_positionless_visible_agent_is_parked_by_tick(self):
+        # The self-recovery sweep: an agent already poisoned in a saved state
+        # (visible, no x/y) is parked by the engine tick instead of killing
+        # every pass with KeyError('x').
+        state = {'agents': {'ghost': {'id': 'ghost', 'visible': True,
+                                      'offDuty': False}},
+                 'sim': {'tick': 0}}
+        engine = sim.SimEngine()
+        engine._pos_heal_age = 7  # force the sweep on this tick
+        engine.tick(state)
+        g = state['agents']['ghost']
+        self.assertFalse(g['visible'])
+        self.assertTrue(g['offDuty'])
+        self.assertIsNone(g.get('x'))
+
+    def test_pair_navigator_skips_positionless_candidate(self):
+        grid, doors = sim._load_outdoor_geometry()
+        if not grid or not doors or 'observatory' not in doors:
+            self.skipTest('observatory geometry unavailable')
+        state = {'agents': {
+            'drv': {'id': 'drv', 'x': 900, 'y': 400, 'visible': True,
+                    'busy': False, 'offDuty': False},
+            'pos': {'id': 'pos', 'visible': True, 'offDuty': False},
+        }, 'sim': {}}
+        task = {'id': 'task-1', 'room': 'observatory', 'title': 't'}
+        result = sim._recruit_pair_navigator(state, 'drv', task,
+                                             can_wake_off_duty=False,
+                                             grid=grid, doors=doors,
+                                             now_ms=0)
+        # 'pos' (positionless) must never be walked; no candidate qualified.
+        self.assertIsNone(result)
+        self.assertNotIn('pairWith', state['agents']['pos'])
