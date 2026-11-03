@@ -985,6 +985,20 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                        {'from': model, 'to': slug, 'depth': _fallback_depth},
                        authorized=False)
             return result
+        # Transport-class failures (remote end closed connection, connection
+        # reset, socket timeout) land in this generic branch, not the
+        # HTTPError one, so they never reached the band's tier fallbacks --
+        # the coding band's provider flaked chronically on 2026-11-03 and
+        # every story burned its retry budget on raw re-attempts of the same
+        # dead connection. Try the band's configured alternates here too.
+        if _fallback_depth < TIER_FALLBACK_MAX_DEPTH:
+            fallback = _try_tier_fallbacks(
+                model, _fallback_depth,
+                lambda slug: _call_openrouter_once_sync(
+                    slug, messages, max_tokens,
+                    _fallback_depth=_fallback_depth + 1))
+            if fallback is not None:
+                return fallback
         raise
     record_model_result(model, success=True)
     if not is_custom:
