@@ -894,6 +894,9 @@ def _reconcile_extracted_sections(conn, data):
     return ok
 
 
+_DIR_SYNC_LOCK = threading.Lock()
+
+
 def _save_phase(data, name):
     """Save-path breadcrumb (2026-11-02): two same-day tank freezes wedged
     with the tick breadcrumb at 'done' -- i.e. inside this save. Stamp the
@@ -1002,10 +1005,29 @@ def save_state_to_db(data):
             _save_phase(data, 'save_checksum')
             _state_checksum_write(conn, json.dumps(blob))
         _save_phase(data, 'save_committed')
+        # The per-agent mirror (agent.json/AGENTS.md/MEMORY.md/conversations)
+        # runs OFF the tick thread (2026-11-02): it was the pass tail, and the
+        # tick breadcrumb kept freezing at/after save_committed -- minutes-long
+        # or hung mirror work held _PASS_LOCK and stopped the whole tank while
+        # contributing no tick. The mirror only WRITES files from the saved
+        # snapshot (never mutates state), so it is safe concurrently; a
+        # non-blocking lock keeps at most one mirror run at a time and skips
+        # when one is already running (the throttle fingerprint re-fires the
+        # next tick anyway).
         try:
-            sync_agent_directories(data, throttle=True)
+            import threading as _threading
+            if _DIR_SYNC_LOCK.acquire(blocking=False):
+                def _run_mirror():
+                    try:
+                        sync_agent_directories(data, throttle=True)
+                    except Exception as e:
+                        print(f'[agent-dirs] sync failed: {e}', flush=True)
+                    finally:
+                        _DIR_SYNC_LOCK.release()
+                _threading.Thread(target=_run_mirror, name='agent-dir-sync',
+                                  daemon=True).start()
         except Exception as e:
-            print(f'[agent-dirs] sync failed: {e}')  # best-effort -- a filesystem hiccup shouldn't break autosave
+            print(f'[agent-dirs] spawn failed: {e}', flush=True)
     finally:
         # If this thread is inside a state transaction (see _state_begin /
         # _state_writer), the save is the commit point: release the blob lock so
