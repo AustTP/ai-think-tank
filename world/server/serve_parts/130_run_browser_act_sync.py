@@ -368,10 +368,20 @@ def _urlopen_with_resilience(req, timeout, max_attempts=3, base_delay=0.5):
             last_exc = e
             if e.code not in _RETRYABLE_HTTP_CODES or attempt == max_attempts - 1:
                 raise
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError) as _net_err:
             last_exc = None
             if attempt == max_attempts - 1:
-                raise
+                # A bare socket TimeoutError str()s to '' -- the live
+                # 2026-11-02 outage surfaced as {"error": ""} from /api/chat,
+                # which hid the actual failure from every consumer. Only an
+                # EMPTY message gets the readable wrap; an error that already
+                # says something ('net down') propagates unchanged.
+                if str(_net_err).strip():
+                    raise
+                raise TimeoutError(
+                    f'request timed out after {max_attempts} attempts '
+                    f'(timeout={timeout}s): {getattr(req, "full_url", "?")}'
+                ) from _net_err
         time.sleep(base_delay * (2 ** attempt))
     raise last_exc
 

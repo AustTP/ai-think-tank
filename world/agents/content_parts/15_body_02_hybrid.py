@@ -215,6 +215,12 @@ def _hybrid_latent_plan(snapshot, agent_id, task, base, key):
                                'taskId': task.get('id'),
                                'hybridBypass': True}, key)
         notes = (r.get('reply') or '').strip() if isinstance(r, dict) else ''
+        if not notes and isinstance(r, dict):
+            # No exception but no reply either: the chat endpoint returned an
+            # error body (e.g. {'error': ...} from a dead pool). Capture it
+            # so the latent-failed row says WHY instead of 'None'.
+            _plan_err = {'replyKeys': sorted(r.keys()),
+                         'error': str(r.get('error') or '')[:120]}
     except Exception as _exc:
         # NOT 'except ... as _plan_err': Python unbinds the as-name when the
         # except block exits, which would leave _plan_err undefined exactly
