@@ -917,19 +917,71 @@ def _get_pool(dsn):
     with _POOL_LOCK:
         if _POOL is None:
             import psycopg2.pool
-            _POOL = psycopg2.pool.ThreadedConnectionPool(1, 50, dsn)
+            _POOL = psycopg2.pool.ThreadedConnectionPool(
+                1, 50, dsn, **_PG_CONNECT_KWARGS())
         return _POOL
+
+
+def _PG_CONNECT_KWARGS():
+    """Liveness bounds for every Postgres connection (2026-11-02).
+
+    The tank froze four times in one afternoon with the tick breadcrumb at a
+    DIFFERENT _db() call site each time (save_blob_write, save_committed,
+    ...): the common resource is the connection, not the statement. The DB is
+    reached over a Tailscale link; a black-holed connect or a silently stalled
+    socket used to hang a fresh connection FOREVER (no timeouts were set), one
+    wedged pass held _PASS_LOCK, and the whole tank stopped. These bounds turn
+    a dead link into a fast, retryable error instead of a frozen tank:
+    - connect_timeout 10s: a black-holed TCP connect fails instead of hanging;
+    - TCP keepalives (30s idle, 10s interval, 3 probes): a silently dead
+      socket is detected in ~1 minute;
+    - statement_timeout 60s (set session-level on checkout): a wedged query
+      self-aborts rather than pinning the connection.
+    """
+    return {
+        'connect_timeout': 10,
+        'keepalives': 1,
+        'keepalives_idle': 30,
+        'keepalives_interval': 10,
+        'keepalives_count': 3,
+    }
+
+
+_STATEMENT_TIMEOUT_MS = 60000
+
+
+def _prime_session(raw):
+    """Set the session statement timeout on a checked-out connection.
+    Best-effort: if the SET itself fails, the connection is still usable for
+    callers that tolerate degraded liveness bounds."""
+    try:
+        cur = raw.cursor()
+        cur.execute('SET statement_timeout = %d' % _STATEMENT_TIMEOUT_MS)
+        raw.commit()
+        cur.close()
+    except Exception:
+        try:
+            raw.rollback()
+        except Exception:
+            pass
 
 
 def _checkout(dsn):
     try:
         pool = _get_pool(dsn)
-        return pool.getconn(), pool
+        raw = pool.getconn()
+        _prime_session(raw)
+        return raw, pool
     except Exception:
         # Pool exhausted or unusable: fall back to an unpooled connection
         # rather than failing the request (the caller closes it outright).
+        # The connect kwargs matter MOST here: the fallback fires exactly
+        # when the pool is wedged, and an unbounded connect used to hang the
+        # calling pass forever on a stalled link.
         import psycopg2
-        return psycopg2.connect(dsn), None
+        raw = psycopg2.connect(dsn, **_PG_CONNECT_KWARGS())
+        _prime_session(raw)
+        return raw, None
 
 
 def connect(path=None):
