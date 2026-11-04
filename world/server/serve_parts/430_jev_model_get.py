@@ -322,12 +322,6 @@ async def logout(request: Request):
     return resp
 
 
-# Static files last -- the explicit routes above are registered first and
-# always win; this is the catch-all for *.js/assets/... etc. (index.html
-# itself is now served by the templated route above, not this mount).
-app.mount('/', StaticFiles(directory=ROOT, html=True), name='static')
-
-
 # ---------------------------------------------------------------------------
 # Content-executor re-exports (phase-consolidation). The per-room executors + the
 # router moved to content.py (see there for the "why"); they are re-exported
