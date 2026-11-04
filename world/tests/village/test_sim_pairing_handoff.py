@@ -170,7 +170,12 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
         self.assertEqual(len(out.get('handoffs', [])), 1)
         self.assertEqual(out['handoffs'][0]['title'], 'The report')
 
-    def test_credit_pause_leaves_the_queue_untouched(self):
+    def test_credit_pause_dispatches_queued_work(self):
+        # 2026-11-04 credits ladder: a credits pause blocks PAID calls only.
+        # The free pool keeps serving low/sublow work and JEV, so the tick
+        # keeps consuming the queue -- the old blanket hold idled the whole
+        # village even though free capacity was available. Paid-only cards
+        # park at the per-call enforcement and requeue intact.
         state = self._state()
         grid, doors = sim._load_outdoor_geometry()
         item = {'title': 'Paused work', 'room': 'pressoffice',
@@ -181,9 +186,9 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
         with unittest.mock.patch('serve.credits_pause_active', return_value=True):
             sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
                             task_id_holder=[0])
-        self.assertEqual(state['workQueue'], [item],
-                         'a credit pause must not consume the queued card')
-        self.assertNotIn('tasks', state)
+        self.assertEqual(state['workQueue'], [],
+                         'a credit pause must not freeze the queue -- free '
+                         'capacity keeps the tank working')
 
     def test_pair_card_recruits_a_navigator_server_side(self):
         # A `pair` card assigned server-side must recruit a navigator (walking

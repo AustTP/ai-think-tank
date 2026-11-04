@@ -380,8 +380,12 @@ def test_task_cycle_credit_pause_and_error(monkeypatch):
              'agents': {'a': {'task': 't', 'busy': True}},
              'tasks': {'t': {'id': 't', 'status': 'working'}},
              'workQueue': []}
+    # 2026-11-04 credits ladder: the tick no longer blanket-holds during a
+    # credits pause. The operator directed the tank to keep working on the
+    # free pool (free low/sublow stay exempt from the pause), so the cycle
+    # proceeds and paid-only work parks at the per-call enforcement instead
+    # (the content worker requeues the card intact, 030__dispatch_content_work).
     sim._task_cycle(state, now=1, grid={}, doors={})
-    assert state['tasks']['t']['workUntil'] >= 301
     monkeypatch.setattr(serve, 'credits_pause_active',
                         lambda: (_ for _ in ()).throw(RuntimeError('x')))
     sim._task_cycle(state, now=1, grid={}, doors={})
