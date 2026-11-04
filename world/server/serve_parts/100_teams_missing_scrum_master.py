@@ -455,6 +455,34 @@ OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD = float(
     _load_env().get('OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', '0.50') or 0.50)
 _CREDITS_WATCHDOG_STATE = {'low': False}
 _CREDITS_PAUSE = {'active': False, 'since': 0.0}
+# Durable across process restarts (2026-11-04): the server is kept alive by a
+# launchd agent that respawns it after every kill, and each fresh process used
+# to start with an unseeded watchdog -- so every respawn re-fired the 'low'
+# transition and sent the player ANOTHER 'credits exhausted' message. The
+# pause state now lives in the settings table and is seeded on first read.
+_CREDITS_STATE_SETTING = 'credits_pause_state'
+_CREDITS_STATE_SEEDED = False
+
+
+def _seed_credits_pause_state():
+    """Restore the credits pause/wd latch from the settings table exactly once
+    per process. Best-effort: a failed read leaves the default (not paused)."""
+    global _CREDITS_STATE_SEEDED
+    if _CREDITS_STATE_SEEDED:
+        return
+    _CREDITS_STATE_SEEDED = True
+    try:
+        raw = _get_setting(_CREDITS_STATE_SETTING, '') or ''
+        data = json.loads(raw) if raw else {}
+        active = bool(data.get('active'))
+        _CREDITS_PAUSE['active'] = active
+        try:
+            _CREDITS_PAUSE['since'] = float(data.get('since') or 0.0) if active else 0.0
+        except (TypeError, ValueError):
+            _CREDITS_PAUSE['since'] = 0.0
+        _CREDITS_WATCHDOG_STATE['low'] = active
+    except Exception:
+        pass
 
 
 class OpenRouterCreditsPaused(RuntimeError):
@@ -463,6 +491,7 @@ class OpenRouterCreditsPaused(RuntimeError):
 
 
 def credits_pause_active():
+    _seed_credits_pause_state()
     return bool(_CREDITS_PAUSE.get('active'))
 
 
@@ -485,6 +514,11 @@ def _set_credits_pause(active, credits=None, source='probe'):
     _CREDITS_PAUSE['active'] = active
     _CREDITS_PAUSE['since'] = time.time() if active else 0.0
     _CREDITS_WATCHDOG_STATE['low'] = active
+    try:
+        _set_setting(_CREDITS_STATE_SETTING, json.dumps(
+            {'active': active, 'since': _CREDITS_PAUSE['since']}))
+    except Exception:
+        pass  # durable state is best-effort; the in-memory latch still works
     remaining = None
     if isinstance(credits, dict):
         try:

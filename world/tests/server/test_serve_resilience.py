@@ -817,6 +817,29 @@ class CreditsWatchdogTest(unittest.TestCase):
     def test_unknown_credits_do_not_alert(self):
         self.assertIsNone(serve._credits_watchdog_step(None, 1.0, {}))
 
+    def test_credits_pause_state_survives_restart(self):
+        # The server is kept alive by a launchd agent that respawns it after
+        # every kill. Each respawn used to start with an unseeded watchdog,
+        # re-fire the 'low' transition, and send the player ANOTHER 'credits
+        # exhausted' message. The pause state is durable now: a fresh process
+        # seeds from the settings row and must not re-notify.
+        with mock.patch.object(serve, 'OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD', 0.50), \
+             mock.patch.object(serve, 'send_player_telegram_sync',
+                               return_value=True) as tg:
+            serve._CREDITS_STATE_SEEDED = True
+            serve._set_credits_pause(
+                True, {'remaining': 0.10, 'totalCredits': 10.0,
+                       'totalUsage': 9.9}, 'probe')
+            self.assertEqual(tg.call_count, 1)
+            # Simulate a fresh process: only the settings row survives.
+            serve._CREDITS_PAUSE.update(active=False, since=0.0)
+            serve._CREDITS_WATCHDOG_STATE.update(low=False)
+            serve._CREDITS_STATE_SEEDED = False
+            self.assertTrue(serve.credits_pause_active(),
+                            'the respawn must restore the pause from settings')
+            self.assertEqual(tg.call_count, 1,
+                             'a respawn must not re-send the transition message')
+
 
 class CreditsPauseTest(unittest.TestCase):
     def setUp(self):
