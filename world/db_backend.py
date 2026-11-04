@@ -966,10 +966,50 @@ def _prime_session(raw):
             pass
 
 
+def _apply_socket_timeouts(raw):
+    """Bound the CLIENT side of every statement and commit.
+
+    The DB rides a Tailscale link; when packets vanish mid-flight the socket
+    just goes quiet. TCP keepalives never fire (the connection is not idle
+    while unacked data is pending) and the server-side statement_timeout
+    never triggers (the server never received the query) -- so libpq's recv
+    waited forever and one wedged pass froze the whole tank (observed twice
+    on 2026-11-04: a commit inside log_action, then a savepoint release).
+    SO_RCVTIMEO/SO_SNDTIMEO on the connection's own fd bound every network
+    wait client-side, including COMMIT, which statement_timeout does not
+    cover. A timed-out socket raises OperationalError -- a fast, retryable
+    error instead of a frozen tank.
+
+    The socket object is constructed over the EXISTING fd and immediately
+    detached, so ownership (and closing) stays with psycopg2.
+    """
+    import socket as _socket
+    import struct as _struct
+    tv = _struct.pack('ll', _SOCKET_TIMEOUT_S, 0)
+    try:
+        fd = raw.fileno()
+        if not fd or fd < 0:
+            return
+        s = _socket.socket(fileno=fd)
+        try:
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVTIMEO, tv)
+            s.setsockopt(_socket.SOL_SOCKET, _socket.SO_SNDTIMEO, tv)
+        finally:
+            s.detach()
+    except Exception:
+        # Options are a hardening layer, not a dependency: a platform that
+        # refuses them still gets the connect/keepalive/statement bounds.
+        pass
+
+
+_SOCKET_TIMEOUT_S = 90
+
+
 def _checkout(dsn):
     try:
         pool = _get_pool(dsn)
         raw = pool.getconn()
+        _apply_socket_timeouts(raw)
         _prime_session(raw)
         return raw, pool
     except Exception:
@@ -980,6 +1020,7 @@ def _checkout(dsn):
         # calling pass forever on a stalled link.
         import psycopg2
         raw = psycopg2.connect(dsn, **_PG_CONNECT_KWARGS())
+        _apply_socket_timeouts(raw)
         _prime_session(raw)
         return raw, None
 
