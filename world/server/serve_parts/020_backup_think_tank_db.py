@@ -651,6 +651,7 @@ def _task_archive_load_locked():
         cache['tasks'] = {}
     cache['db'] = DB_PATH
     cache['loaded'] = True
+    _bump_task_archive_rev()
     return cache['tasks']
 
 
@@ -673,16 +674,46 @@ def _merge_archived_tasks(data, mode='copy'):
     if mode == 'alias':
         # Caller contract (see get_state_from_db): never mutate any task
         # object. Aliasing the archive cache makes the merge a dict spread
-        # instead of a 1.2s whole-archive deepcopy on every read.
+        # instead of a whole-archive deepcopy on every read.
         merged = dict(archived)
     else:
         # Copy the archived task dicts before merging. The tick mutates the
         # state in place; if it mutated the cache's own dicts,
         # _reconcile_task_archive would see cached == task and skip the DB
         # write, silently losing the change on the next restart.
-        merged = {tid: copy.deepcopy(task) for tid, task in archived.items()}
+        #
+        # The copy is a JSON round-trip of a revision-keyed snapshot, not a
+        # per-task copy.deepcopy: at 6.8k archived tasks the deepcopy cost
+        # ~1.9s per read (observed 2026-11-04 -- 60+ call sites, the tick
+        # among them, so the loop and the workers thrashed on copies all
+        # evening and the village starved). A JSON round-trip of the same
+        # data costs ~0.1s and yields exactly what deepcopy yielded for
+        # pure-JSON payloads: fresh, freely mutable objects.
+        merged = json.loads(_archived_snapshot_json())
     merged.update(data.get('tasks') or {})
     data['tasks'] = merged
+
+
+# Revision of the in-process archive cache. Bumped on every mutation so the
+# serialized snapshot can be rebuilt lazily instead of per read.
+_TASK_ARCHIVE_REV = 0
+_TASK_ARCHIVE_SNAPSHOT: dict = {'rev': None, 'json': None}
+
+
+def _bump_task_archive_rev():
+    global _TASK_ARCHIVE_REV
+    _TASK_ARCHIVE_REV += 1
+
+
+def _archived_snapshot_json():
+    global _TASK_ARCHIVE_REV
+    with _TASK_ARCHIVE_LOCK:
+        if _TASK_ARCHIVE_SNAPSHOT['rev'] != _TASK_ARCHIVE_REV \
+                or _TASK_ARCHIVE_SNAPSHOT['json'] is None:
+            _TASK_ARCHIVE_SNAPSHOT['json'] = json.dumps(
+                _task_archive_load_locked())
+            _TASK_ARCHIVE_SNAPSHOT['rev'] = _TASK_ARCHIVE_REV
+        return _TASK_ARCHIVE_SNAPSHOT['json']
 
 
 def _reconcile_task_archive(done):
@@ -712,6 +743,7 @@ def _reconcile_task_archive(done):
         except sqlite3.OperationalError:
             return False
         cached.update(changed)
+        _bump_task_archive_rev()
         return True
 
 
@@ -737,6 +769,7 @@ def _prune_task_archive(conn):
         return  # a failed prune retries on the next reconcile; never fatal
     for tid in stale:
         _TASK_ARCHIVE_CACHE['tasks'].pop(tid, None)
+    _bump_task_archive_rev()
 
 
 # --- Scale slices: high-cardinality sections leave the whole blob ---------
