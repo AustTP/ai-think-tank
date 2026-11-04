@@ -883,9 +883,15 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
     # Free routes are exempt from the credits pause and the monthly spend cap
     # by construction: price_per_m 0 spends nothing, and serving low-band work
     # for free while the account is out of credits is exactly the fallback the
-    # free pool exists to provide.
+    # free pool exists to provide. BELOW the free floor ($0.05, operator
+    # directive 2026-11-04) even free routes stop: the decisions model serves
+    # from the laya/colab standby and nothing else runs on OpenRouter.
     if not is_custom and not free_route and credits_pause_active():
         raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
+    if not is_custom and free_route and _credits_free_floor_reached():
+        raise OpenRouterCreditsPaused(
+            'OpenRouter balance is at the free floor ($0.05); free routes are '
+            'stopped -- the laya/colab standby serves the decisions model')
     if (not is_custom or _provider_is_billable(provider)) and not free_route and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):

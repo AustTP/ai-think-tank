@@ -735,6 +735,33 @@ def _decision_model_chain():
                 chain = cand
     if chain is None:
         chain = [JEV_MODEL]
+    # Credits-aware candidate set (operator, 2026-11-04): the paid slug stops
+    # at the credits floor ($3.00, the credits watchdog), the FREE low pool
+    # keeps JEV usable down to the free floor ($0.05), and the Colab/Laya
+    # standby is the bottom of the chain. The CACHED OpenRouter balance (the
+    # 300s probe -- never a network call here) picks who serves; a cold cache
+    # fails open to the full chain.
+    free_low = None
+    try:
+        free_low = _freepool_route_for_band('low', force=True)
+    except Exception:
+        free_low = None
+    if free_low and free_low not in chain:
+        # Insert ahead of the first '://' provider (the laya standby) so the
+        # free pool is tried before the last-resort runtime.
+        laya_at = next((i for i, c in enumerate(chain) if '://' in c),
+                       len(chain))
+        chain.insert(laya_at, free_low)
+    remaining = _credits_remaining_cached()
+    if remaining is not None and remaining <= _credits_free_floor():
+        # Below the free floor even free routes stop: JEV serves from the
+        # laya/colab standby only.
+        chain = [c for c in chain if '://' in c]
+    elif credits_pause_active():
+        # Paid spend is paused at the credits floor; free-pool candidates (and
+        # the laya standby) keep the decisions model alive.
+        chain = [c for c in chain
+                 if '://' in c or c.startswith('@freepool:')]
     # The CLI-managed Colab/Laya standby trails the chain as the LAST fallback:
     # when the colab CLI is available (and not operator-disabled), the loopback
     # Laya provider is advertised so the failover can reach it during an outage
@@ -830,6 +857,40 @@ def _colab_standby_enabled():
     so it must never turn on accidentally -- keeping hermetic test suites (and
     machines without Colab) single-chain by default."""
     return bool(COLAB_ENABLED and COLAB_CLI_AVAILABLE and COLAB_STANDBY_ENABLED)
+
+
+def _credits_free_floor():
+    """The balance at which even FREE OpenRouter routes stop and the
+    laya/colab standby takes over (operator directive, 2026-11-04). The paid
+    floor stays the credits watchdog's OPENROUTER_CREDITS_WATCHDOG_FLOOR_USD
+    ($3.00): paid stops there, free low/sublow keep serving, JEV stays usable
+    on the free pool until this floor, then laya serves."""
+    try:
+        return float(_load_env().get('OPENROUTER_CREDITS_FREE_FLOOR_USD',
+                                     '0.05') or 0.05)
+    except (TypeError, ValueError):
+        return 0.05
+
+
+def _credits_remaining_cached():
+    """The cached OpenRouter remaining balance, or None when cold/stale --
+    reads ONLY the credits probe's cache (300s TTL, refreshed by the
+    background loop), never the network: chain building runs on request
+    paths."""
+    try:
+        cache = _OPENROUTER_CREDITS_CACHE
+        data = cache.get('data')
+        if data and (time.time() - cache.get('at', 0)) < \
+                OPENROUTER_CREDITS_CACHE_TTL_S:
+            return float(data.get('remaining'))
+    except Exception:
+        pass
+    return None
+
+
+def _credits_free_floor_reached():
+    remaining = _credits_remaining_cached()
+    return remaining is not None and remaining <= _credits_free_floor()
 
 
 def _colab_standby_ensure_session(session=None):

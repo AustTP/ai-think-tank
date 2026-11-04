@@ -67,10 +67,19 @@ def _jev_health_window():
 
 def _jev_is_degraded():
     """True when the decisions model looks unavailable -- exactly the
-    predicate underlying the 'Jev decision call(s) failed' health alert."""
+    predicate underlying the 'Jev decision call(s) failed' health alert.
+    ALSO degraded (operator directive, 2026-11-04): when the OpenRouter
+    balance is at/below the free floor ($0.05), JEV is directed to serve from
+    the laya/colab standby -- the loop stands it up proactively so the first
+    laya-bound decision does not fail while the runtime boots."""
     attempts, failures = _jev_health_window()
-    return (attempts >= JEV_HEALTH_MIN_ATTEMPTS
-            and failures >= attempts * JEV_HEALTH_FAILURE_RATE)
+    if attempts >= JEV_HEALTH_MIN_ATTEMPTS and \
+            failures >= attempts * JEV_HEALTH_FAILURE_RATE:
+        return True
+    try:
+        return bool(_credits_free_floor_reached())
+    except Exception:
+        return False
 
 
 # ---- Colab agent compute -- run_on_colab tool ----------------
