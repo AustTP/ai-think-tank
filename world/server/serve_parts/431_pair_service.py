@@ -87,12 +87,29 @@ def _pair_agent_key():
 
 
 def _pair_chat_model():
+    # The low band's RESOLVED pick carries the free-pool overlay
+    # ('@freepool:low:...'), and a circuit-broken free endpoint surfaces as a
+    # model error mid-conversation. A live pairing session should not ride
+    # the free pool: read the band's PAID slug straight from model_tiers and
+    # fall back to mid, then to the literal band name (which /api/chat
+    # resolves).
     try:
-        return _resolve_model_tier(
-            'Pair-programming conversational reply with the player',
-            allow_high=False)
+        with _pair_db() as conn:
+            row = conn.execute(
+                "SELECT slug FROM model_tiers WHERE band = 'low'").fetchone()
+        if row and row['slug'] and not str(row['slug']).startswith('@'):
+            return row['slug']
     except Exception:
-        return 'low'
+        pass
+    try:
+        with _pair_db() as conn:
+            row = conn.execute(
+                "SELECT slug FROM model_tiers WHERE band = 'mid'").fetchone()
+        if row and row['slug'] and not str(row['slug']).startswith('@'):
+            return row['slug']
+    except Exception:
+        pass
+    return 'low'
 
 
 def _pair_model_reply(thread_id, player_text):
