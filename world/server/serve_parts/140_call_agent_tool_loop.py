@@ -58,6 +58,30 @@ def _model_error_detail(data):
     return str(error).strip()
 
 
+_TOOL_GIST_KEEP = 600
+_TOOL_GIST_MARK = ('\n…[older tool output compressed to a gist for the next round; '
+                   're-run the tool if you need the full content again]')
+
+
+def _gist_older_tool_messages(messages, keep_from):
+    """Model-facing view of the conversation with tool results OLDER than the
+    most recent batch compressed to a bounded gist. Returns a shallow copy --
+    the caller's list (the transcript handed to the spike synthesis pass)
+    keeps full fidelity. Messages that are not oversized tool results pass
+    through untouched."""
+    if keep_from >= len(messages):
+        return messages
+    out = list(messages)
+    for idx in range(keep_from):
+        m = out[idx]
+        if isinstance(m, dict) and m.get('role') == 'tool' \
+                and isinstance(m.get('content'), str) \
+                and len(m['content']) > _TOOL_GIST_KEEP:
+            out[idx] = dict(m, content=m['content'][:_TOOL_GIST_KEEP]
+                            + _TOOL_GIST_MARK)
+    return out
+
+
 def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3, max_tokens=None,
                           service='__player_ask__', force_first_tool=False, return_transcript=False,
                           task_id=None, village_id=None, escalate_model=None,
@@ -139,16 +163,29 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                     'you can do without it.')
         return raw_execute_tool(name, args)
 
+    # Index where the MOST RECENT tool-result batch begins: everything at or
+    # after it stays full-length in the model view; everything older is
+    # gisted. Starts at len(current_messages) so a resumed transcript's
+    # pre-existing messages are untouched until this run appends a batch.
+    last_batch_start = len(current_messages)
+
     for i in range(max_iterations):
         # Item 4 per-task gate inside the loop too: a spike that is already
         # over its task budget must not keep paying for further tool rounds.
         if task_id and _task_budget_exhausted(task_id):
             return (None, current_messages) if return_transcript else None
+        # Token economy (2026-11-04): tool results from EARLIER iterations are
+        # gisted in the model-facing view -- the model already acted on them,
+        # and a 20k page re-shipped on every later round was pure cost. The
+        # most recent batch stays full (that is what the model is acting on),
+        # and `current_messages` itself is never mutated: the returned
+        # transcript keeps full fidelity for the spike synthesis pass.
+        model_view = _gist_older_tool_messages(current_messages, last_batch_start)
         tool_choice = None
         if force_first_tool and i == 0:
             tool_choice = ({'type': 'function', 'function': {'name': force_first_tool}}
                            if isinstance(force_first_tool, str) else 'required')
-        data = _post_openrouter_raw(model, current_messages, tools=tools, max_tokens=max_tokens,
+        data = _post_openrouter_raw(model, model_view, tools=tools, max_tokens=max_tokens,
                                     tool_choice=tool_choice)
         error_detail = _model_error_detail(data)
         if error_detail:
@@ -231,7 +268,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                     print(f'[ask-debug] empty content (finish_reason=length, '
                           f'reasoning present); retrying {model} once with '
                           f'max_tokens={_retry_budget}', flush=True)
-                    data = _post_openrouter_raw(model, current_messages, tools=tools,
+                    data = _post_openrouter_raw(model, model_view, tools=tools,
                                                 max_tokens=_retry_budget,
                                                 tool_choice=tool_choice)
                     error_detail = _model_error_detail(data)
@@ -258,6 +295,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
                 current_messages.append(message)
                 return (content, current_messages) if return_transcript else content
         # Executed results -> role:tool, back into the conversation.
+        first_tool_index = len(current_messages)
         current_messages.append(message)
         if on_before_tools:
             try:
@@ -287,6 +325,7 @@ def _call_agent_tool_loop(model, messages, tools, execute_tool, max_iterations=3
             except Exception as e:  # noqa: BLE001 - surface tool failure to the model
                 output = f'__TOOL_ERROR__: {e}'
             current_messages.append({'role': 'tool', 'tool_call_id': call.get('id'), 'content': output})
+        last_batch_start = min(first_tool_index + 1, len(current_messages))
         if on_after_tools:
             try:
                 on_after_tools(current_messages)

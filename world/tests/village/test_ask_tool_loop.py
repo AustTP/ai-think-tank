@@ -75,6 +75,45 @@ class AskToolLoop(unittest.TestCase):
                 lambda n, a: 'x', max_iterations=3)
         self.assertIsNone(reply)
 
+    def test_older_tool_results_gisted_in_model_view_but_not_transcript(self):
+        # 2026-11-04 token economy: a 20k tool result from an EARLIER
+        # iteration is compressed to a gist in the messages the MODEL sees on
+        # later rounds, while the returned transcript keeps full fidelity
+        # (the spike synthesis pass reads the transcript).
+        page = 'P' * 20000
+        seen_views = []
+
+        def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
+            seen_views.append(list(messages))
+            if len(seen_views) < 3:
+                return {'choices': [{'message': {'role': 'assistant', 'content': None,
+                                                 'tool_calls': [
+                                                     _search_tool_call(f'c{len(seen_views)}')]}}]}
+            return {'choices': [{'message': {'role': 'assistant', 'content': 'settled'}}]}
+
+        with unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post):
+            text, transcript = serve._call_agent_tool_loop(
+                'm', [{'role': 'user', 'content': 'q'}], serve.AGENT_ASK_TOOLS,
+                lambda n, a: page, max_iterations=3, return_transcript=True)
+        self.assertEqual(text, 'settled')
+        # Round 2's model view: round 1's result is the NEWEST batch and
+        # stays full (the model is acting on it right now).
+        round2_tools = [m for m in seen_views[1] if m.get('role') == 'tool']
+        self.assertEqual(len(round2_tools), 1)
+        self.assertEqual(len(round2_tools[0]['content']), len(page))
+        # Round 3's model view: the NEWEST result stays full, the older one
+        # is now a gist.
+        round3_tools = [m for m in seen_views[2] if m.get('role') == 'tool']
+        self.assertEqual(len(round3_tools), 2)
+        self.assertEqual(len(round3_tools[0]['content']),
+                         len(serve._TOOL_GIST_MARK) + 600)
+        self.assertIn('compressed to a gist', round3_tools[0]['content'])
+        self.assertEqual(len(round3_tools[1]['content']), len(page))
+        # The transcript is never mutated: both results stay full.
+        transcript_tools = [m for m in transcript if m.get('role') == 'tool']
+        self.assertEqual([len(m['content']) for m in transcript_tools],
+                         [len(page), len(page)])
+
     def test_tool_error_is_surfaced_to_model(self):
         def fake_post(model, messages, tools=None, max_tokens=None, tool_choice=None):
             if any(m.get('role') == 'tool' for m in messages):  # after the error result
