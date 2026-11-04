@@ -778,6 +778,7 @@ AUTH_PUBLIC_PATHS = (
     '/api/templates', '/api/avatar',
     '/api/escalation/resolve',                          # its own per-escalation token gate
     '/api/chat',                                        # session OR agent key, in-handler
+    '/api/pair/',                                       # pairing mode: player session OR PAIR_KEY, in-handler (431_pair_service)
     '/api/mail', '/api/reports', '/api/download',
     '/api/file-grants', '/api/app-grants',
     '/api/device/checkin',                              # X-Device-Key
