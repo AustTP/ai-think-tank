@@ -54,6 +54,12 @@ def _compact_command_output(text, limit=COMMAND_CONTEXT_MAX):
     drop the one traceback or diff hunk in the middle, so signal lines are
     reserved first, then the remaining budget fills head and tail.
     """
+    if isinstance(text, bytes):
+        # subprocess.TimeoutExpired always carries bytes for stdout/stderr,
+        # even when the run used text=True -- a timed-out command used to
+        # crash the execute response with "Object of type bytes is not JSON
+        # serializable" at the JSONResponse render.
+        text = text.decode('utf-8', errors='replace')
     text = text or ''
     if isinstance(text, (bytes, bytearray)):
         # subprocess.TimeoutExpired.stdout is ALWAYS bytes even when the
