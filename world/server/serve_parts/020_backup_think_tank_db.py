@@ -698,7 +698,32 @@ def _reconcile_task_archive(done):
         except sqlite3.OperationalError:
             return False
         cached.update(changed)
+        _prune_task_archive(conn)
         return True
+
+
+# Retention (2026-11-04): the archive only exists so state['tasks'] keeps its
+# shape on read; a 6.2k-row archive made every 'copy'-mode read pay a ~1.9s
+# deepcopy on every tick and execute pass. Done tasks older than this window
+# leave the archive table AND the in-process cache. Their history is not
+# lost: action_log retains every trail row, and an old done task's content
+# lives in the Library when it produced one. The prune runs on the reconcile
+# writer (the only writer), at most once per pass, bounded to one DELETE.
+_TASK_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
+
+
+def _prune_task_archive(conn):
+    cutoff = time.time() * 1000 - _TASK_ARCHIVE_RETENTION_MS
+    stale = [tid for tid, task in _TASK_ARCHIVE_CACHE.get('tasks', {}).items()
+             if _task_attention_age_ms(task) > cutoff]
+    if not stale:
+        return
+    try:
+        conn.executemany('DELETE FROM task_archive WHERE id = ?', [(t,) for t in stale])
+    except Exception:
+        return  # a failed prune retries on the next reconcile; never fatal
+    for tid in stale:
+        _TASK_ARCHIVE_CACHE['tasks'].pop(tid, None)
 
 
 # --- Scale slices: high-cardinality sections leave the whole blob ---------
