@@ -784,8 +784,11 @@ class _ClassifyCommandJev(unittest.TestCase):
         serve.init_db()
 
     def _run(self, decision, confidence):
+        return self._run_cmd('echo hi', decision, confidence)
+
+    def _run_cmd(self, command, decision, confidence):
         async def go():
-            return await serve._classify_command('echo hi', 'runs a test')
+            return await serve._classify_command(command, 'runs a test')
         with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
                                         return_value={'answers': {'choice': {'choice': decision, 'confidence': confidence, 'probabilities': {}}}}), \
@@ -801,7 +804,13 @@ class _ClassifyCommandJev(unittest.TestCase):
         self.assertEqual(reason, 'allow')
 
     def test_low_confidence_allow_blocks_without_escalation(self):
-        allowed, reason, save_called = self._run('allow', 0.4)
+        # 2026-11-04: the low-confidence lane now has a deterministic
+        # exception -- a command whose whole text parses as provably
+        # read-only runs without any confidence vote (echo hi is the
+        # canonical case, and it is what the read-only allowlist tests
+        # cover). This test therefore uses a command that is NOT read-only,
+        # which still must not run on a low-confidence allow.
+        allowed, reason, save_called = self._run_cmd('touch /tmp/x', 'allow', 0.4)
         self.assertFalse(allowed, 'low-confidence allow must not run the command')
         # The block reason is now actionable (names the confidence, the
         # threshold, the block categories, and what to do differently) --
@@ -809,6 +818,15 @@ class _ClassifyCommandJev(unittest.TestCase):
         # with a score and no fix path.
         self.assertIn('not confident enough', reason)
         self.assertIn('0.40', reason)
+        save_called.assert_not_called()
+
+    def test_low_confidence_allow_runs_readonly_command(self):
+        # The deterministic lane: echo hi parses as read-only, so a
+        # low-confidence classifier allow runs it immediately -- no chain,
+        # no escalation record. This is the 2026-11-04 operator decision
+        # that ended the owner-ping flood.
+        allowed, reason, save_called = self._run_cmd('echo hi', 'allow', 0.4)
+        self.assertTrue(allowed, 'a provably read-only command needs no confidence vote')
         save_called.assert_not_called()
 
     def test_block_blocks_without_escalation(self):

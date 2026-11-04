@@ -172,6 +172,16 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     if decision != 'allow' and decision != 'approve':
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False
+    # Deterministic fast lane (2026-11-04): a command whose ENTIRE text
+    # parses as provably read-only (see _readonly_shell_command) needs no
+    # rung vote and no owner page, at any classifier confidence. The parse
+    # is stricter than any LLM vote: every segment is a whitelisted
+    # read-only binary, output redirection is confined to /dev/null, and
+    # interpreters/writers/exec-flags fail the parse. A classifier BLOCK
+    # still blocks (checked above) -- this lane only upgrades an allow.
+    if action == 'execute_classify' and _readonly_shell_command(target or ''):
+        log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed', 'confidence': confidence, 'cost': cost, 'reason': 'read-only command allowlist (deterministic parse)'}, authorized=authorized, trace_id=trace_id)
+        return True
     if confidence < _effective_safety_confidence():
         # Low-confidence allow is uncertainty, not a block. The senior
         # director gets the decision; if the director also cannot approve
