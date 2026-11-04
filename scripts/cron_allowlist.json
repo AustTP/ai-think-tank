@@ -46,6 +46,15 @@
         "IMESSAGE_STATE_FILE"
       ],
       "hostReason": "Reads Messages.app chat.db on the host"
+    },
+    {
+      "path": "scripts/vote_run_cron.py",
+      "sha256": "bc9768383b25d39fd1b90904f720ecb5563f9db875bf31f0f492e3da12bfe16b",
+      "runner": "host",
+      "allowedHosts": [
+        "100.96.104.61"
+      ],
+      "env": []
     }
   ]
 }
