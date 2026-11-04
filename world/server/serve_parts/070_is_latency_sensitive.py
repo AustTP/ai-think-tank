@@ -161,6 +161,15 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
 # invisible. Runs on its own cadence, server-side, like the health/mail loops.
 DIRECTOR_APPROVAL_INTERVAL_S = 30
 
+# Outage patience for the escalation chain (2026-11-04): when a rung's
+# reviewer model returns NULL (call failed, not an opinion), the escalation
+# is parked for this long and the SAME rung is retried, instead of burning
+# one rung per pass into an owner page. After ESCALATION_MODEL_COOLDOWN_RETRIES
+# consecutive parkings the chain falls through to the old behavior -- a
+# genuinely undecidable question still reaches the human, ~30 minutes later.
+ESCALATION_MODEL_COOLDOWN_S = 300
+ESCALATION_MODEL_COOLDOWN_RETRIES = 6
+
 # Re-ask policy for the director's delegated approvals (added after the
 # Escalation storm -- ~204k Jev calls in 24h, 161k of them
 # "escalation_unsure" dead-ends): a pending escalation Jev can't resolve

@@ -231,6 +231,18 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
             'rung': 'admin', 'decision': decision,
             'confidence': round(float(confidence or 0.0), 3)})
     if decision not in ('approve', 'deny'):
+        if decision is None:
+            # Both tiers failed to answer: a model outage, not an opinion.
+            # Park the record and clear adminAskedAt so the loop's cooldown
+            # retry re-fires this rung instead of exhausting the chain into
+            # an owner page. After the retry cap, fall through to the old
+            # tried-and-notify path (a genuinely undecidable question still
+            # reaches the human).
+            retries = esc.get('_modelCooldownRetries') or 0
+            if retries < ESCALATION_MODEL_COOLDOWN_RETRIES:
+                esc['_modelCooldownRetries'] = retries + 1
+                esc['_modelCooldownUntil'] = time.time() + ESCALATION_MODEL_COOLDOWN_S
+                esc.pop('adminAskedAt', None)
         log_action(admin_id, 'escalation_admin_unsure',
                    {'escalationId': esc_id, 'kind': esc_kind,
                     'decision': decision, 'confidence': confidence,
@@ -463,6 +475,10 @@ def _resolve_pending_escalations_sync():
         # wait for the human's email link.
         if _escalation_floor(esc_kind) >= 1.0:
             continue
+        # A reviewer model that just failed parks the record for a cooldown
+        # (see the null-decision branch below); skip it until then.
+        if (esc.get('_modelCooldownUntil') or 0) > now:
+            continue
         # Heterogeneous-judge drift circuit: a kind whose judge cross-check has
         # repeatedly failed closed is taken out of delegation entirely and waits
         # for the human's link. Notify once, immediately; do not spend a pass
@@ -491,6 +507,13 @@ def _resolve_pending_escalations_sync():
                                          director_id, roster):
                 dirty = True
                 resolved += 1
+                continue
+            if (esc.get('_modelCooldownUntil') or 0) > now:
+                # The admin's model failed and set the retry cooldown inside
+                # the attempt (cleared adminAskedAt so the retry can re-fire).
+                # Do not burn the last internal rung -- and the owner's
+                # attention -- on an outage.
+                dirty = True
                 continue
             esc['_adminTried'] = True
             esc.setdefault('_chainTried', []).append(reviewer_id)
@@ -535,6 +558,24 @@ def _resolve_pending_escalations_sync():
             # move to the next one on the next pass. Never auto-approve on a
             # classifier failure.
             _escalation_jev_errors.bump(esc_kind)
+            if decision is None:
+                # None = the reviewer call FAILED (unreachable model,
+                # unparseable output), not an opinion. On a tier-wide outage
+                # this used to burn the whole chain -- one failed rung per
+                # 30s pass -- into a human page within minutes (observed
+                # 2026-11-04: 752 of 903 rung votes were nulls during a
+                # free-pool degradation, and every chain reached the owner).
+                # Park the escalation and retry the SAME rung after a
+                # cooldown, so an outage waits instead of paging. A rung
+                # that stays undecidable after the retry cap falls through
+                # to the old tried-and-advance path: a genuinely undecidable
+                # question still reaches the human, just slower.
+                retries = esc.get('_modelCooldownRetries') or 0
+                if retries < ESCALATION_MODEL_COOLDOWN_RETRIES:
+                    esc['_modelCooldownRetries'] = retries + 1
+                    esc['_modelCooldownUntil'] = now + ESCALATION_MODEL_COOLDOWN_S
+                    dirty = True
+                    continue
             _mark_escalation_rung(esc, rung, reviewer_id)
             dirty = True
             continue

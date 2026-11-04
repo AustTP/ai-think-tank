@@ -103,6 +103,20 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
                         'model': review_model, 'traceId': trace_id},
                        authorized=False)
             return True
+        if decision is None:
+            # None = the reviewer call FAILED (unreachable model, unparseable
+            # output), not an opinion. Walking further rungs on a broken tier
+            # just burns one failed call per rung and still ends at the owner
+            # (observed 2026-11-04: 752 of 903 rung votes were nulls during a
+            # free-pool degradation). Fail closed here; the pending action
+            # stays blocked, and the escalation record (created below on
+            # chain exhaustion) carries the votes cast before the outage.
+            log_action(reviewer_id, 'jev_chain_model_unavailable',
+                       {'agent': agent_id, 'action': action, 'target': target,
+                        'level': level, 'model': review_model,
+                        'traceId': trace_id},
+                       authorized=False)
+            break
         log_action(reviewer_id, 'jev_chain_unsure',
                    {'agent': agent_id, 'action': action, 'target': target,
                     'purpose': purpose, 'jevConfidence': confidence,
