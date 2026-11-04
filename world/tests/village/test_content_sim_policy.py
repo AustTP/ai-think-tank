@@ -124,6 +124,25 @@ class RosterAndStateTest(_Base):
         self.assertIsNotNone(first)
         self.assertIsNone(second)
 
+    def test_card_failure_notices_collapse_to_one_family(self):
+        # Operator request (2026-11-04): when an outage fails a burst of
+        # cards, per-issue-key dedup still pushed one Telegram message per
+        # card. All card failures share ONE 30-minute window now.
+        state = {}
+        t0 = 1_700_000_000_000
+        first = sim._queue_player_email(
+            state, 'card_failure:DEV-1', '[AI Think Tank] Card failed: A',
+            'the pipeline kept failing', now_ms=t0)
+        self.assertIsNotNone(first)
+        second = sim._queue_player_email(
+            state, 'card_failure:DEV-2', '[AI Think Tank] Card failed: B',
+            'different card, same flood', now_ms=t0 + 60_000)
+        self.assertIsNone(second)
+        third = sim._queue_player_email(
+            state, 'card_failure:DEV-3', '[AI Think Tank] Card failed: C',
+            'another one', now_ms=t0 + 30 * 60 * 1000 + 1)
+        self.assertIsNotNone(third)
+
     def test_credits_notices_collapse_to_one_per_six_hours(self):
         # Operator request (2026-11-04): the free pool keeps work flowing
         # through a credits pause, so per-card pause/failure notices became

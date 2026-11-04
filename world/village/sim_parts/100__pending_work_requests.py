@@ -798,6 +798,13 @@ _EMAIL_DEDUP_MS = 30_000
 # card produced them, so the player hears about the pause, not every card.
 _CREDITS_NOTICE_DEDUP_MS = 6 * 3600 * 1000
 _CREDITS_NOTICE_KEY = '_credits_notice'
+# Card-failure notices used to dedup per issue key: one message PER failing
+# card. When a free-pool outage fails a burst of cards, that is one push per
+# card -- the operator's inbox flooded. All card failures now share ONE dedup
+# key with a 30-minute window (the health digest carries the detail).
+_CARD_FAILURE_PREFIX = 'card_failure:'
+_CARD_FAILURE_KEY = '_card_failures'
+_CARD_FAILURE_DEDUP_MS = 30 * 60 * 1000
 
 
 def _queue_player_email(state, kind, subject, body_text, now_ms=None,
@@ -814,10 +821,14 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None,
     if kind == 'spike_done' and str(subject or '').startswith('[AI Think Tank] Spike done:'):
         return None
     # Credits/budget notices collapse to one per six hours across ALL cards.
+    # Card-failure notices collapse to one per 30 minutes across ALL cards.
     dedup_kind = kind
     dedup_ms = _EMAIL_DEDUP_MS
     combined = f'{subject or ""}\n{body_text or ""}'.lower()
-    if 'credit' in combined or 'budget' in combined:
+    if kind.startswith(_CARD_FAILURE_PREFIX):
+        dedup_kind = _CARD_FAILURE_KEY
+        dedup_ms = _CARD_FAILURE_DEDUP_MS
+    elif 'credit' in combined or 'budget' in combined:
         dedup_kind = _CREDITS_NOTICE_KEY
         dedup_ms = _CREDITS_NOTICE_DEDUP_MS
     outbox = state.setdefault('emailOutbox', [])
