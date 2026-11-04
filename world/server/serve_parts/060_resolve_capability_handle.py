@@ -91,6 +91,11 @@ def _credits_watchdog_step(credits, now, state=None):
     balance falls to the floor, 'restored' once when it comes back, and None
     otherwise. No reminders."""
     state = _CREDITS_WATCHDOG_STATE if state is None else state
+    if state is _CREDITS_WATCHDOG_STATE:
+        # The probe loop reads the latch directly (not via
+        # credits_pause_active), so the durable seed must run here too --
+        # otherwise every respawn re-fires the 'low' transition.
+        _seed_credits_pause_state()
     if not isinstance(credits, dict):
         return None
     try:

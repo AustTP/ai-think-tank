@@ -432,7 +432,11 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
         # (so the park pass can rest her again) and the text stays in her
         # mailbox for her next natural work cycle.
         text = str((payload or {}).get('text') or '')
-        m = re.match(r'^\s*HANDOFF:?[:\s]*(.+)$', text, re.DOTALL)
+        # Mailbox entries carry a "Sender: " prefix (the API path formats
+        # f'{from_name}: {text}'), so anchor on a HANDOFF LINE, not the
+        # string start (MULTILINE). HANDOFF is one line by convention.
+        m = re.search(r'^\s*HANDOFF:?[ \t]*:?[ \t]*(.+?)[ \t]*$', text,
+                      re.MULTILINE)
         if not m:
             return True
         request = m.group(1).strip()
