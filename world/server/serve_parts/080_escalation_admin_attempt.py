@@ -203,6 +203,26 @@ def _escalation_admin_attempt(state, esc_id, esc, esc_kind, director_id, roster)
     review_model = _high_tier_slug() or _jev_model()
     decision, confidence, _cost = _jev_quorum_choice_sync(
         instr, criteria, model=review_model, kind='escalation_resolve')
+    if decision not in ('approve', 'deny'):
+        # A null decision is a MODEL failure, not an opinion. The high tier
+        # can be down (provider outage, breaker) while the mid tier is
+        # healthy; without a retry every full chain dead-ends at the human
+        # on a provider hiccup (observed 2026-11-04: the high tier returned
+        # null all evening, so every reached-the-top escalation paged the
+        # owner). One mid-tier retry, then the normal gates: the composite
+        # floor and the judge cross-check below still apply to whatever the
+        # retry produces, so this adds availability, not permissiveness.
+        fallback_model = _mid_tier_slug() or _jev_model()
+        if fallback_model and fallback_model != review_model:
+            decision, confidence, _cost = _jev_quorum_choice_sync(
+                instr, criteria, model=fallback_model,
+                kind='escalation_resolve')
+            if decision in ('approve', 'deny'):
+                log_action(admin_id, 'escalation_admin_fallback',
+                           {'escalationId': esc_id, 'kind': esc_kind,
+                            'primary': review_model, 'fallback': fallback_model,
+                            'decision': decision, 'confidence': confidence},
+                           authorized=False)
     # Same vote record the director rungs keep (see the loop): the admin's
     # read is the last internal opinion, and the escalation record should
     # show it even when the composite gate refuses to act on it.
