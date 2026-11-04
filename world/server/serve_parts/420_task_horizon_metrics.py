@@ -191,7 +191,19 @@ def compute_health_snapshot():
         work_queue = data.get('workQueue', [])
         work_queue_size = len(work_queue)
         work_queue_due_size = _count_due_work_items(work_queue, now * 1000)
+        # The agents section is a scale slice: once the live_agent table is
+        # authoritative the blob carries no 'agents' key (the first
+        # reconciling save drops it), so a raw-blob count reads 0 while 145
+        # agents exist (observed 2026-11-04 -- the monitoring blind spot
+        # made a healthy village look empty). Fall back to the table count.
         agents_count = len(data.get('agents', {}))
+        if not agents_count:
+            try:
+                with _db() as conn:
+                    agents_count = conn.execute(
+                        'SELECT count(*) FROM live_agent').fetchone()[0]
+            except Exception:
+                agents_count = 0
         # Admin gap 1: aging in-flight work -- a non-bug task wedged past its
         # budget (the stale-work sweep's domain, SM gap 1) is a health signal
         # here too: it means the sweep hasn't re-planned it yet, so the digest
