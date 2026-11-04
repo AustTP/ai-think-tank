@@ -791,6 +791,13 @@ def _player_ask_decider_default(state, issue_key, director_id, question, context
 # of cards blocking at once sends one combined player nudge, not a flood.
 # ---------------------------------------------------------------------------
 _EMAIL_DEDUP_MS = 30_000
+# Credits-flavored notices (budget pauses, credits-exhausted failures) are
+# deduped to ONE player message per six hours (operator request, 2026-11-04:
+# the free pool keeps work flowing through a pause, so every paused/failed
+# card no longer needs a push). They share one dedup key regardless of which
+# card produced them, so the player hears about the pause, not every card.
+_CREDITS_NOTICE_DEDUP_MS = 6 * 3600 * 1000
+_CREDITS_NOTICE_KEY = '_credits_notice'
 
 
 def _queue_player_email(state, kind, subject, body_text, now_ms=None,
@@ -806,11 +813,20 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None,
     # still use the same kind and still notify.
     if kind == 'spike_done' and str(subject or '').startswith('[AI Think Tank] Spike done:'):
         return None
+    # Credits/budget notices collapse to one per six hours across ALL cards.
+    dedup_kind = kind
+    dedup_ms = _EMAIL_DEDUP_MS
+    combined = f'{subject or ""}\n{body_text or ""}'.lower()
+    if 'credit' in combined or 'budget' in combined:
+        dedup_kind = _CREDITS_NOTICE_KEY
+        dedup_ms = _CREDITS_NOTICE_DEDUP_MS
     outbox = state.setdefault('emailOutbox', [])
     last = state.get('_lastEmailAt') or {}
-    if now_ms - (last.get(kind) or 0) < _EMAIL_DEDUP_MS:
+    if now_ms - (last.get(dedup_kind) or 0) < dedup_ms:
         return None
     last[kind] = now_ms
+    if dedup_kind != kind:
+        last[dedup_kind] = now_ms
     state['_lastEmailAt'] = last
     entry = {'kind': kind, 'subject': subject, 'body': body_text,
              'queuedAt': now_ms}

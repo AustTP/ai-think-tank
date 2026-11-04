@@ -124,6 +124,35 @@ class RosterAndStateTest(_Base):
         self.assertIsNotNone(first)
         self.assertIsNone(second)
 
+    def test_credits_notices_collapse_to_one_per_six_hours(self):
+        # Operator request (2026-11-04): the free pool keeps work flowing
+        # through a credits pause, so per-card pause/failure notices became
+        # per-minute spam. Credits/budget-flavored notices share ONE dedup
+        # key with a six-hour window, regardless of which card produced them.
+        state = {}
+        t0 = 1_700_000_000_000
+        first = sim._queue_player_email(
+            state, 'spike_done', '[AI Think Tank] Spike came up empty: X',
+            'the model call failed: OpenRouter credits are exhausted',
+            now_ms=t0)
+        self.assertIsNotNone(first)
+        # A DIFFERENT card, seconds later, same flavor: suppressed.
+        second = sim._queue_player_email(
+            state, 'spike_done', '[AI Think Tank] Spike paused on budget: Y',
+            'task already used its full model-spend budget ($0.12 spent)',
+            now_ms=t0 + 60_000)
+        self.assertIsNone(second)
+        # A NON-credits failure still flows through at the normal cadence.
+        third = sim._queue_player_email(
+            state, 'card_failure:k', '[AI Think Tank] Card failed: Z',
+            'the pipeline kept failing', now_ms=t0 + 120_000)
+        self.assertIsNotNone(third)
+        # Six hours later the credits notice flows again.
+        fourth = sim._queue_player_email(
+            state, 'spike_done', '[AI Think Tank] Spike came up empty: W',
+            'OpenRouter credits are exhausted', now_ms=t0 + 6 * 3600 * 1000 + 1)
+        self.assertIsNotNone(fourth)
+
 
 class GuardsTest(_Base):
     def test_spawn_team_agent_fired(self):
