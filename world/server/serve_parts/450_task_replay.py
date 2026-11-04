@@ -27,12 +27,23 @@ def _task_replay_rows(conn, task_id):
     like = f'%"{task_id}"%'
     import db_backend as _dbm
     if _dbm.is_postgres():
-        rows = conn.execute(
-            "SELECT ts, agent_id, action, details FROM action_log "
-            "WHERE details::jsonb->>'taskId' = ? OR details LIKE ? "
-            "ORDER BY ts ASC LIMIT ?",
-            (task_id, like, _TRAIL_LIMIT),
-        ).fetchall()
+        # details is freeform: JSON rows carry taskId, others are prose.
+        # Only cast rows that even look like JSON; a malformed JSON row would
+        # still raise, so fall back to the substring match on any error.
+        try:
+            rows = conn.execute(
+                "SELECT ts, agent_id, action, details FROM action_log "
+                "WHERE (details LIKE '{%' AND details::jsonb->>'taskId' = ?) "
+                "   OR details LIKE ? "
+                "ORDER BY ts ASC LIMIT ?",
+                (task_id, like, _TRAIL_LIMIT),
+            ).fetchall()
+        except Exception:
+            rows = conn.execute(
+                "SELECT ts, agent_id, action, details FROM action_log "
+                "WHERE details LIKE ? ORDER BY ts ASC LIMIT ?",
+                (like, _TRAIL_LIMIT),
+            ).fetchall()
     else:
         rows = conn.execute(
             "SELECT ts, agent_id, action, details FROM action_log "
