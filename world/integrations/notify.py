@@ -26,6 +26,7 @@ import json
 import os
 
 from core.review_decode import review_target
+import re
 import secrets
 import smtplib
 import threading
@@ -364,10 +365,36 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     # a new escalation per attempt -- the 3.8k-record pileup this guard
     # exists to prevent. Only PENDING records dedup; a resolved one lets a
     # fresh escalation be created if the same thing genuinely recurs later.
+    #
+    # Agent-agnostic dedupe (2026-11-04): safety questions embed the requester
+    # ("Agent marcus needs a decision on this ..."), so ten agents running the
+    # SAME shared-prompt command produced ten distinct questions, ten pending
+    # records, and ten pings for one decision. The dedupe key strips that
+    # prefix so one pending decision covers every agent that hits the same
+    # target; the extra requesters are recorded on the winner (alsoWaiting)
+    # instead of multiplying records.
+    dedupe_key = kind + '|' + re.sub(
+        r'^Agent \S+ needs a decision on this ', '', question or '')
     escalations = _serve._load_escalations()
     for esc_id, existing in escalations.items():
-        if existing.get('status') == 'pending' and existing.get('kind') == kind \
-                and existing.get('question') == question:
+        if existing.get('status') != 'pending' \
+                or existing.get('kind') != kind:
+            continue
+        existing_key = existing.get('dedupeKey') or (
+            kind + '|' + (existing.get('question') or ''))
+        if existing_key == dedupe_key:
+            waiting = existing.setdefault('alsoWaiting', [])
+            if agent_id and agent_id not in waiting and len(waiting) < 50:
+                waiting.append(agent_id)
+            _serve._save_escalations(escalations)
+            try:
+                _serve.log_action(None, 'escalation_deduped', {
+                    'escalationId': esc_id, 'kind': kind,
+                    'agentId': agent_id or None,
+                    'alsoWaiting': len(waiting),
+                }, authorized=False)
+            except Exception:
+                pass
             return esc_id
     # A random unguessable token per escalation, not just the record id --
     # the resolve link needs to not be trivially enumerable (id alone
@@ -375,7 +402,7 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     esc_id = 'esc-' + secrets.token_hex(4)
     token = secrets.token_urlsafe(24)
     reviewed = review_target(question)
-    escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first}
+    escalations[esc_id] = {'kind': kind, 'question': question, 'status': 'pending', 'token': token, 'ts': time.time(), 'note': on_approve_note, 'whatChecked': what_checked, 'lookFirst': look_first, 'dedupeKey': dedupe_key}
     if reviewed['decoded']:
         escalations[esc_id]['reviewQuestion'] = reviewed['text']
         escalations[esc_id]['decodedForReview'] = True

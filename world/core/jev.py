@@ -224,9 +224,18 @@ ESCALATION_KIND_RISK = {
     # routine approval.
     'unsure safety decision':  {'floor': 0.85},
     # The full director -> senior director -> chief of staff chain could not
-    # decide a low-confidence JEV safety question. Only the owner may resolve
-    # this kind; the director loop is barred by the 1.0 floor.
-    'owner safety decision':  {'floor': 1.0},
+    # decide a low-confidence JEV safety question in the synchronous in-request
+    # walk. Operator decision (2026-11-04): the OWNER no longer wants these
+    # pinged directly -- they route to the director loop instead (the same
+    # supervisor -> recursive director -> chief-of-staff walk, but with the
+    # loop's composite floor, per-rung ask caps, and the heterogeneous judge
+    # cross-check, which the in-request chain does not have). The floor is the
+    # HIGHEST delegable bar: only a near-certain reviewer whose vote a
+    # second, different judge model independently agrees with may resolve it.
+    # If the loop still cannot decide (ask cap / judge-drift circuit), the
+    # human is notified exactly as before -- the owner stays the last resort,
+    # not the first pager.
+    'owner safety decision':  {'floor': 0.95},
     # A human's explicit "blocked" verdict on a command or pipeline step is the
     # strongest signal the think tank produces that the action is dangerous. A
     # director-LLM re-framing it as benign should NOT override that -- 1.0 =
