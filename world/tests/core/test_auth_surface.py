@@ -52,6 +52,11 @@ EXPECTED_PUBLIC = (
     # X-Webhook-Key header (403 without it) and only appends to the JSONL
     # queue; a bad or missing key stores nothing.
     '/api/webhook/',
+    # Pairing mode (431_pair_service.py). Public HERE because the pairing CLI
+    # authenticates with the PAIR_KEY env secret, not a session cookie; the
+    # endpoints self-guard in-handler (X-Pair-Key compared with
+    # secrets.compare_digest, fail-closed when PAIR_KEY is unset).
+    '/api/pair/',
     # MCP edge (421_mcp_edge.py). Public HERE because the login middleware's
     # session cookie has no meaning for MCP clients; the endpoint self-guards
     # with a bearer token (401 on a wrong token) and fails CLOSED (503) when
