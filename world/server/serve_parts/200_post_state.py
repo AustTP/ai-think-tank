@@ -238,7 +238,16 @@ async def api_mail_send(request: Request):
         state.setdefault('agents', {})[to_id] = target
     entry = {'text': f'{from_name}: {text}', 'read': False,
              'ts': int(time.time() * 1000)}
-    _sim._append_mailbox(target, entry)
+    # Wake-on-mail parity (2026-11-04): the sim's _deliver_mail wakes an
+    # OFF-DUTY recipient so the mail is acted on instead of sitting unread
+    # until an unrelated trigger. The API path previously only appended, so a
+    # mailed HANDOFF to a parked agent idled overnight. Unknown recipients
+    # (just created above) keep the plain append.
+    if to_id in ids:
+        _sim._deliver_mail(state, to_id, 'agent_mail',
+                           {'text': f'{from_name}: {text}'})
+    else:
+        _sim._append_mailbox(target, entry)
     # BP-62 appeal path: an agent reporter replying about a declined card may
     # re-surface it once. The reply text names the issue key (our decline mail
     # carries it), so an agent-to-SM reply on a declined card registers the

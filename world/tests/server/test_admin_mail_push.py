@@ -102,6 +102,25 @@ class AdminMailPush(unittest.TestCase):
         self.assertEqual(s['playerInbox'][0]['answer'], 'On it -- checking all 13 services now.')
         self.assertEqual(s['playerInbox'][0]['agentId'], 'theo')
 
+    def test_agent_mail_wakes_off_duty_recipient(self):
+        # 2026-11-04: the API mail path used to only append to the mailbox,
+        # so a HANDOFF mailed to a PARKED (off-duty) agent sat unread until an
+        # unrelated trigger. Parity with the sim's _deliver_mail: the
+        # recipient wakes and carries the _mailAwake marker so the park pass
+        # does not immediately re-park her.
+        s = _state()
+        ben = s['agents']['ben']
+        ben['offDuty'] = True
+        c = self._client(s)
+        r = c.post('/api/mail/send', json={
+            'fromId': 'theo', 'toId': 'ben', 'text': 'HANDOFF: do the thing'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(ben.get('offDuty'),
+                         'the recipient must wake for agent mail')
+        self.assertIsNotNone(ben.get('_mailAwake'))
+        self.assertEqual(ben['_mailAwake']['kind'], 'agent_mail')
+        self.assertIn('HANDOFF: do the thing', ben['mailbox'][0]['text'])
+
     def test_player_mail_to_non_admin_does_not_route(self):
         # Workers read their mailboxes during content tasks, so only the admin
         # (who never runs content work) gets the routing push.
