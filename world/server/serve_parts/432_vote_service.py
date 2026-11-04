@@ -646,12 +646,8 @@ async def api_vote_run(request: Request):
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
     if not authority:
         return JSONResponse(
-            {'error': 'vote runs are called by a director or the '
-                      'chief of staff'}, status_code=403)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
+            {'error': 'publishing the ballot is a director or chief-of-staff '
+                      'decision'}, status_code=403)
     week = _vote_week_key()
     row = _vote_get_week(week)
     now = time.time()
