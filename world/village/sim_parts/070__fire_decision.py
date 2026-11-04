@@ -519,8 +519,13 @@ def _queue_peer_repair(state, parent, rationale=None, not_before=None):
                     + f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
                     + '\nOriginal request instructions:\n' + (original or '(not recorded)')
                     + '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
+    # One 'Fix: ' prefix over the title's ROOT: stacking 'Fix: Fix: ...'
+    # every repair cycle made the queue unreadable (observed six deep) and
+    # made every cycle's title textually unique. The root is what repairs
+    # repeat; the loop stopper already reduces these prefixes, so this keeps
+    # the queue title stable across cycles too.
     item = {
-        'title': 'Fix: ' + str(parent.get('title') or tid),
+        'title': 'Fix: ' + (_fix_title_root(parent.get('title')) or tid),
         'room': parent.get('room') or 'pressoffice',
         # teamId must survive a repair: every team-routed mechanism (worker
         # stuck-help, stale-work re-plan) resolves the OWNING team from the
