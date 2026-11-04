@@ -1,24 +1,23 @@
 # Feed-proposal voting (2026-11-03): the costed ballot layer for the feed
 # triage lane. Markers pull items from feeds and POST structured proposals
-# here; a screen call (sublow band) kills noise for one cheap call; passing
-# items above the thresholds get a two-voter quorum (novelty rubric, cost
-# rubric -- separate calls so the voters never share a context); agreement
-# files a card instruction to the coordinator, a split escalates with both
-# reasons, and mechanical cases never vote at all. Every decision lands in
-# action_log. Ballots are tight (~1k tokens in, ~80 out) so a full day of
-# triage stays in the pennies; the naive full-context version costs three
-# orders of magnitude more.
+# here. Voting is WEEKLY by operator decision: proposals accumulate all week,
+# the ballot is published Monday 09:00 local and mailed to the PLAYER (the
+# operator wants to review every item in advance and strike the ones they
+# oppose), a 48-hour veto window follows, and then one batched vote runs on
+# the survivors. Off-cycle votes happen only on an explicit director or
+# chief-of-staff call and are logged as off-cycle. Every decision lands in
+# the tank's action_log.
 #
-# Filing stays with the coordinator (ruth) exactly like pairing mode: this
-# service decides, it never files cards itself. Escalation and filing mails
-# are sent AS theo (chief of staff runs the vote service) via the loopback
-# mail endpoint, so the sender binding stays server-authoritative.
+# Authority policy (operator): any agent may PROPOSE; the decision to cast
+# votes (publish early, run off-cycle, veto) is a director or chief-of-staff
+# call via the tank's own _is_director_or_admin gate; the player session is
+# the operator and overrides. The scheduled cron (scripts/vote_run_cron.py)
+# acts AS theo -- the chief of staff's standing duty.
 #
-# Cost guards baked in: reject-dominated items cost one screen call; batched
-# ballots amortize the prompt across up to 5 proposals per rubric; one revote
-# is possible only because a resubmitted proposal is a new row (clusters keep
-# duplicates out for 7 days); voter-call failure after one retry defers to
-# the coordinator instead of blocking on assembly.
+# Cost guards: reject-dominated items cost one screen call; batched ballots
+# amortize the prompt across up to 5 proposals per rubric; voter-call failure
+# after one retry defers instead of blocking; duplicate proposals are
+# clustered out for 7 days. A whole week of triage stays in the pennies.
 
 import hashlib
 import json
@@ -29,8 +28,6 @@ import threading
 import contextlib
 
 _VOTE_COORDINATOR_ID = 'ruth'
-_VOTE_RUN_LIMIT_DEFAULT = 8
-_VOTE_RUN_LIMIT_MAX = 25
 _VOTE_BATCH = 5                  # proposals per ballot call
 _VOTE_SCREEN_MAX_TOKENS = 140
 _VOTE_BALLOT_MAX_TOKENS = 320
@@ -39,6 +36,9 @@ _VOTE_AUTO_FILE_MAX_COST = 2.0   # $ estimated work below which no quorum runs
 _VOTE_ESCALATE_COST = 20.0       # expensive proposals skip voting entirely
 _VOTE_DUPLICATE_WINDOW = 7 * 24 * 3600.0
 _VOTE_MAX_TEXT = 1200
+_VOTE_PUBLISH_DOW = 0            # Monday (time.localtime tm_wday)
+_VOTE_PUBLISH_HOUR = 9           # 09:00 local
+_VOTE_VETO_WINDOW = 48 * 3600.0  # operator review window after publication
 
 _VOTE_SCREEN_PROMPT = (
     'You are a feed-item screener for a software-building agent organization. '
@@ -89,6 +89,11 @@ CREATE TABLE IF NOT EXISTS vote_ballots (
 );
 CREATE INDEX IF NOT EXISTS idx_vote_ballots_proposal
     ON vote_ballots(proposal_id);
+CREATE TABLE IF NOT EXISTS vote_weeks (
+    week_key     TEXT PRIMARY KEY,
+    published_ts REAL,
+    voted_ts     REAL
+);
 '''
 
 
@@ -98,10 +103,14 @@ def _vote_db():
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(_VOTE_SCHEMA)
-        try:
-            conn.execute('ALTER TABLE vote_proposals ADD COLUMN processing_ts REAL')
-        except Exception:
-            pass   # column already exists
+        for _col, _ddl in (('processing_ts', 'ALTER TABLE vote_proposals '
+                            'ADD COLUMN processing_ts REAL'),
+                           ('ballot_week', 'ALTER TABLE vote_proposals '
+                            'ADD COLUMN ballot_week TEXT')):
+            try:
+                conn.execute(_ddl)
+            except Exception:
+                pass   # column already exists
         yield conn
         conn.commit()
     finally:
@@ -109,8 +118,8 @@ def _vote_db():
 
 
 def _vote_actor(request):
-    # Any roster agent (its own key) or the player session may propose and
-    # run; the deny-by-default middleware already keeps anonymous traffic out.
+    # Any roster agent (its own key) or the player session; the
+    # deny-by-default middleware already keeps anonymous traffic out.
     key_owner = _agent_id_for_key(request.headers.get('X-Agent-Key'))
     if key_owner:
         return key_owner
@@ -119,11 +128,24 @@ def _vote_actor(request):
     return None
 
 
+def _vote_authority(request):
+    # (actor, is_authority). The player session is the operator and always
+    # authoritative; agents need the tank's director/chief-of-staff gate.
+    actor = _vote_actor(request)
+    if not actor:
+        return None, False
+    if actor == 'player':
+        return actor, True
+    try:
+        state = get_state_from_db()
+    except Exception:
+        return actor, False
+    return actor, bool(_is_director_or_admin(state, actor))
+
+
 def _vote_log(action, details, agent_id='vote-service'):
     # action_log lives in the tank's OWN backend (postgres on this host) --
-    # writing it through the service-local sqlite handle silently landed the
-    # rows in a stale sqlite table the operator never reads. _db() is the
-    # backend-aware handle the rest of the tank audits through.
+    # the service-local sqlite handle is only for the vote tables.
     try:
         with _db() as conn:
             conn.execute(
@@ -151,6 +173,44 @@ def _vote_model(band):
 
 def _vote_theo_key():
     return get_or_create_agent_key('theo')
+
+
+def _vote_mail(to_id, text):
+    try:
+        result = _http_json('POST', SELF_BASE_URL, '/api/mail/send',
+                            {'toId': to_id, 'text': text[:2000]},
+                            _vote_theo_key(), timeout=30)
+        return isinstance(result, dict) and result.get('ok')
+    except Exception:
+        return False
+
+
+def _vote_telegram(text):
+    # The operator reads the ballot on Telegram (their explicit delivery
+    # preference). _telegram_send_text_sync caps at 4000 chars per message,
+    # so chunk; each call is a blocking HTTP round-trip, so this runs in its
+    # own thread -- never on the event loop.
+    sent = 0
+    text = text or ''
+    for start in range(0, len(text), 3900):
+        try:
+            if _telegram_send_text_sync(text[start:start + 3900]):
+                sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+def _vote_deliver(player_text, ruth_note):
+    # Fire-and-forget fan-out in a daemon thread: two mails + Telegram, all
+    # blocking calls that must stay off the event loop.
+    def _send():
+        if player_text:
+            _vote_mail('player', player_text)
+            _vote_telegram(player_text)
+        if ruth_note:
+            _vote_mail(_VOTE_COORDINATOR_ID, ruth_note)
+    threading.Thread(target=_send, daemon=True, name='vote-deliver').start()
 
 
 def _vote_chat_on(band, messages, max_tokens, timeout=90):
@@ -186,19 +246,11 @@ def _vote_cluster_hash(title, claim):
 
 
 def _vote_proposal_text(p, idx):
-    return (f"{idx}. title: {p['title']}\n   claim: {p['claim']}\n"
+    return (f"{idx}. [{p['id']}] {p['title']}\n"
+            f"   claim: {p['claim']}\n"
             f"   proposed action: {p['action']}\n   source: {p['source']}\n"
-            f"   estimated cost: ${p['est_cost']:.2f}")
-
-
-def _vote_mail_ruth(text):
-    try:
-        result = _http_json('POST', SELF_BASE_URL, '/api/mail/send',
-                            {'toId': _VOTE_COORDINATOR_ID, 'text': text[:2000]},
-                            _vote_theo_key(), timeout=30)
-        return isinstance(result, dict) and result.get('ok')
-    except Exception:
-        return False
+            f"   estimated cost: ${p['est_cost']:.2f}  confidence: "
+            f"{p['confidence']:.2f}")
 
 
 def _vote_decide(p, status, note):
@@ -235,9 +287,8 @@ def _vote_screen(p):
 
 
 def _vote_quorum_ballot(rubric_name, rubric_text, batch):
-    # Returns {proposal_id: (vote, reason)} for the batch, keyed by the REAL
-    # proposal id (the prompt numbers them 1..n and the model's numeric ids
-    # map back through the batch).
+    # Returns {proposal_id: (vote, reason)} for the batch: the prompt numbers
+    # them 1..n and the model's numeric ids map back through the batch.
     user = '\n\n'.join(_vote_proposal_text(p, i + 1)
                        for i, p in enumerate(batch))
     reply = _vote_chat_on(
@@ -312,6 +363,183 @@ def _vote_run_quorum(passing):
     return decided
 
 
+def _vote_process_items(rows):
+    # The decision pipeline for a batch of ballot rows. Runs in its OWN
+    # thread: model calls here are blocking and can take minutes under
+    # transport failures; they must never stall the server's event loop.
+    passing = []
+    for p in rows:
+        try:
+            if p['est_cost'] >= _VOTE_ESCALATE_COST:
+                _vote_mail(_VOTE_COORDINATOR_ID,
+                           f"VOTE ESCALATION (expensive, no ballot run): "
+                           f"{p['title']} est ${p['est_cost']:.2f}. "
+                           f"Claim: {p['claim']}")
+                _vote_decide(p, 'escalated',
+                             f"est_cost ${p['est_cost']:.2f} over threshold")
+                continue
+            if p['confidence'] >= _VOTE_AUTO_FILE_CONFIDENCE and \
+                    p['est_cost'] <= _VOTE_AUTO_FILE_MAX_COST:
+                _vote_mail(_VOTE_COORDINATOR_ID,
+                           f"FILE (high-confidence proposal, no quorum needed): "
+                           f"{p['action']} -- from {p['source']}: {p['title']}")
+                _vote_decide(p, 'filed', 'auto-filed: confidence/cost thresholds')
+                continue
+            screen = _vote_screen(p)
+            if screen is None:
+                _vote_decide(p, 'deferred', 'screener unavailable after failure')
+                continue
+            verdict, reason = screen
+            if verdict == 'reject':
+                _vote_decide(p, 'screened_out', f'screener: {reason}')
+                continue
+            passing.append(p)
+        except Exception as e:   # one bad proposal never kills the batch
+            _vote_decide(p, 'deferred', f'processing error: {e}'[:300])
+    if passing:
+        for p, status, note in _vote_run_quorum(passing):
+            _vote_decide(p, status, note)
+            if status == 'filed':
+                _vote_mail(_VOTE_COORDINATOR_ID,
+                           f"FILE (proposal, quorum approved): {p['action']} "
+                           f"-- from {p['source']}: {p['title']}")
+            elif status == 'escalated':
+                _vote_mail(_VOTE_COORDINATOR_ID,
+                           f"VOTE SPLIT on {p['title']}: novelty and cost "
+                           f"voters disagree -- decide or refile. "
+                           f"Claim: {p['claim']}")
+
+
+# --- weekly cycle -----------------------------------------------------------
+
+def _vote_week_key(ts=None):
+    return time.strftime('%G-W%V', time.localtime(ts or time.time()))
+
+
+def _vote_publish_moment():
+    # Epoch of this week's Monday 09:00 local.
+    lt = time.localtime()
+    monday = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday - lt.tm_wday,
+                          _VOTE_PUBLISH_HOUR, 0, 0, 0, 0, -1))
+    return monday
+
+
+def _vote_get_week(week_key):
+    with _vote_db() as conn:
+        row = conn.execute('SELECT * FROM vote_weeks WHERE week_key = ?',
+                           (week_key,)).fetchone()
+        if not row:
+            conn.execute('INSERT INTO vote_weeks (week_key) VALUES (?)',
+                         (week_key,))
+            row = conn.execute('SELECT * FROM vote_weeks WHERE week_key = ?',
+                               (week_key,)).fetchone()
+    return dict(row)
+
+
+def _vote_ballot_paper(week_key):
+    with _vote_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM vote_proposals WHERE ballot_week = ? '
+            'ORDER BY created_ts', (week_key,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _vote_publish(week_key, by):
+    # Move every pending proposal onto this week's ballot and deliver the
+    # paper to the player (mail + Telegram) AND the coordinator. Publishing
+    # twice is an AMENDMENT: the paper already went out, so new pendings join
+    # the open ballot and a fresh copy is delivered (the veto window still
+    # runs from the first publish). Once the week has voted, nothing moves.
+    now = time.time()
+    with _vote_db() as conn:
+        week_row = conn.execute('SELECT * FROM vote_weeks WHERE week_key = ?',
+                                (week_key,)).fetchone()
+        if week_row and week_row['voted_ts'] is not None:
+            return None   # week closed
+        fresh = conn.execute(
+            'UPDATE vote_weeks SET published_ts = ? WHERE week_key = ? '
+            'AND published_ts IS NULL', (now, week_key)).rowcount
+        rows = conn.execute(
+            "SELECT * FROM vote_proposals WHERE status = 'pending' "
+            'ORDER BY created_ts').fetchall()
+        for r in rows:
+            conn.execute(
+                'UPDATE vote_proposals SET status = "balloted", '
+                'ballot_week = ? WHERE id = ? AND status = "pending"',
+                (week_key, r['id']))
+    rows = [dict(r) for r in rows]
+    amended = not fresh
+    if not rows:
+        if amended:
+            return []   # nothing new to add to an already-published ballot
+        body = (f'Weekly vote ballot {week_key}: no proposals were queued '
+                f'this week; no vote will run.')
+        _vote_deliver(body, f'Ballot {week_key} published (0 items).')
+        _vote_log('vote_ballot_published', f'{week_key} by {by}: 0 items')
+        return []
+    paper = '\n\n'.join(_vote_proposal_text(p, i + 1)
+                        for i, p in enumerate(rows))
+    if amended:
+        body = (f'Ballot {week_key} AMENDED -- {len(rows)} new item(s) joined '
+                f'the open ballot (48h review window still runs from the '
+                f'first publish; reply to oppose any item):\n\n{paper}')
+    else:
+        body = (f'Weekly vote ballot {week_key} -- {len(rows)} item(s) will '
+                f'be voted after the 48-hour review window. Reply to oppose '
+                f'any item (strike it from the ballot):\n\n{paper}')
+    _vote_deliver(body,
+                  f'Ballot {week_key} {"amended" if amended else "published"} '
+                  f'({len(rows)} item(s)); vote runs after the 48h window.')
+    _vote_log('vote_ballot_amended' if amended else 'vote_ballot_published',
+              f'{week_key} by {by}: {len(rows)} item(s)')
+    return rows
+
+
+def _vote_execute(week_key, by):
+    # Claim this week's non-vetoed ballot items and run the pipeline in a
+    # background thread; the week closes (voted_ts + result mail) when the
+    # thread finishes.
+    with _vote_db() as conn:
+        open_week = conn.execute(
+            'UPDATE vote_weeks SET voted_ts = ? WHERE week_key = ? '
+            'AND published_ts IS NOT NULL AND voted_ts IS NULL',
+            (time.time(), week_key)).rowcount
+        if not open_week:
+            return None   # nothing to vote, or already voted this week
+        rows = conn.execute(
+            "SELECT * FROM vote_proposals WHERE ballot_week = ? AND "
+            "status = 'balloted' ORDER BY created_ts", (week_key,)).fetchall()
+        for r in rows:
+            conn.execute(
+                'UPDATE vote_proposals SET status = "processing", '
+                'processing_ts = ? WHERE id = ?', (time.time(), r['id']))
+
+    def _run_and_close():
+        _vote_process_items(rows)
+        with _vote_db() as conn:
+            conn.execute('UPDATE vote_weeks SET voted_ts = ? WHERE week_key = ?',
+                         (time.time(), week_key))
+        summary = _vote_week_summary(week_key)
+        _vote_deliver(f'Vote results for {week_key}:\n\n{summary}',
+                      f'Vote closed for {week_key}.')
+        _vote_log('vote_week_closed', f'{week_key} by {by}: {summary[:400]}')
+
+    threading.Thread(target=_run_and_close, daemon=True,
+                     name='vote-week').start()
+    return len(rows)
+
+
+def _vote_week_summary(week_key):
+    with _vote_db() as conn:
+        rows = conn.execute(
+            'SELECT * FROM vote_proposals WHERE ballot_week = ? '
+            'ORDER BY created_ts', (week_key,)).fetchall()
+    lines = []
+    for r in rows:
+        lines.append(f"- [{r['status']}] {r['title'][:90]}")
+    return '\n'.join(lines) or '(no items)'
+
+
 @app.post('/api/vote/propose')
 async def api_vote_propose(request: Request):
     actor = _vote_actor(request)
@@ -354,96 +582,148 @@ async def api_vote_propose(request: Request):
             (pid, source, title, claim, action, est_cost, confidence,
              chash, 'pending', now))
     _vote_log('vote_proposed', f'{pid} by {actor}: {title[:120]}')
-    return JSONResponse({'ok': True, 'proposalId': pid, 'status': 'pending'})
+    return JSONResponse({'ok': True, 'proposalId': pid, 'status': 'pending',
+                         'note': 'queued for the weekly ballot; the ballot is '
+                                 'published Monday 09:00 and voted 48h later'})
 
 
-def _vote_process_claimed(rows):
-    # Runs in its OWN thread: model calls here are blocking and can take
-    # minutes under transport failures; they must never stall the server's
-    # event loop (the first inline version froze the whole server mid-run).
-    passing = []
-    for p in rows:
-        try:
-            if p['est_cost'] >= _VOTE_ESCALATE_COST:
-                _vote_mail_ruth(
-                    f"VOTE ESCALATION (expensive, no ballot run): "
-                    f"{p['title']} est ${p['est_cost']:.2f}. Claim: {p['claim']}")
-                _vote_decide(p, 'escalated',
-                             f"est_cost ${p['est_cost']:.2f} over threshold")
-                continue
-            if p['confidence'] >= _VOTE_AUTO_FILE_CONFIDENCE and \
-                    p['est_cost'] <= _VOTE_AUTO_FILE_MAX_COST:
-                _vote_mail_ruth(
-                    f"FILE (high-confidence feed proposal, no quorum needed): "
-                    f"{p['action']} -- from {p['source']}: {p['title']}")
-                _vote_decide(p, 'filed', 'auto-filed: confidence/cost thresholds')
-                continue
-            screen = _vote_screen(p)
-            if screen is None:
-                _vote_decide(p, 'deferred', 'screener unavailable after failure')
-                continue
-            verdict, reason = screen
-            if verdict == 'reject':
-                _vote_decide(p, 'screened_out', f'screener: {reason}')
-                continue
-            passing.append(p)
-        except Exception as e:   # one bad proposal never kills the batch
-            _vote_decide(p, 'deferred', f'processing error: {e}'[:300])
-    if passing:
-        for p, status, note in _vote_run_quorum(passing):
-            _vote_decide(p, status, note)
-            if status == 'filed':
-                _vote_mail_ruth(
-                    f"FILE (feed proposal, quorum approved): {p['action']} "
-                    f"-- from {p['source']}: {p['title']}")
-            elif status == 'escalated':
-                _vote_mail_ruth(
-                    f"VOTE SPLIT on {p['title']}: novelty and cost voters "
-                    f"disagree -- decide or refile. Claim: {p['claim']}")
+@app.post('/api/vote/weekly')
+async def api_vote_weekly(request: Request):
+    # The cron tick (any authenticated caller): the SERVER owns the schedule,
+    # the tick just advances it. Publishes the weekly ballot when due, then
+    # runs the vote once the veto window has closed.
+    if not _vote_actor(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    week = _vote_week_key()
+    row = _vote_get_week(week)
+    now = time.time()
+    if row['published_ts'] is None:
+        due = _vote_publish_moment()
+        if now >= due:
+            items = _vote_publish(week, 'scheduled')
+            return JSONResponse({'ok': True, 'week': week, 'phase': 'published',
+                                 'items': len(items or [])})
+        return JSONResponse({'ok': True, 'week': week, 'phase': 'collecting',
+                             'publishDueAt': due})
+    if row['voted_ts'] is None:
+        ends = row['published_ts'] + _VOTE_VETO_WINDOW
+        if now >= ends:
+            n = _vote_execute(week, 'scheduled')
+            if n is None:
+                return JSONResponse({'ok': True, 'week': week,
+                                     'phase': 'nothing-to-vote'})
+            return JSONResponse({'ok': True, 'week': week, 'phase': 'voting',
+                                 'items': n})
+        return JSONResponse({'ok': True, 'week': week, 'phase': 'ballot-open',
+                             'vetoWindowEnds': ends})
+    return JSONResponse({'ok': True, 'week': week, 'phase': 'done'})
 
 
-_VOTE_PROCESS_STALE = 600.0   # seconds before an abandoned 'processing' claim is re-takeable
+@app.post('/api/vote/publish')
+async def api_vote_publish(request: Request):
+    # Publish the ballot early (director / chief of staff / player).
+    actor, authority = _vote_authority(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    if not authority:
+        return JSONResponse(
+            {'error': 'publishing the ballot is a director or chief-of-staff '
+                      'decision'}, status_code=403)
+    week = _vote_week_key()
+    rows = _vote_publish(week, f'early:{actor}')
+    if rows is None:
+        return JSONResponse({'ok': True, 'week': week,
+                             'note': 'already published this week'})
+    return JSONResponse({'ok': True, 'week': week, 'published': len(rows)})
 
 
 @app.post('/api/vote/run')
 async def api_vote_run(request: Request):
-    actor = _vote_actor(request)
+    # Run this week's vote. Off-cycle (before the veto window closes) this is
+    # an explicit director/chief-of-staff/player call and is logged as such.
+    actor, authority = _vote_authority(request)
     if not actor:
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    if not authority:
+        return JSONResponse(
+            {'error': 'vote runs are called by a director or the '
+                      'chief of staff'}, status_code=403)
     try:
         body = await request.json()
     except Exception:
         body = {}
-    try:
-        limit = max(1, min(int(body.get('limit') or _VOTE_RUN_LIMIT_DEFAULT),
-                           _VOTE_RUN_LIMIT_MAX))
-    except (TypeError, ValueError):
-        limit = _VOTE_RUN_LIMIT_DEFAULT
+    week = _vote_week_key()
+    row = _vote_get_week(week)
     now = time.time()
-    with _vote_db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM vote_proposals WHERE status = 'pending' OR "
-            "(status = 'processing' AND (processing_ts IS NULL OR "
-            'processing_ts < ?)) ORDER BY created_ts LIMIT ?',
-            (now - _VOTE_PROCESS_STALE, limit)).fetchall()
-        if not rows:
-            return JSONResponse({'ok': True, 'claimed': 0})
-        ids = [r['id'] for r in rows]
-        marks = ','.join('?' * len(ids))
-        conn.execute(
-            f'UPDATE vote_proposals SET status = "processing", processing_ts = ? '
-            f'WHERE id IN ({marks})',   # nosec B608 -- placeholders are parameterized
-            (now, *ids))
-    thread = threading.Thread(target=_vote_process_claimed, args=(rows,),
-                              daemon=True, name='vote-run')
-    thread.start()
-    _vote_log('vote_run_claimed',
-              f'{len(rows)} proposal(s) claimed by {actor}: '
-              f'{", ".join(ids[:5])}{"..." if len(ids) > 5 else ""}')
-    return JSONResponse({'ok': True, 'claimed': len(ids),
-                         'ids': ids,
+    if row['published_ts'] is None:
+        _vote_publish(week, f'pre-run:{actor}')
+        row = _vote_get_week(week)
+    if row['voted_ts'] is not None:
+        return JSONResponse({'ok': False, 'week': week,
+                             'error': 'this week already voted'}, status_code=409)
+    off_cycle = now < row['published_ts'] + _VOTE_VETO_WINDOW
+    if off_cycle:
+        _vote_log('vote_off_cycle', f'{week} forced early by {actor}')
+    n = _vote_execute(week, actor)
+    if n is None:
+        return JSONResponse({'ok': True, 'week': week,
+                             'note': 'nothing left to vote this week'})
+    return JSONResponse({'ok': True, 'week': week, 'items': n,
+                         'offCycle': off_cycle,
                          'note': 'processing in background; watch '
-                                 'GET /api/vote/proposals?status=processing'})
+                                 'GET /api/vote/ballot'})
+
+
+@app.post('/api/vote/veto')
+async def api_vote_veto(request: Request):
+    # The operator's advance-review power: strike an item from the open
+    # ballot before the vote. Player session or director/chief of staff.
+    actor, authority = _vote_authority(request)
+    if not actor:
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    if not authority:
+        return JSONResponse(
+            {'error': 'vetoes come from the player or a director'}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    pid = (body.get('proposalId') or '').strip()
+    reason = (body.get('reason') or '').strip()[:300] or 'no reason given'
+    week = _vote_week_key()
+    with _vote_db() as conn:
+        row = conn.execute('SELECT * FROM vote_proposals WHERE id = ?',
+                           (pid,)).fetchone()
+        if not row or row['ballot_week'] != week:
+            return JSONResponse(
+                {'error': 'item is not on the current ballot'}, status_code=404)
+        if row['status'] != 'balloted':
+            return JSONResponse(
+                {'error': f'item is {row["status"]}, not on the open ballot'},
+                status_code=409)
+        conn.execute(
+            'UPDATE vote_proposals SET status = "vetoed", decided_ts = ? '
+            'WHERE id = ?', (time.time(), pid))
+    _vote_log('vote_vetoed', f'{pid} by {actor}: {reason}')
+    _vote_mail(_VOTE_COORDINATOR_ID,
+               f'Operator veto on ballot {week}: "{row["title"]}" struck '
+               f'({reason}).')
+    return JSONResponse({'ok': True, 'proposalId': pid, 'status': 'vetoed'})
+
+
+@app.get('/api/vote/ballot')
+async def api_vote_ballot(request: Request):
+    if not _vote_actor(request):
+        return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
+    week = _vote_week_key()
+    row = _vote_get_week(week)
+    return JSONResponse({'ok': True, 'week': week,
+                         'publishedTs': row['published_ts'],
+                         'votedTs': row['voted_ts'],
+                         'vetoWindowEnds': (row['published_ts'] +
+                                            _VOTE_VETO_WINDOW
+                                            if row['published_ts'] else None),
+                         'items': _vote_ballot_paper(week)})
 
 
 @app.get('/api/vote/proposals')
