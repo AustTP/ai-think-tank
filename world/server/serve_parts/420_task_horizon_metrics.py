@@ -543,10 +543,12 @@ def _persist_new_health_alerts(alerts):
     now = time.time()
     persisted = []
     with _db() as conn:
-        prior = set(conn.execute(
+        prior = {(r[0], r[1]) for r in conn.execute(
             'SELECT category, severity FROM health_alerts WHERE ts > ?',
             (now - HEALTH_ALERT_DEDUP_WINDOW_S,),
-        ).fetchall())
+        ).fetchall()}   # value tuples: row objects hash by identity, so a
+        # bare set(fetchall()) never matched on the postgres backend and
+        # re-pushed the same alerts every pass
         for a in alerts:
             key = (a['category'], a['severity'])
             if key in prior:
