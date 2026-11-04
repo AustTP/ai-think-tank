@@ -433,10 +433,10 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
         # mailbox for her next natural work cycle.
         text = str((payload or {}).get('text') or '')
         # Mailbox entries carry a "Sender: " prefix (the API path formats
-        # f'{from_name}: {text}'), so anchor on a HANDOFF LINE, not the
-        # string start (MULTILINE). HANDOFF is one line by convention.
-        m = re.search(r'^\s*HANDOFF:?[ \t]*:?[ \t]*(.+?)[ \t]*$', text,
-                      re.MULTILINE)
+        # f'{from_name}: {text}') and a HANDOFF request may be a single long
+        # line, so tolerate an optional short sender prefix before the marker.
+        m = re.search(r'^(?:\s*[A-Za-z][A-Za-z ]{0,18}: )?\s*HANDOFF:?[ \t]*:?[ \t]*(.+)$',
+                      text, re.DOTALL)
         if not m:
             return True
         request = m.group(1).strip()

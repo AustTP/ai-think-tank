@@ -101,9 +101,12 @@ def test_unroutable_wake_is_completed():
 
 def test_agent_mail_handoff_queues_pinned_research_card():
     state = {'workQueue': []}
+    # API-path mail carries a sender prefix on the SAME line; the marker
+    # must still be recognized after it.
     assert sim._queue_mail_work(
         state, 'ruth', 'agent_mail',
-        {'text': 'HANDOFF: review @dankornas tweets and report.'}, 5000) is True
+        {'text': 'Theo: HANDOFF: review @dankornas tweets and report.'},
+        5000) is True
     assert len(state['workQueue']) == 1
     card = state['workQueue'][0]
     assert card['assignedTo'] == 'ruth'
