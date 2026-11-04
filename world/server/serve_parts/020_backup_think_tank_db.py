@@ -565,6 +565,15 @@ def get_state_from_db(archive_merge='copy'):
               (serialize-and-return handlers, single-key readers). Cuts the
               merge to a dict spread; a mutating caller would silently
               corrupt the archive cache and lose changes on restart.
+      'none'  -- the archive is NOT merged at all: state['tasks'] holds only
+              the live blob's tasks. For callers that never read tasks
+              (roster/village lookups, sandbox id remaps). Observed
+              2026-11-04: the execute pipeline's _village_sandbox_id paid a
+              ~1.9s whole-archive deepcopy ON THE EVENT LOOP per run while
+              needing only the roster -- the loop stalled behind every
+              execute and HTTP health checks timed out. A 'none' reader that
+              DOES touch tasks sees a truncated view: never use it where
+              task ids are resolved.
     """
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
@@ -572,7 +581,8 @@ def get_state_from_db(archive_merge='copy'):
             return None
         data = json.loads(row[0])
     _merge_extracted_sections(data)
-    _merge_archived_tasks(data, mode=archive_merge)
+    if archive_merge != 'none':
+        _merge_archived_tasks(data, mode=archive_merge)
     return data
 
 

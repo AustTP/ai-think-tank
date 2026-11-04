@@ -267,7 +267,10 @@ def _director_of_agent(agent_id, state=None):
         return None
     try:
         if state is None:
-            state = _serve.get_state_from_db() or {}
+            # Roster-only lookup: skip the whole-archive merge (the copy-mode
+            # read costs ~1.9s of deepcopy and runs on the event loop inside
+            # the chat handler's spend accrual).
+            state = _serve.get_state_from_db(archive_merge='none') or {}
     except Exception:
         return None
     for d in (state.get('agentRoster') or []):

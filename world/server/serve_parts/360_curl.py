@@ -792,7 +792,11 @@ def _village_sandbox_id(agent_id, sandbox_id, state=None):
     versa. The repo is provisioned lazily by _sandbox_dir_for."""
     if not sandbox_id or not agent_id or agent_id == 'player':
         return sandbox_id
-    state = state if state is not None else get_state_from_db()
+    # 'none' merge (2026-11-04): this lookup reads ONLY the roster and one
+    # agent field; the default copy-mode read deep-copies the whole 6k-task
+    # archive (~1.9s) and runs on the event loop inside every execute
+    # pipeline -- the stalls that made HTTP health checks time out.
+    state = state if state is not None else get_state_from_db(archive_merge='none')
     if not state or _is_admin(state, agent_id):
         return sandbox_id
     import village.sim_helpers as _sh
