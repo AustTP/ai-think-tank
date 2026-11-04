@@ -196,7 +196,7 @@ class ModelTierRefreshLoop(unittest.TestCase):
         self._run_loop(
             refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
             get_cached_model_tiers=tiers,
-            get_state_from_db=lambda: state,
+            get_state_from_db=lambda *a, **k: state,
             log_action=unittest.mock.DEFAULT,
             _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),
         )
@@ -214,7 +214,7 @@ class ModelTierRefreshLoop(unittest.TestCase):
         self._run_loop(
             refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
             get_cached_model_tiers=tiers,
-            get_state_from_db=lambda: state,
+            get_state_from_db=lambda *a, **k: state,
             log_action=unittest.mock.DEFAULT,
             _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),
         )
@@ -226,7 +226,7 @@ class ModelTierRefreshLoop(unittest.TestCase):
         self._run_loop(
             refresh_model_tiers=unittest.mock.AsyncMock(return_value={'high': {'id': 'high-model'}}),
             get_cached_model_tiers=tiers,
-            get_state_from_db=lambda: {'agentRoster': []},
+            get_state_from_db=lambda *a, **k: {'agentRoster': []},
             log_action=unittest.mock.DEFAULT,
             _auto_failover_jev_if_gone=unittest.mock.AsyncMock(),
         )

@@ -115,7 +115,7 @@ def _player_env(state=None, **patches):
 def _agent_env(state=None, requester="agent-1", key_ok=True):
     return unittest.mock.patch.multiple(
         serve,
-        get_state_from_db=lambda: state,
+        get_state_from_db=lambda *a, **k: state,
         verify_session=lambda cookie: True,
         _resolve_requester=lambda request: requester,
         verify_agent_key=lambda *a, **k: True if key_ok else "mismatch",

@@ -116,7 +116,7 @@ def _no_session_env(state=None):
     """Unauthenticated caller: no valid session, no agent key."""
     return unittest.mock.patch.multiple(
         serve,
-        get_state_from_db=lambda: state,
+        get_state_from_db=lambda *a, **k: state,
         verify_session=lambda cookie: False,
     )
 
@@ -124,7 +124,7 @@ def _no_session_env(state=None):
 def _agent_env(state=None, requester="agent-1", key_ok=True):
     return unittest.mock.patch.multiple(
         serve,
-        get_state_from_db=lambda: state,
+        get_state_from_db=lambda *a, **k: state,
         verify_session=lambda cookie: True,
         _resolve_requester=lambda request: requester,
         verify_agent_key=lambda *a, **k: True if key_ok else "mismatch",

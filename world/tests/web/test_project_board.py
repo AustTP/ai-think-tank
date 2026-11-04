@@ -34,7 +34,7 @@ class ProjectBoard(unittest.TestCase):
             f.write('x')
         self.patcher = unittest.mock.patch.multiple(
             serve, LIBRARY_DIR=self.library,
-            get_state_from_db=lambda: self.state,
+            get_state_from_db=lambda *a, **k: self.state,
         )
         self.patcher.start()
 

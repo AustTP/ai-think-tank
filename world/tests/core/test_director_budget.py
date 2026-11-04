@@ -91,7 +91,7 @@ def _state():
 def _bank_env(state, ledger):
     return unittest.mock.patch.multiple(
         serve,
-        get_state_from_db=lambda: state,
+        get_state_from_db=lambda *a, **k: state,
         _spend_ledger_read=lambda: ledger,
         _spend_ledger_write=lambda ledger: None,
     )

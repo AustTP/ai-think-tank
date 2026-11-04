@@ -115,7 +115,7 @@ def _player_env(state=None, **patches):
 def _agent_env(state=None, requester="agent-1", key_ok=True):
     return unittest.mock.patch.multiple(
         serve,
-        get_state_from_db=lambda: state,
+        get_state_from_db=lambda *a, **k: state,
         verify_session=lambda cookie: True,
         _resolve_requester=lambda request: requester,
         verify_agent_key=lambda *a, **k: True if key_ok else "mismatch",
@@ -380,7 +380,7 @@ class ProvisionPlayerEmail(unittest.TestCase):
         # session) must still not provision email: the handler is
         # session-gated.
         with unittest.mock.patch.multiple(
-                serve, get_state_from_db=lambda: state,
+                serve, get_state_from_db=lambda *a, **k: state,
                 verify_session=lambda cookie: False,
                 _valid_agent_key_presented=lambda key: True):
             r = _post(_client(), "/api/player-email/credential",
@@ -421,7 +421,7 @@ class TestPlayerEmail(unittest.TestCase):
         # session) must still not send player email: the handler is
         # session-gated.
         with unittest.mock.patch.multiple(
-                serve, get_state_from_db=lambda: state,
+                serve, get_state_from_db=lambda *a, **k: state,
                 verify_session=lambda cookie: False,
                 _valid_agent_key_presented=lambda key: True):
             r = _post(_client(), "/api/player-email/test", {},
