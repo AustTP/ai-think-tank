@@ -424,6 +424,32 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
         return _requeue_card_task(state, agent_id, issue_key, now_ms)
     if task_id:
         return _requeue_task_for_agent(state, agent_id, task_id, now_ms)
+    if kind == 'agent_mail':
+        # Direct agent-to-agent mail (2026-11-04). A `HANDOFF:` request files
+        # one research card pinned to the recipient (the wake must produce
+        # work; a woken agent with no task just idles and re-parks).
+        # Conversation mail returns True WITHOUT a card: the marker clears
+        # (so the park pass can rest her again) and the text stays in her
+        # mailbox for her next natural work cycle.
+        text = str((payload or {}).get('text') or '')
+        m = re.match(r'^\s*HANDOFF:?[:\s]*(.+)$', text, re.DOTALL)
+        if not m:
+            return True
+        request = m.group(1).strip()
+        queue = state.get('workQueue')
+        if not isinstance(queue, list):
+            return False
+        queue.append({
+            'title': ('HANDOFF: ' + request.splitlines()[0])[:80],
+            'room': None,
+            'instructions': request,
+            'goal': None,
+            'taskType': 'research',
+            'assignedTo': agent_id,  # wake-on-mail pin: THIS agent works it
+            '_mailResume': True,
+            'notBefore': now_ms,
+        })
+        return True
     return False
 
 

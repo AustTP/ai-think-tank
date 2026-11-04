@@ -99,6 +99,27 @@ def test_unroutable_wake_is_completed():
     assert '_mailAwake' not in state['agents']['ada']
 
 
+def test_agent_mail_handoff_queues_pinned_research_card():
+    state = {'workQueue': []}
+    assert sim._queue_mail_work(
+        state, 'ruth', 'agent_mail',
+        {'text': 'HANDOFF: review @dankornas tweets and report.'}, 5000) is True
+    assert len(state['workQueue']) == 1
+    card = state['workQueue'][0]
+    assert card['assignedTo'] == 'ruth'
+    assert card['taskType'] == 'research'
+    assert 'dankornas' in card['instructions']
+    assert card['title'].startswith('HANDOFF: ')
+
+
+def test_agent_mail_conversation_queues_no_card():
+    state = {'workQueue': []}
+    assert sim._queue_mail_work(
+        state, 'ruth', 'agent_mail', {'text': 'Thanks for the review!'},
+        5000) is True
+    assert state['workQueue'] == []
+
+
 def test_complete_for_agent_without_match_is_false():
     assert sim._wake_complete_for_agent({}, 'ada', 'notice', {}, 'done', 1) is False
 
