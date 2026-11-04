@@ -505,9 +505,16 @@ def _queue_peer_repair(state, parent, rationale=None):
         for r in (parent.get('peerReviews') or [])[-2:]
         if r.get('verdict') == 'actionable')
     feedback = rationale or 'Address the rejected peer-review findings.'
+    # Carry the parent's ORIGINAL instructions (2026-11-04): a Fix card that
+    # only restates the refusal gives the author no work spec, so she ships a
+    # placeholder and the repair loop spins. Cap it so the card stays lean.
+    original = str(parent.get('instructions') or '').strip()
+    if len(original) > 1500:
+        original = original[:1500] + ' …[truncated]'
     instructions = (feedback + '\n' + findings
                     + f"\nOriginal deliverable: {parent.get('title')}"
                     + f"\nExisting Library document: {parent.get('libraryPath') or 'not yet saved'}."
+                    + '\nOriginal request instructions:\n' + (original or '(not recorded)')
                     + '\nSave the corrected deliverable and meet the original acceptance criteria before requesting review.')
     item = {
         'title': 'Fix: ' + str(parent.get('title') or tid),
