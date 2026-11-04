@@ -120,8 +120,12 @@ def _vote_actor(request):
 
 
 def _vote_log(action, details, agent_id='vote-service'):
+    # action_log lives in the tank's OWN backend (postgres on this host) --
+    # writing it through the service-local sqlite handle silently landed the
+    # rows in a stale sqlite table the operator never reads. _db() is the
+    # backend-aware handle the rest of the tank audits through.
     try:
-        with _vote_db() as conn:
+        with _db() as conn:
             conn.execute(
                 'INSERT INTO action_log (agent_id, action, details, '
                 'authorized, ts, trace_id) VALUES (?, ?, ?, 1, ?, NULL)',
