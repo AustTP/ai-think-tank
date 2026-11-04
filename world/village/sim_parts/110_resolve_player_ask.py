@@ -329,12 +329,15 @@ def _upsert_rejection_mailbox(agent, entry):
     _append_mailbox(agent, entry)
 
 
-def _deliver_mail(state, agent_id, kind, payload=None):
+def _deliver_mail(state, agent_id, kind, payload=None, route_if_idle=True):
     """File one action-needed mail item into an agent's mailbox. If the
     recipient is OFF-DUTY, wake her (appear_from_outskirts -- lazily loads
     geometry, clears stale busy/task) and set `_mailAwake` so the park-idle pass
-    does not re-park her before she has acted on the mail. Pure: mutates
-    `state` only. Returns True when dispatched, False for an unknown agent."""
+    does not re-park her before she has acted on the mail. 2026-11-04: an
+    AWAKE but IDLE recipient gets the same marker (mail to her used to sit
+    unread forever). Callers that already route or queue the work directly
+    (the watchdog event) pass route_if_idle=False. Pure: mutates `state`
+    only. Returns True when dispatched, False for an unknown agent."""
     now_ms = int(time.time() * 1000)
     a = (state.get('agents') or {}).get(agent_id)
     if not isinstance(a, dict):
@@ -350,10 +353,17 @@ def _deliver_mail(state, agent_id, kind, payload=None):
             if k in payload:
                 entry[k] = payload[k]
     _append_mailbox(a, entry)
-    if a.get('offDuty'):
-        # Wake the affected agent to act on the mail. Waking from an
-        # off-duty rest is the whole point of wake-on-mail.
-        appear_from_outskirts(state, agent_id)
+    # Wake the affected agent to act on the mail. Waking from an off-duty
+    # rest is the whole point of wake-on-mail. 2026-11-04: an AWAKE but IDLE
+    # agent (not busy, no task) needs the same routing -- mail to her used to
+    # sit unread forever, because only a queued card would ever give her a
+    # work cycle, and nothing queued one.
+    needs_wake = bool(a.get('offDuty')) or (route_if_idle and (
+        not a.get('busy') and not a.get('task')
+        and not a.get('handoff') and not a.get('pairWith')))
+    if needs_wake:
+        if a.get('offDuty'):
+            appear_from_outskirts(state, agent_id)
         a['_mailAwake'] = {'kind': kind, 'entry': entry, 'at': now_ms}
         _wake_enqueue(state, agent_id, kind, entry, now_ms)
     return True
@@ -511,7 +521,8 @@ def _deliver_watchdog_event(state, evt):
     if not senior_id:
         print('[sim] watchdog event: no senior director to notify', flush=True)
     else:
-        _deliver_mail(state, senior_id, 'sim_watchdog', {'text': text})
+        _deliver_mail(state, senior_id, 'sim_watchdog', {'text': text},
+                      route_if_idle=False)
         a = (state.get('agents') or {}).get(senior_id)
         if isinstance(a, dict) and not a.get('_mailAwake'):
             # On-duty: no marker, so route the pinned item now (an off-duty

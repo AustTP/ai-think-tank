@@ -136,6 +136,24 @@ class DeliverWatchdogEvent(unittest.TestCase):
 
 
 class MailActionStepUnroutable(unittest.TestCase):
+    def test_awake_idle_recipient_also_gets_routed(self):
+        # 2026-11-04: only OFF-DUTY agents used to wake on mail. An awake but
+        # idle agent (no task, queue empty) never got a work cycle, so a
+        # HANDOFF sat unread forever. She must be routed the same way.
+        st = _state()
+        st['agents']['nora']['offDuty'] = False
+        st['agents']['nora']['task'] = None
+        st['agents']['nora']['busy'] = False
+        st['workQueue'] = []
+        sim._deliver_mail(st, 'nora', 'agent_mail',
+                          {'text': 'Theo: HANDOFF: review tweets and report.'})
+        self.assertTrue(st['agents']['nora'].get('_mailAwake'))
+        sim._mail_action_step(st, 0, _NOW_MS)
+        self.assertEqual(len(st['workQueue']), 1)
+        card = st['workQueue'][0]
+        self.assertEqual(card['assignedTo'], 'nora')
+        self.assertIn('review tweets', card['instructions'])
+
     def test_unroutable_system_mail_clears_marker_without_queueing(self):
         st = _state()
         st['agents']['theo']['offDuty'] = True
