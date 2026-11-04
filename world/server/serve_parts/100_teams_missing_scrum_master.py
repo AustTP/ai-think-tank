@@ -447,6 +447,13 @@ OPENROUTER_MONTHLY_BUDGET_USD = float(_load_env().get('OPENROUTER_MONTHLY_BUDGET
 # thresholds.
 OPENROUTER_CREDITS_WARN_PCT = 0.20   # remaining <= 20% of live funds -> warning push
 OPENROUTER_CREDITS_CRIT_PCT = 0.10   # remaining <= 10% of live funds -> critical push
+# Dollar thresholds for the balance-led budget alert (2026-11-04): the
+# account is SHARED (the operator spends from it in OpenCode too), so a
+# percentage of lifetime deposits is meaningless -- the firm number is the
+# remaining balance itself. Warn at $10, go critical at the credits
+# watchdog's $5 pause floor.
+OPENROUTER_BALANCE_WARN_USD = 10.0
+OPENROUTER_BALANCE_CRIT_USD = 5.0
 # Credit watchdog: when the live OpenRouter balance is at or below this floor,
 # pause new model-dependent work, send one notice, and keep probing. When the
 # balance is restored, resume the queued work automatically. No hourly

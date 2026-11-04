@@ -585,37 +585,48 @@ class HealthChecks(unittest.TestCase):
             bank_over_cap=[], bank_used=4.0, bank_cap=100.0,
         )), [])
 
-    # --- OpenRouter live-deposit spend alerts -----------------------------
-    # Alerts fire on the LIVE account funds (percent of total_credits
-    # actually spent), not on the monthly plan. $10 deposited / $8 spent =
-    # 80% used -> warning; $9 spent = 90% -> critical. The monthly budget
-    # ($50 expected) is separate gauge context and never triggers these.
-    def test_openrouter_80pct_of_deposit_spent_raises_warning(self):
+    # --- OpenRouter balance alerts (2026-11-04 operator request) ----------
+    # The account is SHARED (the operator spends from it in OpenCode too), so
+    # a percentage of lifetime deposits is meaningless. The alert leads with
+    # the FIRM remaining balance in dollars: warn at <= $10, critical at the
+    # credits watchdog's $5 pause floor. The tank's month-to-date spend rides
+    # along as a secondary clause.
+    def test_balance_at_10_dollars_raises_warning(self):
         alerts = serve._health_alerts_for_signals(self._signals(
-            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 8.0, 'remaining': 2.0},
+            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 450.0,
+                                'remaining': 10.0},
             openrouter_api_key_set=True,
         ))
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['category'], 'budget')
         self.assertEqual(alerts[0]['severity'], 'warning')
-        self.assertIn('80%', alerts[0]['message'])
-        self.assertIn('8.00', alerts[0]['message'])
-        self.assertIn('10.00', alerts[0]['message'])
+        self.assertIn('10.00 remaining', alerts[0]['message'])
 
-    def test_openrouter_90pct_of_deposit_spent_raises_critical(self):
+    def test_balance_at_5_dollars_raises_critical(self):
         alerts = serve._health_alerts_for_signals(self._signals(
-            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 9.0, 'remaining': 1.0},
+            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 455.0,
+                                'remaining': 5.0},
             openrouter_api_key_set=True,
         ))
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['severity'], 'critical')
-        self.assertIn('90%', alerts[0]['message'])
 
-    def test_openrouter_below_80pct_spent_raises_nothing(self):
+    def test_balance_above_10_dollars_raises_nothing(self):
         self.assertEqual(serve._health_alerts_for_signals(self._signals(
-            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 7.9, 'remaining': 2.1},
+            openrouter_credits={'totalCredits': 474.0, 'totalUsage': 462.06,
+                                'remaining': 11.94},
             openrouter_api_key_set=True,
         )), [])
+
+    def test_month_spend_rides_along_as_a_clause(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            spend_month={'month': '2026-11', 'allServicesUsd': 8.49,
+                         'capUsd': 50.0, 'exceeded': False},
+            openrouter_credits={'totalCredits': 474.0, 'totalUsage': 462.06,
+                                'remaining': 11.94},
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(alerts, [])
 
     def test_openrouter_no_deposit_skips_the_divide(self):
         # Never-funded account: totalCredits == 0 must not divide by zero or
@@ -626,10 +637,11 @@ class HealthChecks(unittest.TestCase):
         )), [])
 
     def test_openrouter_monthly_budget_does_not_trigger_the_alert(self):
-        # The $50 monthly plan is planning context only -- a large plan with a
-        # healthy live deposit raises nothing.
+        # The $50 monthly plan is planning context only -- a healthy balance
+        # raises nothing regardless of the plan size.
         self.assertEqual(serve._health_alerts_for_signals(self._signals(
-            openrouter_credits={'totalCredits': 10.0, 'totalUsage': 1.0, 'remaining': 9.0},
+            openrouter_credits={'totalCredits': 474.0, 'totalUsage': 462.0,
+                                'remaining': 12.0},
             openrouter_monthly_budget_usd=50.0,
             openrouter_api_key_set=True,
         )), [])
@@ -642,48 +654,6 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]['severity'], 'info')
         self.assertIn('probe unavailable', alerts[0]['message'])
-
-    # --- MONTHLY budget view (2026-11-04 operator request) ----------------
-    # The budget alert leads with "spent this month / remaining this month"
-    # against the monthly cap; the lifetime deposit number is secondary
-    # context only and must never trigger by itself while the month is fine.
-    def test_month_view_80pct_spent_raises_warning(self):
-        alerts = serve._health_alerts_for_signals(self._signals(
-            spend_month={'month': '2026-11', 'allServicesUsd': 40.0,
-                         'capUsd': 50.0, 'exceeded': False},
-            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
-                                'remaining': 6.0},
-            openrouter_api_key_set=True,
-        ))
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]['category'], 'budget')
-        self.assertEqual(alerts[0]['severity'], 'warning')
-        self.assertIn('monthly budget', alerts[0]['message'])
-        self.assertIn('40.00', alerts[0]['message'])
-        self.assertIn('10.00 remaining this month', alerts[0]['message'])
-
-    def test_month_view_90pct_spent_raises_critical(self):
-        alerts = serve._health_alerts_for_signals(self._signals(
-            spend_month={'month': '2026-11', 'allServicesUsd': 46.0,
-                         'capUsd': 50.0, 'exceeded': False},
-            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
-                                'remaining': 6.0},
-            openrouter_api_key_set=True,
-        ))
-        self.assertEqual(len(alerts), 1)
-        self.assertEqual(alerts[0]['severity'], 'critical')
-
-    def test_healthy_month_never_triggers_on_lifetime_gauge(self):
-        # The operator's ask: a scary lifetime-deposit number must not spam
-        # alerts while THIS month's spend is fine.
-        self.assertEqual(serve._health_alerts_for_signals(self._signals(
-            spend_month={'month': '2026-11', 'allServicesUsd': 3.0,
-                         'capUsd': 50.0, 'exceeded': False},
-            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
-                                'remaining': 6.0},
-            openrouter_api_key_set=True,
-        )), [])
-
 
 class AgingInFlightWork(unittest.TestCase):
     """Admin gap 1: the health snapshot's mirror of sim's stale-work sweep --

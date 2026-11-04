@@ -682,51 +682,36 @@ def _health_alerts_for_signals(signals):
               f'${signals.get("bank_used", 0.0):.2f} of ${signals.get("bank_cap", 0.0):.2f} '
               f'cumulative; directors should reallocate or raise a cap')
 
-    # Budget alert (2026-11-04 operator request): lead with the MONTHLY
-    # picture -- spent this month vs the monthly cap and what remains -- and
-    # carry the OpenRouter account's lifetime balance only as secondary
-    # context (the account can still run dry mid-month; the credits watchdog
-    # pauses at its floor, so the hard stop stays covered). Thresholds key on
-    # the month view: 80% of the monthly cap warns, 90% goes critical, using
-    # the same knob values the deposit gauge used.
-    month = signals.get('spend_month') or {}
-    month_used = month.get('allServicesUsd')
-    month_cap = float(month.get('capUsd') or 0)
+    # Budget alert (2026-11-04 operator request, revised): the FIRM number is
+    # the OpenRouter account's remaining balance (purchased minus spent --
+    # money that actually buys calls). The $50 monthly cap is soft context:
+    # it only holds if the operator tops up. So the alert leads with the
+    # account balance in dollars, adds the tank's own month-to-date spend as
+    # one clause, and triggers on dollar thresholds aligned with the credits
+    # watchdog's $5 pause floor: warn at $10, critical at $5.
     credits = signals.get('openrouter_credits')
-    account_note = ''
+    remaining = None
+    account_msg = ''
     if credits and (credits.get('totalCredits') or 0) > 0:
         total = float(credits.get('totalCredits') or 0)
         used = float(credits.get('totalUsage') or 0)
-        account_note = (f' OpenRouter account balance: ${max(0.0, total - used):.2f} '
-                        f'left of ${total:.2f} ever deposited (lifetime).')
-    if month_cap > 0 and isinstance(month_used, (int, float)):
-        used_pct = float(month_used) / month_cap
-        remaining = max(0.0, month_cap - float(month_used))
-        spent_msg = (f'${float(month_used):.2f} of the ${month_cap:.2f} monthly budget '
-                     f'({used_pct:.0%} used), ${remaining:.2f} remaining this month')
-        if used_pct >= 0.90:
+        remaining = max(0.0, total - used)
+        account_msg = f'OpenRouter balance: ${remaining:.2f} remaining.'
+    month = signals.get('spend_month') or {}
+    month_used = month.get('allServicesUsd')
+    month_clause = ''
+    if isinstance(month_used, (int, float)):
+        month_clause = (f' Tank spend this month: ${float(month_used):.2f}'
+                        + (f' of the ${float(month.get("capUsd")):.2f} cap'
+                           if month.get('capUsd') else '') + '.')
+    if remaining is not None:
+        if remaining <= OPENROUTER_BALANCE_CRIT_USD:
             alert('budget', 'critical',
-                  f'OpenRouter spend this month: {spent_msg}.{account_note} '
-                  f'Top up or raise the monthly cap now or model calls will fail closed')
-        elif used_pct >= 0.80:
-            alert('budget', 'warning',
-                  f'OpenRouter spend this month: {spent_msg}.{account_note} '
-                  f'Top up soon or model calls will fail closed')
-    elif credits and (credits.get('totalCredits') or 0) > 0:
-        # No monthly cap configured: fall back to the lifetime-deposit gauge
-        # so an unfunded account still warns before failing closed.
-        total = float(credits.get('totalCredits') or 0)
-        used = float(credits.get('totalUsage') or 0)
-        used_pct = used / total
-        spent_msg = (f'${used:.2f} of the ${total:.2f} deposited ({used_pct:.0%} used), '
-                     f'${max(0.0, total - used):.2f} remaining')
-        if used_pct >= 1 - OPENROUTER_CREDITS_CRIT_PCT:
-            alert('budget', 'critical',
-                  f'OpenRouter has spent {used_pct:.0%} of deposited funds -- {spent_msg}. '
+                  f'{account_msg}{month_clause} '
                   f'Top up now or model calls will fail closed')
-        elif used_pct >= 1 - OPENROUTER_CREDITS_WARN_PCT:
+        elif remaining <= OPENROUTER_BALANCE_WARN_USD:
             alert('budget', 'warning',
-                  f'OpenRouter has spent {used_pct:.0%} of deposited funds -- {spent_msg}. '
+                  f'{account_msg}{month_clause} '
                   f'Top up soon or model calls will fail closed')
     elif not credits and signals.get('openrouter_api_key_set'):
         # Key is set but the probe yielded nothing (network failure or a
