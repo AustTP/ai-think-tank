@@ -695,10 +695,13 @@ def _reconcile_task_archive(done):
                         'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?) '
                         'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
                         (tid, json.dumps(t), now))
+                # INSIDE the with-block: _db() closes the connection on exit,
+                # so a prune placed after it would run against a dead handle
+                # and silently no-op (caught 2026-11-04 before first fire).
+                _prune_task_archive(conn)
         except sqlite3.OperationalError:
             return False
         cached.update(changed)
-        _prune_task_archive(conn)
         return True
 
 
