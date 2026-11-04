@@ -164,6 +164,14 @@ class CompletionEvidence(unittest.TestCase):
         self.assertIn('no saved Library artifact', st['tasks']['t']['failNote'])
         self.assertIsNone(st['agents']['a']['task'])
         self.assertFalse(st['agents']['a']['busy'])
+        # The refusal must queue the author's repair in the SAME mutation:
+        # the repair-flag sweep runs before the watchdog loop and pops a flag
+        # with no live repair child, which used to block the card forever.
+        fix_items = [q for q in st.get('workQueue') or []
+                     if q.get('reviewOf') == 't'
+                     and q.get('taskType') not in ('review', 'qa')]
+        self.assertEqual(len(fix_items), 1)
+        self.assertEqual(fix_items[0]['assignedTo'], 'a')
 
     def test_distill_refusal_names_the_missing_note(self):
         st = {

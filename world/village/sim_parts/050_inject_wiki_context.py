@@ -1070,6 +1070,17 @@ def finish_task(state, agent_id, grid=None):
             task['deliveryState'] = 'blocked'
             task['manualAttention'] = False
             task['_peerRepairPending'] = True
+            # Contract (completion_watchdog.sweep_stale_repair_flags): the
+            # flag survives only while a repair child is live. The sweep runs
+            # BEFORE the watchdog loop each tick, so setting the flag without
+            # queueing the child got it popped immediately and the card
+            # blocked forever ('Choose a recovery action'). Queue the author's
+            # repair in the same mutation, like every other flag-setter.
+            try:
+                _queue_peer_repair(state, task,
+                                   f'Completion blocked: {completion_gap}.')
+            except Exception:
+                pass  # the watchdog recovery loop remains the backstop
         else:
             task['status'] = 'done'
             # A landed task satisfies any dependency-block keyed on it: queue
