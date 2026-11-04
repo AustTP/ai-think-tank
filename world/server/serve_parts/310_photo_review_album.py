@@ -553,7 +553,12 @@ async def chat(request: Request):
     key_ok = verify_agent_key(body.get('agentId'), request.headers.get('X-Agent-Key')) is True
     if not session_ok and not key_ok:
         return JSONResponse({'error': 'Unauthorized -- please log in'}, status_code=401)
-    if credits_pause_active():
+    model_requested = str(body.get('model') or '')
+    if credits_pause_active() and not model_requested.startswith('@freepool:'):
+        # The credits pause blocks PAID calls only: free-pool requests ride
+        # through (price_per_m 0 -- serving low-band work for free while the
+        # account is out of credits is what the free pool exists for; the
+        # deeper per-call enforcement in the model-call path still applies).
         return JSONResponse({
             'error': 'OpenRouter credits are exhausted. Model work is paused and will resume automatically when credits are added.',
             'creditsPaused': True,
