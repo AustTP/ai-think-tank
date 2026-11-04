@@ -438,20 +438,13 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         return state  # browser still drives; stay inert (revert = set owner back)
 
     agents = state.get('agents') or {}
-    # Credit pause: hold all model-dependent work, keep in-flight tasks alive,
-    # and resume the same queue when the probe sees the balance restored.
-    try:
-        import serve as _serve
-        if _serve.credits_pause_active():
-            for a in agents.values():
-                if not isinstance(a, dict) or not a.get('task'):
-                    continue
-                task = (state.get('tasks') or {}).get(a['task'])
-                if isinstance(task, dict) and task.get('status') == 'working':
-                    task['workUntil'] = max(task.get('workUntil') or 0, now + 300)
-            return state
-    except Exception:
-        pass
+    # Credits pause (2026-11-04 ladder): the tick no longer short-circuits.
+    # The old blanket hold idled the whole village whenever the balance hit
+    # the floor, even though the free pool can keep serving low/sublow work
+    # and JEV (operator directive: free low/sublow keep the tank usable). The
+    # per-call enforcement still refuses PAID calls, and the content worker
+    # requeues a paused task intact (030__dispatch_content_work), so paid-only
+    # work parks itself while free-capable work proceeds on the free pool.
     _check_schedules(state, now, now_ms)
     # Phase 4: server-owned governance (auto-hire + auto-firing review) runs in
     # the same single read-modify-write, gated on the server-owner + idle rule
