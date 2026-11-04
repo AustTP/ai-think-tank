@@ -473,8 +473,11 @@ def _stop_repair_loop(state, task, info, author):
                      'note': (task.get('failNote') or '')[:200]})
 
 
-def _queue_peer_repair(state, parent, rationale=None):
-    """Queue one author-owned repair for a rejected deliverable."""
+def _queue_peer_repair(state, parent, rationale=None, not_before=None):
+    """Queue one author-owned repair for a rejected deliverable. `not_before`
+    (ms) delays the repair past the current tick -- callers that must keep the
+    fail-closed release observable (abandonment fallbacks) use it, because the
+    same tick's assignment loop otherwise re-tasks the agent immediately."""
     if (parent.get('_peerGate') or {}).get('escalated'):
         return None
     author = parent.get('assignedTo')
@@ -557,6 +560,8 @@ def _queue_peer_repair(state, parent, rationale=None):
     parent['_peerRepairPending'] = True
     parent['_peerGate'] = dict(parent.get('_peerGate') or {})
     parent['_peerGate']['escalated'] = False
+    if not_before is not None:
+        item['notBefore'] = int(not_before)
     queue_work(state, [item])
     return item
 

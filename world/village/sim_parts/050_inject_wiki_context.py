@@ -1075,10 +1075,13 @@ def finish_task(state, agent_id, grid=None):
             # BEFORE the watchdog loop each tick, so setting the flag without
             # queueing the child got it popped immediately and the card
             # blocked forever ('Choose a recovery action'). Queue the author's
-            # repair in the same mutation, like every other flag-setter.
+            # repair in the same mutation, like every other flag-setter --
+            # with a one-minute backoff so the SAME tick's assignment loop
+            # does not re-task the agent the fail-closed release just freed.
             try:
-                _queue_peer_repair(state, task,
-                                   f'Completion blocked: {completion_gap}.')
+                _queue_peer_repair(
+                    state, task, f'Completion blocked: {completion_gap}.',
+                    not_before=int(time.time() * 1000) + 60_000)
             except Exception:
                 pass  # the watchdog recovery loop remains the backstop
         else:

@@ -73,9 +73,23 @@ class DeliverMail(unittest.TestCase):
         self.assertTrue(st['agents']['nadia'].get('_mailAwake'))
         self.assertEqual(len(st['agents']['nadia']['mailbox']), 1)
 
-    def test_on_duty_recipient_only_files_mail(self):
+    def test_awake_idle_recipient_is_routed(self):
+        # 2026-11-04 contract change: an AWAKE but IDLE recipient (no task,
+        # not busy) is routed like an off-duty one -- mail to her used to sit
+        # unread forever, because only a queued card gave her a work cycle.
         st = _state()
-        # nadia is awake (offDuty False); _deliver_mail must NOT set _mailAwake.
+        ok = sim._deliver_mail(st, 'nadia', 'player_answer',
+                               {'issueKey': 'DEV-1', 'text': 'answering'})
+        self.assertTrue(ok)
+        self.assertTrue(st['agents']['nadia'].get('_mailAwake'))
+        self.assertEqual(len(st['agents']['nadia']['mailbox']), 1)
+
+    def test_busy_recipient_only_files_mail(self):
+        # A busy agent has a live work cycle that reads her mailbox; she does
+        # not need the wake/route marker.
+        st = _state()
+        st['agents']['nadia']['busy'] = True
+        st['agents']['nadia']['task'] = 'task-1'
         ok = sim._deliver_mail(st, 'nadia', 'player_answer',
                                {'issueKey': 'DEV-1', 'text': 'answering'})
         self.assertTrue(ok)
