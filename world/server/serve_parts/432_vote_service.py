@@ -25,6 +25,7 @@ import json
 import re
 import time
 import sqlite3
+import threading
 import contextlib
 
 _VOTE_COORDINATOR_ID = 'ruth'
@@ -97,6 +98,10 @@ def _vote_db():
     conn.row_factory = sqlite3.Row
     try:
         conn.executescript(_VOTE_SCHEMA)
+        try:
+            conn.execute('ALTER TABLE vote_proposals ADD COLUMN processing_ts REAL')
+        except Exception:
+            pass   # column already exists
         yield conn
         conn.commit()
     finally:
@@ -213,7 +218,7 @@ def _vote_screen(p):
         'sublow',
         [{'role': 'system', 'content': _VOTE_SCREEN_PROMPT},
          {'role': 'user', 'content': _vote_proposal_text(p, 1)}],
-        _VOTE_SCREEN_MAX_TOKENS)
+        _VOTE_SCREEN_MAX_TOKENS, timeout=45)
     if reply is None:
         return None   # transport/model failure, not a verdict
     parsed = _vote_parse_json(reply) or {}
@@ -235,7 +240,7 @@ def _vote_quorum_ballot(rubric_name, rubric_text, batch):
         'low',
         [{'role': 'system', 'content': _VOTE_BALLOT_PROMPT + ' ' + rubric_text},
          {'role': 'user', 'content': user}],
-        _VOTE_BALLOT_MAX_TOKENS)
+        _VOTE_BALLOT_MAX_TOKENS, timeout=60)
     if reply is None:
         return None
     parsed = _vote_parse_json(reply)
@@ -348,6 +353,54 @@ async def api_vote_propose(request: Request):
     return JSONResponse({'ok': True, 'proposalId': pid, 'status': 'pending'})
 
 
+def _vote_process_claimed(rows):
+    # Runs in its OWN thread: model calls here are blocking and can take
+    # minutes under transport failures; they must never stall the server's
+    # event loop (the first inline version froze the whole server mid-run).
+    passing = []
+    for p in rows:
+        try:
+            if p['est_cost'] >= _VOTE_ESCALATE_COST:
+                _vote_mail_ruth(
+                    f"VOTE ESCALATION (expensive, no ballot run): "
+                    f"{p['title']} est ${p['est_cost']:.2f}. Claim: {p['claim']}")
+                _vote_decide(p, 'escalated',
+                             f"est_cost ${p['est_cost']:.2f} over threshold")
+                continue
+            if p['confidence'] >= _VOTE_AUTO_FILE_CONFIDENCE and \
+                    p['est_cost'] <= _VOTE_AUTO_FILE_MAX_COST:
+                _vote_mail_ruth(
+                    f"FILE (high-confidence feed proposal, no quorum needed): "
+                    f"{p['action']} -- from {p['source']}: {p['title']}")
+                _vote_decide(p, 'filed', 'auto-filed: confidence/cost thresholds')
+                continue
+            screen = _vote_screen(p)
+            if screen is None:
+                _vote_decide(p, 'deferred', 'screener unavailable after failure')
+                continue
+            verdict, reason = screen
+            if verdict == 'reject':
+                _vote_decide(p, 'screened_out', f'screener: {reason}')
+                continue
+            passing.append(p)
+        except Exception as e:   # one bad proposal never kills the batch
+            _vote_decide(p, 'deferred', f'processing error: {e}'[:300])
+    if passing:
+        for p, status, note in _vote_run_quorum(passing):
+            _vote_decide(p, status, note)
+            if status == 'filed':
+                _vote_mail_ruth(
+                    f"FILE (feed proposal, quorum approved): {p['action']} "
+                    f"-- from {p['source']}: {p['title']}")
+            elif status == 'escalated':
+                _vote_mail_ruth(
+                    f"VOTE SPLIT on {p['title']}: novelty and cost voters "
+                    f"disagree -- decide or refile. Claim: {p['claim']}")
+
+
+_VOTE_PROCESS_STALE = 600.0   # seconds before an abandoned 'processing' claim is re-takeable
+
+
 @app.post('/api/vote/run')
 async def api_vote_run(request: Request):
     actor = _vote_actor(request)
@@ -362,59 +415,31 @@ async def api_vote_run(request: Request):
                            _VOTE_RUN_LIMIT_MAX))
     except (TypeError, ValueError):
         limit = _VOTE_RUN_LIMIT_DEFAULT
+    now = time.time()
     with _vote_db() as conn:
         rows = conn.execute(
-            "SELECT * FROM vote_proposals WHERE status = 'pending' "
-            'ORDER BY created_ts LIMIT ?', (limit,)).fetchall()
-    results = []
-    passing = []
-    final_status = {}
-    for p in rows:
-        if p['est_cost'] >= _VOTE_ESCALATE_COST:
-            _vote_mail_ruth(
-                f"VOTE ESCALATION (expensive, no ballot run): "
-                f"{p['title']} est ${p['est_cost']:.2f}. Claim: {p['claim']}")
-            _vote_decide(p, 'escalated',
-                         f"est_cost ${p['est_cost']:.2f} over threshold")
-            final_status[p['id']] = 'escalated'
-            continue
-        if p['confidence'] >= _VOTE_AUTO_FILE_CONFIDENCE and \
-                p['est_cost'] <= _VOTE_AUTO_FILE_MAX_COST:
-            _vote_mail_ruth(
-                f"FILE (high-confidence feed proposal, no quorum needed): "
-                f"{p['action']} -- from {p['source']}: {p['title']}")
-            _vote_decide(p, 'filed', 'auto-filed: confidence/cost thresholds')
-            final_status[p['id']] = 'filed'
-            continue
-        screen = _vote_screen(p)
-        if screen is None:
-            _vote_decide(p, 'deferred', 'screener unavailable after failure')
-            final_status[p['id']] = 'deferred'
-            continue
-        verdict, reason = screen
-        if verdict == 'reject':
-            _vote_decide(p, 'screened_out', f'screener: {reason}')
-            final_status[p['id']] = 'screened_out'
-            continue
-        passing.append(p)
-    if passing:
-        for p, status, note in _vote_run_quorum(passing):
-            _vote_decide(p, status, note)
-            final_status[p['id']] = status
-            if status == 'filed':
-                _vote_mail_ruth(
-                    f"FILE (feed proposal, quorum approved): {p['action']} "
-                    f"-- from {p['source']}: {p['title']}")
-            elif status == 'escalated':
-                _vote_mail_ruth(
-                    f"VOTE SPLIT on {p['title']}: novelty and cost voters "
-                    f"disagree -- decide or refile. Claim: {p['claim']}")
-    for p in rows:
-        results.append({'id': p['id'],
-                        'status': final_status.get(p['id'], p['status'])})
-    filed = sum(1 for r in results if r.get('status') == 'filed')
-    return JSONResponse({'ok': True, 'processed': len(results),
-                         'filed': filed, 'results': results})
+            "SELECT * FROM vote_proposals WHERE status = 'pending' OR "
+            "(status = 'processing' AND (processing_ts IS NULL OR "
+            'processing_ts < ?)) ORDER BY created_ts LIMIT ?',
+            (now - _VOTE_PROCESS_STALE, limit)).fetchall()
+        if not rows:
+            return JSONResponse({'ok': True, 'claimed': 0})
+        ids = [r['id'] for r in rows]
+        marks = ','.join('?' * len(ids))
+        conn.execute(
+            f'UPDATE vote_proposals SET status = "processing", processing_ts = ? '
+            f'WHERE id IN ({marks})',   # nosec B608 -- placeholders are parameterized
+            (now, *ids))
+    thread = threading.Thread(target=_vote_process_claimed, args=(rows,),
+                              daemon=True, name='vote-run')
+    thread.start()
+    _vote_log('vote_run_claimed',
+              f'{len(rows)} proposal(s) claimed by {actor}: '
+              f'{", ".join(ids[:5])}{"..." if len(ids) > 5 else ""}')
+    return JSONResponse({'ok': True, 'claimed': len(ids),
+                         'ids': ids,
+                         'note': 'processing in background; watch '
+                                 'GET /api/vote/proposals?status=processing'})
 
 
 @app.get('/api/vote/proposals')
