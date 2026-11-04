@@ -396,14 +396,15 @@ def _read_source(path):
     for fn in sorted(f for f in os.listdir(parts) if f.endswith('.py')):
         with open(os.path.join(parts, fn), 'r', encoding='utf-8') as fh:
             chunks.append(fh.read())
-    # Join with a guaranteed newline boundary. A part file saved without its
-    # trailing newline fused its last line into the next part's first line
-    # (observed 2026-11-04: `return SKILLS_DIRimport json`), silently
-    # producing a SyntaxError in every stitched source -- which made every
-    # AST scan over serve (config/jev/env_reload export rebinds) fail closed
-    # while the tank kept running with stale bindings.
-    return '\n'.join(chunk if chunk.endswith('\n') else chunk + '\n'
-                     for chunk in chunks)
+    # Guarantee a newline boundary between parts WITHOUT changing the exact
+    # concatenation of well-formed parts. A part saved without its trailing
+    # newline fused its last line into the next part's first line (observed
+    # 2026-11-04: `return SKILLS_DIRimport json`), silently producing a
+    # SyntaxError in every stitched source -- which made every AST scan over
+    # serve (config/jev/env_reload export rebinds) fail closed while the tank
+    # kept running with stale bindings.
+    return ''.join(chunk if chunk.endswith('\n') else chunk + '\n'
+                   for chunk in chunks)
 
 
 def _resolve_path(path):
