@@ -478,6 +478,23 @@ def compute_health_snapshot():
         'openrouter_monthly_budget_usd': OPENROUTER_MONTHLY_BUDGET_USD,
         'openrouter_api_key_set': bool(OPENROUTER_API_KEY),
     }
+    # Month-to-date budget view (2026-11-04 operator request): the operator
+    # reads the budget as "spent this month / remaining this month", not the
+    # lifetime deposit gauge. The think tank's own ledger tracks month
+    # slices per service; SPEND_CAP_USD is the monthly denominator. Best
+    # effort: a ledger failure leaves the lifetime gauge as the readout.
+    try:
+        import serve as _serve_mod
+        ledger = _serve_mod._spend_ledger_read() or {}
+        signals['spend_month'] = {
+            'month': _serve_mod._spend_cap_period(),
+            'openrouterUsd': _serve_mod._openrouter_month_to_date(ledger),
+            'allServicesUsd': _serve_mod._ledger_month_to_date(ledger),
+            'capUsd': float(_serve_mod.SPEND_CAP_USD or 0),
+            'exceeded': _serve_mod._think_tank_spend_cap_exceeded(),
+        }
+    except Exception:
+        pass
     # Integrity gates (015): tape hash chain + action-log parity windows.
     # None means the check could not run; False means it ran and FAILED.
     try:

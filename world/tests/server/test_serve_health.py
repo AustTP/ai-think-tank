@@ -643,6 +643,47 @@ class HealthChecks(unittest.TestCase):
         self.assertEqual(alerts[0]['severity'], 'info')
         self.assertIn('probe unavailable', alerts[0]['message'])
 
+    # --- MONTHLY budget view (2026-11-04 operator request) ----------------
+    # The budget alert leads with "spent this month / remaining this month"
+    # against the monthly cap; the lifetime deposit number is secondary
+    # context only and must never trigger by itself while the month is fine.
+    def test_month_view_80pct_spent_raises_warning(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            spend_month={'month': '2026-11', 'allServicesUsd': 40.0,
+                         'capUsd': 50.0, 'exceeded': False},
+            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
+                                'remaining': 6.0},
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['category'], 'budget')
+        self.assertEqual(alerts[0]['severity'], 'warning')
+        self.assertIn('monthly budget', alerts[0]['message'])
+        self.assertIn('40.00', alerts[0]['message'])
+        self.assertIn('10.00 remaining this month', alerts[0]['message'])
+
+    def test_month_view_90pct_spent_raises_critical(self):
+        alerts = serve._health_alerts_for_signals(self._signals(
+            spend_month={'month': '2026-11', 'allServicesUsd': 46.0,
+                         'capUsd': 50.0, 'exceeded': False},
+            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
+                                'remaining': 6.0},
+            openrouter_api_key_set=True,
+        ))
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]['severity'], 'critical')
+
+    def test_healthy_month_never_triggers_on_lifetime_gauge(self):
+        # The operator's ask: a scary lifetime-deposit number must not spam
+        # alerts while THIS month's spend is fine.
+        self.assertEqual(serve._health_alerts_for_signals(self._signals(
+            spend_month={'month': '2026-11', 'allServicesUsd': 3.0,
+                         'capUsd': 50.0, 'exceeded': False},
+            openrouter_credits={'totalCredits': 460.0, 'totalUsage': 454.0,
+                                'remaining': 6.0},
+            openrouter_api_key_set=True,
+        )), [])
+
 
 class AgingInFlightWork(unittest.TestCase):
     """Admin gap 1: the health snapshot's mirror of sim's stale-work sweep --
