@@ -830,7 +830,11 @@ class _ClassifyCommandJev(unittest.TestCase):
         save_called.assert_not_called()
 
     def test_block_blocks_without_escalation(self):
-        allowed, reason, save_called = self._run('block', 0.99)
+        # A classifier BLOCK on a command that is not provably read-only
+        # still blocks (echo hi would take the deterministic read-only lane
+        # and run even against a block -- see the 2026-11-04 operator
+        # decision in test_readonly_shell.py).
+        allowed, reason, save_called = self._run_cmd('touch /tmp/x', 'block', 0.99)
         self.assertFalse(allowed)
         save_called.assert_not_called()
 
@@ -865,6 +869,20 @@ class ReadOnlyGitPreapproval(unittest.TestCase):
             self.assertEqual(reason, 'allow')
             self.assertIsNone(kind)
 
+    def test_readonly_compound_git_runs_despite_classifier_block(self):
+        # 2026-11-04 operator decision: a compound whose every segment parses
+        # as provably read-only runs through the deterministic lane even when
+        # the classifier returns a block -- the parse outranks the vote for
+        # this narrow class (git log + echo cannot mutate anything).
+        for command in ('git log && echo pwned', 'echo hi && git status'):
+            async def go():
+                return await serve._classify_command(command, 'misc')
+            with unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'test-key'), \
+                 unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                            return_value={'answers': {'choice': {'choice': 'block', 'confidence': 0.99, 'probabilities': {}}}}):
+                allowed, reason, kind = asyncio.run(go())
+            self.assertTrue(allowed, f'{command} is provably read-only')
+
     def test_write_shaped_and_compound_git_still_needs_jev(self):
         # Anything that is not a single pure read-only git invocation falls
         # through to the classifier as before (asserted by JEV being called;
@@ -873,8 +891,8 @@ class ReadOnlyGitPreapproval(unittest.TestCase):
         for command in ('git branch -D main', 'git tag v1', 'git config user.name bot',
                         'git remote add origin https://x.test', 'git checkout main',
                         'git push origin main', 'git stash drop',
-                        'git log && echo pwned', 'git log | tee out.txt',
-                        'git log > out.txt', 'echo hi && git status',
+                        'git log | tee out.txt',
+                        'git log > out.txt',
                         'status'):
             async def go():
                 return await serve._classify_command(command, 'misc')
