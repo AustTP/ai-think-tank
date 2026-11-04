@@ -1061,12 +1061,28 @@ _STATE_LOCK = threading.RLock()
 _state_txn = threading.local()
 
 
+_STATE_LOCK_TIMEOUT_S = 120
+
+
 def _state_begin():
     """Acquire the state lock and return the latest blob. The caller (or its
     @_state_writer wrapper) is guaranteed to release via save or _state_abort.
     Reads through get_state_from_db() so tests that mock that reader to inject
     a state keep working."""
-    _STATE_LOCK.acquire()
+    # Bounded acquire, 2026-11-04: the DB rides a Tailscale link, and a
+    # statement whose packets vanish mid-flight (black-holed send) waits on
+    # libpq with NO client-side read timeout -- TCP keepalives never fire
+    # because the connection is not idle while unacked data is pending, and
+    # the server-side statement_timeout never triggers because the server
+    # never received the query. One wedged writer holding _STATE_LOCK then
+    # piled every other writer behind it and froze the whole tank (observed
+    # twice today). A bounded acquire turns that freeze into a fast, clear
+    # 503 for the waiters; the wedged holder still self-heals when the OS
+    # retransmission timer (~15 min) finally kills its socket.
+    if not _STATE_LOCK.acquire(timeout=_STATE_LOCK_TIMEOUT_S):
+        raise TimeoutError(
+            f'state lock not acquired within {_STATE_LOCK_TIMEOUT_S}s '
+            '-- a writer is wedged on the DB link; retry shortly')
     _state_txn.held = True
     _state_txn.saved = False
     try:

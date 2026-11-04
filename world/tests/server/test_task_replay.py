@@ -37,6 +37,16 @@ class TaskReplay(unittest.TestCase):
 
     def _seed(self):
         with serve._db() as conn:
+            # The sandbox DB persists across the class's tests; clear this
+            # test's own footprint so re-seeding does not double the trail.
+            conn.execute("DELETE FROM action_log WHERE details LIKE '%task-1%'")
+            # A real agent_keys row: the login middleware resolves the bearer
+            # key against this table itself, so mocks on verify_agent_key do
+            # not reach it. theo owns the key; the roster below makes him
+            # admin, which satisfies the endpoint's operator gate.
+            conn.execute(
+                "INSERT OR REPLACE INTO agent_keys (agent_id, secret_key, created_at) "
+                "VALUES ('theo', 'test-key-theo', ?)", (time.time(),))
             conn.execute(
                 "INSERT OR REPLACE INTO action_log (ts, agent_id, action, details) "
                 "VALUES (?, ?, ?, ?)",
@@ -72,11 +82,7 @@ class TaskReplay(unittest.TestCase):
         return TestClient(serve.app)
 
     def _get(self, path):
-        with unittest.mock.patch.object(serve, 'verify_agent_key',
-                                        return_value=True), \
-             unittest.mock.patch.object(serve, '_agent_id_for_key',
-                                        return_value='theo'):
-            return self._client().get(path, headers={'X-Agent-Key': 'k'})
+        return self._client().get(path, headers={'X-Agent-Key': 'test-key-theo'})
 
     def test_requires_operator(self):
         self._seed()
