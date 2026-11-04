@@ -971,6 +971,12 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     escalated = _maybe_escalate_stuck_gate(state, task, gate,
                                            'quality pipeline keeps failing')
     _log_quality_gate_reject(state, task, note, escalated=escalated)
+    # Institutional memory: draft the deduplicated lesson skill so this class
+    # of failure is captured once (440_rejection_lessons; fire-and-forget).
+    try:
+        _capture_rejection_lesson(state, task, note, escalated)
+    except Exception:
+        pass
     if escalated:
         return  # auto-closed after cycle cap -- no further fix cycling
     if _open_fix_exists(state, task.get('title')):

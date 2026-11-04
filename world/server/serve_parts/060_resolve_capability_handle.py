@@ -80,6 +80,7 @@ async def _health_check_loop():
             new_alerts = await asyncio.to_thread(_persist_new_health_alerts, snapshot['alerts'])
             await asyncio.to_thread(_push_new_health_alerts, new_alerts)
             await asyncio.to_thread(_write_health_digest, snapshot)
+            await asyncio.to_thread(_player_daily_digest_tick)
         except Exception as e:
             print(f'[health-check] loop error: {e}', flush=True)
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_S)

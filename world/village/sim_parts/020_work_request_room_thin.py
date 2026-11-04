@@ -1043,6 +1043,12 @@ def _build_agent_perception(state, agent_id, task=None):
             else:
                 text = str(f)
             if text:
+                # Token economy (2026-11-04): a feedback entry can carry a
+                # whole send-back essay; the perception block ships it on
+                # EVERY dispatch for this agent. Cap each entry -- the full
+                # text lives in the mailbox/skill when it matters.
+                if len(text) > 400:
+                    text = text[:400] + ' …(truncated)'
                 lines.append(f'- {text}')
         if lines:
             parts.append('Feedback on your recent work:\n' + '\n'.join(lines))

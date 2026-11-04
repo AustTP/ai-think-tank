@@ -612,6 +612,70 @@ def _prune_old_health_digests():
             pass
 
 
+_DIGEST_LAST_SETTING = 'player_digest_last'
+_DIGEST_HOUR_LOCAL = 8   # first health tick at/after 08:00 local sends it
+
+
+def _player_daily_digest_tick():
+    """The nightly 5-line digest (operator directive, 2026-11-04, adapted from
+    an agent-company practice): ONE compact player message per day -- what
+    shipped, what is stuck, spend, the top watch item, decisions -- instead of
+    per-event alert spam. Fires on the first health tick at/after 08:00 local
+    whose date differs from the stored stamp; every failure is swallowed (the
+    digest must never take the health loop down). Deterministic queries only:
+    no model calls."""
+    try:
+        today = time.strftime('%Y-%m-%d', time.localtime())
+        if int(time.strftime('%H', time.localtime())) < _DIGEST_HOUR_LOCAL:
+            return
+        if (_get_setting(_DIGEST_LAST_SETTING, '') or '') >= today:
+            return
+        since = time.time() - 86400
+        with _db() as conn:
+            def _count(action):
+                return conn.execute(
+                    'SELECT count(*) FROM action_log '
+                    'WHERE action = ? AND ts > ?', (action, since)).fetchone()[0]
+            shipped = _count('task_completed')
+            titles = []
+            # details is a JSON TEXT blob; the postgres adapter has no
+            # json_extract translation, so parse in Python.
+            for (blob,) in conn.execute(
+                    "SELECT details FROM action_log WHERE action = "
+                    "'task_completed' AND ts > ? ORDER BY ts DESC LIMIT 2",
+                    (since,)).fetchall():
+                try:
+                    titles.append((json.loads(blob).get('title') or ''))
+                except Exception:
+                    continue
+            stuck = conn.execute(
+                "SELECT count(*) FROM action_log WHERE ts > ? AND "
+                "(action = 'help_signal' OR details LIKE '%\"blocked\"%')",
+                (since,)).fetchone()[0]
+            watch = conn.execute(
+                "SELECT category || ': ' || substr(message, 1, 90) "
+                "FROM health_alerts WHERE severity = 'critical' "
+                "ORDER BY ts DESC LIMIT 1").fetchone()
+        credits = _OPENROUTER_CREDITS_CACHE.get('data') or {}
+        remaining = credits.get('remaining')
+        spend = (f"${remaining:.2f} remaining, paid calls "
+                 f"{'PAUSED (free pool serving)' if credits_pause_active() else 'running'}"
+                 if remaining is not None else
+                 f"paid calls {'PAUSED (free pool serving)' if credits_pause_active() else 'running'}")
+        lines = [
+            f"Shipped: {shipped} task(s) completed in 24h"
+            + (f"; latest: {(titles[0] or '')[:60]}" if titles else ""),
+            f"Stuck: {stuck} blocked/help signal(s) in 24h",
+            f"Spend: {spend}",
+            f"Watch: {watch[0] if watch else 'no critical alerts'}",
+            f"Digest: {today} {time.strftime('%H:%M', time.localtime())} local",
+        ]
+        send_player_telegram_sync('[AI Think Tank] Daily digest', '\n'.join(lines))
+        _set_setting(_DIGEST_LAST_SETTING, today)
+    except Exception as e:
+        print(f'[daily-digest] error: {e}', flush=True)
+
+
 def _write_health_digest(snapshot):
     with _DIGEST_LOCK:
         now = time.time()
