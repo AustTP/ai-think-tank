@@ -291,18 +291,73 @@ def roster_order(cid, roster):
 
 
 def _fix_title_root(title):
-    """Strip repeated 'Fix: ' prefixes and retry suffixes so 'Fix: Fix: Act on
+    """Reduce a repair-chain title to the ONE card it is really about.
+
+    Strip repeated 'Fix: ' prefixes and retry suffixes so 'Fix: Fix: Act on
     mail (retry 2)' and 'Act on mail' compare equal. Mirrors _task_fix_spirals'
-    own reduction."""
+    own reduction.
+
+    2026-11-05 (the weatherstation/disk-full re-card pump): repairs now nest
+    agent names and lane tags -- 'Fix: [BUG] Leif ([SPIKE] Gretchen (Fix:
+    [TASK] Park task-12289 ...)))'. The old reduction saw every nesting as a
+    NEW root, so the loop stoppers, the pattern suppression, the open-fix
+    dedup, and the Telegram card-failure dedup all minted fresh identities per
+    variant and the pump never tripped. Peel the wrappers (agent-name ('Fix:
+    ...') parentheticals and leading [LANE] tags) down to the innermost
+    original subject so every variant compares equal and the existing caps
+    fire."""
     root = str(title or '').strip()
-    while root.startswith('Fix: '):
-        root = root[len('Fix: '):].strip()
+    for _ in range(12):  # chains have been observed six deep; headroom
+        before = root
+        had_fix = False
+        while root.startswith('Fix: '):
+            root = root[len('Fix: '):].strip()
+            had_fix = True
+        root = re.sub(r'^(?:Re:\s*|Reopen(?:ed)?:\s*)+', '', root,
+                      flags=re.I)
+        root = re.sub(r'^\[(?:story|bug|spike|task|fix|research|report|qa|'
+                      r'review|distill)\]\s*', '', root, flags=re.I)
+        # Unwrap one agent-name repair parenthetical: a short wrapper name
+        # whose parenthetical content carries a Fix chain somewhere inside --
+        # 'Leif ([SPIKE] Gretchen (Fix: X ...))' -> '[SPIKE] Gretchen (Fix:
+        # X ...))' -- and the next loop pass strips the tag and unwraps
+        # again. A plain '(urgent)' suffix never matches: its content holds
+        # no Fix chain.
+        m = re.match(r"^[^()]{1,40}?\(", root)
+        if m:
+            inner = root[m.end():]
+            depth, idx = 1, 0
+            for i, ch in enumerate(inner):
+                if ch == '(':
+                    depth += 1
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        idx = i
+                        break
+            content = inner[:idx] if idx else ''
+            # Unwrap when the parenthetical carries a Fix chain itself, OR
+            # when this pass already peeled a 'Fix:' prefix (the chain lives
+            # outside now: 'Fix: Max ([TASK] Park ...)' -> 'Max ([TASK]
+            # Park ...)' has no Fix left inside). A '(retry N)' suffix is a
+            # counter, never a wrapper -- leave it for the retry-stripper.
+            is_retry_suffix = bool(re.fullmatch(r'retry\s+\d+', content.strip(),
+                                                flags=re.I))
+            if (idx and not is_retry_suffix
+                    and (had_fix or re.search(r'\bfix\b', content, re.I))):
+                root = (content + ' ' + inner[idx + 1:]).strip()
+        if root == before:
+            break
     while True:
         reduced = re.sub(r'\s*\(retry\s+\d+\)\s*$', '', root).strip()
         if reduced == root:
             break
         root = reduced
-    return root
+    # The mint template appends finding tails of varying length
+    # (': # Findings: task-12289 diagnosis' vs ': # Findings'); cut them so
+    # the variants compare equal. A subject never contains ': #'.
+    root = re.split(r'\s*:\s*#', root)[0].strip()
+    return re.sub(r'\s+', ' ', root).strip()
 
 
 def _open_fix_exists(state, title):

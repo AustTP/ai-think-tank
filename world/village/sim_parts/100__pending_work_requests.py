@@ -858,13 +858,11 @@ def _card_failure_dedup_title(title):
     Telegram dedup key -- the player got a failure notice per rename
     even though it is the same failing card. The DISPLAY keeps the full
     title; only the KEY is normalized."""
-    t = str(title or '')
-    for _ in range(6):  # titles can stack several prefixes deep
-        t = re.sub(r'^(?:Fix:\s*|Re:\s*|Reopen(?:ed)?:\s*)+', '', t, flags=re.I)
-        t = re.sub(r'^\[(?:story|bug|spike|task|fix|research|report|qa|review)\]\s*',
-                   '', t, flags=re.I)
-        if t == str(title or ''):
-            break
+    # The repair-chain reducer (_fix_title_root, 070) peels 'Fix:' prefixes,
+    # lane tags, AND the agent-name repair parentheticals; running it first
+    # means 'Fix: [BUG] Leif ([SPIKE] Gretchen (Fix: [TASK] Park task-12289
+    # ...)))' collapses onto the same identity as the original card.
+    t = _fix_title_root(title) or str(title or '')
     return re.sub(r'\s+', ' ', t).strip().lower()
 
 
