@@ -12,13 +12,11 @@
 // Hiring must be monitorable, not just a toast after the fact -- so it
 // is two real phases, not one instant background event. While it's
 // running, the hirer is busy/invisible on the outdoor map (same
-// as being in a Town Hall call) but genuinely present and visible in
-// Control Room during that window
-// (renderAgentsInRoom(), agents.js). A room nobody can observe is also a
-// room where elevated access could be misused without anyone noticing --
-// noted as a real design tension, not resolved here (no actual misuse
-// mechanic is built; this just makes the room a real, checkable place
-// instead of an opaque instant event).
+// as being in a Town Hall call). The Control Room rendering of the hirer
+// (renderAgentsInRoom, agents.js) was retired 2026-11-05 by the owner
+// directive: agents are no longer drawn inside player rooms at all -- their
+// physical placement is theater. The audit surface for "what is the hirer
+// doing" is the state and the Backstage view, not the room picture.
 const HIRE_NAME_POOL = ['Marcus', 'Priya', 'Sam', 'Nadia', 'Leo', 'Ines', 'Theo', 'Yuki', 'Omar', 'Greta'];
 const HIRE_COLOR_POOL = ['#f6b26b', '#76a5af', '#a4c2f4', '#d5a6bd', '#b6d7a8', '#ffe599'];
 const HIRE_COOLDOWN_MS = 45000;

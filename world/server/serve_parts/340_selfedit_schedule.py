@@ -630,41 +630,28 @@ def _agent_is_in_weatherstation(agent_id, live_room=None):
     # index.html). Every other identity still gets the real check.
     if agent_id == 'player':
         return True
-    # live_room override first -- it's the freshest truth an agent has.
-    if live_room == 'weatherstation':
-        return True
-    state = get_state_from_db()
-    if not state:
-        return False
-    agent = (state.get('agents') or {}).get(agent_id)
-    return bool(agent and agent.get('inRoom') == 'weatherstation')
+    # Owner directive (2026-11-05): agents do not have the player's physical
+    # boundaries. The weatherstation's four walls are player-facing theater;
+    # an agent may make the room-tied call from anywhere. Everything above
+    # this function in the curl path is unchanged: the Jev judgment, the
+    # domain allowlist, rate limits, and temp-access grants still apply to
+    # every call regardless of location.
+    return True
 
 
 SANDBOX_DOWNLOAD_ROOMS = ('observatory', 'pressoffice')
 
 
 def _agent_is_in_sandbox_room(agent_id, live_room=None):
-    # Real server-side room gate, extended to
-    # the Work Room: downloading directly into a sandbox
-    # only works from inside a room that actually has one -- Observatory
-    # (RESEARCH_SANDBOX_ID) or Work Room (WORKROOM_SANDBOX_ID) -- same
-    # exclusivity curl draws around the Weather Station
-    # (_agent_is_in_weatherstation, right above). Checked against the
-    # real persisted state, not trusted from whatever the client claims.
-    # `live_room` is the agent's current in-room as asserted by the
-    # calling client in real-time -- accepted as the same autosave-latency
-    # override described in _agent_is_in_weatherstation (an agent that
-    # just arrived hasn't had its `inRoom` autosaved yet, and the very
-    # first sandbox call would otherwise be wrongly denied).
+    # Owner directive (2026-11-05): agents do not have the player's physical
+    # boundaries. The sandbox rooms' four walls are player-facing theater --
+    # an agent may download into a sandbox from anywhere. The security model
+    # is unchanged: Jev still judges every download, the final-URL re-gate
+    # still re-judges redirects, and the byte caps still apply. The player
+    # keeps their client-side proximity requirement.
     if agent_id == 'player':
         return True
-    if live_room in SANDBOX_DOWNLOAD_ROOMS:
-        return True
-    state = get_state_from_db()
-    if not state:
-        return False
-    agent = (state.get('agents') or {}).get(agent_id)
-    return bool(agent and agent.get('inRoom') in SANDBOX_DOWNLOAD_ROOMS)
+    return True
 
 
 API_CALL_MAX_BODY_BYTES = 200_000

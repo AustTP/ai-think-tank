@@ -597,15 +597,12 @@ function renderAgents(ctx, toScreen, zoom, playerSprites) {
   }
 }
 
-// Agents "in" a specific room (hiring.js, while Control Room is in use) --
-// only ever drawn if the player is currently inside that same room, so
-// this doubles as the monitoring: walk in and see who's
-// actually there.
+// Agents "in" a specific room are NO LONGER RENDERED (owner directive,
+// 2026-11-05): agents do not have the player's physical boundaries -- they
+// make room-tied API calls from anywhere, so a body standing at a desk is
+// theater. The player's rooms show only the player. Where agents actually
+// are stays observable through the outdoor map (walking), the Backstage
+// HUD view, and the state itself.
 function renderAgentsInRoom(ctx, toScreen, zoom, playerSprites, building) {
-  for (const id in AGENTS) {
-    const a = AGENTS[id];
-    if (a.inRoom !== building) continue;
-    if (!agentIsDrawn(a)) continue;
-    drawAgentAt(ctx, toScreen, zoom, playerSprites, a, a.roomX, a.roomY);
-  }
+  return;
 }

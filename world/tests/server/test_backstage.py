@@ -144,6 +144,27 @@ class BackstageEnterExit(unittest.TestCase):
             _STATE['agents']['marcus']['inRoom'] = None
 
 
+class AgentsBeyondBoundaries(unittest.TestCase):
+    """Owner directive 2026-11-05: agents do not have the player's physical
+    boundaries. The room-tied tool gates (curl/weatherstation, sandbox
+    download, sandbox save) answer True for any agent from anywhere; the
+    security layers above them (Jev, allowlist, caps, temp-access) are
+    unchanged and tested at their own level."""
+
+    def test_weatherstation_gate_lifted_for_agents(self):
+        self.assertTrue(serve._agent_is_in_weatherstation('marcus', None))
+        self.assertTrue(serve._agent_is_in_weatherstation(
+            'marcus', 'library'))
+
+    def test_sandbox_room_gate_lifted_for_agents(self):
+        self.assertTrue(serve._agent_is_in_sandbox_room('marcus', None))
+        self.assertTrue(serve._agent_is_in_sandbox_room('ruth', 'bank'))
+
+    def test_player_still_passes_without_room(self):
+        self.assertTrue(serve._agent_is_in_weatherstation('player', None))
+        self.assertTrue(serve._agent_is_in_sandbox_room('player', None))
+
+
 class BackstageMergeAnchor(unittest.TestCase):
     def test_server_backstage_anchors_over_client_stale(self):
         server = {'id': 'marcus', 'inRoom': 'backstage', 'x': 5, 'y': 6}
