@@ -370,7 +370,13 @@ def sync_prototypes(agent_id, sandbox_dir):
         # ignore .browser-act (transient driver state: shots, profile
         # cookies) -- the prototypes mirror is "what the agent is working on,"
         # not leftover browser session material.
-        shutil.copytree(sandbox_dir, dest, ignore=shutil.ignore_patterns('.browser-act'))
+        # ignore .git (2026-11-05 disk emergency): the mirror copied the
+        # sandbox's entire 2.2 GB git history into every agent dir on every
+        # sync -- 45 live agents x 2.2 GB of loose-object bloat, rmtree'd and
+        # re-copied each time. The real VCS lives in the sandbox; prototypes
+        # is a view of the working tree.
+        shutil.copytree(sandbox_dir, dest,
+                        ignore=shutil.ignore_patterns('.browser-act', '.git'))
     except OSError as e:
         print(f'[agent-dirs] prototypes sync failed for {agent_id}: {e}')
 

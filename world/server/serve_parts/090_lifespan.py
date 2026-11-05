@@ -90,6 +90,7 @@ async def _lifespan(app):
     director_task = asyncio.create_task(_director_approval_loop())
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
+    disk_task = asyncio.create_task(_disk_hygiene_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
     # External watches (owner expansion, 2026-10-27): dead-man switch ping,
     # new free-model discovery, weekly OSV dependency audit, GitHub CI/issue
@@ -174,6 +175,7 @@ async def _lifespan(app):
     if colab_compute_task is not None:
         colab_compute_task.cancel()
     prune_task.cancel()
+    disk_task.cancel()
     tier_refresh_task.cancel()
     tier_boot_backfill_task.cancel()
     photo_watch_task.cancel()

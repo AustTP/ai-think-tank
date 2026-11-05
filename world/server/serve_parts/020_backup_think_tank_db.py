@@ -151,6 +151,172 @@ async def _log_prune_loop():
         _LAST_LOG_PRUNE = time.time()
 
 
+# Disk hygiene (2026-11-05 emergency): task stage sandboxes and agent
+# prototypes mirrors grew without bound -- every sandbox carries a git repo
+# that only ever accumulated (2.2 GB of loose objects per sandbox; the
+# prototypes mirror even copied the whole .git into agents/<id>/). The disk
+# hit 403 MiB free and deliverable writes started failing with ENOSPC. The
+# sweeper below runs on the log-prune cadence and enforces three rules:
+#   1. A stage sandbox whose task is terminal or no longer known (pruned from
+#      the archive) is scratch space: delete it after a grace window.
+#   2. A live sandbox's git gets gc'd -- history survives, loose objects go.
+#   3. Agent prototypes mirrors must never contain .git (sync_prototypes
+#      now ignores it; this also strips any legacy copy).
+_SANDBOX_GRACE_S = 6 * 3600
+_SANDBOX_GC_PER_RUN = 6
+_SANDBOX_MIN_FREE_GIB = 20.0
+
+
+def _sandbox_task_status(workspace):
+    """Terminal/absent status for a stage workspace's task id, or None when
+    the task is live. Absent-from-everything counts as terminal: the task
+    predates the archive's own retention."""
+    if not workspace:
+        return 'absent'
+    try:
+        state = get_state_from_db(archive_merge='none') or {}
+        if workspace in (state.get('tasks') or {}):
+            return None
+    except Exception:
+        return None  # can't judge -> never delete
+    try:
+        with _db() as conn:
+            row = conn.execute('SELECT 1 FROM task_archive WHERE id = ?',
+                               (workspace,)).fetchone()
+        return 'terminal' if row else 'absent'
+    except Exception:
+        return None
+
+
+def _prune_sandboxes():
+    import shutil as _shutil
+    sandboxes_dir = os.path.join(THINK_TANK_DIR, 'sandboxes')
+    try:
+        names = os.listdir(sandboxes_dir)
+    except OSError:
+        return
+    now = time.time()
+    reaped, gced = 0, 0
+    for name in names:
+        path = os.path.join(sandboxes_dir, name)
+        if not os.path.isdir(path):
+            continue
+        if name in ('workroom-shared',) or name.startswith(('hf-', 'direct-',
+                                                            'headful', 'fb-',
+                                                            'project-',
+                                                            'vpn-')):
+            continue
+        if not name.startswith('stage-'):
+            continue
+        if name not in _SANDBOX_LIVE_IDS:
+            # Not referenced by anything right now. Reap after the grace
+            # window (mtime is the last real activity on the workspace).
+            try:
+                if now - os.path.getmtime(path) > _SANDBOX_GRACE_S:
+                    _shutil.rmtree(path, ignore_errors=True)
+                    reaped += 1
+                    continue
+            except OSError:
+                pass
+        # Live sandbox: keep the git history but collapse the loose objects.
+        if gced < _SANDBOX_GC_PER_RUN:
+            git_dir = os.path.join(path, '.git')
+            if os.path.isdir(git_dir):
+                try:
+                    subprocess.run(
+                        ['git', 'gc', '--prune=now', '--quiet'], cwd=path,
+                        capture_output=True, timeout=600)
+                    gced += 1
+                except Exception:
+                    pass
+    # Stray legacy .git mirrors inside agent prototypes.
+    agents_dir = os.path.join(THINK_TANK_DIR, 'agents')
+    try:
+        roster = {r[0] for r in _db().__enter__().execute(
+            'SELECT id FROM roster_agent').fetchall()}
+    except Exception:
+        roster = None
+    try:
+        for name in os.listdir(agents_dir):
+            git_dir = os.path.join(agents_dir, name, 'prototypes', '.git')
+            if os.path.isdir(git_dir) and (roster is None
+                                           or name not in roster):
+                _shutil.rmtree(git_dir, ignore_errors=True)
+    except OSError:
+        pass
+    if reaped or gced:
+        print(f'[disk-hygiene] sandboxes reaped={reaped} gc={gced}',
+              flush=True)
+
+
+def _refresh_sandbox_liveness():
+    """The set of stage sandbox ids the live state or runtime pointers can
+    vouch for. Everything else ages out through the grace window."""
+    live = set()
+    try:
+        state = get_state_from_db(archive_merge='none') or {}
+        sim_agents = (state.get('sim') or {}).get('agents') or {}
+        for rec in sim_agents.values():
+            if isinstance(rec, dict):
+                for k in ('sandboxId', 'sandbox', 'sandbox_id'):
+                    v = rec.get(k)
+                    if isinstance(v, str) and v.startswith('stage-'):
+                        live.add(v)
+        agents = state.get('agents') or {}
+        for rec in agents.values():
+            if isinstance(rec, dict):
+                for k in ('sandboxId', 'sandbox', 'sandbox_id'):
+                    v = rec.get(k)
+                    if isinstance(v, str) and v.startswith('stage-'):
+                        live.add(v)
+    except Exception:
+        pass
+    sandboxes_dir = os.path.join(THINK_TANK_DIR, 'sandboxes')
+    try:
+        for name in os.listdir(sandboxes_dir):
+            if not name.startswith('stage-'):
+                continue
+            for suffix in ('.runtime.json', '.repair.json'):
+                fp = os.path.join(sandboxes_dir, name + suffix)
+                if os.path.exists(fp):
+                    live.add(name)
+    except OSError:
+        pass
+    _SANDBOX_LIVE_IDS.clear()
+    _SANDBOX_LIVE_IDS.update(live)
+
+
+_SANDBOX_LIVE_IDS = set()
+
+
+def _disk_free_gib():
+    try:
+        usage = shutil.disk_usage(THINK_TANK_DIR)
+        return usage.free / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def _disk_pressure_ok():
+    """Guard for expensive provisioning: refuse when free disk is under the
+    floor, so the tank degrades with a clear error instead of dying with
+    ENOSPC mid-write."""
+    free = _disk_free_gib()
+    if free is None:
+        return True
+    return free >= _SANDBOX_MIN_FREE_GIB
+
+
+async def _disk_hygiene_loop():
+    while True:
+        await asyncio.sleep(LOG_PRUNE_INTERVAL_S)
+        try:
+            await asyncio.to_thread(_refresh_sandbox_liveness)
+            await asyncio.to_thread(_prune_sandboxes)
+        except Exception as e:
+            print(f'[disk-hygiene] sweep failed: {e}', flush=True)
+
+
 def _wiki_page_body(page_id, category):
     """Read a wiki page's current BODY straight off disk (the server-authority
     write path persists `library/wiki/{category}/{page_id}.md`), or '' when it

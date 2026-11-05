@@ -762,6 +762,14 @@ _SANDBOX_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')
 def _sandbox_dir_for(sandbox_id):
     if not sandbox_id or not isinstance(sandbox_id, str) or not _SANDBOX_ID_RE.match(sandbox_id):
         raise ValueError(f'invalid sandbox id: {sandbox_id!r}')
+    # Low-disk guard (2026-11-05 emergency): a new sandbox costs a repo copy
+    # plus a growing git history. When free space is under the floor, refuse
+    # here with a clear error instead of dying with ENOSPC mid-write later.
+    if not _disk_pressure_ok():
+        raise RuntimeError(
+            f'disk pressure: under {_SANDBOX_MIN_FREE_GIB} GiB free; the '
+            'disk-hygiene sweeper must reclaim space before new sandboxes '
+            'are provisioned')
     path = os.path.join(SANDBOXES_DIR, sandbox_id)
     os.makedirs(path, exist_ok=True)
     return path
