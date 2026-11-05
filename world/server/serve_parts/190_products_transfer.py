@@ -9,15 +9,16 @@ re-routes future asks to the new owner automatically.
 
 The handshake (all writes go through the state writer, all steps audited):
 
-  POST /api/products/transfer-request  {productId, toTeamId, note?}
-      A member of the OWNING team proposes the transfer. A member is the
-      team's supervisor or any worker reporting to them (the same span
-      rule the roster uses everywhere else).
+    POST /api/products/transfer-request  {productId, toTeamId, note?}
+      The OWNING team's DIRECTOR proposes the transfer (owner directive
+      2026-11-05: strict director authority on both sides -- a transfer is
+      an org decision, not a card; workers mail their director instead).
+      The tank admin may propose on any team's behalf.
   POST /api/products/transfer-accept   {productId}
-      A member of the RECEIVING team accepts. The product's teamId flips
+      The RECEIVING team's DIRECTOR accepts. The product's teamId flips
       atomically; the pending proposal is consumed.
   POST /api/products/transfer-cancel   {productId}
-      Either side cancels while pending.
+      A director of either side (or the admin) cancels while pending.
 
 Pending proposals live in state['pendingTransfers'][productId]. A
 product can have at most one pending transfer; a transfer to the
@@ -45,6 +46,32 @@ def _roster_member_of(agent_id, team_id):
     except Exception:
         return False
     return str(blob.get('director') or '').lower() == str(team_id).lower()
+
+
+def _roster_director_of(agent_id, team_id, state=None):
+    """True when the agent is the team's DIRECTOR (or the tank admin).
+    Owner directive (2026-11-05): product ownership transfers are a
+    director-level act on both sides -- a member proposing one commits
+    their team's product without their leadership's consent, and a member
+    accepting commits a team to ownership it never agreed to. Workers who
+    spot a mismatch mail their director instead. The caller's in-hand state
+    is used when given (the handlers always have one)."""
+    if not agent_id or not team_id:
+        return False
+    try:
+        state = state if state is not None else get_state_from_db(
+            archive_merge='none')
+    except Exception:
+        return False
+    if _is_admin(state or {}, agent_id):
+        return True
+    teams = state.get('teams') or []
+    team = next((t for t in teams
+                 if str(t.get('id') or '').lower() == str(team_id).lower()),
+                None)
+    if not team:
+        return False
+    return str(team.get('directorId') or '').lower() == str(agent_id).lower()
 
 
 @app.post('/api/products/transfer-request')
@@ -79,9 +106,11 @@ async def api_product_transfer_request(request: Request):
         return JSONResponse({'error': 'product is unowned; claim it through '
                             'the normal backlog flow instead'},
                             status_code=409)
-    if not _roster_member_of(agent_id, owner):
-        return JSONResponse({'error': 'only a member of the owning team can '
-                            'propose a transfer'}, status_code=403)
+    if not _roster_director_of(agent_id, owner, state=state):
+        return JSONResponse({'error': 'only the owning team\'s director '
+                            '(or the admin) can propose a transfer; '
+                            'members mail their director instead'},
+                            status_code=403)
     teams = {t.get('id') for t in (state.get('teams') or [])}
     if to_team == owner:
         return JSONResponse({'error': 'the product is already owned by that '
@@ -155,9 +184,10 @@ async def api_product_transfer_accept(request: Request):
     if not pending:
         return JSONResponse({'error': 'no pending transfer for this '
                             'product'}, status_code=404)
-    if not _roster_member_of(agent_id, pending['toTeamId']):
-        return JSONResponse({'error': 'only a member of the receiving team '
-                            'can accept'}, status_code=403)
+    if not _roster_director_of(agent_id, pending['toTeamId'],
+                               state=state):
+        return JSONResponse({'error': 'only the receiving team\'s director '
+                            '(or the admin) can accept'}, status_code=403)
     product = (state.get('products') or {}).get(product_id)
     if not isinstance(product, dict):
         return JSONResponse({'error': 'product vanished mid-handshake'},
@@ -201,10 +231,12 @@ async def api_product_transfer_cancel(request: Request):
     if not pending:
         return JSONResponse({'error': 'no pending transfer for this '
                             'product'}, status_code=404)
-    if not (_roster_member_of(agent_id, pending['fromTeamId'])
-            or _roster_member_of(agent_id, pending['toTeamId'])):
-        return JSONResponse({'error': 'only a member of either side can '
-                            'cancel'}, status_code=403)
+    if not (_roster_director_of(agent_id, pending['fromTeamId'],
+                                state=state)
+            or _roster_director_of(agent_id, pending['toTeamId'],
+                                   state=state)):
+        return JSONResponse({'error': 'only a director of either side '
+                            '(or the admin) can cancel'}, status_code=403)
     (state.get(_TRANSFER_PENDING_KEY) or {}).pop(product_id, None)
     save_state_to_db(state)
     log_action(agent_id, 'product_transfer_cancelled',

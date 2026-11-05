@@ -51,7 +51,8 @@ def setUpModule():
     with serve._db() as conn:
         for agent, director in (('marcus', 'ben'), ('nora', 'theo'),
                                 ('theo', None), ('clara', 'ben'),
-                                ('ada', None)):
+                                ('ada', None), ('ben', None),
+                                ('apu', 'ada')):
             conn.execute('INSERT INTO agent_keys (agent_id, secret_key, '
                          'created_at) VALUES (?, ?, ?)',
                          (agent, f'key-{agent}', 0.0))
@@ -241,7 +242,8 @@ class DirectorCardScan(unittest.TestCase):
 class ProductOwnershipTransfer(unittest.TestCase):
     def _state(self, products):
         return {'products': products,
-                'teams': [{'id': 'ben'}, {'id': 'ada'}],
+                'teams': [{'id': 'ben', 'directorId': 'ben'},
+                          {'id': 'ada', 'directorId': 'ada'}],
                 'pendingTransfers': {}}
 
     def test_request_by_non_owner_refused(self):
@@ -255,6 +257,20 @@ class ProductOwnershipTransfer(unittest.TestCase):
                               headers={'X-Agent-Key': 'key-nora'})
         self.assertEqual(r.status_code, 403)
 
+    def test_member_of_owning_team_cannot_propose(self):
+        # Strict director authority (2026-11-05): a worker of the owning
+        # team (clara reports to ben) cannot propose a transfer.
+        st = self._state({'p1': {'name': 'Widget', 'teamId': 'ben'}})
+        with unittest.mock.patch.object(serve, '_state_begin',
+                                        return_value=st), \
+                unittest.mock.patch.object(serve, 'save_state_to_db',
+                                           lambda s: None):
+            r = client().post('/api/products/transfer-request',
+                              json={'productId': 'p1', 'toTeamId': 'ada'},
+                              headers={'X-Agent-Key': 'key-clara'})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('director', r.json()['error'])
+
     def test_full_handshake_flips_ownership(self):
         st = self._state({'p1': {'name': 'Widget', 'teamId': 'ben'}})
         saved = {}
@@ -265,13 +281,19 @@ class ProductOwnershipTransfer(unittest.TestCase):
             r1 = client().post('/api/products/transfer-request',
                                json={'productId': 'p1', 'toTeamId': 'ada',
                                      'note': 'ada has the datastore skill'},
-                               headers={'X-Agent-Key': 'key-marcus'})
+                               headers={'X-Agent-Key': 'key-ben'})
             self.assertEqual(r1.status_code, 200)
+            # clara is on ada's span but is not ada: only the receiving
+            # team's director may accept.
             r2 = client().post('/api/products/transfer-accept',
                                json={'productId': 'p1'},
-                               headers={'X-Agent-Key': 'key-clara'})
-        # clara reports to ben, NOT ada: she cannot accept for ada.
-        self.assertEqual(r2.status_code, 403)
+                               headers={'X-Agent-Key': 'key-apu'})
+            self.assertEqual(r2.status_code, 403)
+            r3 = client().post('/api/products/transfer-accept',
+                               json={'productId': 'p1'},
+                               headers={'X-Agent-Key': 'key-ada'})
+            self.assertEqual(r3.status_code, 200)
+        self.assertEqual(st['products']['p1']['teamId'], 'ada')
 
     def test_receiver_accepts_and_owner_flips(self):
         st = self._state({'p1': {'name': 'Widget', 'teamId': 'ben'}})
@@ -279,10 +301,10 @@ class ProductOwnershipTransfer(unittest.TestCase):
                                         return_value=st), \
                 unittest.mock.patch.object(serve, 'save_state_to_db',
                                            lambda s: None):
-            # a ben-side agent proposes
+            # the owning team's director proposes
             client().post('/api/products/transfer-request',
                           json={'productId': 'p1', 'toTeamId': 'ada'},
-                          headers={'X-Agent-Key': 'key-marcus'})
+                          headers={'X-Agent-Key': 'key-ben'})
             # an ada-side agent accepts (ada herself)
             r = client().post('/api/products/transfer-accept',
                               json={'productId': 'p1'},
@@ -299,12 +321,32 @@ class ProductOwnershipTransfer(unittest.TestCase):
                                            lambda s: None):
             client().post('/api/products/transfer-request',
                           json={'productId': 'p1', 'toTeamId': 'ada'},
-                          headers={'X-Agent-Key': 'key-marcus'})
+                          headers={'X-Agent-Key': 'key-ben'})
+            # a worker on either span cannot cancel; a director can.
+            r_worker = client().post('/api/products/transfer-cancel',
+                                     json={'productId': 'p1'},
+                                     headers={'X-Agent-Key': 'key-apu'})
+            self.assertEqual(r_worker.status_code, 403)
             r = client().post('/api/products/transfer-cancel',
                               json={'productId': 'p1'},
                               headers={'X-Agent-Key': 'key-ada'})
         self.assertEqual(r.status_code, 200)
         self.assertNotIn('p1', st.get('pendingTransfers') or {})
+
+    def test_receiving_director_gets_a_wake(self):
+        st = self._state({'p1': {'name': 'Widget', 'teamId': 'ben'}})
+        st['agents'] = {'ada': {'mailbox': []}}
+        with unittest.mock.patch.object(serve, '_state_begin',
+                                        return_value=st), \
+                unittest.mock.patch.object(serve, 'save_state_to_db',
+                                           lambda s: None):
+            client().post('/api/products/transfer-request',
+                          json={'productId': 'p1', 'toTeamId': 'ada',
+                                'note': 'they own the datastore skill'},
+                          headers={'X-Agent-Key': 'key-ben'})
+        box = st['agents']['ada']['mailbox']
+        self.assertTrue(box, 'receiving director got no wake')
+        self.assertIn('p1', box[-1]['text'])
 
 
 if __name__ == '__main__':
