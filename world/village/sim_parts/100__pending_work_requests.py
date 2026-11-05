@@ -850,6 +850,24 @@ def _queue_player_email(state, kind, subject, body_text, now_ms=None,
 _CARD_FAILURE_DEDUP_MS = 30 * 60 * 1000
 
 
+def _card_failure_dedup_title(title):
+    """Collapse the re-card machine's renames into one dedup identity.
+
+    Each repair re-card mints a new title ('Fix: [SPIKE] X' after
+    '[SPIKE] X' after 'X'), and every new title used to be a fresh
+    Telegram dedup key -- the player got a failure notice per rename
+    even though it is the same failing card. The DISPLAY keeps the full
+    title; only the KEY is normalized."""
+    t = str(title or '')
+    for _ in range(6):  # titles can stack several prefixes deep
+        t = re.sub(r'^(?:Fix:\s*|Re:\s*|Reopen(?:ed)?:\s*)+', '', t, flags=re.I)
+        t = re.sub(r'^\[(?:story|bug|spike|task|fix|research|report|qa|review)\]\s*',
+                   '', t, flags=re.I)
+        if t == str(title or ''):
+            break
+    return re.sub(r'\s+', ' ', t).strip().lower()
+
+
 def _notify_card_failure(state, task, reason, category='failed', now_ms=None):
     """One Telegram notice per failing card, with the reason and card identity.
 
@@ -862,7 +880,7 @@ def _notify_card_failure(state, task, reason, category='failed', now_ms=None):
     task_id = task.get('id') or task.get('taskId')
     title = (task.get('title') or task_id or 'untitled card').strip()
     issue = (task.get('issueKey') or '').strip()
-    key = issue or f"{task.get('room') or ''}|{title}"
+    key = issue or f"{task.get('room') or ''}|{_card_failure_dedup_title(title)}"
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
     seen = state.setdefault('_cardFailureNotified', {})
     if now_ms - float(seen.get(key) or 0) < _CARD_FAILURE_DEDUP_MS:
