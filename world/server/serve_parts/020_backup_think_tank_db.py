@@ -575,6 +575,28 @@ def get_state_from_db(archive_merge='copy'):
               DOES touch tasks sees a truncated view: never use it where
               task ids are resolved.
     """
+    # Read cache (2026-11-05 batched saves): the merged state object is kept
+    # in memory and served to every default-mode reader. Each uncached read
+    # cost a 5.6 MB blob transfer + parse + a ~1.2s archived-task deepcopy,
+    # all serialized behind _STATE_LOCK -- the 25-30s request stalls under
+    # load came from WRITERS queueing behind each other's read-modify-write
+    # cycles. The cache turns a writer's read into a dict lookup.
+    #
+    # The cached object is SHARED and mutable by design: every writer holds
+    # _STATE_LOCK while mutating, so mutations accumulate on one object and
+    # the next save persists all of them. A save always refreshes the cache
+    # to the saved snapshot. 'copy' merge semantics are preserved where they
+    # matter: the cache only ever stores 'copy'-merged states (private
+    # deepcopies of archived tasks), so callers may still mutate freely
+    # without corrupting the archive cache.
+    #
+    # Known staleness: a writer OUTSIDE this process (operator psql) is not
+    # reflected until restart. That hazard predates the cache -- every full
+    # blob save already clobbered external writes.
+    global _STATE_READ_CACHE
+    if archive_merge == 'copy' and _STATE_READ_CACHE['obj'] is not None \
+            and not _state_io_test_mode():
+        return _STATE_READ_CACHE['obj']
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if not row:
@@ -583,6 +605,8 @@ def get_state_from_db(archive_merge='copy'):
     _merge_extracted_sections(data)
     if archive_merge != 'none':
         _merge_archived_tasks(data, mode=archive_merge)
+    if archive_merge == 'copy' and not _state_io_test_mode():
+        _STATE_READ_CACHE['obj'] = data
     return data
 
 
@@ -980,7 +1004,109 @@ def _save_phase(data, name):
         pass
 
 
+# Batched state persistence (2026-11-05): the request path stopped paying
+# the full read-modify-write on every mutation. get_state_from_db serves a
+# shared cached object; save_state_to_db queues the mutated state and a
+# background saver persists at most one snapshot per coalescing window.
+# Request latency drops from seconds (5.6 MB blob over the Tailscale DB
+# link, serialized behind _STATE_LOCK) to milliseconds; the durability
+# window grows to the coalescing window (default 3s), which the sim's own
+# cadence and the client's 5s autosave make immaterial in practice.
+_SAVE_COALESCE_S = 3.0
+_SAVE_PENDING: dict = {'snapshot': None, 'at': 0.0}
+_SAVE_EVENT = threading.Event()
+_SAVE_WORKER: list = []
+_STATE_READ_CACHE: dict = {'obj': None}
+_SAVE_FLUSHED = threading.Event()
+
+
+def _state_io_test_mode():
+    """True when state I/O must behave exactly like the pre-batching code:
+    synchronous saves, no read cache. Every pytest run and any explicit
+    force-sqlite process gets the deterministic path."""
+    try:
+        import db_backend as _dbm
+        return _dbm._test_sandboxed()
+    except Exception:
+        return False
+
+
+def _queue_state_save(data):
+    """Record the newest state snapshot and wake the saver. Called instead
+    of the synchronous save on the request/tick paths in production. The
+    snapshot is a TOP-LEVEL copy taken at queue time: later nested mutations
+    may still be visible to the saver's serialize (harmless -- a serialize
+    race raises, the saver re-queues, and the NEXT snapshot persists), and
+    a newer queue always supersedes an older one."""
+    _SAVE_PENDING['snapshot'] = dict(data)
+    _SAVE_PENDING['at'] = time.time()
+    _STATE_READ_CACHE['obj'] = data
+    _SAVE_EVENT.set()
+
+
+def _flush_pending_save(timeout=20.0):
+    """Persist whatever is queued right now (shutdown path)."""
+    snap = _SAVE_PENDING.get('snapshot')
+    if snap is None or _SAVE_FLUSHED.is_set():
+        return
+    _SAVE_FLUSHED.set()
+    try:
+        _save_state_to_db_sync(snap)
+    except Exception as e:
+        print(f'[state-save] shutdown flush failed: {e}', flush=True)
+
+
+def _save_worker_loop():
+    # Coalescing saver: sleep through the quiet tail of a burst, then persist
+    # the newest snapshot once. A failed serialize/save keeps its payload and
+    # retries after a short backoff -- the tank never loses a queued mutation
+    # to a transient race.
+    while True:
+        _SAVE_EVENT.wait(timeout=0.5)
+        _SAVE_EVENT.clear()
+        snap = _SAVE_PENDING.get('snapshot')
+        if snap is None:
+            continue
+        age = time.time() - float(_SAVE_PENDING.get('at') or 0)
+        if age < _SAVE_COALESCE_S and not _SAVE_FLUSHED.is_set():
+            continue
+        _SAVE_PENDING['snapshot'] = None
+        try:
+            _save_state_to_db_sync(snap)
+        except Exception as e:
+            print(f'[state-save] coalesced save failed, re-queued: '
+                  f'{type(e).__name__}: {e}', flush=True)
+            if _SAVE_PENDING.get('snapshot') is None:
+                _SAVE_PENDING['snapshot'] = snap
+                _SAVE_PENDING['at'] = time.time() - _SAVE_COALESCE_S
+            _SAVE_EVENT.set()
+            time.sleep(5.0)
+
+
+def _ensure_save_worker():
+    if _SAVE_WORKER:
+        return
+    t = threading.Thread(target=_save_worker_loop, name='state-save-worker',
+                         daemon=True)
+    _SAVE_WORKER.append(t)
+    t.start()
+    import atexit as _atexit
+    _atexit.register(_flush_pending_save)
+
+
 def save_state_to_db(data):
+    # Production: queue and return. The caller's lock (held via
+    # _state_begin) is released by the @_state_writer wrapper's
+    # _state_abort, exactly as before -- only the DB I/O left the request
+    # path. Tests and sandboxed processes keep the synchronous path so
+    # write-then-read fixtures stay deterministic.
+    if _state_io_test_mode():
+        return _save_state_to_db_sync(data)
+    _ensure_save_worker()
+    _queue_state_save(data)
+
+
+def _save_state_to_db_sync(data):
     # Pass 1 completion recovery: a stale whole-state save must not erase a
     # newer player recovery decision. Only tasks with newer intervention
     # history are protected; ordinary saves pass through unchanged.
