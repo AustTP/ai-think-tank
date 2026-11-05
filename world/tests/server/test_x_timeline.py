@@ -56,11 +56,11 @@ def setUpModule():
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
         THINK_TANK_DIR=_TMP_DIR,
-        _TRUSTED_REPOS_PATH=os.path.join(_TMP_DIR, 'trusted_repos.json'),
+        _TRUSTED_CODEBASE_PATH=os.path.join(_TMP_DIR, 'trusted_codebase.json'),
         _X_POOL_DIR=os.path.join(_TMP_DIR, 'x_scrape'),
         _X_POOL_DB=os.path.join(_TMP_DIR, 'x_scrape', 'accounts.db'),
         _x_tool_path=lambda: _FAKE_TOOL,
-        _trusted_repos=lambda: {'vladkens/twscrape'},
+        source_is_trusted=lambda s: s.lower() == 'vladkens/twscrape',
         verify_session=lambda sess: False,
         check_rate_limit=lambda aid: True,
         _load_env=lambda: {'X_SESSION_AUTH_TOKEN': 'a' * 40,
@@ -68,7 +68,7 @@ def setUpModule():
     )
     _PATCHER.start()
     serve.init_db()
-    serve.seed_trusted_repos()
+    serve.seed_trusted_codebase()
     # Pre-seed the pool marker so non-seeding tests skip the subprocess;
     # the seeding tests rmtree the dir themselves for a fresh run.
     os.makedirs(os.path.join(_TMP_DIR, 'x_scrape'), exist_ok=True)
@@ -161,7 +161,7 @@ class XAdapterCLI(unittest.TestCase):
 class XAdapterPreconditions(unittest.TestCase):
     def test_untrusted_repo_is_503(self):
         with unittest.mock.patch.object(
-                serve, '_trusted_repos', lambda: set()):
+                serve, 'source_is_trusted', lambda s: False):
             r = client().get('/api/x/search', params={'query': 'q'},
                              headers={'X-Agent-Key': _KEY})
         self.assertEqual(r.status_code, 503)
@@ -206,63 +206,6 @@ class XProjection(unittest.TestCase):
         d = serve._x_strip_tweet(long)
         self.assertEqual(len(d['text']), 2000)
         self.assertEqual(d['links'], ['https://github.com/a/b'])
-
-
-class TrustedReposRegistry(unittest.TestCase):
-    def test_seeded_with_twscrape(self):
-        r = client().get('/api/trusted-repos', headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r.status_code, 200)
-        repos = r.json()['repos']
-        self.assertTrue(any(x['repo'] == 'vladkens/twscrape'
-                            for x in repos))
-
-    def test_requires_auth(self):
-        r = client().get('/api/trusted-repos')
-        self.assertEqual(r.status_code, 401)
-
-    def test_agent_can_add_and_revouch(self):
-        r = client().post('/api/trusted-repos',
-                          json={'repo': 'example/cleaner',
-                                'kind': 'pip-cli', 'tool': 'cleaner',
-                                'purpose': 'HTML to markdown for the '
-                                           'retrieval corpus'},
-                          headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()['added_by_key'] if
-                         'added_by_key' in r.json() else
-                         r.json()['added']['added_by'], 'marcus')
-        r2 = client().post('/api/trusted-repos',
-                           json={'repo': 'example/cleaner',
-                                 'kind': 'pip-cli',
-                                 'purpose': 'second opinion'},
-                           headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r2.status_code, 200)
-        self.assertTrue(r2.json().get('revouched'))
-        listing = client().get('/api/trusted-repos',
-                               headers={'X-Agent-Key': _KEY}).json()
-        matches = [x for x in listing['repos']
-                   if x['repo'] == 'example/cleaner']
-        self.assertEqual(len(matches), 1)
-        self.assertIn('marcus', matches[0]['vouched_by'])
-
-    def test_bad_slug_rejected(self):
-        r = client().post('/api/trusted-repos',
-                          json={'repo': 'not a slug', 'purpose': 'x'},
-                          headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r.status_code, 400)
-
-    def test_bad_kind_rejected(self):
-        r = client().post('/api/trusted-repos',
-                          json={'repo': 'ok/slug', 'kind': 'wget',
-                                'purpose': 'x'},
-                          headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r.status_code, 400)
-
-    def test_purpose_required(self):
-        r = client().post('/api/trusted-repos',
-                          json={'repo': 'ok/slug'},
-                          headers={'X-Agent-Key': _KEY})
-        self.assertEqual(r.status_code, 400)
 
 
 if __name__ == '__main__':

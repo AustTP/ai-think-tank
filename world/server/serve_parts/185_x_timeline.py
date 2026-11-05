@@ -3,7 +3,7 @@
 DESIGN RULE (owner directive): the tank RUNS vetted upstream tools; it does
 not re-implement their logic in-tree. The X reader here is a THIN adapter
 around the `twscrape` CLI from the trusted repository vladkens/twscrape
-(see GET /api/trusted-repos). This module contributes only:
+(see GET /api/trusted-codebase). This module contributes only:
 
   - credential custody: the operator's X session cookies (.env
     X_SESSION_AUTH_TOKEN / X_SESSION_CT0) are seeded ONCE into a 0700/0600
@@ -39,18 +39,6 @@ _X_PROC_TIMEOUT_S = 120.0
 _X_SEARCH_MAX_ITEMS = 2000
 
 
-def _trusted_repos():
-    """The trusted-repository registry (187_trusted_repos). A tool runs only
-    when its repo is on the list; an unreadable registry fails closed."""
-    try:
-        with open(os.path.join(THINK_TANK_DIR, 'trusted_repos.json')) as fh:
-            data = json.load(fh)
-        repos = {r.get('repo', '').lower() for r in data.get('repos', [])}
-    except Exception:
-        return set()
-    return repos
-
-
 def _x_tool_path():
     """The trusted tool's CLI binary, or None. Located through PATH like any
     other installed tool; the tank pins provenance through the trusted-repos
@@ -61,9 +49,10 @@ def _x_tool_path():
 def _x_ready():
     """(ok, error_response_builder) -- shared preconditions: tool trusted,
     tool installed, pool seeded from .env."""
-    if _X_TRUSTED_REPO not in _trusted_repos():
-        return None, ('tool repo not trusted; ask an agent with repo access '
-                      f'to add {_X_TRUSTED_REPO} to /api/trusted-repos')
+    if not source_is_trusted(_X_TRUSTED_REPO):
+        return None, ('tool source not trusted; an agent can add '
+                      f'{_X_TRUSTED_REPO} via POST /api/trusted-codebase '
+                      'with a purpose')
     if _x_tool_path() is None:
         return None, (f'{_X_TOOL} CLI not installed on the server '
                       '(pip install twscrape)')

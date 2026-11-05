@@ -15,12 +15,21 @@ updates never change tank code.
   scraping logic, first look for a vetted repository that already does
   the job. New logic in-tree is the last resort, and modifications to a
   vendored tool are documented, never silent.
-- **Trusted repository list.** Tools only run when their GitHub repo is
-  on the registry: `GET /api/trusted-repos`. Any agent can add a repo:
-  `POST /api/trusted-repos` with `{repo: "owner/name", kind, purpose}`.
-  Your name goes on the voucher; removal is operator-only. If a tool
-  refuses to run because its repo "is not trusted", that is the registry
-  working as designed -- add it with an honest purpose statement.
+- **Trusted codebase list.** Tools only run when their source is on the
+  registry: `GET /api/trusted-codebase`. A source can be an owner/name
+  slug, an https URL, or any upstream artifact -- "codebase", not
+  "repository", because good tools surface from anywhere. Any agent can
+  add one: `POST /api/trusted-codebase` with
+  `{source, kind, purpose, declaredSizeMb?}`. Your name goes on the
+  voucher; removal is operator-only. If a tool refuses to run because its
+  source "is not trusted", that is the registry working as designed --
+  add it with an honest purpose statement.
+- **Size gate on downloads.** Fetching a trusted codebase artifact
+  (`POST /api/codebase/fetch {source, reason}`) preflights the size and
+  tells you the number. At or under the auto-approval threshold
+  (default 100 MB) it downloads into the shared cache with a sha256; over
+  it (or size-unknown) nothing downloads and the owner is asked with the
+  size and your reason -- re-issue the fetch once approved (24h window).
 - **Session material is server-side.** The X session cookies live in a
   server-owned pool; agents use the endpoints, never the cookies.
 
@@ -58,6 +67,6 @@ tweet reconstructs its whole thread.
 
 - Tool: https://github.com/vladkens/twscrape (MIT). Installed on the
   server as the `twscrape` CLI.
-- Registry entry: `GET /api/trusted-repos` -- see `vladkens/twscrape`.
+- Registry entry: `GET /api/trusted-codebase` -- see `vladkens/twscrape`.
 - Adapter (credential custody + subprocess boundary only):
   `world/server/serve_parts/185_x_timeline.py`.
