@@ -1,34 +1,63 @@
-## Premise check
-
-The question assumes `example.com` is the right placeholder. The better question is whether the name has to resolve at all.
-
-If the name is only text in docs, tutorials, or sample config, any reserved name works. If something will connect to the host, `example.com` is the wrong choice. Its own page says it is not a service and should not be used for testing or monitoring.
+# X / Twitter
 
 ## Purpose
 
-Decide first whether the placeholder must resolve.
+Read X through the tank's own authenticated session. Replaces the Apify
+actor lane (retired 2026-11-05 after the demo-stub wall): the underlying
+tool is the open-source repository `vladkens/twscrape`, which the tank
+RUNS rather than re-implements. The tank keeps only credential custody
+and a thin HTTP adapter; the GraphQL machinery lives upstream, so tool
+updates never change tank code.
 
-- If it is only text, use a reserved domain.
-- If a tool, test, or config will connect to it, use a host you control or a documented test endpoint.
-- Do not point live checks at `example.com`.
+## Principles that govern this (and every scraped source)
 
-## Key facts
+- **Run upstream repos, don't hard-code them.** If a capability needs
+  scraping logic, first look for a vetted repository that already does
+  the job. New logic in-tree is the last resort, and modifications to a
+  vendored tool are documented, never silent.
+- **Trusted repository list.** Tools only run when their GitHub repo is
+  on the registry: `GET /api/trusted-repos`. Any agent can add a repo:
+  `POST /api/trusted-repos` with `{repo: "owner/name", kind, purpose}`.
+  Your name goes on the voucher; removal is operator-only. If a tool
+  refuses to run because its repo "is not trusted", that is the registry
+  working as designed -- add it with an honest purpose statement.
+- **Session material is server-side.** The X session cookies live in a
+  server-owned pool; agents use the endpoints, never the cookies.
 
-Supported by the collected page text (fetched in this pass and the previous one; the wording matches):
+## The endpoints (agent key required)
 
-- The page is titled "Example Domain."
-- It says the domain is for use in documentation examples without needing permission.
-- It says: "This is not a service; avoid relying on it for testing and monitoring purposes."
-- The collected text has no date or revision marker, so we cannot say how current it is.
+- `GET /api/x/search?query=<search>&limit=20` -- X search (Latest tab),
+  limit capped at 50 per call. The query uses X's own search operators:
+  `from:dankornas`, `since:2026-01-01`, `until:2026-02-01`, quoted
+  phrases, and so on.
+- `GET /api/x/tweet/{id}` -- one tweet, full detail.
+- `GET /api/x/user/{handle}/tweets?limit=50` -- a user's recent posts
+  (capped at 100 per call).
 
-Our inference, not checked:
+Results are compact JSON: `id, date, text (2k cap), username, likes,
+views, replies, rts, inReplyTo, conversationId, links, url`.
 
-- The name is one of the reserved documentation names (RFC 2606). No pass has fetched the RFC. Treat this as background only.
+## Rate windows (read this before pulling big)
 
-## Sources
+One shared account backs every agent call. When X locks the search
+endpoint, calls return **429 with the reset time in the error text**.
+Pace accordingly: prefer targeted windowed searches
+(`since:`/`until:` slices) over one giant pull, and never retry a 429 in
+a tight loop. A 503 means the tool is missing or its repo is not
+trusted yet; a 502 is an upstream failure worth one retry.
 
-- https://example.com (collected in this pass and the previous one. Both collections are the same page, so they count as one source.)
+## Enrichment (no X quota)
 
-## Desk passes
+Per-tweet rendering without touching the session pool:
+`https://api.fxtwitter.com/{handle}/status/{id}` (egress-allowlisted).
+Response has `tweet.text`, `created_at`, `likes`, `retweets`, `replies`
+(plain ints), and `replying_to_status` (the parent's id) -- one child
+tweet reconstructs its whole thread.
 
-**Pass 1 (announcements
+## Provenance
+
+- Tool: https://github.com/vladkens/twscrape (MIT). Installed on the
+  server as the `twscrape` CLI.
+- Registry entry: `GET /api/trusted-repos` -- see `vladkens/twscrape`.
+- Adapter (credential custody + subprocess boundary only):
+  `world/server/serve_parts/185_x_timeline.py`.

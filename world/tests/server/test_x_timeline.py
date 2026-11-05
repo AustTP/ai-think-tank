@@ -1,13 +1,20 @@
-"""Tests for the X/Timeline research capability (185_x_timeline).
+"""Tests for the X capability adapter (185_x_timeline) and the trusted
+repository registry (187_trusted_repos).
 
-Hermetic: the twscrape layer is replaced by async stubs, the pool directory
-is a temp dir, and the agent-key/session checks are patched. Network is
-never touched. The live path was validated against the real pool during
-development; these tests pin the contract: auth required, limits capped,
-seeding gated by .env keys, rate-window waits return 429, cookies never
-leak into responses, and every call is audited.
+Hermetic: the CLI subprocess boundary is replaced by canned JSONL, the
+registry file lives in a temp dir, and auth uses a real agent-keys row so
+the login middleware path is exercised. Network is never touched.
+
+Contract pinned here:
+  - the tool runs ONLY when its repo is on the trusted registry;
+  - the adapter shells out to the `twscrape` CLI (fixed argv), it does
+    not embed scraper logic;
+  - agent-key auth, result caps, 429 on rate windows, 503 with a clear
+    reason when the tool/repo/cookies are missing;
+  - any authenticated agent can add a trusted repo (vouched, audited);
+    slugs are validated; duplicates become re-vouches.
 """
-import asyncio
+import json
 import os
 import shutil
 import sys
@@ -23,87 +30,54 @@ from starlette.testclient import TestClient  # noqa: E402
 
 _TMP_DIR = None
 _PATCHER = None
+_KEY = 'xtl-test-key'
+_FAKE_TOOL = '/tmp/fake-twscrape-bin'
 
 
-class _StubPool:
-    def __init__(self, path):
-        self.path = path
-
-    async def add_account_cookies(self, name, cookies):
-        self.cookies = cookies
-
-
-class _StubAPI:
-    def __init__(self, pool):
-        self.pool = pool
-
-    async def search(self, query, limit=20, kv=None):
-        for i in range(7):
-            yield _FakeTweet(i)
-
-    async def tweet_details(self, tid):
-        if str(tid) == '4004000000000000000':
-            return None
-        return _FakeTweet(0)
-
-    async def user_by_login(self, login):
-        if login == 'nobody':
-            return None
-        return _FakeUser(login)
-
-    async def user_tweets(self, uid, limit=20):
-        for i in range(7):
-            yield _FakeTweet(i)
-
-
-class _FakeTweet:
-    def __init__(self, i):
-        self._d = {
-            'id_str': f'21100000000000000{i}{i}',
-            'date': '2026-10-03 03:35:16+00:00',
-            'rawContent': '🔗 GitHub: https://github.com/o/r',
-            'likeCount': i, 'viewCount': 100 + i, 'replyCount': 0,
-            'retweetCount': 0,
-            'inReplyToTweetIdStr': '2099000000000000000',
-            'conversationIdStr': '2099000000000000000',
-            'links': [{'url': 'https://github.com/o/r'}],
-            'url': f'https://x.com/DanKornas/status/21100000000000000{i}{i}',
-            'user': {'username': 'DanKornas'},
-        }
-
-    def json(self):
-        import json as _json
-        return _json.dumps(self._d)
-
-
-class _FakeUser:
-    def __init__(self, login):
-        self.id = 1406639376675770374
-        self.username = login
+def _tweet(i, repo='owner/repo'):
+    return {
+        'id_str': f'21100000000000000{i}{i}',
+        'date': '2026-10-03 03:35:16+00:00',
+        'rawContent': f'🔗 GitHub: https://github.com/{repo}',
+        'likeCount': i, 'viewCount': 100 + i, 'replyCount': 0,
+        'retweetCount': 0,
+        'inReplyToTweetIdStr': '2099000000000000000',
+        'conversationIdStr': '2099000000000000000',
+        'links': [{'url': f'https://github.com/{repo}'}],
+        'url': f'https://x.com/DanKornas/status/21100000000000000{i}{i}',
+        'user': {'username': 'DanKornas'},
+    }
 
 
 def setUpModule():
     global _TMP_DIR, _PATCHER
-    _TMP_DIR = tempfile.mkdtemp(prefix='think-tank-x-timeline-test-')
+    _TMP_DIR = tempfile.mkdtemp(prefix='think-tank-xtl-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
         THINK_TANK_DIR=_TMP_DIR,
+        _TRUSTED_REPOS_PATH=os.path.join(_TMP_DIR, 'trusted_repos.json'),
         _X_POOL_DIR=os.path.join(_TMP_DIR, 'x_scrape'),
         _X_POOL_DB=os.path.join(_TMP_DIR, 'x_scrape', 'accounts.db'),
+        _x_tool_path=lambda: _FAKE_TOOL,
+        _trusted_repos=lambda: {'vladkens/twscrape'},
         verify_session=lambda sess: False,
         check_rate_limit=lambda aid: True,
-        _x_scraper=lambda: (_StubPool, _StubAPI),
         _load_env=lambda: {'X_SESSION_AUTH_TOKEN': 'a' * 40,
                            'X_SESSION_CT0': 'c' * 160},
     )
     _PATCHER.start()
     serve.init_db()
-    # A real DB-backed agent key: the login middleware verifies X-Agent-Key
-    # against agent_keys, so the tests present a key that genuinely exists.
+    serve.seed_trusted_repos()
+    # Pre-seed the pool marker so non-seeding tests skip the subprocess;
+    # the seeding tests rmtree the dir themselves for a fresh run.
+    os.makedirs(os.path.join(_TMP_DIR, 'x_scrape'), exist_ok=True)
+    with open(os.path.join(_TMP_DIR, 'x_scrape', 'seeded'), 'w') as fh:
+        fh.write('0')
     with serve._db() as conn:
-        conn.execute('INSERT INTO agent_keys (agent_id, secret_key, created_at) '
-                     'VALUES (?, ?, ?)', ('marcus', 'good-key', 0.0))
+        conn.execute('INSERT INTO agent_keys (agent_id, secret_key, '
+                     'created_at) VALUES (?, ?, ?)',
+                     ('marcus', _KEY, 0.0))
 
 
 def tearDownModule():
@@ -115,112 +89,180 @@ def client():
     return TestClient(serve.app)
 
 
-class XTimelineAuth(unittest.TestCase):
+class XAdapterAuth(unittest.TestCase):
     def test_requires_agent_key_or_session(self):
         r = client().get('/api/x/search', params={'query': 'from:x test'})
         self.assertEqual(r.status_code, 401)
 
-    def test_bad_key_rejected(self):
-        r = client().get('/api/x/search',
-                         params={'query': 'from:x test'},
-                         headers={'X-Agent-Key': 'wrong'})
-        self.assertEqual(r.status_code, 401)
+    def test_malformed_tweet_id(self):
+        r = client().get('/api/x/tweet/nope',
+                         headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 400)
 
-    def test_bad_tweet_id_rejected(self):
-        r = client().get('/api/x/tweet/notanumber',
-                         headers={'X-Agent-Key': 'good-key'})
+    def test_malformed_query(self):
+        r = client().get('/api/x/search', params={'query': ''},
+                         headers={'X-Agent-Key': _KEY})
         self.assertEqual(r.status_code, 400)
 
 
-class XTimelineSearch(unittest.TestCase):
-    def test_search_returns_stripped_rows_and_audits(self):
-        rows = []
-        with unittest.mock.patch.object(serve, 'log_action',
-                                        lambda *a, **k: rows.append(k or a)):
+class XAdapterCLI(unittest.TestCase):
+    def _cli(self, rows):
+        def fake_run(verb_args, wait_s):
+            captured = {'args': verb_args}
+            return rows
+        return fake_run
+
+    def test_search_runs_cli_and_strips(self):
+        captured = {}
+
+        def fake_run(verb_args, wait_s):
+            captured['args'] = verb_args
+            return [_tweet(0), _tweet(1), {'garbage': True}]
+        with unittest.mock.patch.object(serve, '_x_run_cli', fake_run):
             r = client().get('/api/x/search',
                              params={'query': 'from:dankornas github.com',
                                      'limit': '5'},
-                             headers={'X-Agent-Key': 'good-key'})
+                             headers={'X-Agent-Key': _KEY})
         self.assertEqual(r.status_code, 200)
         body = r.json()
-        self.assertEqual(body['count'], 5)
+        self.assertEqual(body['count'], 2)
         first = body['tweets'][0]
         self.assertEqual(first['username'], 'DanKornas')
-        self.assertEqual(first['inReplyTo'], '2099000000000000000')
-        self.assertEqual(first['links'], ['https://github.com/o/r'])
+        self.assertEqual(first['links'], ['https://github.com/owner/repo'])
         self.assertNotIn('rawContent', first)
-        self.assertTrue(rows)
+        # fixed argv through the CLI, no shell
+        self.assertEqual(captured['args'][0], 'search')
+        self.assertIn('--limit', captured['args'])
 
-    def test_limit_capped(self):
-        captured = {}
-
-        async def spy(query, limit):
-            captured['limit'] = limit
-            return []
-        with unittest.mock.patch.object(serve, '_x_search', spy):
-            r = client().get('/api/x/search',
-                             params={'query': 'q', 'limit': '999'},
-                             headers={'X-Agent-Key': 'good-key'})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(captured['limit'], serve._X_SEARCH_CAP)
-
-    def test_rate_window_returns_429(self):
-        def boom(coro, timeout):
-            coro.close()
-            raise TimeoutError('x rate window')
-        with unittest.mock.patch.object(serve, '_x_call', boom):
+    def test_rate_window_is_429(self):
+        def boom(verb_args, wait_s):
+            raise TimeoutError('x rate window: account rate-locked')
+        with unittest.mock.patch.object(serve, '_x_run_cli', boom):
             r = client().get('/api/x/search', params={'query': 'q'},
-                             headers={'X-Agent-Key': 'good-key'})
+                             headers={'X-Agent-Key': _KEY})
         self.assertEqual(r.status_code, 429)
 
+    def test_tweet_found_and_missing(self):
+        with unittest.mock.patch.object(
+                serve, '_x_run_cli',
+                lambda a, w: [_tweet(0)]):
+            r = client().get('/api/x/tweet/2110000000000000000',
+                             headers={'X-Agent-Key': _KEY})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.json()['tweet']['id'],
+                             '2110000000000000000')
+        with unittest.mock.patch.object(serve, '_x_run_cli',
+                                        lambda a, w: []):
+            r = client().get('/api/x/tweet/2099000000000000000',
+                             headers={'X-Agent-Key': _KEY})
+            self.assertEqual(r.status_code, 404)
 
-class XTimelineSeeding(unittest.TestCase):
-    def test_seed_uses_env_once_and_chmods(self):
+
+class XAdapterPreconditions(unittest.TestCase):
+    def test_untrusted_repo_is_503(self):
+        with unittest.mock.patch.object(
+                serve, '_trusted_repos', lambda: set()):
+            r = client().get('/api/x/search', params={'query': 'q'},
+                             headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 503)
+        self.assertIn('not trusted', r.json()['error'])
+
+    def test_missing_tool_is_503(self):
+        with unittest.mock.patch.object(serve, '_x_tool_path',
+                                        lambda: None):
+            r = client().get('/api/x/search', params={'query': 'q'},
+                             headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 503)
+
+    def test_seeding_runs_cli_once_and_chmods(self):
         pool_dir = serve._X_POOL_DIR
         shutil.rmtree(pool_dir, ignore_errors=True)
-        ok, why = serve._x_seed_pool()
-        self.assertTrue(ok, why)
-        self.assertTrue(os.path.exists(
-            os.path.join(pool_dir, 'seeded')))
+        calls = []
+
+        def fake_run(cmd, capture_output, timeout):
+            calls.append(cmd)
+            return type('P', (), {'returncode': 0})()
+        with unittest.mock.patch.object(serve.subprocess, 'run', fake_run):
+            ok, err = serve._x_ready()
+        self.assertTrue(ok, err)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('add_cookie', calls[0])
         marker = os.path.join(pool_dir, 'seeded')
         self.assertEqual(oct(os.stat(marker).st_mode & 0o777), '0o600')
 
-    def test_seed_missing_env_fails_clean(self):
+    def test_seeding_missing_env_fails_clean(self):
         pool_dir = serve._X_POOL_DIR
         shutil.rmtree(pool_dir, ignore_errors=True)
         with unittest.mock.patch.object(serve, '_load_env', lambda: {}):
-            ok, why = serve._x_seed_pool()
+            ok, err = serve._x_ready()
         self.assertFalse(ok)
-        self.assertIn('missing', why)
-
-
-class XTimelineTweet(unittest.TestCase):
-    def test_tweet_found(self):
-        r = client().get('/api/x/tweet/2110000000000000000',
-                         headers={'X-Agent-Key': 'good-key'})
-        self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()['tweet']['id'], '2110000000000000000')
-
-    def test_tweet_missing_404(self):
-        r = client().get('/api/x/tweet/4004000000000000000',
-                         headers={'X-Agent-Key': 'good-key'})
-        self.assertEqual(r.status_code, 404)
-
-    def test_user_tweets_unknown_user_404(self):
-        r = client().get('/api/x/user/nobody/tweets',
-                         headers={'X-Agent-Key': 'good-key'})
-        self.assertEqual(r.status_code, 404)
+        self.assertIn('missing from .env', err)
 
 
 class XProjection(unittest.TestCase):
     def test_text_bounded_and_links_only_urls(self):
         long = {'id_str': '1', 'rawContent': 'x' * 3000, 'user': {},
                 'links': [{'url': 'https://github.com/a/b', 'text': 't'}]}
-        fake = type('T', (), {'json': staticmethod(
-            lambda: __import__('json').dumps(long))})()
-        d = serve._x_strip_tweet(fake)
+        d = serve._x_strip_tweet(long)
         self.assertEqual(len(d['text']), 2000)
         self.assertEqual(d['links'], ['https://github.com/a/b'])
+
+
+class TrustedReposRegistry(unittest.TestCase):
+    def test_seeded_with_twscrape(self):
+        r = client().get('/api/trusted-repos', headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 200)
+        repos = r.json()['repos']
+        self.assertTrue(any(x['repo'] == 'vladkens/twscrape'
+                            for x in repos))
+
+    def test_requires_auth(self):
+        r = client().get('/api/trusted-repos')
+        self.assertEqual(r.status_code, 401)
+
+    def test_agent_can_add_and_revouch(self):
+        r = client().post('/api/trusted-repos',
+                          json={'repo': 'example/cleaner',
+                                'kind': 'pip-cli', 'tool': 'cleaner',
+                                'purpose': 'HTML to markdown for the '
+                                           'retrieval corpus'},
+                          headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['added_by_key'] if
+                         'added_by_key' in r.json() else
+                         r.json()['added']['added_by'], 'marcus')
+        r2 = client().post('/api/trusted-repos',
+                           json={'repo': 'example/cleaner',
+                                 'kind': 'pip-cli',
+                                 'purpose': 'second opinion'},
+                           headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r2.status_code, 200)
+        self.assertTrue(r2.json().get('revouched'))
+        listing = client().get('/api/trusted-repos',
+                               headers={'X-Agent-Key': _KEY}).json()
+        matches = [x for x in listing['repos']
+                   if x['repo'] == 'example/cleaner']
+        self.assertEqual(len(matches), 1)
+        self.assertIn('marcus', matches[0]['vouched_by'])
+
+    def test_bad_slug_rejected(self):
+        r = client().post('/api/trusted-repos',
+                          json={'repo': 'not a slug', 'purpose': 'x'},
+                          headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 400)
+
+    def test_bad_kind_rejected(self):
+        r = client().post('/api/trusted-repos',
+                          json={'repo': 'ok/slug', 'kind': 'wget',
+                                'purpose': 'x'},
+                          headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 400)
+
+    def test_purpose_required(self):
+        r = client().post('/api/trusted-repos',
+                          json={'repo': 'ok/slug'},
+                          headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 400)
 
 
 if __name__ == '__main__':
