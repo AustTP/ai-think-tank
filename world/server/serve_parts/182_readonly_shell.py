@@ -25,11 +25,19 @@ when the whole command is provably read-only by construction:
     wrapper that would hide its argument binary (timeout, nice, command)
     is simply absent from the whitelist.
 
+  - a dev-analysis lane covers the static analyzers (python -m flake8,
+    flake8, python -m ruff check, ruff check, python -m mypy, mypy): their
+    whole argv must be plain flags and paths, and per-tool flags that write
+    files or mutate the tree (--fix, format, --output-file, --tee, report
+    writers) are refused, so the lane only ever inspects code.
+
 Anything the parser does not recognize fails closed (returns False) and the
 command takes the normal JEV path. This adds a fast lane for a narrow,
 auditable class; it does not loosen any existing gate. The gate hook lives
 in _jev_safety_gate: a classifier ALLOW plus a passing parse is decided
-immediately, so no rung is woken and no owner is pinged.
+immediately, so no rung is woken and no owner is pinged. During classifier
+outages the gate also consults the parse directly, because a command this
+module accepts is safe to run with no model in the loop at all.
 """
 import re
 
@@ -64,6 +72,20 @@ _FIND_WRITE_FLAGS = frozenset({
 # Per-binary flags that would write a file despite a read-only-looking name.
 _FORBIDDEN_FLAGS = {
     'sort': ('-o', '--output'),
+}
+
+# Static-analysis tools runnable under the dev-analysis lane. Each may only
+# inspect code; the forbidden sets name the flags that would write report
+# files or rewrite the tree, and ruff additionally must use the `check`
+# subcommand (its `format` subcommand rewrites files).
+_DEV_ANALYSIS_TOOLS = frozenset({'flake8', 'ruff', 'mypy'})
+_DEV_ANALYSIS_FORBIDDEN = {
+    'flake8': frozenset({'--output-file', '--tee', '-o'}),
+    'ruff': frozenset({'--fix', '--fix-only', '--unsafe-fixes', '--fixable'}),
+    'mypy': frozenset({'--html-report', '--junit-xml', '--txt-report',
+                       '--xml-report', '--cobertura-xml-report',
+                       '--linecount-report', '--linecoverage-report',
+                       '--lineprecision-report'}),
 }
 
 # Shell structure keywords. for/if/while headers carry a condition that is
@@ -247,9 +269,38 @@ def _segment_ok(statement):
     for banned in _FORBIDDEN_FLAGS.get(head, ()):
         if any(w == banned or w.startswith(banned + '=') for w in words[1:]):
             return False
+    if _dev_analysis_ok(words):
+        return True
     if not _word_ok(head, binary_mode=True):
         return False
     return all(_word_ok(w) for w in words[1:])
+
+
+_PY_INTERPRETER_RE = re.compile(r'^python(?:3(?:\.\d+)?)?$')
+
+
+def _dev_analysis_ok(words):
+    """True for a static-analyzer invocation: `python -m flake8|ruff|mypy`
+    or the bare tool. The whole argv must be plain flags and paths, the
+    per-tool write flags are refused, and ruff must use its `check`
+    subcommand so the lane can never reformat or rewrite the tree."""
+    tool = None
+    rest = []
+    if _PY_INTERPRETER_RE.match(words[0]) and len(words) >= 3 and words[1] == '-m':
+        if words[2] in _DEV_ANALYSIS_TOOLS:
+            tool = words[2]
+            rest = words[3:]
+    elif words[0] in _DEV_ANALYSIS_TOOLS:
+        tool = words[0]
+        rest = words[1:]
+    if tool is None:
+        return False
+    if tool == 'ruff' and (not rest or rest[0] != 'check'):
+        return False
+    for banned in _DEV_ANALYSIS_FORBIDDEN[tool]:
+        if any(w == banned or w.startswith(banned + '=') for w in rest):
+            return False
+    return all(_word_ok(w) for w in rest)
 
 
 def _readonly_shell_command(text, depth=0):

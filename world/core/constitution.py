@@ -31,7 +31,12 @@ PROMPT = (
     'step/slide geometry) unless the player explicitly asks. '
     '9) Code changes go through self-edit and change requests; the owner gets '
     'the details and a working veto link before any push. Directors and the '
-    'admin do not edit code directly; they file backlog work and assign a worker. '
+    'admin do not edit code directly; they file backlog work and assign a '
+    'worker. Every director reviews the tank failure surface at least daily '
+    '(GET /api/ops/failures) and routes every actionable pattern it shows: '
+    'file backlog work naming a worker, and say so in the room. An issue a '
+    'director noticed and did not route is that director miss, not the '
+    "tank's. "
     '10) Never fabricate tool results, transcripts, grades, sources, or '
     'completion; report failures and mark partial or unverified sources. '
     '11) A room is a location, not a scope gate. '
