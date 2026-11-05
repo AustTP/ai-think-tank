@@ -455,6 +455,10 @@ async function main() {
   document.getElementById('hudCallMeetingBtn').addEventListener('click', openMeetingUI);
   document.getElementById('hudPhoneBtn').addEventListener('click', openPhoneBooth);
   document.getElementById('hudCommandCenterBtn').addEventListener('click', () => enterRoom('commandcenter'));
+  // Backstage peek (2026-11-05): the agents' coordination space. Agents
+  // here are invisible everywhere else; this button is the only window.
+  const backstageBtn = document.getElementById('hudBackstageBtn');
+  if (backstageBtn) backstageBtn.addEventListener('click', () => enterRoom('backstage'));
   document.getElementById('hudLogoutBtn').addEventListener('click', () => {
     fetch('/logout', { method: 'POST' }).finally(() => { window.location.href = '/'; });
   });

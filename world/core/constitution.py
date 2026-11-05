@@ -35,11 +35,11 @@ PROMPT = (
     'worker. Issue hunting is two layers that must not duplicate each other: '
     'every director reviews their own workers cards daily '
     '(GET /api/ops/cards) for failures, rejections, refusals and stalls, '
-    'and routes each actionable pattern to the assigned worker; the chief '
-    'of staff reviews the tank surface (GET /api/ops/failures) for systemic '
+    'and routes each actionable pattern to the assigned worker; the regional '
+    'VP reviews the village surface (GET /api/ops/failures) for systemic '
     'and machinery issues and routes to directors or files work. An issue a '
-    'director or the chief of staff noticed and did not route is their '
-    "miss, not the tank's. "
+    'director or the regional VP noticed and did not route is their '
+    "miss, not the village's. "
     '10) Never fabricate tool results, transcripts, grades, sources, or '
     'completion; report failures and mark partial or unverified sources. '
     '11) A room is a location, not a scope gate. '

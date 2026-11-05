@@ -39,7 +39,11 @@ def setUpModule():
     with serve._db() as conn:
         conn.execute('INSERT INTO agent_keys (agent_id, secret_key, '
                      'created_at) VALUES (?, ?, ?)',
-                     ('marcus', _KEY, 0.0))
+                     ('nora', _KEY, 0.0))
+        conn.execute('INSERT INTO roster_agent (id, seq, blob, updated_at) '
+                     'VALUES (?, ?, ?, ?)',
+                     ('nora', 0, '{"id": "nora", "role": "regional_vp"}',
+                      0.0))
         now = time.time()
         for details, n in (
             ('{"decision": "blocked", "reason": "jev: classifier unavailable, '
@@ -76,6 +80,21 @@ class OpsFailures(unittest.TestCase):
     def test_requires_auth(self):
         r = client().get('/api/ops/failures')
         self.assertEqual(r.status_code, 401)
+
+    def test_regular_agent_is_403(self):
+        with unittest.mock.patch.object(
+                serve, '_agent_id_for_key', lambda k: 'marcus' if k else None), \
+                unittest.mock.patch.object(
+                    serve, 'verify_agent_key', lambda a, k: k == _KEY), \
+                unittest.mock.patch.object(
+                    serve, '_db') as db_ctx:
+            conn = db_ctx.return_value.__enter__.return_value
+            conn.execute.return_value.fetchone.return_value = (
+                '{"id": "marcus", "role": "worker"}',)
+            r = client().get('/api/ops/failures',
+                             headers={'X-Agent-Key': _KEY})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('regional VP', r.json()['error'])
 
     def test_groups_blocks_and_breaks_out_outage(self):
         r = client().get('/api/ops/failures', params={'hours': '12'},

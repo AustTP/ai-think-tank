@@ -173,6 +173,13 @@ def _merge_server_owned_agent(server_agent, client_agent):
     for f in _SERVER_OWNED_AGENT_FIELDS:
         if f in server_agent:
             out[f] = server_agent[f]
+    # Backstage presence is server-anchored (191_backstage): the agent went
+    # there through the audited endpoint, so the client's stale inRoom must
+    # not eject her on the next autosave. The anchor releases only through
+    # /api/backstage/exit (the server writes inRoom=null) or the client
+    # independently confirming the same value.
+    if server_agent.get('inRoom') == 'backstage':
+        out['inRoom'] = server_agent['inRoom']
     return out
 
 

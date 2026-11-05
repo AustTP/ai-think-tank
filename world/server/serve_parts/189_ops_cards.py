@@ -7,12 +7,12 @@ The two-layer issue hunt, per the owner's directive:
   is GET /api/ops/cards?hours=24 -- one call, scoped to the director's
   own span.
 
-  THE CHIEF OF STAFF scans the TANK: systemic and machinery failure
+  THE REGIONAL VP scans the VILLAGE: systemic and machinery failure
   (classifier outages, provider incidents, blocked-command patterns,
   budget, escalations) via GET /api/ops/failures, plus every director's
   span on request. The layers must not duplicate each other: a director
-  who finds a card-level pattern routes a fix to the assigned worker; a
-  chief of staff who finds a tank-level pattern routes to directors or
+  who finds a card-level pattern routes a fix to the assigned worker; the
+  regional VP who finds a village-level pattern routes to directors or
   files work. (constitution rule 9.)
 
 GET /api/ops/cards?hours=24&directorId=me   (agent key)
@@ -153,9 +153,10 @@ async def api_ops_cards(request: Request):
             blob = json.loads(row[0]) if row else {}
         except Exception:
             blob = {}
-    is_cos = (is_agent and (blob.get('role') == 'Chief of Staff'
-                            or blob.get('isAdmin')))
-    if is_player or is_cos:
+    is_scan_authority = (is_agent and (blob.get('role') == 'regional_vp'
+                                       or blob.get('role') == 'Chief of Staff'
+                                       or blob.get('isAdmin')))
+    if is_player or is_scan_authority:
         if wanted and wanted not in ('me',):
             span = _roster_span(wanted)
         elif scope == 'tank':

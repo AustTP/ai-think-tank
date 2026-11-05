@@ -80,6 +80,14 @@ const ROOMS = {
   // door. Same open "Outskirts" layout -- shared art with the outdoor
   // clearing look. Non-delegable: agents rest here, never get pushed work.
   hangout: { image: '/assets/rooms/room_hangout.png', collision: 'hangout', label: 'Hangout' },
+  // Backstage (2026-11-05): the agents' coordination space, outside the
+  // player's physical world. No door trigger, never a walk target, never a
+  // work room -- agents enter by a server state transition (teleport, no
+  // pathfinding) and interact with plain same-room rules. An agent here
+  // appears in NO room the player visits; the only way to see who is
+  // backstage is this view itself (the owner's audit peek). Same
+  // reachability model as the Command Center: HUD button, from anywhere.
+  backstage: { image: '/assets/rooms/room_workstations.png', collision: 'workstations', label: 'Backstage' },
 };
 
 // Door triggers on the OUTDOOR map. Authored in NATIVE image coordinates

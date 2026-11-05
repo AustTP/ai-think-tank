@@ -15,9 +15,11 @@ GET /api/ops/failures?hours=12 returns, for the window:
   - tool/API failures by endpoint (5xx, timeouts);
   - open health alerts, newest first (capped).
 
-Read-only: one SELECT family over action_log + health_alerts. Auth mirrors
-the tank norm (player session or agent key); the data itself is aggregate
-counts and sanitized reason strings, not payloads.
+Read-only: one SELECT family over action_log + health_alerts. Auth is
+NARROW on purpose (the regional VP's village scan, the player, and admin):
+the data itself is aggregate counts and sanitized reason strings, not
+payloads, but the failure surface is a leadership instrument, not an
+agent toy.
 """
 
 import time
@@ -76,13 +78,29 @@ def _ops_failures(hours):
 async def api_ops_failures(request: Request):
     hours = int(request.query_params.get('hours') or _OPS_DEFAULT_HOURS)
     hours = max(1, min(hours, _OPS_MAX_HOURS))
-    agent_id = _agent_id_for_key(request.headers.get('X-Agent-Key')) or 'player'
-    authorized = (verify_agent_key(agent_id, request.headers.get('X-Agent-Key'))
-                  is True) or bool(verify_session(
-                      request.cookies.get(SESSION_COOKIE_NAME)))
-    if not authorized:
-        return JSONResponse({'error': 'Unauthorized -- please log in'},
-                            status_code=401)
+    key = request.headers.get('X-Agent-Key')
+    agent_id = _agent_id_for_key(key)
+    is_agent = agent_id and verify_agent_key(agent_id, key) is True
+    is_player = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
+    allowed = is_player
+    if is_agent:
+        try:
+            with _db() as conn:
+                row = conn.execute(
+                    'SELECT blob FROM roster_agent WHERE id = ?',
+                    (agent_id,)).fetchone()
+            blob = json.loads(row[0]) if row else {}
+        except Exception:
+            blob = {}
+        allowed = allowed or blob.get('role') in ('regional_vp',
+                                                  'Chief of Staff') \
+            or blob.get('isAdmin')
+    if not allowed:
+        return JSONResponse(
+            {'error': 'the village scan is the regional VP instrument; '
+                      'directors use /api/ops/cards for their span'},
+            status_code=403)
+    authorized = is_player or is_agent
     if not check_rate_limit(agent_id):
         return JSONResponse({'error': 'rate limited'}, status_code=429)
     try:
