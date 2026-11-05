@@ -836,54 +836,35 @@ class RateLimit(unittest.TestCase):
 
 
 class CurlRoomGate(unittest.TestCase):
+    # Owner directive 2026-11-05: agents do not have the player's physical
+    # boundaries. The room-tied tool gates answer True for any agent from
+    # any location. The security layers above the gate (Jev judgment,
+    # domain allowlist, rate limits) are unchanged and own the real
+    # restrictions. The player's restriction lives in the UI
+    # (openTerminal()'s room check, index.html).
+
     def test_player_is_always_allowed(self):
-        # The player has no `inRoom` entry at all (that field only exists
-        # for NPC agents) -- this must not be read as "not in the room."
-        # The real UI-level gate (openTerminal()'s room check, index.html)
-        # is what actually restricts the player; the server only needs to
-        # not ALSO block the one identity it can't see a location for.
         self.assertTrue(serve._agent_is_in_weatherstation('player'))
 
-    def test_agent_actually_in_weatherstation_is_allowed(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'eli': {'inRoom': 'weatherstation'}}}):
-            self.assertTrue(serve._agent_is_in_weatherstation('eli'))
+    def test_agent_anywhere_is_allowed(self):
+        self.assertTrue(serve._agent_is_in_weatherstation('eli'))
+        self.assertTrue(serve._agent_is_in_weatherstation('sam'))
 
-    def test_agent_elsewhere_is_blocked(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'sam': {'inRoom': 'pressoffice'}}}):
-            self.assertFalse(serve._agent_is_in_weatherstation('sam'))
-
-    def test_unknown_agent_is_blocked(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {}}):
-            self.assertFalse(serve._agent_is_in_weatherstation('nobody'))
-
-    def test_no_saved_state_fails_closed(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=None):
-            self.assertFalse(serve._agent_is_in_weatherstation('eli'))
+    def test_unknown_agent_is_also_allowed(self):
+        # The room gate is no longer an identity lookup at all; a Jev
+        # judgment and the allowlist above it carry the security load.
+        self.assertTrue(serve._agent_is_in_weatherstation('nobody'))
 
 
 class SandboxDownloadRoomGate(unittest.TestCase):
-    # Mirrors CurlRoomGate exactly, for the sandbox-download endpoint's
-    # own room restriction (extended to cover the
-    # Work Room alongside the Observatory -- both are real sandboxed
-    # rooms, RESEARCH_SANDBOX_ID and WORKROOM_SANDBOX_ID respectively).
+    # Owner directive 2026-11-05: lifted with the curl gate. Any agent, any
+    # location; Jev + caps + the redirect re-gate carry the security load.
+
     def test_player_is_always_allowed(self):
         self.assertTrue(serve._agent_is_in_sandbox_room('player'))
 
-    def test_agent_actually_in_observatory_is_allowed(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'dev': {'inRoom': 'observatory'}}}):
-            self.assertTrue(serve._agent_is_in_sandbox_room('dev'))
-
-    def test_agent_actually_in_the_work_room_is_also_allowed(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'dev': {'inRoom': 'pressoffice'}}}):
-            self.assertTrue(serve._agent_is_in_sandbox_room('dev'))
-
-    def test_agent_elsewhere_is_blocked(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'dev': {'inRoom': 'bank'}}}):
-            self.assertFalse(serve._agent_is_in_sandbox_room('dev'))
-
-    def test_no_saved_state_fails_closed(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value=None):
-            self.assertFalse(serve._agent_is_in_sandbox_room('dev'))
+    def test_agent_anywhere_is_allowed(self):
+        self.assertTrue(serve._agent_is_in_sandbox_room('dev'))
 
 
 class TempAccessGrants(unittest.TestCase):

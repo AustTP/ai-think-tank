@@ -794,24 +794,18 @@ class AllowlistRequestEndpoint(unittest.TestCase):
 
 
 class RoomGates(unittest.TestCase):
-    def test_weatherstation_live_room_override_allows(self):
-        self.assertTrue(serve._agent_is_in_weatherstation('eli', 'weatherstation'))
+    # Owner directive 2026-11-05: agents do not have the player's physical
+    # boundaries. The room-tied tool gates answer True for any agent from
+    # any location (the old room-position assertions pinned theater); the
+    # security layers above the gates (Jev, allowlist, caps) are unchanged.
 
-    def test_weatherstation_live_room_mismatch_checks_state(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'eli': {'inRoom': 'bank'}}}):
-            self.assertFalse(serve._agent_is_in_weatherstation('eli', 'lobby'))
+    def test_weatherstation_gate_lifted_for_agents(self):
+        self.assertTrue(serve._agent_is_in_weatherstation('eli', None))
+        self.assertTrue(serve._agent_is_in_weatherstation('eli', 'lobby'))
 
-    def test_sandbox_room_live_room_override_allows(self):
-        self.assertTrue(serve._agent_is_in_sandbox_room('dev', 'observatory'))
-        self.assertTrue(serve._agent_is_in_sandbox_room('dev', 'pressoffice'))
-
-    def test_sandbox_room_live_room_mismatch_checks_state(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'dev': {'inRoom': 'bank'}}}):
-            self.assertFalse(serve._agent_is_in_sandbox_room('dev', 'hangout'))
-
-    def test_sandbox_room_state_in_room_allows(self):
-        with unittest.mock.patch.object(serve, 'get_state_from_db', return_value={'agents': {'dev': {'inRoom': 'observatory'}}}):
-            self.assertTrue(serve._agent_is_in_sandbox_room('dev'))
+    def test_sandbox_room_gate_lifted_for_agents(self):
+        self.assertTrue(serve._agent_is_in_sandbox_room('dev', 'hangout'))
+        self.assertTrue(serve._agent_is_in_sandbox_room('dev'))
 
 
 
