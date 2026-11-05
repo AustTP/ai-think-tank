@@ -1,52 +1,49 @@
-# GitHub
+# GitHub research and publishing (teams own this)
 
-## Purpose
-Reach for this before any real GitHub work: the player-triggered publish flow,
-or any future work that creates or manages a repository.
+The tank keeps GitHub interaction generic: a neutral authenticated-call
+primitive plus standard git. This file is the recipe book.
 
-## Key facts
-- The think tank's ONLY current GitHub integration is the player-triggered
-  "Publish to GitHub" action from The House, which pushes the think tank's released
-  work to a single pre-existing private repo named by `AI_THINK_TANK_PUBLISH_REPO`
-  (`owner/repo`) in `.env`, via `git push` authenticated through the `gh` CLI's
-  own cached login (`gh auth token`) -- NOT the vault-held `GITHUB_TOKEN`. The
-  target repo is not created by the app: make it private first, then set the var.
-- Nothing leaves the machine unless the player explicitly clicks publish;
-  agents never push on their own.
-- There is currently **no code path that creates a new repository** anywhere in
-  the think tank. This policy is for if/when that capability gets built.
-- The vault-held `GITHUB_TOKEN` was checked live and its actual
-  granted scopes are **very broad**: `admin:org, admin:org_hook,
-  admin:public_key, admin:repo_hook, delete:packages, delete_repo, gist,
-  notifications, project, repo, user, workflow, write:packages`. That includes
-  full org administration and the ability to delete ANY repo the account can
-  reach -- far more than pushing released work needs. Treat it as a
-  high-blast-radius credential; scope any capability handle built on it as
-  narrowly as the specific action actually requires.
-- Recommendation (not yet acted on): if real repo-creation or repo-management
-  work is ever built, prefer minting a fine-grained GitHub PAT scoped to only
-  the specific repo(s) involved, rather than continuing to use this
-  broadly-scoped classic PAT.
+## What the tank provides
 
-## Policy for this think tank
-1. **Any repository an agent creates or pushes to MUST be private.** No
-   exceptions without an explicit, separate player decision. This applies
-   whether the repo already exists (verify before pushing) or gets created by
-   a future capability (set `private: true` / equivalent at creation time,
-   never rely on a default).
-2. Before any future "create a repo" capability is built, re-scope the
-   underlying token (fine-grained PAT, repo-restricted) rather than handing an
-   agent a capability backed by the current admin-level classic PAT.
-3. Same vault pattern as everything else external: an agent gets a scoped
-   capability handle, never the raw token.
+- `_github_api_call`-backed credential store: a stored GitHub token is used
+  through the credential ask flow; you name the service, never see the
+  secret.
+- Standard `git` in your sandbox (clone, commit, push to any remote the
+  card names).
+- The trusted-codebase registry for anything beyond REST + git.
 
-## Sources
-- Verify a target repo's visibility with `gh repo view <owner>/<repo>` and
-  inspect an actual token's granted scopes via `GET api.github.com/user` (the
-  `X-OAuth-Scopes` response header).
+## Recipe 1: read public data (no credentials)
 
-## Lessons learned
-- The publish path uses `gh`'s own logged-in session for push, never the
-  vault-held token -- this keeps the broad-scoped token off the hot path.
-  If a future capability mints real repository access, prefer a fine-grained,
-  repo-restricted PAT over a broadly-scoped classic one.
+```
+curl -s 'https://api.github.com/repos/OWNER/REPO/issues?per_page=10'
+curl -s 'https://api.github.com/repos/OWNER/REPO/actions/runs?per_page=5'
+```
+
+Unauthenticated REST is rate-limited (60/hr per IP) — batch your questions.
+
+## Recipe 2: authenticated calls
+
+Request the GitHub credential via the ask flow, then call the REST API with
+the injected token (the ask flow injects it into your sandbox env; you never
+see it):
+
+```
+curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+     'https://api.github.com/repos/OWNER/REPO/issues?per_page=10'
+```
+
+5000/hr. Use it for issue triage, releases, CI status at scale.
+
+## Recipe 3: publish a deliverable
+
+The publish staging flow (cards that end in a GitHub push) already runs
+`git init → add -A → commit → push` against the card's approved remote.
+For a NEW repo or org, that is an owner decision — file an escalation, do
+not create repos unilaterally.
+
+## Guardrails
+
+- Never commit secrets; the repo scanner rejects them anyway.
+- Issues/PRs you open must cite the card id in the body.
+- Public API only from sandboxes; web scraping of github.com HTML is
+  unnecessary — the REST API is the interface.

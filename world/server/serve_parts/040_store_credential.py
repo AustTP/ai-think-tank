@@ -675,16 +675,60 @@ def _youtube_transcript(url, lang='en', timeout=90):
 # host is allowlisted (see BROWSE_ALLOWLIST_DOMAINS) so the Colab URL gate
 # passes without a Jev round trip, exactly like dreyx.com before it. Returns
 # (text, None) or (None, error-string); fails closed on any failure.
+def _youtube_transcript_captions(url, lang='en'):
+    """Tier 1 of YouTube transcription (2026-11-05): fetch the video's own
+    captions with the trusted youtube-transcript-api package -- no Apify
+    actor, no Colab runtime, no audio download. Returns (text, None) or
+    (None, error). Replaces the Apify actor as the primary path per the
+    owner's run-upstream-tools directive; the Colab/whisper path below stays
+    as the fallback for captionless videos."""
+    vid = _youtube_video_id(url)
+    if not vid:
+        return None, 'could not resolve a YouTube video id from the URL'
+    try:
+        from youtube_transcript_api import YouTubeTranscriptApi
+        try:
+            # Newer API (1.x): a client object with fetch().
+            fetched = YouTubeTranscriptApi().fetch(vid, languages=[lang])
+            parts = [{'text': s.text, 'start': s.start} for s in fetched]
+        except TypeError:
+            # Older API (0.x): module-level get_transcript.
+            raw = YouTubeTranscriptApi.get_transcript(vid, languages=[lang])
+            parts = raw
+        text = ' '.join(str(p.get('text') or '').replace('\n', ' ').strip()
+                        for p in parts if isinstance(p, dict))
+        text = ' '.join(text.split())
+        if len(text) < 40:
+            return None, 'captions fetched but effectively empty'
+        return text, None
+    except Exception as e:
+        return None, f'{type(e).__name__}: {e}'
+
+
 def _youtube_transcript_colab(url, lang='en', model_size='small'):
-    """Whisper-transcribe a YouTube video on a Colab runtime: the Apify actor
-    downloads the audio, faster-whisper transcribes it -- all on the runtime."""
+    """YouTube transcription entry point.
+
+    Tier 1 (2026-11-05): the video's own captions via the trusted
+    youtube-transcript-api package, fetched locally -- no Apify actor, no
+    Colab, no audio download.
+
+    Tier 2 (fallback for captionless videos): the original Colab path --
+    the Apify actor downloads the audio, faster-whisper transcribes it --
+    all on the runtime."""
     url = (url or '').strip()
     if not _is_youtube_url(url):
         return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
+    text, _cap_err = _youtube_transcript_captions(url, lang)
+    if text:
+        return text, None
     if not COLAB_ENABLED:
-        return None, 'Colab is disabled (COLAB_ENABLED=0) -- cannot download and transcribe the audio.'
+        return None, ('the video has no usable captions '
+                      f'({_cap_err}) and Colab is disabled '
+                      '(COLAB_ENABLED=0) -- no audio path available.')
     if not COLAB_CLI_AVAILABLE:
-        return None, 'Colab CLI is not installed -- cannot download and transcribe the audio.'
+        return None, ('the video has no usable captions '
+                      f'({_cap_err}) and the Colab CLI is not installed '
+                      '-- no audio path available.')
     if _colab_budget_exceeded():
         return None, 'Colab usage cap reached for this period -- cannot download and transcribe the audio.'
     if not APIFY_API_KEY:

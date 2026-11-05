@@ -101,6 +101,33 @@ async def api_product_transfer_request(request: Request):
     log_action(agent_id, 'product_transfer_requested',
                {'productId': product_id, 'from': owner, 'to': to_team},
                authorized=True)
+    # The handshake is only real if the receiving side knows it exists:
+    # mail the receiving team's director (best-effort, off the response),
+    # with the same wake-on-mail parity the regular mail path uses.
+    try:
+        import sim as _sim
+        _teams = state.get('teams') if isinstance(state, dict) else None
+        _team = next((x for x in (_teams or [])
+                      if str(x.get('id') or '').lower() == str(to_team).lower()),
+                     None)
+        _director = str((_team or {}).get('directorId') or '') or None
+        if _director:
+            _text = (f'{agent_id}: product transfer requested: {product_id} '
+                     f'({owner} -> {to_team}). Accept with '
+                     f'POST /api/products/transfer-accept '
+                     f'{{productId: "{product_id}"}} or cancel it.'
+                     + (f' Note: {note}' if note else ''))
+            if _director in (state.get('agents') or {}):
+                _sim._deliver_mail(state, _director, 'agent_mail',
+                                   {'text': _text})
+            else:
+                _target = {'mailbox': []}
+                state.setdefault('agents', {})[_director] = _target
+                _sim._append_mailbox(_target, {
+                    'text': _text, 'read': False,
+                    'ts': int(time.time() * 1000)})
+    except Exception:
+        pass
     return JSONResponse({'ok': True, 'pending': pending[product_id]})
 
 
