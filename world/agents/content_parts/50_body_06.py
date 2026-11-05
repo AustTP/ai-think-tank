@@ -215,6 +215,8 @@ def _vision_review_base64(agent_id, agent_key, task_id, image_b64, question):
             'taskId': task_id or '',
         }, agent_key, timeout=120)
     except Exception as e:
+        if getattr(e, 'credits_paused', False):
+            raise  # the credits pause holds the card, it is not a run failure
         return {'ok': False, 'note': f'vision call failed: {e}'}
     if isinstance(r, dict) and not r.get('error') and r.get('reply'):
         return {'ok': True, 'reply': str(r['reply']).strip()}

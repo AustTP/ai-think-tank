@@ -525,6 +525,11 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             on_before_tools=_checkpoint_before,
             on_after_tools=_checkpoint_after)
     except Exception as e:
+        # The credits pause is not a run failure: re-raise so the dispatch
+        # thread holds the card intact (030__dispatch_content_work) instead of
+        # recording a failed spike and churning the card (2026-11-05).
+        if getattr(e, 'credits_paused', False):
+            raise
         # A model-call failure (circuit-breaker RuntimeError, a 4xx, a network
         # blip) must never crash the spike executor or leave a half-baked
         # result -- record an honest not-ok like the empty-investigation path

@@ -746,6 +746,13 @@ def _plain_completion(model, messages, max_tokens, service='spike', task_id=None
         with _heartbeat_keepalive(task_id):
             data = _serve._call_openrouter_sync(model, messages, max_tokens)
     except Exception as e:
+        # The credits pause is not a run failure. Re-raise it so the dispatch
+        # thread's credits_paused handler holds the card intact and the task
+        # cycle requeues it -- swallowing it here (the old behavior) let a
+        # paused run continue on empty, produce nothing, get abandoned,
+        # refused, and re-minted every ~3 minutes (the 2026-11-05 pump).
+        if getattr(e, 'credits_paused', False):
+            raise
         print(f'[spike] plain completion failed: {e}', flush=True)
         return ''
     if not isinstance(data, dict):
