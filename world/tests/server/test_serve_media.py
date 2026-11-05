@@ -411,25 +411,23 @@ class YoutubeTranscriptLocal(unittest.TestCase):
 
 
 class YoutubeTranscriptColab(unittest.TestCase):
-    """_youtube_transcript_colab edge branches."""
+    """_youtube_transcript_colab: captions tier plus the honest no-audio
+    error. The Apify-actor audio path was REMOVED (2026-11-05,
+    teams-own-external-services directive); captionless videos are the
+    agents' own sandbox recipe (library/skills/youtube.md)."""
 
     URL = 'https://www.youtube.com/watch?v=abc123def45'
 
-    def _call(self, url=None, colab_return=None, colab_exc=None, enabled=True,
-              cli=True, key='test-key', budget=False):
-        patchers = [
-            unittest.mock.patch.object(serve, 'COLAB_ENABLED', enabled),
-            unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', cli),
-            unittest.mock.patch.object(serve, 'APIFY_API_KEY', key),
-            unittest.mock.patch.object(serve, '_colab_budget_exceeded',
-                                       return_value=budget),
-        ]
-        if colab_return is not None:
-            patchers.append(unittest.mock.patch.object(serve, '_colab_compute_run',
-                                                       return_value=colab_return))
-        if colab_exc is not None:
-            patchers.append(unittest.mock.patch.object(serve, '_colab_compute_run',
-                                                       side_effect=colab_exc))
+    def _call(self, url=None, captions_return=None, captions_exc=None):
+        patchers = []
+        if captions_return is not None:
+            patchers.append(unittest.mock.patch.object(
+                serve, '_youtube_transcript_captions',
+                return_value=captions_return))
+        if captions_exc is not None:
+            patchers.append(unittest.mock.patch.object(
+                serve, '_youtube_transcript_captions',
+                side_effect=captions_exc))
         for p in patchers:
             p.start()
         try:
@@ -443,36 +441,19 @@ class YoutubeTranscriptColab(unittest.TestCase):
         self.assertIsNone(text)
         self.assertIn('Not a YouTube URL', error)
 
-    def test_colab_disabled_is_error(self):
-        text, error = self._call(enabled=False)
-        self.assertIsNone(text)
-        self.assertIn('Colab is disabled', error)
-
-    def test_cli_unavailable_is_error(self):
-        text, error = self._call(cli=False)
-        self.assertIsNone(text)
-        self.assertIn('Colab CLI is not installed', error)
-
-    def test_compute_run_crash_is_error(self):
-        text, error = self._call(colab_exc=RuntimeError('boom'))
-        self.assertIsNone(text)
-        self.assertIn('run crashed: boom', error)
-
-    def test_non_dict_response_is_error(self):
-        text, error = self._call(colab_return='oops')
-        self.assertIsNone(text)
-        self.assertIn('Unexpected Colab transcription response', error)
-
-    def test_no_text_is_error(self):
-        text, error = self._call(colab_return={'stdout': '__TRANSCRIPT_END__'})
-        self.assertIsNone(text)
-        self.assertIn('returned no text', error)
-
-    def test_chars_truncated_to_max(self):
-        stdout = ('x' * 100 + '\n') * 600 + '__TRANSCRIPT_END__\n'
-        text, error = self._call(colab_return={'stdout': stdout})
+    def test_captions_are_returned(self):
+        text, error = self._call(
+            captions_return=('hello world transcript text that is long '
+                             'enough to pass the empty check', None))
         self.assertIsNone(error)
-        self.assertEqual(len(text), 50000)
+        self.assertIn('hello world', text)
+
+    def test_no_captions_points_to_the_sandbox_recipe(self):
+        text, error = self._call(
+            captions_return=(None, 'NoTranscriptFound: nothing available'))
+        self.assertIsNone(text)
+        self.assertIn('no usable captions', error)
+        self.assertIn('library/skills/youtube.md', error)
 
 
 

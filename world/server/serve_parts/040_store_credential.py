@@ -712,176 +712,21 @@ def _youtube_transcript_colab(url, lang='en', model_size='small'):
     youtube-transcript-api package, fetched locally -- no Apify actor, no
     Colab, no audio download.
 
-    Tier 2 (fallback for captionless videos): the original Colab path --
-    the Apify actor downloads the audio, faster-whisper transcribes it --
-    all on the runtime."""
+    Tier 2 was REMOVED (2026-11-05, teams-own-external-services directive):
+    the Apify-actor audio path is gone from the tank. For captionless
+    videos, agents follow library/skills/youtube.md recipe 2 -- yt-dlp plus
+    faster-whisper inside their own sandbox via /api/execute. This function
+    returns an honest error pointing there instead of pretending."""
     url = (url or '').strip()
     if not _is_youtube_url(url):
         return None, f'Not a YouTube URL (only youtube.com / youtu.be are allowed): {url}'
-    text, _cap_err = _youtube_transcript_captions(url, lang)
+    text, cap_err = _youtube_transcript_captions(url, lang)
     if text:
         return text, None
-    if not COLAB_ENABLED:
-        return None, ('the video has no usable captions '
-                      f'({_cap_err}) and Colab is disabled '
-                      '(COLAB_ENABLED=0) -- no audio path available.')
-    if not COLAB_CLI_AVAILABLE:
-        return None, ('the video has no usable captions '
-                      f'({_cap_err}) and the Colab CLI is not installed '
-                      '-- no audio path available.')
-    if _colab_budget_exceeded():
-        return None, 'Colab usage cap reached for this period -- cannot download and transcribe the audio.'
-    if not APIFY_API_KEY:
-        return None, ('APIFY_API_KEY is not configured -- it is required to download the audio '
-                      'on the Colab runtime (the Apify actor does the YouTube download).')
-    # Everything runs INSIDE the Colab runtime, never on the host: the runtime
-    # starts the Apify actor run with APIFY_API_KEY (passed via env), polls it
-    # to SUCCEEDED, fetches the dataset item's downloadUrl, downloads the audio
-    # (retrying with a token-suffixed URL for private KV stores), and runs
-    # faster-whisper on it. Fail-closed: any failure prints __ERROR__ and the
-    # run is only accepted as a transcript when it ends with the
-    # __TRANSCRIPT_END__ marker -- a mid-run crash can never masquerade as text.
-    code = (
-        "import os, sys, json, time, urllib.request, urllib.error\n"
-        "from faster_whisper import WhisperModel\n"
-        "api_key = os.environ.get('APIFY_API_KEY', '')\n"
-        "url = %r\n"
-        "lang = %r\n"
-        "out_path = '/content/yt_audio.webm'\n"
-        "def api(path, method='GET', body=None):\n"
-        "    req = urllib.request.Request('https://api.apify.com/v2' + path,\n"
-        "        data=json.dumps(body).encode('utf-8') if body is not None else None,\n"
-        "        method=method,\n"
-        "        headers={'Authorization': 'Bearer ' + api_key, 'Content-Type': 'application/json'})\n"
-        "    with urllib.request.urlopen(req, timeout=120) as resp:\n"
-        "        return json.loads(resp.read().decode('utf-8', errors='replace'))\n"
-        "if not api_key:\n"
-        "    print('__ERROR__: APIFY_API_KEY not set on the runtime')\n"
-        "    sys.exit(1)\n"
-        "try:\n"
-        "    run = api('/acts/IHDsaLO64Wge9wSWx/runs', 'POST',\n"
-        "              {'videos': [{'url': url}], 'audioQuality': 'best'})\n"
-        "except Exception as e:\n"
-        "    print('__ERROR__: actor start failed: ' + repr(e)[:300])\n"
-        "    sys.exit(1)\n"
-        "run = run.get('data') if isinstance(run, dict) else run\n"
-        "run_id = run.get('id') if isinstance(run, dict) else None\n"
-        "dataset_id = run.get('defaultDatasetId') if isinstance(run, dict) else None\n"
-        "if not run_id or not dataset_id:\n"
-        "    print('__ERROR__: actor run response missing id/defaultDatasetId: ' + repr(run)[:300])\n"
-        "    sys.exit(1)\n"
-        "status = ''\n"
-        "deadline = time.time() + 300\n"
-        "while time.time() < deadline:\n"
-        "    try:\n"
-        "        poll = api('/actor-runs/' + str(run_id))\n"
-        "        status = (poll.get('data') if isinstance(poll, dict) else {}).get('status', '')\n"
-        "    except Exception:\n"
-        "        status = ''\n"
-        "    if status == 'SUCCEEDED':\n"
-        "        break\n"
-        "    if status in ('FAILED', 'ABORTED', 'TIMED-OUT'):\n"
-        "        print('__ERROR__: Apify actor run ended ' + status)\n"
-        "        sys.exit(1)\n"
-        "    time.sleep(4)\n"
-        "else:\n"
-        "    print('__ERROR__: Apify actor run did not finish in time')\n"
-        "    sys.exit(1)\n"
-        "try:\n"
-        "    items = api('/datasets/' + str(dataset_id) + '/items?limit=1')\n"
-        "except Exception as e:\n"
-        "    print('__ERROR__: could not fetch dataset items: ' + repr(e)[:300])\n"
-        "    sys.exit(1)\n"
-        "if not isinstance(items, list):\n"
-        "    items = (items.get('data') if isinstance(items, dict) else None) or []\n"
-        "download_url = None\n"
-        "if isinstance(items, list):\n"
-        "    for item in items:\n"
-        "        if isinstance(item, dict):\n"
-        "            download_url = item.get('downloadUrl') or item.get('download_url')\n"
-        "            if download_url:\n"
-        "                break\n"
-        "if not download_url:\n"
-        "    print('__ERROR__: no downloadUrl in the actor dataset output')\n"
-        "    sys.exit(1)\n"
-        "try:\n"
-        "    with urllib.request.urlopen(download_url, timeout=300) as resp:\n"
-        "        data = resp.read()\n"
-        "except urllib.error.HTTPError:\n"
-        "    try:\n"
-        "        with urllib.request.urlopen(download_url + '?token=' + api_key, timeout=300) as resp:\n"
-        "            data = resp.read()\n"
-        "    except Exception as e:\n"
-        "        print('__ERROR__: could not download the audio: ' + repr(e)[:300])\n"
-        "        sys.exit(1)\n"
-        "except Exception as e:\n"
-        "    print('__ERROR__: could not download the audio: ' + repr(e)[:300])\n"
-        "    sys.exit(1)\n"
-        "with open(out_path, 'wb') as f:\n"
-        "    f.write(data)\n"
-        "if not data or os.path.getsize(out_path) < 1000:\n"
-        "    print('__ERROR__: downloaded audio is empty or too small')\n"
-        "    sys.exit(1)\n"
-        "import traceback\n"
-        "try:\n"
-        "    import glob\n"
-        "    if os.path.exists('/usr/local/cuda'):\n"
-        "        for base in ('libcublas', 'libcublasLt', 'libcudart'):\n"
-        "            link = '/usr/lib64-nvidia/' + base + '.so.12'\n"
-        "            if os.path.lexists(link):\n"
-        "                continue\n"
-        "            matches = sorted(glob.glob('/usr/local/cuda*/lib64/' + base + '.so'))\n"
-        "            if matches and os.path.isdir('/usr/lib64-nvidia'):\n"
-        "                try:\n"
-        "                    os.symlink(matches[-1], link)\n"
-        "                except Exception:\n"
-        "                    pass\n"
-        "    model = WhisperModel(%r, device='cuda' if os.path.exists('/usr/local/cuda') else 'cpu',\n"
-        "                         compute_type='float16' if os.path.exists('/usr/local/cuda') else 'int8')\n"
-        "    segments, _info = model.transcribe(out_path, language=(lang if lang != 'en' else None),\n"
-        "                                        beam_size=3)\n"
-        "    print('__TRANSCRIPT_BEGIN__')\n"
-        "    for seg in segments:\n"
-        "        print(seg.text.strip())\n"
-        "    print('__TRANSCRIPT_END__')\n"
-        "except Exception:\n"
-        "    print('__ERROR__: whisper failed:')\n"
-        "    traceback.print_exc()\n"
-        "    sys.exit(1)\n"
-    ) % (url, lang, model_size)
-    purpose = 'transcribe a YouTube video by downloading its audio'
-    try:
-        result = _colab_compute_run('player', code, purpose,
-                                    packages=['faster-whisper', 'av==13.1.0'],
-                                    timeout_seconds=min(600, COLAB_TIMEOUT_MAX_S),
-                                    runtimes=1, kind='gpu',
-                                    env={'APIFY_API_KEY': APIFY_API_KEY or ''})
-    except Exception as e:
-        return None, f'Colab transcription run crashed: {e}'
-    if not isinstance(result, dict):
-        return None, 'Unexpected Colab transcription response.'
-    if result.get('error'):
-        return None, f'Colab transcription failed: {result["error"]}'
-    stdout = (result.get('stdout') or '').strip()
-    if '__ERROR__' in stdout:
-        detail = next((line.split('__ERROR__:', 1)[1].strip() for line in stdout.splitlines()
-                       if '__ERROR__' in line), '')
-        return None, ('Colab could not download or transcribe the audio on the runtime'
-                      + (f': {detail[:200]}' if detail else '.') + '.')
-    if '__TRANSCRIPT_END__' not in stdout:
-        return None, 'Colab transcription did not complete (no end marker) -- the run died partway.'
-    if '__TRANSCRIPT_BEGIN__' in stdout:
-        body = stdout.split('__TRANSCRIPT_BEGIN__', 1)[1].split('__TRANSCRIPT_END__', 1)[0]
-    else:
-        body = stdout.rsplit('__TRANSCRIPT_END__', 1)[0]
-    lines = [l.strip() for l in body.splitlines()
-             if l.strip() and l.strip() not in ('__TRANSCRIPT_BEGIN__', '__TRANSCRIPT_END__')]
-    if not lines:
-        return None, 'Colab transcription returned no text.'
-    text = '\n'.join(lines)
-    if len(text) > YOUTUBE_TRANSCRIPT_MAX_CHARS:
-        text = text[:YOUTUBE_TRANSCRIPT_MAX_CHARS]
-    return text, None
+    return None, (f'this video has no usable captions ({cap_err}) and the '
+                  'tank no longer runs an audio-transcription path: follow '
+                  'library/skills/youtube.md recipe 2 (yt-dlp + '
+                  'faster-whisper in your own sandbox via /api/execute).')
 
 
 def _pixellab_token():
