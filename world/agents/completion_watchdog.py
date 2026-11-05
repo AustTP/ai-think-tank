@@ -13,8 +13,40 @@ def budget_only_stops(control):
     return control.get('approvalPreset') == 'always' and control.get('budgetOnlyStops') is True
 
 
-def related(state, task):
+def build_relation_index(state):
+    """One O(n) grouping of review/investigation relations, built once per
+    step() pass. The 2026-11-05 freeze: with 1,100+ live tasks the old
+    per-task full scans made each tick O(n^2) -- the sim thread spun at 100%
+    CPU inside related() and the tick went stale. The index holds OBJECT
+    references only; callers still read live fields (status, libraryPath,
+    createdAt) at use time, so mid-pass mutations stay visible."""
+    children, queued, done_replacements = {}, {}, {}
+    for t in (state.get('tasks') or {}).values():
+        if not isinstance(t, dict):
+            continue
+        for field in ('reviewOf', 'investigationOf'):
+            parent = t.get(field)
+            if parent:
+                children.setdefault(parent, []).append(t)
+        if t.get('investigationOf') and t.get('libraryPath'):
+            done_replacements.setdefault(t['investigationOf'], []).append(t)
+    for q in state.get('workQueue') or []:
+        if not isinstance(q, dict):
+            continue
+        for field in ('reviewOf', 'investigationOf'):
+            parent = q.get(field)
+            if parent:
+                queued.setdefault(parent, []).append(q)
+    return {'children': children, 'queued': queued,
+            'done_replacements': done_replacements}
+
+
+def related(state, task, index=None):
     tid = task['id']
+    if index is not None:
+        return (index['children'].get(tid, []),
+                index['queued'].get(tid, []))
+    # Direct callers (tests, one-off probes): the original full scan.
     children = [t for t in (state.get('tasks') or {}).values()
                 if t.get('reviewOf') == tid or t.get('investigationOf') == tid]
     queued = [q for q in state.get('workQueue') or []
@@ -85,6 +117,7 @@ def step(state, now_ms=None, observe_only=True):
     control.setdefault('maxRecoveryAttempts', 3)
     control.setdefault('retryBaseMs', 30000)
     control.setdefault('maxRecoveriesPerTick', 2)
+    index = build_relation_index(state)
     recovered = 0
     for task in list((state.get('tasks') or {}).values()):
         status = task.get('status')
@@ -98,7 +131,7 @@ def step(state, now_ms=None, observe_only=True):
                     or (blocked_at and now - blocked_at > RECOVERY_BLOCK_TTL_MS)):
                 terminalize(task, 'Automatic recovery exhausted after the retry limit.', now)
                 continue
-        children, queued = related(state, task)
+        children, queued = related(state, task, index=index)
         active = [t for t in children if t.get('status') in ACTIVE]
         repair_running = any(t.get('taskType') not in ('review', 'qa')
                              and t.get('status') in ('walking', 'working') for t in children)
@@ -125,9 +158,8 @@ def step(state, now_ms=None, observe_only=True):
                             deliveryState='completed', manualAttention=False,
                             note='Investigation follow-up completed; saved report still does not approve the original deliverable.')
                 continue
-            replacements = [t for t in (state.get('tasks') or {}).values()
-                            if t.get('investigationOf') == task['investigationOf']
-                            and t.get('status') == 'done' and t.get('libraryPath')
+            replacements = [t for t in index['done_replacements'].get(task.get('investigationOf'), [])
+                            if t.get('status') == 'done'
                             and (t.get('createdAt') or 0) > (task.get('createdAt') or 0)]
             if replacements:
                 latest = max(replacements, key=lambda t: t.get('createdAt') or 0)
@@ -192,7 +224,12 @@ def step(state, now_ms=None, observe_only=True):
                 task.pop('recoveryStaffed', None)
                 import village.recovery_staffing as recovery_staffing
                 recovery_staffing.step(state)
-                if not related(state, task)[1]:
+                # Fresh scan, not the pass-start index: staffing may have
+                # queued the repair item seconds ago, inside this very pass.
+                queued_now = [q for q in state.get('workQueue') or []
+                              if q.get('reviewOf') == task['id']
+                              or q.get('investigationOf') == task['id']]
+                if not queued_now:
                     block(task, 'Assign an available recovery owner and worker to investigate this story.')
                 record.update(attempts=record['attempts'] + 1, nextAttemptAt=now + min(900000, control['retryBaseMs'] * 2 ** min(record['attempts'], 6)))
                 recovered += 1
@@ -222,7 +259,13 @@ def step(state, now_ms=None, observe_only=True):
                 continue
             sim._queue_peer_repair(state, task, rationale)
             task['status'] = 'repairing'
-        children, queued = related(state, task)
+        # Fresh queued scan: _queue_peer_repair may have added the item
+        # seconds ago, inside this same pass; the pass-start index cannot
+        # see it and would falsely block the story.
+        children = index['children'].get(task['id'], [])
+        queued = [q for q in state.get('workQueue') or []
+                  if q.get('reviewOf') == task['id']
+                  or q.get('investigationOf') == task['id']]
         delay = min(900000, control['retryBaseMs'] * 2 ** min(record['attempts'], 6))
         for item in queued:
             item['notBefore'] = max(item.get('notBefore') or 0, now + delay)

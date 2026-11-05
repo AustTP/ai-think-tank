@@ -28,7 +28,7 @@ def test_investigating_and_format_and_budget(monkeypatch):
     import sim, village.recovery_staffing as recovery_staffing
     monkeypatch.setattr(sim, '_queue_peer_repair', lambda *a: None)
     monkeypatch.setattr(recovery_staffing, 'step', lambda s: None)
-    monkeypatch.setattr(cw, 'related', lambda s, t: ([], []))
+    monkeypatch.setattr(cw, 'related', lambda s, t, index=None: ([], []))
     state = {'tasks': {'a': {'id': 'a', 'status': 'investigating', 'assignedTo': 'w',
                              'completionRecovery': {'attempts': 0}}},
              'agents': {'w': {}}, 'completionControl': _control()}
