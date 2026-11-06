@@ -866,8 +866,26 @@ class CreditsPauseTest(unittest.TestCase):
             self.assertEqual(send.call_count, 2)
 
     def test_model_call_is_refused_while_paused(self):
+        # No healthy free endpoint in this test env -> the call refuses.
         serve._CREDITS_PAUSE.update(active=True)
-        with self.assertRaises(serve.OpenRouterCreditsPaused):
+        with mock.patch.object(serve, '_freepool_route_for_band', return_value=None), \
+             self.assertRaises(serve.OpenRouterCreditsPaused):
             serve._call_openrouter_once_sync('test/model', [], 10)
         with self.assertRaises(serve.OpenRouterCreditsPaused):
             serve._post_openrouter_raw('test/model', [])
+
+    def test_paused_paid_call_degrades_to_free_pool(self):
+        # Operator directive 2026-11-05: with the account dry and a healthy
+        # free endpoint available, a paid call DEGRADES to the pool instead
+        # of refusing -- a weaker answer beats a parked card.
+        serve._CREDITS_PAUSE.update(active=True)
+        seen = {}
+        with mock.patch.object(serve, '_freepool_route_for_band',
+                               return_value='@freepool:low:gemini-free') as route, \
+             mock.patch.object(serve, '_openrouter_chat_post',
+                               side_effect=lambda body: seen.setdefault(
+                                   'model', body.get('model')) or {'choices': []}):
+            serve._call_openrouter_once_sync('test/paid-model', [], 10)
+        self.assertEqual(route.call_args[0][0], 'low')
+        self.assertEqual(seen.get('model'), '@freepool:low:gemini-free')
+        serve._CREDITS_PAUSE.update(active=False)

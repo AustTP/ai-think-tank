@@ -887,7 +887,18 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
     # directive 2026-11-04) even free routes stop: the decisions model serves
     # from the laya/colab standby and nothing else runs on OpenRouter.
     if not is_custom and not free_route and credits_pause_active():
-        raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
+        # Operator directive (2026-11-05): the tank runs on the free tier when
+        # the paid account is dry. Degrade the call to a healthy free-pool
+        # endpoint instead of refusing it -- the pool's models are weaker than
+        # the paid tiers, but a weaker answer beats a parked card. Raise only
+        # when even the free pool cannot serve (all endpoints down/breaked).
+        degraded = _freepool_route_for_band('low', force=True)
+        if degraded:
+            model = degraded
+            provider = _model_provider_for(model)
+            free_route = True
+        else:
+            raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if not is_custom and free_route and _credits_free_floor_reached():
         raise OpenRouterCreditsPaused(
             'OpenRouter balance is at the free floor ($0.05); free routes are '
@@ -1098,7 +1109,15 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     is_custom = bool(provider and provider.get('is_custom'))
     free_route = bool(provider and provider.get('free'))
     if not is_custom and not free_route and credits_pause_active():
-        raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
+        # Same free-tier degrade as the plain call: the tank runs on the free
+        # tier while the paid account is dry (operator directive 2026-11-05).
+        degraded = _freepool_route_for_band('low', force=True)
+        if degraded:
+            model = degraded
+            provider = _model_provider_for(model)
+            free_route = True
+        else:
+            raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if (not is_custom or _provider_is_billable(provider)) and not free_route and _think_tank_spend_cap_exceeded():
         raise RuntimeError(f'Think Tank spend cap (${SPEND_CAP_USD}) reached -- no further model calls until it is raised in .env')
     if not is_custom and _api_key_is_broken('openrouter'):
