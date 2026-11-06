@@ -632,14 +632,17 @@ class Visits(unittest.TestCase):
         # its service container; with no reachable postgres the test
         # skips rather than pretending.
         import getpass
-        import psycopg2
         from urllib.parse import urlsplit, urlunsplit
         base = os.environ.get('THINK_TANK_TEST_PG_DSN') or (
             'postgresql://' + getpass.getuser() + '@/postgres')
         try:
+            import psycopg2
             probe = psycopg2.connect(base, connect_timeout=3)
         except Exception as exc:
-            self.skipTest(f'no reachable postgres for the real surgery '
+            # no driver (CI without psycopg2) or no reachable postgres:
+            # either way the real-surgery coverage is unavailable HERE,
+            # not failed
+            self.skipTest(f'no usable postgres for the real surgery '
                           f'test: {type(exc).__name__}')
         probe.close()
         parts = urlsplit(base)
