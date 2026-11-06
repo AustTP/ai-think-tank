@@ -104,6 +104,13 @@ def _collect_move_payload(state, team_id):
             rows[table] = conn.execute(
                 f'SELECT id, seq, blob, updated_at FROM {table}'
                 f' WHERE id IN ({ph})', members).fetchall()
+        try:
+            ltm = conn.execute(
+                f'SELECT id, agent_id, mem_type, content, created_at,'
+                f' active, confidence, source_type FROM agent_ltm'
+                f' WHERE agent_id IN ({ph})', members).fetchall()
+        except Exception:
+            ltm = []  # a DB with no LTM yet has nothing to move
         keys = conn.execute(
             f'SELECT agent_id, secret_key, created_at FROM agent_keys'
             f' WHERE agent_id IN ({ph})', members).fetchall()
@@ -141,6 +148,9 @@ def _collect_move_payload(state, team_id):
                       'updatedAt': r[3]} for r in rows['live_agent']],
         'keyRows': [{'agentId': k[0], 'secretKey': k[1], 'createdAt': k[2]}
                     for k in keys],
+        'ltmRows': [{'id': r[0], 'agentId': r[1], 'memType': r[2],
+                     'content': r[3], 'createdAt': r[4], 'active': r[5],
+                     'confidence': r[6], 'sourceType': r[7]} for r in ltm],
         'tasks': tasks,
         # Cards left behind: assigned to a moving worker but owned by
         # another team. The parent clears their assignee after the move.
@@ -211,6 +221,19 @@ async def village_move_in(request: Request):
                     'INSERT OR REPLACE INTO backlog_request (id, seq,'
                     ' blob, updated_at) VALUES (?, ?, ?, ?)',
                     (row[0], row[1], row[2], row[3]))
+            conn.execute(
+                'CREATE TABLE IF NOT EXISTS agent_ltm (id INTEGER PRIMARY'
+                ' KEY AUTOINCREMENT, agent_id TEXT NOT NULL, mem_type TEXT,'
+                ' content TEXT, created_at REAL, active INTEGER DEFAULT 1,'
+                ' confidence REAL, source_type TEXT)')
+            for row in payload.get('ltmRows') or []:
+                conn.execute(
+                    'INSERT INTO agent_ltm (agent_id, mem_type, content,'
+                    ' created_at, active, confidence, source_type)'
+                    ' VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    (row['agentId'], row['memType'], row['content'],
+                     row['createdAt'], row['active'], row['confidence'],
+                     row['sourceType']))
         save_state_to_db(state)
     except Exception as exc:
         _state_abort()
@@ -313,6 +336,11 @@ async def admin_move_team_to_village(request: Request):
             conn.execute(f'DELETE FROM {table} WHERE id IN ({ph})', members)
         conn.execute(
             f'DELETE FROM agent_keys WHERE agent_id IN ({ph})', members)
+        try:
+            conn.execute(
+                f'DELETE FROM agent_ltm WHERE agent_id IN ({ph})', members)
+        except Exception:
+            pass  # a parent without any LTM yet has no table to clear
         for row in payload['deliverableRows']:
             conn.execute('DELETE FROM completed_deliverable WHERE id = ?',
                          (row[0],))
@@ -472,3 +500,139 @@ async def admin_return_village_cards(request: Request):
                {'village': village_id, 'restored': restored},
                authorized=True)
     return {'ok': True, 'restored': restored}
+
+
+@app.post('/api/admin/move-team-plan')
+async def admin_move_team_plan(request: Request):
+    """Collect the full move payload WITHOUT moving anything. The hardened
+    CLI stops the destination village, writes the payload into its DB
+    directly (no running sim to race), restarts it, and only then commits
+    the parent-side removal -- a village process's queued saves race the
+    sim's ticks, so an in-process move-in can be silently reverted."""
+    from serve import verify_session, SESSION_COOKIE_NAME
+    key = request.headers.get('X-Agent-Key')
+    actor = _is_tank_admin(request) if key else None
+    if not actor and not _move_token_ok(request) and \
+            not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    team_id = str((body or {}).get('teamId') or '').strip()
+    if not team_id:
+        return JSONResponse({'error': 'teamId required'}, status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        payload, err = _collect_move_payload(state, team_id)
+        if err:
+            return JSONResponse({'error': err}, status_code=409)
+        return {'ok': True, 'plan': payload}
+    finally:
+        _state_abort()
+
+
+@app.post('/api/admin/move-team-commit')
+async def admin_move_team_commit(request: Request):
+    """Remove a team that has ALREADY been written into its village DB.
+    Body: {villageId, plan}. No village call: the village side is already
+    done (or the village is being restarted by the CLI)."""
+    from serve import verify_session, SESSION_COOKIE_NAME, log_action, \
+        save_state_to_db
+    key = request.headers.get('X-Agent-Key')
+    actor = _is_tank_admin(request) if key else None
+    if not actor and not _move_token_ok(request) and \
+            not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    village_id = str((body or {}).get('villageId') or '').strip()
+    plan = (body or {}).get('plan') or {}
+    if not village_id or not isinstance(plan, dict) or not plan.get('team'):
+        return JSONResponse({'error': 'villageId and plan are required'},
+                            status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    team_id = plan['team'].get('id')
+    members = plan.get('members') or []
+    state['teams'] = [t for t in (state.get('teams') or [])
+                      if not (isinstance(t, dict) and t.get('id') == team_id)]
+    tasks = state.get('tasks') or {}
+    for tid in list((plan.get('tasks') or {}).keys()):
+        tasks.pop(tid, None)
+    if plan.get('queue'):
+        state['workQueue'] = [q for q in (state.get('workQueue') or [])
+                              if q not in plan['queue']]
+    for tid in plan.get('reassignedElsewhere') or []:
+        card = tasks.get(tid)
+        if isinstance(card, dict):
+            card['assignedTo'] = None
+    ph = ','.join('?' * len(members)) if members else None
+    with _db() as conn:
+        if ph:
+            for table in ('roster_agent', 'live_agent'):
+                conn.execute(f'DELETE FROM {table} WHERE id IN ({ph})',
+                             members)
+            conn.execute(
+                f'DELETE FROM agent_keys WHERE agent_id IN ({ph})', members)
+            try:
+                conn.execute(
+                    f'DELETE FROM agent_ltm WHERE agent_id IN ({ph})',
+                    members)
+            except Exception:
+                pass
+        for row in plan.get('deliverableRows') or []:
+            conn.execute('DELETE FROM completed_deliverable WHERE id = ?',
+                         (row[0],))
+        for row in plan.get('backlogRows') or []:
+            conn.execute('DELETE FROM backlog_request WHERE id = ?',
+                         (row[0],))
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS villages_teams ('
+            ' village_id TEXT NOT NULL, team_id TEXT NOT NULL,'
+            ' director_id TEXT, updated_at REAL,'
+            ' PRIMARY KEY (village_id, team_id))')
+        conn.execute(
+            'INSERT INTO villages_teams (village_id, team_id, director_id,'
+            ' updated_at) VALUES (?, ?, ?, ?)'
+            ' ON CONFLICT(village_id, team_id) DO UPDATE SET'
+            ' director_id = excluded.director_id,'
+            ' updated_at = excluded.updated_at',
+            (village_id, team_id, plan['team'].get('directorId'),
+             time.time()))
+    save_state_to_db(state)
+    log_action(actor or 'operator-tool', 'team_moved_to_village',
+               {'team': team_id, 'village': village_id,
+                'members': members, 'tasks': len(plan.get('tasks') or {})},
+               authorized=True)
+    try:
+        import sim as _sim
+        _sim._log_governance(state, actor or 'admin',
+                             'team_moved_to_village',
+                             {'team': team_id, 'village': village_id,
+                              'members': members})
+        director_id = plan['team'].get('directorId')
+        agent = (state.get('agents') or {}).get(director_id)
+        if isinstance(agent, dict):
+            box = agent.setdefault('mailbox', [])
+            box.append({
+                'kind': 'team_moved', 'read': False,
+                'ts': int(time.time() * 1000),
+                'about': team_id,
+                'text': (f'Your team "{plan["team"].get("name") or team_id}" '
+                         f'now lives in village {village_id}. Your workers '
+                         'moved with it; your agent row stayed home. '
+                         'Supervision briefs for that team will be relayed '
+                         'to you here.'),
+            })
+            del box[:-200]
+        save_state_to_db(state)
+    except Exception:
+        pass
+    return {'ok': True, 'team': team_id, 'village': village_id,
+            'members': members, 'tasksMoved': len(plan.get('tasks') or {})}

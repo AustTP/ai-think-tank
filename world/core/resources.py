@@ -2,10 +2,13 @@
 
 The global class limits in ``world/deployment.json`` are the host ceiling. A
 village's directors can lower its share and hold classes through
-``/api/villages/{id}/resources``. This module is deliberately state-free for
-the config and uses an in-process lease table for live usage; the server is one
-process, so that is the same scope the Docker commands run in.
-"""
+``/api/villages/{id}/resources``. Live usage is an in-process lease table in
+each process -- which is why, in village mode, leases are ROUTED THROUGH THE
+PARENT (remote acquire/release over the cross-village API): one governor's
+memory only sees its own process's leases, so a per-process "global" cap
+would silently multiply by the number of villages. If the parent is
+unreachable a village falls back to its local governor (availability over
+strictness; the parent's lease sweep self-heals orphans)."""
 from __future__ import annotations
 
 import copy
@@ -144,6 +147,29 @@ class ResourceDenied(Exception):
         self.retry_after_s = retry_after_s
 
 
+def _remote_resource_call(op, payload, timeout=6.0):
+    """Village mode: route lease accounting through the parent control
+    plane so the deployment.json class caps are enforced HOST-WIDE.
+    Returns the parsed response, or None when village mode is off or the
+    parent is unreachable (the caller falls back to the local governor)."""
+    village = os.environ.get('THINK_TANK_VILLAGE') or ''
+    parent = os.environ.get('THINK_TANK_PARENT_URL') or ''
+    if not village or not parent:
+        return None
+    import urllib.request as _url
+    try:
+        req = _url.Request(
+            f'{parent}/api/villages/{village}/resource-{op}',
+            data=json.dumps(payload).encode(), method='POST',
+            headers={'Content-Type': 'application/json',
+                     'X-Parent-Token':
+                     os.environ.get('THINK_TANK_PARENT_TOKEN') or ''})
+        with _url.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:
+        return None
+
+
 class ResourceGovernor:
     def __init__(self, config=None):
         self._lock = threading.Condition()
@@ -189,6 +215,21 @@ class ResourceGovernor:
         resource_class = resource_class if resource_class in CLASS_NAMES else 'light'
         limit = dict(self.classes.get(resource_class) or self.classes['light'])
         timeout_s = max(1, int(limit.get('timeoutS') or 120))
+        # Village mode: the parent's governor owns the host-wide ledger.
+        # One roundtrip per attempt; a denied answer is final; an
+        # unreachable parent falls through to the local governor so a
+        # control-plane outage never takes a village's work down.
+        remote = _remote_resource_call('acquire', {
+            'resourceClass': resource_class, 'taskId': task_id,
+            'agentId': agent_id, 'timeoutS': timeout_s})
+        if remote is not None:
+            if remote.get('granted'):
+                lease = dict(remote.get('lease') or {})
+                lease['remote'] = True
+                return lease
+            raise ResourceDenied(
+                remote.get('reason') or 'denied by the host resource '
+                'ledger', retry_after_s=60)
         policy = village_policy(state, village_id)
         deadline = time.time() + max(0, float(wait_s or 0))
         with self._lock:
@@ -234,6 +275,10 @@ class ResourceGovernor:
                 self._lock.wait(timeout=min(1.0, max(0.05, deadline - time.time())))
 
     def release(self, lease_id):
+        # In village mode the lease probably lives in the parent's ledger
+        # (remote acquire); fire the remote release and always drop any
+        # local twin. Both are idempotent.
+        _remote_resource_call('release', {'leaseId': lease_id}, timeout=4.0)
         with self._lock:
             self._leases.pop(lease_id, None)
             self._lock.notify_all()

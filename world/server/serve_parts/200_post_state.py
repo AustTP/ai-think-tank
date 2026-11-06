@@ -229,6 +229,32 @@ async def api_mail_send(request: Request):
     roster = state.get('agentRoster') or []
     ids = {d.get('id') for d in roster if isinstance(d, dict)}
     if to_id not in ids:
+        # CROSS-VILLAGE (2026-11-06): in a village, a recipient with no
+        # local row may live in the parent or another village -- relay
+        # through the parent's post office instead of a bare 404. The
+        # parent routes by its cross-village directory and refuses
+        # unknown names, so nothing is silently dropped.
+        from serve import VILLAGE_MODE, VILLAGE_ID, PARENT_URL
+        if VILLAGE_MODE and VILLAGE_ID and PARENT_URL:
+            import json as _json
+            import urllib.request as _url
+            try:
+                body = _json.dumps({'to': to_id, 'text': text,
+                                    'from': from_id or VILLAGE_ID}).encode()
+                req = _url.Request(
+                    f'{PARENT_URL}/api/villages/{VILLAGE_ID}/post',
+                    data=body, method='POST',
+                    headers={'Content-Type': 'application/json',
+                             'X-Parent-Token':
+                             os.environ.get('THINK_TANK_PARENT_TOKEN')
+                             or ''})
+                with _url.urlopen(req, timeout=10) as resp:
+                    routed = _json.loads(resp.read())
+                return JSONResponse({'ok': True, 'relayed': True,
+                                     'routed': routed.get('routed'),
+                                     'to': to_id})
+            except Exception:
+                pass
         return JSONResponse({'error': 'recipient not found'}, status_code=404)
     if from_id != 'player' and from_id not in ids:
         return JSONResponse({'error': 'sender not found'}, status_code=400)

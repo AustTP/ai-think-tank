@@ -106,3 +106,55 @@ async def set_village_resources(village_id: str, request: Request):
                authorized=True)
     return JSONResponse({'ok': True, 'villageId': village_id,
                          **_village_resource_view(state, village_id)})
+
+
+import os
+
+
+def _village_token_ok(request):
+    expected = (os.environ.get('THINK_TANK_PARENT_TOKEN')
+                or _load_env().get('THINK_TANK_PARENT_TOKEN', ''))
+    if not expected:
+        return False
+    return (request.headers.get('X-Parent-Token') or '').strip() == expected
+
+
+@app.post('/api/villages/{village_id}/resource-acquire')
+async def village_resource_acquire(village_id: str, request: Request):
+    """A village asks the HOST-WIDE ledger for a sandbox lease. The
+    parent's governor enforces the deployment.json class caps across every
+    village plus its own work, and the village's own policy (share, holds)
+    from the parent's state."""
+    if not _village_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    cls = str((body or {}).get('resourceClass') or 'light')
+    state = get_state_from_db()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        lease = _resources.GOVERNOR.acquire(
+            village_id, cls,
+            task_id=str((body or {}).get('taskId') or ''),
+            agent_id=str((body or {}).get('agentId') or ''),
+            state=state, wait_s=0)
+    except _resources.ResourceDenied as exc:
+        return JSONResponse({'granted': False, 'reason': str(exc)[:200]})
+    return {'granted': True, 'lease': lease}
+
+
+@app.post('/api/villages/{village_id}/resource-release')
+async def village_resource_release(village_id: str, request: Request):
+    if not _village_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    lease_id = str((body or {}).get('leaseId') or '')
+    if lease_id:
+        _resources.GOVERNOR.release(lease_id)
+    return {'ok': True}

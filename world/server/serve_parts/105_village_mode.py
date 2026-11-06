@@ -58,6 +58,29 @@ def _village_refuse_operator_surface():
 _village_refuse_operator_surface()
 
 
+def _village_heartbeat_agents():
+    """The village's people, for the parent's cross-village directory
+    (who lives here, what room they work in). Powers visiting and
+    cross-village mail routing."""
+    try:
+        from serve import get_state_from_db
+        state = get_state_from_db(archive_merge='none')
+        out = []
+        for row in (state.get('agentRoster') or []):
+            if not isinstance(row, dict) or not row.get('id'):
+                continue
+            agent = (state.get('agents') or {}).get(row['id']) or {}
+            out.append({
+                'id': row['id'],
+                'name': row.get('name') or row['id'],
+                'role': row.get('role') or '',
+                'room': agent.get('inRoom') or '',
+            })
+        return out[:60]
+    except Exception:
+        return []
+
+
 def _village_heartbeat_payload():
     """A compact liveness + pressure snapshot from this village's own DB."""
     try:
@@ -93,7 +116,9 @@ async def _village_heartbeat_loop():
         if not PARENT_URL:
             continue
         try:
-            body = json.dumps(_village_heartbeat_payload()).encode()
+            body = json.dumps(
+                {**_village_heartbeat_payload(),
+                 'agents': _village_heartbeat_agents()}).encode()
             req = urllib.request.Request(
                 f'{PARENT_URL}/api/villages/{VILLAGE_ID}/heartbeat',
                 data=body, method='POST',

@@ -119,6 +119,25 @@ async def village_heartbeat(village_id: str, request: Request):
             'UPDATE villages_registry SET last_heartbeat_at = ?,'
             ' last_status = ? WHERE id = ?',
             (time.time(), json.dumps(status), village_id))
+        # The cross-village directory: who lives in this village right now.
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS villages_agents ('
+            ' village_id TEXT NOT NULL, agent_id TEXT NOT NULL,'
+            ' name TEXT, role TEXT, room TEXT, updated_at REAL,'
+            ' PRIMARY KEY (village_id, agent_id))')
+        agents = body.get('agents') if isinstance(body, dict) else None
+        if isinstance(agents, list):
+            conn.execute('DELETE FROM villages_agents WHERE village_id = ?',
+                         (village_id,))
+            for a in agents[:60]:
+                if not isinstance(a, dict) or not a.get('id'):
+                    continue
+                conn.execute(
+                    'INSERT INTO villages_agents (village_id, agent_id,'
+                    ' name, role, room, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+                    (village_id, str(a.get('id')), str(a.get('name') or ''),
+                     str(a.get('role') or ''), str(a.get('room') or ''),
+                     time.time()))
     # Org intake: alert lines ride the heartbeat into the chief of staff's
     # mailbox -- the channel that keeps a village process from being an
     # island when it needs org-level help.

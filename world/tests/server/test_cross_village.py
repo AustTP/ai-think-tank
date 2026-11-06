@@ -386,3 +386,107 @@ class MoveSemantics(unittest.TestCase):
         card = self.st['tasks']['foreign']
         self.assertIsNone(card['assignedTo'])
         self.assertIn('returned from village north', card['note'])
+
+
+class VisitsAndTalk(unittest.TestCase):
+    """Walking between villages: the parent's cross-village directory and
+    post office let an agent talk to someone in another village and read
+    a visitor snapshot, without either village talking to the other."""
+
+    def setUp(self):
+        os.environ['THINK_TANK_PARENT_TOKEN'] = 'tok-1'
+        self.addCleanup(os.environ.pop, 'THINK_TANK_PARENT_TOKEN', None)
+        for name, val in (('log_action', lambda *a, **k: None),
+                          ('save_state_to_db', lambda s: None),
+                          ('_state_begin', lambda: self.st),
+                          ('check_rate_limit', lambda aid: True)):
+            self._p = unittest.mock.patch.object(serve, name, val)
+            self._p.start()
+            self.addCleanup(self._p.stop)
+
+    def _state(self):
+        self.st = {'agents': {'theo': {'mailbox': []}},
+                   'agentRoster': [{'id': 'theo', 'isAdmin': True}],
+                   'teams': [], 'tasks': {}, 'workQueue': []}
+        return self.st
+
+    def test_heartbeat_builds_the_cross_village_directory(self):
+        self._state()
+        _register_village()
+        r = client().post('/api/villages/north/heartbeat', headers=TOKEN,
+                          json={'ok': True, 'openTasks': 3, 'queued': 0,
+                                'alerts24h': 0,
+                                'agents': [{'id': 'ven', 'name': 'Venus',
+                                            'role': 'Director',
+                                            'room': 'warroom'}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT name, role, room FROM villages_agents'
+                ' WHERE village_id = ? AND agent_id = ?',
+                ('north', 'ven')).fetchone()
+        self.assertEqual(row, ('Venus', 'Director', 'warroom'))
+
+    def test_post_routes_to_a_parent_homed_recipient(self):
+        self._state()
+        _register_village()
+        r = client().post('/api/villages/north/post', headers=TOKEN,
+                          json={'to': 'theo', 'from': 'ora',
+                                'text': 'saw the migration, looks right'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['routed'], 'parent')
+        box = self.st['agents']['theo']['mailbox']
+        self.assertIn('ora (village north)', box[-1]['text'])
+
+    def test_post_routes_to_another_villages_agent(self):
+        self._state()
+        _register_village()
+        _register_village('south')
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO villages_agents (village_id, agent_id, name,'
+                ' role, room, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+                ('south', 'kai', 'Kai', 'Worker', 'lab', 0.0))
+        r = client().post('/api/villages/north/post', headers=TOKEN,
+                          json={'to': 'kai', 'from': 'ora',
+                                'text': 'how is the build going?'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['routed'], 'village:south')
+        with serve._db() as conn:
+            out = conn.execute(
+                'SELECT to_agent, text FROM villages_outbox'
+                ' WHERE village_id = ?', ('south',)).fetchone()
+        self.assertEqual(out[0], 'kai')
+        self.assertIn('ora (village north)', out[1])
+
+    def test_post_refuses_unknown_recipients(self):
+        self._state()
+        _register_village()
+        r = client().post('/api/villages/north/post', headers=TOKEN,
+                          json={'to': 'ghost', 'text': 'hi'})
+        self.assertEqual(r.status_code, 404)
+
+    def test_village_visit_snapshot(self):
+        self.st = {'agents': {'ven': {'inRoom': 'warroom', 'busy': False},
+                              'pax': {'inRoom': 'lab', 'busy': True}},
+                   'agentRoster': [
+                       {'id': 'ven', 'name': 'Venus', 'role': 'Director'},
+                       {'id': 'pax', 'name': 'Pax', 'role': 'Builder'}],
+                   'teams': [{'id': 'ven', 'name': "Venus's Team",
+                              'directorId': 'ven', 'members': ['pax']}],
+                   'tasks': {'t1': {'status': 'working', 'teamId': 'ven'}},
+                   'workQueue': []}
+        _register_village()
+        self._vm = unittest.mock.patch.object(serve, 'VILLAGE_MODE', True)
+        self._vm.start()
+        self.addCleanup(self._vm.stop)
+        r = client().get('/api/villages-self/visit', headers=TOKEN)
+        self.assertEqual(r.status_code, 200, r.text)
+        view = r.json()
+        self.assertEqual(view['rooms']['warroom'][0]['id'], 'ven')
+        self.assertEqual(view['openByTeam'], {'ven': 1})
+        self.assertEqual(view['teams'][0]['name'], "Venus's Team")
+
+    def test_visit_refuses_without_village_mode(self):
+        r = client().get('/api/villages-self/visit', headers=TOKEN)
+        self.assertEqual(r.status_code, 404)

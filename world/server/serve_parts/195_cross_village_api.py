@@ -36,6 +36,7 @@ flooding the chief of staff.
 import json
 import os
 import time
+import urllib.request
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -301,3 +302,139 @@ def _village_deliver_to_org(village_id, items):
                 ' text, ts) VALUES (?, ?, ?, ?, ?)',
                 (village_id, to, str((item or {}).get('kind') or 'directive'),
                  text, now))
+
+
+@app.post('/api/villages/{village_id}/post')
+async def village_post_mail(village_id: str, request: Request):
+    """Cross-village TALK. A village agent (or the parent) sends mail to
+    someone anywhere in the org; the parent routes it:
+      - recipient homed in the parent  -> their mailbox here
+      - recipient homed in a village   -> that village's outbox (its
+        heartbeat loop delivers it into the local mailbox)
+      - unknown                        -> 404 (nothing silently dropped)
+    Body: {to, text, from}. Token-gated."""
+    if not _parent_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    to_id = str((body or {}).get('to') or '').strip()
+    text = str((body or {}).get('text') or '').strip()
+    from_id = str((body or {}).get('from') or village_id).strip()
+    if not to_id or not text:
+        return JSONResponse({'error': 'to and text are required'},
+                            status_code=400)
+    text = text[:2000]
+    # Recipient homed in the parent?
+    state = _state_begin()
+    if state:
+        try:
+            roster_ids = {r.get('id') for r in
+                          (state.get('agentRoster') or [])
+                          if isinstance(r, dict)}
+            if to_id in roster_ids:
+                agent = (state.get('agents') or {}).get(to_id)
+                if isinstance(agent, dict):
+                    from serve import save_state_to_db
+                    box = agent.setdefault('mailbox', [])
+                    box.append({
+                        'kind': 'cross_village_mail',
+                        'read': False,
+                        'ts': int(time.time() * 1000),
+                        'text': f'{from_id} (village {village_id}): {text}',
+                    })
+                    del box[:-200]
+                    save_state_to_db(state)
+                    return {'ok': True, 'routed': 'parent', 'to': to_id}
+        finally:
+            _state_abort()
+    # Recipient homed in another village?
+    _register_teams_tables()
+    with _db() as conn:
+        hit = conn.execute(
+            'SELECT village_id FROM villages_agents WHERE agent_id = ?',
+            (to_id,)).fetchone()
+    if hit:
+        target = hit[0]
+        if target == village_id:
+            return JSONResponse(
+                {'error': f'{to_id} lives in the sending village; mail '
+                          'locally instead'}, status_code=400)
+        _village_deliver_to_org(target, [
+            {'to': to_id, 'kind': 'cross_village_mail',
+             'text': f'{from_id} (village {village_id}): {text}'}])
+        return {'ok': True, 'routed': f'village:{target}', 'to': to_id}
+    return JSONResponse({'error': f'no agent {to_id} is known to the org'},
+                        status_code=404)
+
+
+@app.get('/api/villages/{village_id}/visit')
+async def village_visit_view(village_id: str, request: Request):
+    """KNOWLEDGE GATHERING: a visitor's read-only snapshot of a village --
+    its people and rooms, its teams, its open work counts. Fetched live
+    from the village over the cross-village API. Player session or token."""
+    from serve import verify_session, SESSION_COOKIE_NAME
+    if not (_parent_token_ok(request)
+            or verify_session(request.cookies.get(SESSION_COOKIE_NAME))):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    with _db() as conn:
+        reg = conn.execute(
+            'SELECT api_base FROM villages_registry WHERE id = ?',
+            (village_id,)).fetchone()
+    if reg is None:
+        return JSONResponse({'error': f'unknown village {village_id}'},
+                            status_code=404)
+    try:
+        req = urllib.request.Request(
+            f'{reg[0]}/api/villages-self/visit',
+            headers={'X-Parent-Token':
+                     os.environ.get(_PARENT_TOKEN_ENV)
+                     or _load_env().get(_PARENT_TOKEN_ENV, '')})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            snapshot = json.loads(resp.read())
+    except Exception as exc:
+        return JSONResponse(
+            {'error': f'village unreachable: {type(exc).__name__}'[:120]},
+            status_code=502)
+    return {'villageId': village_id, **snapshot}
+
+
+@app.get('/api/villages-self/visit')
+async def village_self_visit_view(request: Request):
+    """VILLAGE side: the snapshot the parent proxies to visitors."""
+    from serve import VILLAGE_MODE
+    if not VILLAGE_MODE:
+        return JSONResponse({'error': 'village process only'},
+                            status_code=404)
+    if not _parent_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        rooms = {}
+        for row in (state.get('agentRoster') or []):
+            if not isinstance(row, dict) or not row.get('id'):
+                continue
+            agent = (state.get('agents') or {}).get(row['id']) or {}
+            room = agent.get('inRoom') or 'unplaced'
+            rooms.setdefault(room, []).append(
+                {'id': row['id'], 'name': row.get('name') or row['id'],
+                 'role': row.get('role') or '',
+                 'busy': bool(agent.get('busy'))})
+        open_by_team = {}
+        for t in (state.get('tasks') or {}).values():
+            if isinstance(t, dict) and t.get('status') not in (
+                    'done', 'cancelled', 'abandoned'):
+                tid = t.get('teamId') or 'unassigned'
+                open_by_team[tid] = open_by_team.get(tid, 0) + 1
+        teams = [{'id': t.get('id'), 'name': t.get('name') or t.get('id'),
+                  'directorId': t.get('directorId'),
+                  'members': len(t.get('members') or [])}
+                 for t in (state.get('teams') or []) if isinstance(t, dict)]
+        return {'rooms': rooms, 'teams': teams, 'openByTeam': open_by_team,
+                'wiki': (state.get('wiki') or {}).get('villageId') or
+                (state.get('settings') or {}).get('villageId')}
+    finally:
+        _state_abort()
