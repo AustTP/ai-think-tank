@@ -1152,7 +1152,7 @@ def _failure_review_step(state, now, now_ms, decider=None):
 SUPERVISOR_BRIEF_INTERVAL_MS = 15 * 60 * 1000
 SUPERVISOR_CARD_INTERVAL_MS = 30 * 60 * 1000
 SUPERVISOR_CARD_BUDGET_USD = 0.05
-CHIEF_MONITOR_INTERVAL_MS = 60 * 60 * 1000  # routine cross-team sweep, attention still wins
+CHIEF_MONITOR_INTERVAL_MS = 24 * 60 * 60 * 1000  # the VP's routine cross-team sweep is DAILY (operator 2026-11-06: the supervisor of the supervisors scans once a day; the directors' hourly worker scans sit below her); attention cards keep their own 30-min spacing
 # Operator directive (2026-11-06): supervision must not be sprint-gated. A
 # team with active workers but no sprint gets an hourly director scan; the
 # sprint cadence (15 min) stays for active sprints.

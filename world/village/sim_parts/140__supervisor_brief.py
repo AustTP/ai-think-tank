@@ -186,6 +186,9 @@ def _supervisor_brief_step(state, now, now_ms):
     unchanged (more frequent while the sprint runs)."""
     if automation_paused(state):
         return
+    # The supervisor-of-supervisors metrics refresh hourly regardless of who
+    # holds a card this pass.
+    _director_supervision_rollup(state, now_ms)
     seen = state.setdefault('_supervisorBriefAt', {})
     for team in (state.get('teams') or []):
         tid = team.get('id')
@@ -231,12 +234,15 @@ def _supervisor_brief_step(state, now, now_ms):
                              'Do not do the work or edit code.'),
         }])
         state.setdefault('_supervisorCardAt', {})[tid] = now_ms
-    # The chief of staff gets a cross-team card when any team needs attention.
-    # He has no team of his own, so the per-team loop above never reaches him;
-    # without this the admin would be blind to the same failures.
+    # The cross-team oversight card: the SENIOR-MOST DIRECTOR holds it --
+    # the top of the recursive director-of-director chain, NOT the regional
+    # VP (she stands alone with her own instruments). Until a senior-most
+    # director exists the chief of staff holds the card (operator model,
+    # 2026-11-06).
     admin = next((d.get('id') for d in (state.get('agentRoster') or [])
                   if d.get('isAdmin')), None)
-    if not admin or admin not in (state.get('agents') or {}):
+    holder = _senior_most_director(state) or admin
+    if not holder or holder not in (state.get('agents') or {}):
         return
     reasons = []
     for team in (state.get('teams') or []):
@@ -250,15 +256,10 @@ def _supervisor_brief_step(state, now, now_ms):
                if not a.get('teamId')]
     if unowned:
         reasons.append(f"unowned: {len(unowned)} abandoned card(s)")
-    # No failure, no stuck review, no budget pressure: that is the normal idle
-    # state, not a reason to spend a supervision turn. Routine cross-team
-    # sweeps used to refill an otherwise-empty board every cadence.
-    if not reasons:
-        return
-    if _supervisor_admin_card_open(state):
-        return
     routine = not reasons
     if routine and not (state.get('teams') or []):
+        return
+    if _supervisor_admin_card_open(state):
         return
     stamp = '__adminRoutine__' if routine else '__admin__'
     interval = CHIEF_MONITOR_INTERVAL_MS if routine else SUPERVISOR_CARD_INTERVAL_MS
@@ -266,6 +267,10 @@ def _supervisor_brief_step(state, now, now_ms):
     if last_admin and now_ms - last_admin < interval:
         return
     if routine:
+        # Drained-board invariant (2026-11-05 lesson): an idle tank gets no
+        # routine card -- the daily sweep supervises WORK, not emptiness.
+        if not (state.get('tasks') or {}) and not (state.get('workQueue') or []):
+            return
         title = '[SUPERVISE] Cross-team: routine sweep'
         instructions = (
             'Routine cross-team oversight. Read every team report, look for anything '
@@ -274,6 +279,9 @@ def _supervisor_brief_step(state, now, now_ms):
             'director with direct_backlog to put an immediate high-priority task in that '
             "team's backlog, or delegate a scoped check. Do not do the work or edit code."
         )
+        rollup_text = _director_supervision_rollup_text(state)
+        if rollup_text:
+            instructions += '\n\nTeam metrics (24h):\n' + rollup_text
     else:
         title = f"[SUPERVISE] Cross-team: {len(reasons)} team(s) need attention"
         instructions = (
@@ -287,13 +295,130 @@ def _supervisor_brief_step(state, now, now_ms):
         'title': title[:120],
         'room': 'commandcenter',
         'taskType': 'supervise',
-        'assignedTo': admin,
+        'assignedTo': holder,
         'priority': 'high',
         'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
         'sizeEstimate': 'S',
         'instructions': instructions,
     }])
     state.setdefault('_supervisorCardAt', {})[stamp] = now_ms
+
+
+def _senior_most_director(state):
+    """The TOP of the recursive director chain -- the supervisor of the
+    supervisors (operator model, 2026-11-06).
+
+    The regional VP does NOT sit in this recursion: she stands alone with
+    her own instruments (the village scan, senior-tier split routing). The
+    director-of-a-director chain is recursive and its top is the
+    SENIOR-MOST DIRECTOR.
+
+    Derivation, not appointment: the roster's `director` pointer already
+    encodes the tree for workers, and a director points at the director
+    above her the same way. A director is a ROOT when her own pointer is
+    empty or points at an admin, and she has at least one DIRECTOR
+    reporting to her (workers alone make her a team director, not a senior
+    one). Several roots: the one supervising the most directors is the
+    senior-most. No qualifying root (nobody appointed above the directors
+    yet) returns None and the cross-team oversight card falls back to the
+    chief of staff."""
+    roster = [r for r in (state.get('agentRoster') or []) if isinstance(r, dict)]
+    directors = {r.get('id') for r in roster
+                 if r.get('id') and r.get('isDirector') and not r.get('isAdmin')}
+    admin_ids = {r.get('id') for r in roster if r.get('isAdmin')}
+    reports = {}
+    for r in roster:
+        if r.get('id') in directors and r.get('director') in directors:
+            reports.setdefault(r['director'], []).append(r['id'])
+    roots = []
+    for did in sorted(directors):
+        row = next(r for r in roster if r.get('id') == did)
+        parent = row.get('director')
+        if parent and parent not in directors and parent not in admin_ids:
+            continue  # points at neither a director nor an admin: malformed
+        if did in reports:
+            roots.append((did, len(reports[did])))
+    if not roots:
+        return None
+    roots.sort(key=lambda kr: (-kr[1], kr[0]))
+    top = roots[0][0]
+    return top if top in (state.get('agents') or {}) else None
+
+
+DIRECTOR_ROLLUP_CADENCE_MS = 60 * 60 * 1000
+
+
+def _director_supervision_rollup(state, now_ms=None):
+    """Hourly per-team supervision metrics into state['directorSupervision']
+    -- the supervisor-of-supervisors view the operator asked for (2026-11-06):
+    open cards, spend, over-budget pressure, failures, and 24h completions
+    per team. Pure state; computed from live tasks plus the completed-
+    deliverables ledger (done cards are archived out of the live blob, so
+    completions are counted from the ledger, mapped to a team through the
+    member's roster director pointer). Cheap: O(tasks + ledger tail)."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    last = state.get('lastDirectorRollupAt')
+    if last is not None and now_ms - last < DIRECTOR_ROLLUP_CADENCE_MS:
+        return state.get('directorSupervision') or {}
+    state['lastDirectorRollupAt'] = now_ms
+    teams = {t.get('id'): t for t in (state.get('teams') or []) if t.get('id')}
+    per = {tid: {'open': 0, 'spendUsd': 0.0, 'overBudget': 0,
+                 'failedOrBlocked': 0, 'completed24h': 0,
+                 'members': len(team.get('members') or [])}
+           for tid, team in teams.items()}
+    for t in (state.get('tasks') or {}).values():
+        tid = t.get('teamId')
+        if tid not in per:
+            continue
+        status = t.get('status')
+        if status in ('done', 'cancelled', 'abandoned'):
+            continue
+        per[tid]['open'] += 1
+        spend = float(t.get('ownSpendUsd') or 0)
+        per[tid]['spendUsd'] = round(per[tid]['spendUsd'] + spend, 4)
+        budget = float(t.get('budgetUsd') or 0)
+        if budget and spend >= budget * 0.9:
+            per[tid]['overBudget'] += 1
+        if status in ('failed', 'blocked'):
+            per[tid]['failedOrBlocked'] += 1
+    agent_team = {}
+    for r in (state.get('agentRoster') or []):
+        if isinstance(r, dict) and r.get('id'):
+            agent_team[r['id']] = r.get('director')
+    day_ago = now_ms - 24 * 60 * 60 * 1000
+    for d in (state.get('completedDeliverables') or []):
+        if not isinstance(d, dict):
+            continue
+        ts = d.get('ts') or d.get('gradedAt') or 0
+        if not ts or ts < day_ago:
+            continue
+        tid = agent_team.get(d.get('agentId'))
+        if tid in per:
+            per[tid]['completed24h'] += 1
+    roll = state.setdefault('directorSupervision', {})
+    for tid, metrics in per.items():
+        metrics['ts'] = now_ms
+        roll[tid] = metrics
+    # Teams that vanished leave stale rows behind; drop them.
+    for tid in list(roll.keys()):
+        if tid not in per:
+            roll.pop(tid, None)
+    return roll
+
+
+def _director_supervision_rollup_text(state):
+    """One line per team from the last rollup, for the routine sweep card."""
+    roll = _director_supervision_rollup(state)
+    if not roll:
+        return ''
+    lines = []
+    for tid, m in sorted(roll.items()):
+        lines.append(
+            f"- {tid}: open {m.get('open', 0)}, 24h done {m.get('completed24h', 0)}, "
+            f"failed/blocked {m.get('failedOrBlocked', 0)}, "
+            f"spend ${float(m.get('spendUsd') or 0):.2f}"
+            + (f", OVER BUDGET x{m['overBudget']}" if m.get('overBudget') else ''))
+    return '\n'.join(lines)
 
 
 def _supervisor_admin_card_open(state):

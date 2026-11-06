@@ -127,7 +127,7 @@
   "deviceCheckinRetentionDays": 30,
   "supervisorBriefIntervalMs": 900000,
   "supervisorCardIntervalMs": 1800000,
-  "chiefMonitorIntervalMs": 3600000,
+  "chiefMonitorIntervalMs": 86400000,
   "supervisorCardBudgetUsd": 0.05,
   "delegateMaxOpen": 3,
   "delegateBudgetCapUsd": 0.5,
