@@ -344,7 +344,10 @@ def _fix_title_root(title):
             is_retry_suffix = bool(re.fullmatch(r'retry\s+\d+', content.strip(),
                                                 flags=re.I))
             if (idx and not is_retry_suffix
-                    and (had_fix or re.search(r'\bfix\b', content, re.I))):
+                    and (had_fix or re.search(r'\bfix\b', content, re.I)
+                         or re.match(r'\[(?:story|bug|spike|task|fix|research|'
+                                     r'report|qa|review|distill)\]', content,
+                                     flags=re.I))):
                 root = (content + ' ' + inner[idx + 1:]).strip()
         if root == before:
             break
@@ -573,6 +576,14 @@ def _queue_peer_repair(state, parent, rationale=None, not_before=None):
     fail-closed release observable (abandonment fallbacks) use it, because the
     same tick's assignment loop otherwise re-tasks the agent immediately."""
     if (parent.get('_peerGate') or {}).get('escalated'):
+        return None
+    # Sticky stop: once a root has been repair-loop-stopped, no further mint
+    # for that root, from ANY parent copy. The old per-mint 2-failure window
+    # kept re-engaging because sibling copies of the same family each arrived
+    # with fresh ids (live 2026-11-05: the disk-full family minted children
+    # for hours after the stop had already fired for it).
+    root = _fix_title_root(str(parent.get('title') or ''))
+    if root and f'repair_loop:{root}' in (state.get('_repairLoopNotified') or {}):
         return None
     author = parent.get('assignedTo')
     if not author or author not in (state.get('agents') or {}):
@@ -1097,6 +1108,13 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     if _open_fix_exists(state, task.get('title')):
         _log_governance(state, author, 'fix_send_back_deduped',
                         {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120]})
+        return
+    _root = _fix_title_root(str(task.get('title') or ''))
+    if _root and f'repair_loop:{_root}' in (state.get('_repairLoopNotified') or {}):
+        # Sticky stop (2026-11-05): a stopped root mints nothing further.
+        _log_governance(state, author, 'fix_send_back_deduped',
+                        {'taskId': task.get('id'), 'title': (task.get('title') or '')[:120],
+                         'stickyStop': True})
         return
     alternatives = []
     agents = state.get('agents') or {}
