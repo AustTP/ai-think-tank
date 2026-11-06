@@ -105,6 +105,21 @@ async def _village_heartbeat_loop():
 
 
 if VILLAGE_MODE:
-    @app.on_event('startup')
-    async def _start_village_heartbeat():
-        asyncio.get_event_loop().create_task(_village_heartbeat_loop())
+    # The heartbeat rides the app's OWN lifespan (wrapped, not replaced):
+    # @app.on_event is deprecated and conflicts with the custom lifespan
+    # the app was built with -- the wrapper below composes with it and
+    # keeps the heartbeat task's lifetime tied to the server's.
+    import contextlib
+
+    _village_orig_lifespan = app.router.lifespan_context
+
+    @contextlib.asynccontextmanager
+    async def _village_lifespan(app_):
+        hb_task = asyncio.create_task(_village_heartbeat_loop())
+        try:
+            async with _village_orig_lifespan(app_):
+                yield
+        finally:
+            hb_task.cancel()
+
+    app.router.lifespan_context = _village_lifespan

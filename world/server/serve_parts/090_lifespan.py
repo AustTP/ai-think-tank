@@ -95,27 +95,46 @@ async def _lifespan(app):
     # External watches (owner expansion, 2026-10-27): dead-man switch ping,
     # new free-model discovery, weekly OSV dependency audit, GitHub CI/issue
     # watcher, owner calendar ICS sync. Each loop is env-gated and fails open.
-    deadman_task = asyncio.create_task(_deadman_ping_loop())
-    free_model_task = asyncio.create_task(_free_model_discovery_loop())
-    osv_audit_task = asyncio.create_task(_osv_dependency_audit_loop())
-    github_watch_task = asyncio.create_task(_github_watch_loop())
-    owner_calendar_task = asyncio.create_task(_owner_calendar_loop())
+    # Org-exclusive loops (2026-11-06 village architecture): the owner's
+    # external services and the org-level watch loops belong to the PARENT
+    # process. A village worker skips them -- two processes polling the
+    # same Telegram bot 409-conflict, and a village must never touch the
+    # owner's calendar/GitHub/dead-man services. Per-village-instance
+    # loops (health, backup, prune, disk, tier refresh/backfill, ask
+    # drain, avatars, feeds) still run: the village DB is self-contained.
+    deadman_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_deadman_ping_loop())
+    free_model_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_free_model_discovery_loop())
+    osv_audit_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_osv_dependency_audit_loop())
+    github_watch_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_github_watch_loop())
+    owner_calendar_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_owner_calendar_loop())
     tier_boot_backfill_task = asyncio.create_task(_model_tier_boot_backfill())
-    photo_watch_task = asyncio.create_task(_photo_album_watch_loop())
-    tier_price_watch_task = asyncio.create_task(_tier_price_watch_loop())
-    service_price_drift_task = asyncio.create_task(_service_price_drift_loop())
-    tier_failure_recheck_task = asyncio.create_task(_tier_failure_recheck_loop())
-    calibration_task = asyncio.create_task(_calibration_loop())
-    weekly_review_task = asyncio.create_task(_weekly_review_loop())
-    colab_task = asyncio.create_task(_colab_failover_loop())
-    colab_compute_task = asyncio.create_task(_colab_compute_idle_loop()) \
-        if COLAB_CLI_AVAILABLE else None
+    photo_watch_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_photo_album_watch_loop())
+    tier_price_watch_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_tier_price_watch_loop())
+    service_price_drift_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_service_price_drift_loop())
+    tier_failure_recheck_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_tier_failure_recheck_loop())
+    calibration_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_calibration_loop())
+    weekly_review_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_weekly_review_loop())
+    colab_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_colab_failover_loop())
+    colab_compute_task = None if (VILLAGE_MODE or not COLAB_CLI_AVAILABLE) \
+        else asyncio.create_task(_colab_compute_idle_loop())
     telegram_task = None
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS:
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and not VILLAGE_MODE:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
         print(f'[telegram] bridge active for {len(TELEGRAM_ALLOWED_CHAT_IDS)} allowlisted chat(s)', flush=True)
     webhook_task = None
-    _webhook_active = active_webhook_channels()
+    _webhook_active = [] if VILLAGE_MODE else active_webhook_channels()
     if _webhook_active:
         webhook_task = asyncio.create_task(_webhook_poll_loop())
         print(f'[webhook] consumer active for {", ".join(_webhook_active)}', flush=True)
@@ -128,7 +147,8 @@ async def _lifespan(app):
     # gated on --max-idle-minutes: an armed edit has to land at its dormancy
     # path even when the idle watcher itself is disabled. Fully guarded; with
     # no windows and no armed edits it is a 30s no-op poll.
-    dormancy_window_task = asyncio.create_task(_dormancy_window_loop())
+    dormancy_window_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_dormancy_window_loop())
     # The mechanical idle auto-sleep, armed ONLY when --max-idle-minutes is
     # passed (0 = disabled) so default behavior never silently changes.
     idle_shutdown_task = (asyncio.create_task(_idle_shutdown_loop())
@@ -169,24 +189,36 @@ async def _lifespan(app):
     credits_probe_task.cancel()
     director_task.cancel()
     backup_task.cancel()
-    calibration_task.cancel()
-    weekly_review_task.cancel()
-    colab_task.cancel()
+    if calibration_task is not None:
+        calibration_task.cancel()
+    if weekly_review_task is not None:
+        weekly_review_task.cancel()
+    if colab_task is not None:
+        colab_task.cancel()
     if colab_compute_task is not None:
         colab_compute_task.cancel()
     prune_task.cancel()
     disk_task.cancel()
     tier_refresh_task.cancel()
     tier_boot_backfill_task.cancel()
-    photo_watch_task.cancel()
-    tier_price_watch_task.cancel()
-    service_price_drift_task.cancel()
-    tier_failure_recheck_task.cancel()
-    deadman_task.cancel()
-    free_model_task.cancel()
-    osv_audit_task.cancel()
-    github_watch_task.cancel()
-    owner_calendar_task.cancel()
+    if photo_watch_task is not None:
+        photo_watch_task.cancel()
+    if tier_price_watch_task is not None:
+        tier_price_watch_task.cancel()
+    if service_price_drift_task is not None:
+        service_price_drift_task.cancel()
+    if tier_failure_recheck_task is not None:
+        tier_failure_recheck_task.cancel()
+    if deadman_task is not None:
+        deadman_task.cancel()
+    if free_model_task is not None:
+        free_model_task.cancel()
+    if osv_audit_task is not None:
+        osv_audit_task.cancel()
+    if github_watch_task is not None:
+        github_watch_task.cancel()
+    if owner_calendar_task is not None:
+        owner_calendar_task.cancel()
     if telegram_task is not None:
         telegram_task.cancel()
     if webhook_task is not None:
