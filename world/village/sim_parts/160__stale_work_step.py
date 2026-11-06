@@ -592,6 +592,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # state-only brief every 15 minutes (own team, budget, process failures,
     # where to look). Mail, not a task: no spend, no queue.
     _supervisor_brief_step(state, now, now_ms)
+    _sm_standing_touch(state, now_ms)
 
     # First-week onboarding review: mail the reporting director once when the
     # hire's checklist comes due, so orientation has a measured follow-up.

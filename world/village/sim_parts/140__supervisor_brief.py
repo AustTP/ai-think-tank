@@ -304,6 +304,56 @@ def _supervisor_brief_step(state, now, now_ms):
     state.setdefault('_supervisorCardAt', {})[stamp] = now_ms
 
 
+SM_TOUCH_CADENCE_MS = 7 * 24 * 60 * 60 * 1000
+
+
+def _sm_standing_touch(state, now_ms=None):
+    """Weekly scrum-master touchpoint for PERMANENT-duty teams (operator
+    model, 2026-11-06): a team assigned to standing work has no sprint, and
+    the refinement ceremony only convenes on pending requests -- so nothing
+    periodic ever re-plans a drifting standing queue. Once a week, a team
+    with live cards (the drained-board lesson: never convene over an empty
+    board) gets one scrum-master governance card: review the standing queue,
+    replan or close wedged standing work, confirm the standing purpose is
+    still what the operator asked for."""
+    now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    queued = 0
+    touched = state.setdefault('_smTouchAt', {})
+    for team in (state.get('teams') or []):
+        tid = team.get('id')
+        if not tid:
+            continue
+        if any(s.get('status') == 'active' and tid in (s.get('teamIds') or [])
+               for s in (state.get('sprints') or {}).values()):
+            continue  # sprint teams groom at close
+        if not _team_has_active_workers(state, tid):
+            continue
+        if now_ms - int(touched.get(tid) or 0) < SM_TOUCH_CADENCE_MS:
+            continue
+        sm = team.get('scrumMasterId')
+        if not sm or sm not in (state.get('agents') or {}):
+            continue
+        queue_work(state, [{
+            'title': f'[GOVERN] Standing backlog review: {team.get("name") or tid}'[:120],
+            'room': team.get('room') or 'commandcenter',
+            'taskType': 'govern',
+            'assignedTo': sm,
+            'teamId': tid,
+            'priority': 'normal',
+            'budgetUsd': SUPERVISOR_CARD_BUDGET_USD,
+            'sizeEstimate': 'S',
+            'instructions': (
+                'Weekly standing-work touchpoint (no sprint is active for this '
+                'team): review every live card, replan or close wedged standing '
+                'work, and confirm the standing purpose still matches what the '
+                'operator asked for. Direct_backlog the owning director for any '
+                'new work you surface. Do not do the work yourself.'),
+        }])
+        touched[tid] = now_ms
+        queued += 1
+    return queued
+
+
 def _senior_most_director(state):
     """The TOP of the recursive director chain -- the supervisor of the
     supervisors (operator model, 2026-11-06).
