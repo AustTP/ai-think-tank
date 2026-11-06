@@ -100,7 +100,11 @@ async def village_heartbeat(village_id: str, request: Request):
     except Exception:
         body = {}
     if not isinstance(body, dict) or not body.get('ok'):
-        status = {'ok': False, 'seenAt': time.time()}
+        # Keep the village's own error line: a failing beat must be
+        # diagnosable from the parent's registry view alone.
+        status = {'ok': False, 'seenAt': time.time(),
+                  'error': str(body.get('error') or '')[:200] if
+                  isinstance(body, dict) else ''}
     else:
         status = {'ok': True, 'seenAt': time.time(),
                   'openTasks': body.get('openTasks'),
