@@ -839,6 +839,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                         # NOT the parent -- pass it explicitly or the resend
                         # words itself around a stale parent tag.
                         _release_agent_after_failure(state, aid, task)
+                        parent['_failedFixId'] = task.get('id')
                         _send_back_after_failure(state, parent, fail_note=task.get('note'),
                                                  is_infra=bool(task.get('_infraFailure')))
                         send_agent_off_duty(state, aid, doors, grid)

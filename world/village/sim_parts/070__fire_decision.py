@@ -476,7 +476,7 @@ def _stop_card_pattern(state, task, info, author):
             pass
 
 
-def _record_repair_failure(state, task, now_ms):
+def _record_repair_failure(state, task, now_ms, related_task_id=None):
     """Durable, in-state failure ledger for the loop guards.
 
     The guards used to count only live task rows with status failed/blocked;
@@ -484,17 +484,28 @@ def _record_repair_failure(state, task, now_ms):
     counters kept forgetting and the re-card pump minted a fresh generation
     every refusal (live 2026-11-05: ~50 repair children in 20 minutes while
     the counters always read zero). One bounded ledger entry per refusal
-    event, pruned to the longest window on write."""
+    event, pruned to the longest window on write.
+
+    A parent sent back BECAUSE its fix failed is the SAME refusal event as
+    the fix's own failure -- `related_task_id` records that pairing so the
+    loop guard counts one event, not two. Without it the FIRST failed fix
+    already reads as a loop (parent row + fix row, same root) and the story
+    is blocked for manual attention exactly when the cycle cap should have
+    given it one more honest fix (CI: test_failed_fix_does_not_rearm_the_gate,
+    red since the ledger landed)."""
     if not isinstance(task, dict):
         return
     root = _fix_title_root(str(task.get('title') or ''))
     log = state.get('_repairFailureLog')
     if not isinstance(log, list):
         log = state['_repairFailureLog'] = []
-    log.append({'root': root,
-                'key': _card_pattern_key(task),
-                'taskId': task.get('id'),
-                'ts': int(now_ms)})
+    entry = {'root': root,
+             'key': _card_pattern_key(task),
+             'taskId': task.get('id'),
+             'ts': int(now_ms)}
+    if related_task_id:
+        entry['related'] = related_task_id
+    log.append(entry)
     oldest = now_ms - max(REPAIR_LOOP_WINDOW_MS, CARD_PATTERN_WINDOW_MS) - 60_000
     state['_repairFailureLog'] = [e for e in log if int(e.get('ts') or 0) >= oldest][-400:]
 
@@ -506,6 +517,7 @@ def _repair_loop_should_stop(state, title, now_ms):
     if not root:
         return None
     recent = {}
+    fix_of = {}
     for t in (state.get('tasks') or {}).values():
         if t.get('status') not in ('failed', 'abandoned'):
             continue
@@ -514,14 +526,30 @@ def _repair_loop_should_stop(state, title, now_ms):
         ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
         if now_ms - int(ts) <= REPAIR_LOOP_WINDOW_MS:
             recent[t.get('id')] = int(ts)
+            if t.get('reviewOf'):
+                fix_of[t['reviewOf']] = t['id']
+    # A parent and its failing fix are ONE refusal event. The fix row knows
+    # its parent (reviewOf); drop the parent's own row so one failed fix
+    # counts once.
+    for parent_id, fix_id in list(fix_of.items()):
+        if parent_id in recent and fix_id in recent:
+            recent.pop(parent_id, None)
     # The in-state ledger survives watchdog archiving of failed rows, which
-    # used to reset the counters between generations.
+    # used to reset the counters between generations. Same collapse: a
+    # parent entry names the fix it was sent back for (related).
     for e in (state.get('_repairFailureLog') or []):
         if e.get('root') != root:
             continue
         ts = int(e.get('ts') or 0)
         if now_ms - ts <= REPAIR_LOOP_WINDOW_MS:
             recent[e.get('taskId') or f"log:{ts}"] = ts
+    related_by_fix = {}
+    for e in (state.get('_repairFailureLog') or []):
+        if e.get('root') == root and e.get('related'):
+            related_by_fix[str(e['related'])] = e.get('taskId')
+    for fix_id, parent_id in related_by_fix.items():
+        if fix_id in recent and parent_id in recent:
+            recent.pop(parent_id, None)
     if len(recent) < REPAIR_LOOP_MIN_FAILURES:
         return None
     return {'root': root, 'failures': len(recent),
@@ -979,6 +1007,7 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
     author = task.get('assignedTo')
     note = (fail_note or task.get('note') or 'the pipeline did not pass').strip()
     now_ms = int(time.time() * 1000)
+    related_fix_id = task.get('_failedFixId')
     if is_infra is None:
         is_infra = bool(task.get('_infraFailure'))
     if not is_infra:
@@ -989,7 +1018,8 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         task['failedAt'] = now_ms
         task['failNote'] = note[:300]
         try:
-            _record_repair_failure(state, task, now_ms)
+            _record_repair_failure(state, task, now_ms,
+                                   related_task_id=related_fix_id)
         except Exception:
             pass  # the live-row scan remains the backstop
         pattern = _card_pattern_suppressed(state, task, now_ms)
