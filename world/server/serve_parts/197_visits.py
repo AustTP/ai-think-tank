@@ -554,14 +554,15 @@ async def village_self_return_me(request: Request):
         try:
             req = urllib.request.Request(
                 f'{PARENT_URL}/api/villages/{VILLAGE_ID}/return-visitor',
-                data=json.dumps({'agentId': key_owner}).encode(),
+                data=json.dumps({'agentId': key_owner,
+                                 'force': True}).encode(),
                 method='POST',
                 headers={'Content-Type': 'application/json',
                          'X-Parent-Token':
                          os.environ.get('THINK_TANK_PARENT_TOKEN') or ''})
             urllib.request.urlopen(req, timeout=20)
         except Exception:
-            pass
+            pass  # the parent owns the walk from here; its log will show it
     threading.Thread(target=_fire, daemon=True).start()
     return {'ok': True, 'walking': True,
             'agent': key_owner, 'home': '_visitFrom'}
