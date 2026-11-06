@@ -76,13 +76,25 @@ def _collect_move_payload(state, team_id):
         return None, 'no workers to move'
     member_set = set(members)
     tasks = {}
+    # Move the team's OWN cards plus a worker's TEAMLESS cards (a card
+    # with no team follows its worker). A card a moving worker was
+    # ASSIGNED but that belongs to another team STAYS with that team (its
+    # assignee is cleared so the team re-staffs) -- the first real move
+    # proved why: assignee-based collection dragged five parent-team
+    # cards into a village DB their owners could no longer see.
+    reassigned_elsewhere = {}
     for tid, t in (state.get('tasks') or {}).items():
         if not isinstance(t, dict):
             continue
         if t.get('status') not in _OPEN_STATUSES:
             continue
-        if t.get('teamId') == team_id or t.get('assignedTo') in member_set:
+        team_of_card = t.get('teamId') or None
+        if team_of_card == team_id:
             tasks[tid] = t
+        elif team_of_card is None and t.get('assignedTo') in member_set:
+            tasks[tid] = t  # teamless work follows its worker
+        elif t.get('assignedTo') in member_set:
+            reassigned_elsewhere[tid] = t
     queue = [q for q in (state.get('workQueue') or [])
              if isinstance(q, dict) and q.get('teamId') == team_id]
     with _db() as conn:
@@ -130,6 +142,9 @@ def _collect_move_payload(state, team_id):
         'keyRows': [{'agentId': k[0], 'secretKey': k[1], 'createdAt': k[2]}
                     for k in keys],
         'tasks': tasks,
+        # Cards left behind: assigned to a moving worker but owned by
+        # another team. The parent clears their assignee after the move.
+        'reassignedElsewhere': sorted(reassigned_elsewhere),
         'queue': queue,
         'deliverableRows': wanted,
         'backlogRows': wanted_backlog,
@@ -285,6 +300,13 @@ async def admin_move_team_to_village(request: Request):
     if payload['queue']:
         state['workQueue'] = [q for q in (state.get('workQueue') or [])
                               if q not in payload['queue']]
+    for tid in payload.get('reassignedElsewhere') or []:
+        card = tasks.get(tid)
+        if isinstance(card, dict):
+            card['assignedTo'] = None
+            card['note'] = (str(card.get('note') or '') +
+                            ' [assignee moved to a village; re-staffed '
+                            f'{time.strftime("%Y-%m-%d")}]')[:400]
     ph = ','.join('?' * len(members))
     with _db() as conn:
         for table in ('roster_agent', 'live_agent'):
@@ -345,3 +367,108 @@ async def admin_move_team_to_village(request: Request):
     return {'ok': True, 'team': team_id, 'village': village_id,
             'members': members, 'tasksMoved': len(payload['tasks']),
             'villageReport': vres}
+
+
+@app.post('/api/villages-self/release-cards')
+async def village_release_cards(request: Request):
+    """VILLAGE side: hand cards back to the parent. Used to repair a move
+    that dragged foreign-team cards into a village DB (the 2026-11-06 eli
+    move did exactly that). Returns the full task dicts; the village
+    removes them from its own state."""
+    from serve import VILLAGE_MODE
+    if not VILLAGE_MODE:
+        return JSONResponse({'error': 'village process only'},
+                            status_code=404)
+    if not _move_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    wanted = set(str(x) for x in ((body or {}).get('taskIds') or []) if x)
+    if not wanted:
+        return JSONResponse({'error': 'taskIds required'}, status_code=400)
+    from serve import save_state_to_db
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        tasks = state.get('tasks') or {}
+        released = {}
+        for tid in list(wanted):
+            t = tasks.get(tid)
+            if isinstance(t, dict):
+                released[tid] = t
+                tasks.pop(tid, None)
+        save_state_to_db(state)
+    finally:
+        _state_abort()
+    return {'ok': True, 'released': released}
+
+
+@app.post('/api/admin/return-village-cards')
+async def admin_return_village_cards(request: Request):
+    """PARENT side: pull foreign-team cards BACK out of a village and
+    re-home them here (assignee cleared so the owning team re-staffs)."""
+    from serve import verify_session, SESSION_COOKIE_NAME, log_action, \
+        save_state_to_db
+    key = request.headers.get('X-Agent-Key')
+    actor = _is_tank_admin(request) if key else None
+    if not actor and not _move_token_ok(request) and \
+            not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    village_id = str((body or {}).get('villageId') or '').strip()
+    task_ids = [str(x) for x in ((body or {}).get('taskIds') or []) if x]
+    if not village_id or not task_ids:
+        return JSONResponse({'error': 'villageId and taskIds required'},
+                            status_code=400)
+    with _db() as conn:
+        reg = conn.execute(
+            'SELECT api_base FROM villages_registry WHERE id = ?',
+            (village_id,)).fetchone()
+    if reg is None:
+        return JSONResponse({'error': f'unknown village {village_id}'},
+                            status_code=404)
+    token = (os.environ.get(_MOVE_TOKEN_ENV)
+             or _load_env().get(_MOVE_TOKEN_ENV, ''))
+    try:
+        req = urllib.request.Request(
+            f'{reg[0]}/api/villages-self/release-cards',
+            data=json.dumps({'taskIds': task_ids}).encode(), method='POST',
+            headers={'Content-Type': 'application/json',
+                     'X-Parent-Token': token})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            released = json.loads(resp.read()).get('released') or {}
+    except Exception as exc:
+        return JSONResponse(
+            {'error': f'village release failed: '
+                      f'{type(exc).__name__}: {exc}'[:240]}, status_code=502)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        tasks = state.setdefault('tasks', {})
+        restored = []
+        for tid, t in released.items():
+            t['assignedTo'] = None
+            t['note'] = (str(t.get('note') or '') +
+                         ' [returned from village '
+                         f'{village_id}; assignee cleared '
+                         f'{time.strftime("%Y-%m-%d")}]')[:400]
+            tasks[tid] = t
+            restored.append(tid)
+        if restored:
+            save_state_to_db(state)
+        else:
+            _state_abort()
+    except Exception:
+        _state_abort()
+        raise
+    log_action(actor or 'operator-tool', 'village_cards_returned',
+               {'village': village_id, 'restored': restored},
+               authorized=True)
+    return {'ok': True, 'restored': restored}
