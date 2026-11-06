@@ -1153,6 +1153,10 @@ SUPERVISOR_BRIEF_INTERVAL_MS = 15 * 60 * 1000
 SUPERVISOR_CARD_INTERVAL_MS = 30 * 60 * 1000
 SUPERVISOR_CARD_BUDGET_USD = 0.05
 CHIEF_MONITOR_INTERVAL_MS = 60 * 60 * 1000  # routine cross-team sweep, attention still wins
+# Operator directive (2026-11-06): supervision must not be sprint-gated. A
+# team with active workers but no sprint gets an hourly director scan; the
+# sprint cadence (15 min) stays for active sprints.
+SUPERVISOR_IDLE_SCAN_INTERVAL_MS = 60 * 60 * 1000
 
 # Defined after the module's main bind_policy() call; bind_policy merges these
 # into the existing sim pairs so an operator reload rebinds them too.

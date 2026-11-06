@@ -150,9 +150,40 @@ def _first_week_onboard_review_step(state, now_ms):
                         {'agent': aid, 'director': director_id})
 
 
+def _team_has_active_workers(state, tid):
+    """True when the team has live work: any non-terminal task owned by or
+    assigned into the team, or any queued item for it. The operator's
+    supervision floor (2026-11-06): a director with active workers gets an
+    hourly scan even with no sprint -- the pump churn that went unseen for a
+    day ran entirely outside sprints."""
+    for t in (state.get('tasks') or {}).values():
+        if t.get('status') in ('done', 'cancelled', 'abandoned'):
+            continue
+        if t.get('teamId') == tid or t.get('assignedTo') in _team_member_ids(state, tid):
+            return True
+    for q in (state.get('workQueue') or []):
+        if q.get('teamId') == tid:
+            return True
+    return False
+
+
+def _team_member_ids(state, tid):
+    team = next((t for t in (state.get('teams') or []) if t.get('id') == tid), None) or {}
+    ids = set()
+    for a in (state.get('agents') or {}).values():
+        if isinstance(a, dict) and (a.get('teamId') == tid or a.get('id') in (team.get('memberIds') or [])):
+            ids.add(a.get('id'))
+    return ids
+
+
 def _supervisor_brief_step(state, now, now_ms):
     """One cadence pass: while a team has an active sprint, mail its director a
-    fresh scoped brief every SUPERVISOR_BRIEF_INTERVAL_MS. State-only."""
+    fresh scoped brief every SUPERVISOR_BRIEF_INTERVAL_MS. State-only.
+
+    Operator floor (2026-11-06): a team with active workers but no sprint is
+    scanned hourly (SUPERVISOR_IDLE_SCAN_INTERVAL_MS) -- supervision must not
+    be sprint-gated, or out-of-sprint churn runs unseen. The sprint cadence is
+    unchanged (more frequent while the sprint runs)."""
     if automation_paused(state):
         return
     seen = state.setdefault('_supervisorBriefAt', {})
@@ -160,11 +191,14 @@ def _supervisor_brief_step(state, now, now_ms):
         tid = team.get('id')
         if not tid:
             continue
-        if not any(r.get('status') == 'active' and tid in (r.get('teamIds') or [])
-                   for r in (state.get('sprints') or {}).values()):
+        sprint_active = any(r.get('status') == 'active' and tid in (r.get('teamIds') or [])
+                            for r in (state.get('sprints') or {}).values())
+        if not sprint_active and not _team_has_active_workers(state, tid):
             continue
+        interval = (SUPERVISOR_BRIEF_INTERVAL_MS if sprint_active
+                    else SUPERVISOR_IDLE_SCAN_INTERVAL_MS)
         last = int(seen.get(tid) or 0)
-        if last and now_ms - last < SUPERVISOR_BRIEF_INTERVAL_MS:
+        if last and now_ms - last < interval:
             continue
         if _deliver_supervisor_brief(state, tid, now_ms):
             seen[tid] = now_ms
