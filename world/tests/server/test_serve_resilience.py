@@ -852,6 +852,29 @@ class CreditsPauseTest(unittest.TestCase):
         serve._CREDITS_PAUSE.update(self._old)
         serve._CREDITS_WATCHDOG_STATE.update(self._old_watch)
 
+    def test_degrade_compacts_oversized_payload(self):
+        # A paid-tier payload the free proxies reject with 413 must be
+        # compacted for the degraded call, not die (2026-11-05 spike churn).
+        serve._CREDITS_PAUSE.update(active=True)
+        big = 'x' * 60000
+        messages = [
+            {'role': 'system', 'content': 'sys ' + big},
+            {'role': 'user', 'content': 'middle ' + big},
+            {'role': 'user', 'content': 'answer this now: 2+2?'},
+        ]
+        seen = {}
+        with mock.patch.object(serve, '_freepool_route_for_band',
+                               return_value='@freepool:low:gemini-free'), \
+             mock.patch.object(serve, '_openrouter_chat_post',
+                               side_effect=lambda body: seen.setdefault(
+                                   'messages', body.get('messages')) or {'choices': []}):
+            serve._call_openrouter_once_sync('test/paid-model', messages, 10)
+        sent = seen.get('messages') or []
+        total = sum(len(str(m.get('content') or '')) for m in sent)
+        self.assertLess(total, 80000)
+        self.assertEqual(sent[-1].get('content'), 'answer this now: 2+2?')
+        serve._CREDITS_PAUSE.update(active=False)
+
     def test_pause_notifies_once_and_restore_clears_it(self):
         with mock.patch.object(serve, 'send_player_telegram_sync') as send, \
              mock.patch.object(serve, 'log_action'):

@@ -861,6 +861,41 @@ def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
     return out
 
 
+def _degrade_fit_free_pool(messages):
+    """Shrink a conversation so a free-pool endpoint's request-size limit can
+    take it. The paid tiers accepted bodies the free proxies reject with
+    HTTP 413 (live 2026-11-05: a spike's research context degraded to the
+    pool and died instantly). Keep the system message and the LAST few turns
+    (where the actual question lives), and head+tail-truncate any single
+    message larger than _FREE_MSG_MAX_CHARS."""
+    _FREE_MSG_MAX_CHARS = 12000
+    try:
+        msgs = [m for m in (messages or []) if isinstance(m, dict)]
+    except Exception:
+        return messages
+    if not msgs:
+        return messages
+    body_chars = sum(len(str(m.get('content') or '')) for m in msgs)
+    if body_chars <= 80000:
+        return messages
+
+    def _trim(m):
+        c = m.get('content')
+        if not isinstance(c, str) or len(c) <= _FREE_MSG_MAX_CHARS:
+            return m
+        head = c[:_FREE_MSG_MAX_CHARS // 2]
+        tail = c[-(_FREE_MSG_MAX_CHARS // 2):]
+        out = dict(m)
+        out['content'] = head + '\n...[truncated to fit the free tier]\n...' + tail
+        return out
+
+    keep_head = msgs[:1] if str(msgs[0].get('role')) == 'system' else []
+    rest = msgs[len(keep_head):]
+    kept = rest[-4:]
+    kept = [_trim(m) for m in kept]
+    return keep_head + kept
+
+
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                                reasoning_override=None, _tried=None):
     # A BARE tier string ('@freepool:low', two segments) is a band name, not
@@ -897,6 +932,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
             model = degraded
             provider = _model_provider_for(model)
             free_route = True
+            messages = _degrade_fit_free_pool(messages)
         else:
             raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if not is_custom and free_route and _credits_free_floor_reached():
@@ -1116,6 +1152,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
             model = degraded
             provider = _model_provider_for(model)
             free_route = True
+            messages = _degrade_fit_free_pool(messages)
         else:
             raise OpenRouterCreditsPaused('OpenRouter credits are exhausted; work is paused until the balance is restored')
     if (not is_custom or _provider_is_billable(provider)) and not free_route and _think_tank_spend_cap_exceeded():
