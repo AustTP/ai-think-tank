@@ -78,13 +78,21 @@ async def register_village(request: Request):
     if not vid or not api_base:
         return JSONResponse(
             {'error': 'id and apiBase are required'}, status_code=400)
+    launchd_label = str((body or {}).get('launchdLabel') or '').strip()
+    db_url = str((body or {}).get('dbUrl') or '').strip()
+    _ensure_registry_columns()
     with _db() as conn:
         conn.execute(
-            'INSERT INTO villages_registry (id, name, api_base, created_at,'
-            ' last_heartbeat_at, last_status) VALUES (?, ?, ?, ?, NULL, NULL)'
+            'INSERT INTO villages_registry (id, name, api_base,'
+            ' created_at, launchd_label, db_url, last_heartbeat_at,'
+            ' last_status) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)'
             ' ON CONFLICT(id) DO UPDATE SET name = excluded.name,'
-            ' api_base = excluded.api_base',
-            (vid, name, api_base, time.time()))
+            ' api_base = excluded.api_base,'
+            ' launchd_label = COALESCE(NULLIF(excluded.launchd_label, \'\'),'
+            ' villages_registry.launchd_label),'
+            ' db_url = COALESCE(NULLIF(excluded.db_url, \'\'),'
+            ' villages_registry.db_url)',
+            (vid, name, api_base, time.time(), launchd_label, db_url))
     log_action('player', 'village_registered',
                {'id': vid, 'name': name, 'apiBase': api_base},
                authorized=True)

@@ -490,3 +490,160 @@ class VisitsAndTalk(unittest.TestCase):
     def test_visit_refuses_without_village_mode(self):
         r = client().get('/api/villages-self/visit', headers=TOKEN)
         self.assertEqual(r.status_code, 404)
+
+
+class Visits(unittest.TestCase):
+    """True mobility: an agent temporarily rehomes into another village
+    and comes back. The DB surgery itself runs against a live postgres
+    (proven live on 2026-11-06); these tests pin the VALIDATION and the
+    record-keeping."""
+
+    def setUp(self):
+        os.environ['THINK_TANK_PARENT_TOKEN'] = 'tok-1'
+        self.addCleanup(os.environ.pop, 'THINK_TANK_PARENT_TOKEN', None)
+        for name, val in (('log_action', lambda *a, **k: None),
+                          ('save_state_to_db', lambda s: None),
+                          ('_state_begin', lambda: self.st),
+                          ('check_rate_limit', lambda aid: True)):
+            self._p = unittest.mock.patch.object(serve, name, val)
+            self._p.start()
+            self.addCleanup(self._p.stop)
+        serve._ensure_visits_table()
+        serve._ensure_registry_columns()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM villages_visits')
+            conn.execute(
+                "INSERT INTO villages_registry (id, name, api_base,"
+                " created_at, launchd_label, db_url) VALUES"
+                " ('north', 'north', 'http://x:1', 0.0, 'lbl-1',"
+                " 'postgresql://x/north')"
+                " ON CONFLICT(id) DO UPDATE SET launchd_label = 'lbl-1',"
+                " db_url = 'postgresql://x/north'")
+
+    def _state(self, **extra):
+        st = {'agents': {'theo': {'mailbox': []}, 'warren': {'mailbox': []}},
+              'agentRoster': [{'id': 'theo', 'isAdmin': True},
+                              {'id': 'warren'}],
+              'teams': [], 'tasks': {}, 'workQueue': []}
+        st.update(extra)
+        self.st = st
+        return st
+
+    def test_send_refuses_an_agent_with_an_open_task(self):
+        self._state(tasks={'t1': {'assignedTo': 'warren',
+                                  'status': 'working'}})
+        r = client().post('/api/admin/send-visitor', headers=TOKEN,
+                          json={'agentId': 'warren', 'villageId': 'north',
+                                'hours': 1})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn('open task', r.json()['error'])
+
+    def test_send_refuses_an_unknown_village_or_agent(self):
+        self._state()
+        r = client().post('/api/admin/send-visitor', headers=TOKEN,
+                          json={'agentId': 'warren', 'villageId': 'ghost'})
+        self.assertEqual(r.status_code, 409)
+        r = client().post('/api/admin/send-visitor', headers=TOKEN,
+                          json={'agentId': 'ghost', 'villageId': 'north'})
+        self.assertEqual(r.status_code, 404)
+
+    def test_send_records_the_visit(self):
+        self._state()
+        calls = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{}'
+
+        def _fake_urlopen(req, timeout=0, **kw):
+            calls.append(req)
+            return _Resp()
+        # patch every piece of the surgery the test cannot run: launchctl,
+        # port wait, and the village DB writes
+        for name, val in (
+                ('_bootout', lambda label: None),
+                ('_bootstrap', lambda label: None),
+                ('_wait_port', lambda port, want, secs: True),
+                ('_village_port', lambda label: 8938),
+                ('_village_insert_agent',
+                 lambda dsn, aid, rows, blob: calls.append(
+                     ('insert', aid, json.loads(json.dumps(blob))))),
+                ('_ensure_visits_table', lambda: None),
+                ('_ensure_registry_columns', lambda: None)):
+            p = unittest.mock.patch.object(serve, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        # the parent-side footprint rows (idempotent: a prior test may
+        # have left them)
+        with serve._db() as conn:
+            for sql, args in (
+                    ('INSERT INTO roster_agent (id, seq, blob, updated_at)'
+                     ' VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
+                     ('warren', 0, json.dumps({'id': 'warren'}), 0.0)),
+                    ('INSERT INTO live_agent (id, seq, blob, updated_at)'
+                     ' VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
+                     ('warren', 0, json.dumps({'mailbox': []}), 0.0))):
+                conn.execute(sql, args)
+        r = client().post('/api/admin/send-visitor', headers=TOKEN,
+                          json={'agentId': 'warren', 'villageId': 'north',
+                                'hours': 2, 'reason': 'learn the layout'})
+        self.assertEqual(r.status_code, 200, r.text)
+        inserts = [c for c in calls if isinstance(c, tuple)]
+        self.assertEqual(len(inserts), 1)
+        blob = inserts[0][2]
+        self.assertEqual(blob['_visitFrom'], 'main')
+        self.assertGreater(blob['_visitReturnAt'], 0)
+        self.assertTrue(any('VISITING' in str(m.get('text'))
+                            for m in blob.get('mailbox', [])))
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT to_village, returned_at FROM villages_visits'
+                ' WHERE agent_id = ?', ('warren',)).fetchone()
+        self.assertEqual(row[0], 'north')
+        self.assertIsNone(row[1])
+        self.assertNotIn('warren', self.st['agents'])  # gone from home
+
+    def test_return_refuses_when_not_due_and_closes_when_forced(self):
+        self._state()
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO villages_visits (agent_id, from_village,'
+                ' to_village, started_at, return_at) VALUES'
+                " ('warren', 'main', 'north', 0, ?)",
+                (serve.time.time() + 3600,))
+        r = client().post('/api/villages/north/return-visitor', headers=TOKEN,
+                          json={'agentId': 'warren'})
+        self.assertEqual(r.status_code, 409, r.text)
+        # forced early return: the surgery is mocked; the record closes
+        for name, val in (
+                ('_bootout', lambda label: None),
+                ('_bootstrap', lambda label: None),
+                ('_wait_port', lambda port, want, secs: True),
+                ('_village_port', lambda label: 8938),
+                ('_village_extract_agent',
+                 lambda dsn, aid: {
+                     'roster': (0, json.dumps({'id': 'warren'}), 0.0),
+                     'live': (0, json.dumps(
+                         {'mailbox': [], '_visitReturnAt': 1}), 0.0),
+                     'keys': [], 'ltm': []}),
+                ('_village_remove_agent', lambda dsn, aid: None)):
+            p = unittest.mock.patch.object(serve, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        r = client().post('/api/villages/north/return-visitor', headers=TOKEN,
+                          json={'agentId': 'warren', 'force': True})
+        self.assertEqual(r.status_code, 200, r.text)
+        with serve._db() as conn:
+            returned = conn.execute(
+                'SELECT returned_at FROM villages_visits'
+                ' WHERE agent_id = ?', ('warren',)).fetchone()[0]
+        self.assertIsNotNone(returned)
+        self.assertIn('warren', self.st['agents'])  # back home
+        self.assertTrue(any('HOME' in str(m.get('text'))
+                            for m in self.st['agents']['warren']['mailbox']))

@@ -108,6 +108,47 @@ def _village_heartbeat_payload():
                 'error': str(exc)[:200]}
 
 
+def _village_due_visitors():
+    """Visiting agents whose return time has come due, from the local
+    live blobs (_visitReturnAt is stamped on arrival)."""
+    import time as _time
+    due = []
+    try:
+        from serve import _db
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT id, blob FROM live_agent').fetchall()
+        for rid, blob in rows:
+            try:
+                rat = (json.loads(blob) or {}).get('_visitReturnAt')
+            except Exception:
+                continue
+            if rat and _time.time() * 1000 >= rat:
+                due.append(rid)
+    except Exception:
+        pass
+    return due
+
+
+async def _village_fire_returns():
+    """Walk due visitors home: fire the parent's return-visitor and do
+    NOT await a response -- the parent stops THIS process to perform the
+    surgery, so the loop simply resumes after the restart."""
+    import urllib.request
+    for agent_id in _village_due_visitors()[:3]:
+        try:
+            req = urllib.request.Request(
+                f'{PARENT_URL}/api/villages/{VILLAGE_ID}/return-visitor',
+                data=json.dumps({'agentId': agent_id}).encode(),
+                method='POST',
+                headers={'Content-Type': 'application/json',
+                         'X-Parent-Token':
+                         os.environ.get('THINK_TANK_PARENT_TOKEN') or ''})
+            await asyncio.to_thread(urllib.request.urlopen, req, None, 10)
+        except Exception:
+            pass  # the parent owns the return from here
+
+
 async def _village_heartbeat_loop():
     import urllib.request
     token = os.environ.get('THINK_TANK_PARENT_TOKEN') or ''
@@ -115,6 +156,7 @@ async def _village_heartbeat_loop():
         await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
         if not PARENT_URL:
             continue
+        await _village_fire_returns()
         try:
             body = json.dumps(
                 {**_village_heartbeat_payload(),

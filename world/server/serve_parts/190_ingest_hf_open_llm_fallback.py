@@ -787,6 +787,7 @@ AUTH_PUBLIC_PATHS = (
     '/api/villages-self/',                              # village move-in: X-Parent-Token, in-handler (196)
     '/api/admin/move-team-to-village',                  # admin key OR parent token, in-handler (196)
     '/api/admin/return-village-cards',                  # admin key OR parent token, in-handler (196)
+    '/api/admin/send-visitor',                          # admin key OR parent token, in-handler (197)
     '/api/task-budget', '/api/budget', '/api/env/reload',
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',

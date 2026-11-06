@@ -190,6 +190,32 @@ def _merge_server_owned_agent(server_agent, client_agent):
 # surface verbatim in the agent's long-term memory on the next render).
 
 
+def _directory_village_of(to_id):
+    """The village an agent currently lives in, per the parent's
+    cross-village directory (heartbeats feed it). None when unknown."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT village_id FROM villages_agents WHERE agent_id = ?',
+                (to_id,)).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def _route_via_directory(to_id):
+    """PARENT side: does the cross-village directory know this recipient?
+    True means the agent is VISITING a village right now and mail should
+    be relayed to the village she is in."""
+    try:
+        with _db() as conn:
+            return conn.execute(
+                'SELECT 1 FROM villages_agents WHERE agent_id = ?',
+                (to_id,)).fetchone() is not None
+    except Exception:
+        return False
+
+
 @app.post('/api/mail/send')
 @_state_writer
 async def api_mail_send(request: Request):
@@ -229,11 +255,11 @@ async def api_mail_send(request: Request):
     roster = state.get('agentRoster') or []
     ids = {d.get('id') for d in roster if isinstance(d, dict)}
     if to_id not in ids:
-        # CROSS-VILLAGE (2026-11-06): in a village, a recipient with no
-        # local row may live in the parent or another village -- relay
-        # through the parent's post office instead of a bare 404. The
-        # parent routes by its cross-village directory and refuses
-        # unknown names, so nothing is silently dropped.
+        # CROSS-VILLAGE (2026-11-06): a recipient with no local row may be
+        # VISITING another village (or, from a village, live anywhere in
+        # the org) -- relay through the parent's post office instead of a
+        # bare 404. The parent routes by its cross-village directory and
+        # refuses unknown names, so nothing is silently dropped.
         from serve import VILLAGE_MODE, VILLAGE_ID, PARENT_URL
         if VILLAGE_MODE and VILLAGE_ID and PARENT_URL:
             import json as _json
@@ -255,6 +281,18 @@ async def api_mail_send(request: Request):
                                      'to': to_id})
             except Exception:
                 pass
+        elif not VILLAGE_MODE and _route_via_directory(to_id):
+            # PARENT side: the recipient is VISITING a village -- drop the
+            # mail into that village's outbox; its heartbeat delivers it.
+            from serve import _village_deliver_to_org
+            target = _directory_village_of(to_id)
+            if target:
+                _village_deliver_to_org(target, [
+                    {'to': to_id, 'kind': 'cross_village_mail',
+                     'text': f'{from_id or "main"}: {text}'}])
+                return JSONResponse({'ok': True, 'relayed': True,
+                                     'routed': f'village:{target}',
+                                     'to': to_id})
         return JSONResponse({'error': 'recipient not found'}, status_code=404)
     if from_id != 'player' and from_id not in ids:
         return JSONResponse({'error': 'sender not found'}, status_code=400)

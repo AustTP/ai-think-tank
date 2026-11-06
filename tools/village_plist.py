@@ -18,6 +18,7 @@ so the village's identity graph (SEED_ROSTER override, DIRECTOR_MAP) is
 part of its launch definition, not ambient shell state.
 """
 import argparse
+import json
 import os
 import plistlib
 import subprocess
@@ -104,6 +105,25 @@ def main():
             print(r.stderr.strip() or 'bootstrap failed', file=sys.stderr)
             raise SystemExit(r.returncode)
         print(f'loaded {label} (gui/{uid}); logs in ~/Library/Logs/')
+        # Tell the parent's registry who this village is on the host, so
+        # mobility (visits) can stop/start it and reach its DB directly.
+        try:
+            import urllib.request
+            body = json.dumps({
+                'id': args.id, 'name': args.id,
+                'apiBase': f'http://{args.host}:{args.port}',
+                'launchdLabel': label, 'dbUrl': args.db,
+            }).encode()
+            parent = args.parent_url.rstrip('/')
+            req = urllib.request.Request(
+                f'{parent}/api/villages/registry', data=body, method='POST',
+                headers={'Content-Type': 'application/json',
+                         'X-Parent-Token': token})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            print(f'registered {label} + db with the parent')
+        except Exception as exc:
+            print(f'registry update failed ({exc}); the village still runs')
     else:
         print(f'load with: launchctl bootstrap gui/$(id -u) {path}')
 
