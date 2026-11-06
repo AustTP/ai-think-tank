@@ -236,6 +236,23 @@ def queue_work(state, items):
                 and _dedup_blocked(state, item.get('title'),
                                    force=bool(item.get('force'))):
             continue
+        # Sticky repair stop at the ONE gate every queueing path passes. The
+        # mint sites check it, but re-issue paths (transport recovery, stale
+        # sweeps, orphan reclaim) recreate repair rows past them -- and a
+        # stopped root must mint nothing, from anywhere (2026-11-05).
+        if str(item.get('title') or '').startswith('Fix: ') \
+                and not item.get('force'):
+            _stopped_root = _fix_title_root(item.get('title'))
+            if _stopped_root and f'repair_loop:{_stopped_root}' in \
+                    (state.get('_repairLoopNotified') or {}):
+                try:
+                    _log_governance(state, item.get('assignedTo') or None,
+                                    'repair_mint_dropped_sticky',
+                                    {'title': (item.get('title') or '')[:120],
+                                     'root': _stopped_root[:120]})
+                except Exception:
+                    pass
+                continue
         work_queue.append({
             'title': item['title'],
             'room': item.get('room') or None,

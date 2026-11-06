@@ -105,3 +105,30 @@ def test_ledger_survives_archiving():
     assert info, 'archived failure must still count toward the stop'
     assert info['failures'] >= 2, info
     assert 'task-1' in info['taskIds'], info
+
+
+def test_sticky_stop_blocks_reissue_paths():
+    """Re-issue paths recreate repair rows past the mint-site guards; the
+    queue gate itself must drop a stopped root's repair card (2026-11-05)."""
+    st = {'_repairLoopNotified': {
+              'repair_loop:Park task-12289 disk-full chain, stop minting': 1},
+          'agents': {}, 'tasks': {}, 'workQueue': []}
+    item = {'title': 'Fix: Park task-12289 disk-full chain, stop minting',
+            'room': 'pressoffice', 'reviewOf': 'task-12442',
+            'assignedTo': 'ada', 'taskType': 'code'}
+    n = sim.queue_work(st, [item])
+    assert n == 0, 'a stopped root repair card must be dropped at the gate'
+    assert st['workQueue'] == []
+    # a force item still passes (operator override)
+    item2 = dict(item, force=True)
+    sim.queue_work(st, [item2])
+    assert len(st['workQueue']) == 1
+    # a review card for the same root keeps its exemption (not a repair)
+    st2 = {'_repairLoopNotified': {
+               'repair_loop:Park task-12289 disk-full chain, stop minting': 1},
+           'agents': {}, 'tasks': {}, 'workQueue': []}
+    rev = {'title': 'Review: Park task-12289 disk-full chain, stop minting',
+           'room': 'pressoffice', 'reviewOf': 'task-12442',
+           'assignedTo': 'ada', 'taskType': 'review'}
+    sim.queue_work(st2, [rev])
+    assert len(st2['workQueue']) == 1
