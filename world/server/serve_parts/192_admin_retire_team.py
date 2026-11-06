@@ -37,7 +37,8 @@ def _retire_is_tank_admin(request):
 @app.post('/api/admin/retire-team')
 @_state_writer
 async def admin_retire_team(request: Request):
-    from serve import verify_session, SESSION_COOKIE_NAME, log_action
+    from serve import (verify_session, SESSION_COOKIE_NAME, log_action,
+                       save_state_to_db)
     actor = _retire_is_tank_admin(request)
     if not actor and not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
         return JSONResponse({'error': 'Unauthorized -- tank admin or the '
@@ -141,6 +142,7 @@ async def admin_retire_team(request: Request):
     log_action(actor, 'team_dissolved', {'team': team_id, 'members': moved,
                                          'retasked': retasked},
                authorized=True)
+    save_state_to_db(state)
     return {'ok': True, 'team': team_id, 'membersMoved': moved,
             'tasksRetasked': retasked,
             'assignments': {m: a['teamId'] for m, a in assignments.items()}}
