@@ -47,7 +47,8 @@ def _village_refuse_operator_surface():
     async def _village_gate(request: Request, call_next):
         path = request.url.path
         if path == '/login' or path.startswith('/api/admin') \
-                or path.startswith('/api/villages'):
+                or (path.startswith('/api/villages')
+                    and not path.startswith('/api/villages-self')):
             return JSONResponse(
                 {'error': 'this is a village worker; the operator surface '
                           'lives on the parent process'}, status_code=404)
