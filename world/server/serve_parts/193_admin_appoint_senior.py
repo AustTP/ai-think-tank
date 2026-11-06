@@ -1,15 +1,19 @@
-"""Admin: appoint the senior-most director (2026-11-06).
+"""Admin: appoint -- or revoke -- a chain root among the directors.
 
-The director-of-a-director chain is recursive and its top is the
-SENIOR-MOST DIRECTOR -- derived, not stored: a director qualifies when
-other directors point their roster `director` pointer at her and she
-points at no other director. This endpoint performs the appointment as a
-roster edit: every other non-admin director (the regional VP excepted --
-she stands alone) is re-pointed at the target, which makes the target the
-chain's root and the holder of the cross-team oversight cards.
+The director-of-a-director chain is recursive and DERIVED, not stored: a
+director sits above others when those directors point their roster
+`director` pointer at her. This endpoint performs the edit:
 
-Auth: tank admin key or the player session. Refuses an unknown/inactive
-target, the regional VP herself, and admins.
+  * {directorId: X}        -- re-point every other team director at X,
+    making X the chain's root (the cross-team oversight cards follow the
+    derivation in sim._senior_most_director).
+  * {revoke: true}         -- flatten the chain: every team director
+    points back at the admin. The operator clarified (2026-11-06) that
+    the directors stand EQUAL -- there is no senior-most director, so the
+    cross-team card falls back to the chief of staff.
+
+The regional VP and admins are never re-pointed in either mode.
+Auth: tank admin key or the player session.
 """
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -43,13 +47,39 @@ async def admin_appoint_senior_director(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({'error': 'malformed body'}, status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    roster = [r for r in (state.get('agentRoster') or []) if isinstance(r, dict)]
+    admin_id = next((r.get('id') for r in roster if r.get('isAdmin')), None)
+    if (body or {}).get('revoke'):
+        if not admin_id:
+            return JSONResponse({'error': 'no admin in the roster'},
+                                status_code=409)
+        repointed = []
+        for r in roster:
+            if r.get('isAdmin') or r.get('villageChief') \
+                    or not r.get('isDirector'):
+                continue
+            if r.get('director') != admin_id:
+                r['director'] = admin_id
+                repointed.append(r.get('id'))
+        try:
+            import sim as _sim
+            _sim._log_governance(state, actor or 'admin',
+                                 'senior_director_revoked',
+                                 {'repointed': repointed, 'to': admin_id})
+        except Exception:
+            pass
+        log_action(actor, 'senior_director_revoked',
+                   {'repointed': repointed, 'to': admin_id}, authorized=True)
+        save_state_to_db(state)
+        return {'ok': True, 'revoked': True, 'reports': repointed,
+                'to': admin_id}
     target = str((body or {}).get('directorId') or '').strip()
     if not target:
         return JSONResponse({'error': 'directorId is required'},
                             status_code=400)
-    state = _state_begin()
-    if not state:
-        return JSONResponse({'error': 'state unavailable'}, status_code=503)
     roster = [r for r in (state.get('agentRoster') or []) if isinstance(r, dict)]
     tgt = next((r for r in roster if r.get('id') == target), None)
     if tgt is None or target not in (state.get('agents') or {}):

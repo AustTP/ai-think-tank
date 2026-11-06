@@ -115,3 +115,38 @@ class AppointSenior(unittest.TestCase):
         # the derivation now names ben
         import sim
         self.assertEqual(sim._senior_most_director(self.st), 'ben')
+
+
+class RevokeSenior(unittest.TestCase):
+    def setUp(self):
+        self.st = _state()
+        # start from the appointed shape: everyone under ben
+        for r in self.st['agentRoster']:
+            if r.get('isDirector') and r['id'] not in ('ben', 'nora', 'theo'):
+                r['director'] = 'ben'
+        self.st['agentRoster'][2]['director'] = 'theo'  # ben root
+        for name, val in (('get_state_from_db', lambda *a, **k: self.st),
+                          ('save_state_to_db', lambda s: None),
+                          ('log_action', lambda *a, **k: None),
+                          ('_state_begin', lambda: self.st),
+                          ('verify_session', lambda sess: False)):
+            self._p = unittest.mock.patch.object(serve, name, val)
+            self._p.start()
+            self.addCleanup(self._p.stop)
+
+    def test_revoke_flattens_to_equal_standing(self):
+        r = client().post('/api/admin/appoint-senior-director', headers=AUTH,
+                          json={'revoke': True})
+        self.assertEqual(r.status_code, 200, r.text)
+        rows = {r['id']: r for r in self.st['agentRoster']}
+        for did in ('iris', 'dev'):
+            self.assertEqual(rows[did]['director'], 'theo', did)
+        self.assertEqual(rows['ben']['director'], 'theo')   # equal again
+        self.assertEqual(rows['nora']['director'], 'theo')  # VP untouched
+        import sim
+        self.assertIsNone(sim._senior_most_director(self.st))
+
+    def test_revoke_needs_no_director_id(self):
+        r = client().post('/api/admin/appoint-senior-director', headers=AUTH,
+                          json={'revoke': True})
+        self.assertEqual(r.status_code, 200)
