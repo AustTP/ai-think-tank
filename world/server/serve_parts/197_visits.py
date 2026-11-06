@@ -312,7 +312,8 @@ def _perform_visit(state, agent_id, village_id, hours, reason, actor):
             _bootstrap(label)
             return JSONResponse(
                 {'error': f'village insert failed: '
-                          f'{type(exc).__name__}'[:160]}, status_code=502)
+                          f'{type(exc).__name__}: {exc}'[:300]},
+                status_code=502)
         _bootstrap(label)
         if port and not _wait_port(host, port, True, 90):
             return JSONResponse(
