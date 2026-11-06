@@ -42,7 +42,10 @@ def _ensure_village_registry_table():
 
 
 def _heartbeat_token_ok(request: Request) -> bool:
-    expected = os.environ.get(_PARENT_TOKEN_ENV) or ''
+    # os.environ first, then the repo .env (the codebase convention: a key
+    # added to .env after boot still counts without a restart).
+    expected = (os.environ.get(_PARENT_TOKEN_ENV)
+                or _load_env().get(_PARENT_TOKEN_ENV, ''))
     if not expected:
         return False  # no token configured: no heartbeat trust at all
     supplied = (request.headers.get('X-Parent-Token') or '').strip()
