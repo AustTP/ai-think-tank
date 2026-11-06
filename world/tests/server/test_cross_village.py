@@ -569,13 +569,11 @@ class Visits(unittest.TestCase):
         for name, val in (
                 ('_bootout', lambda label: None),
                 ('_bootstrap', lambda label: None),
-                ('_wait_port', lambda port, want, secs: True),
+                ('_wait_port', lambda *a, **k: True),
                 ('_village_port', lambda label: 8938),
                 ('_village_insert_agent',
                  lambda dsn, aid, rows, blob: calls.append(
-                     ('insert', aid, json.loads(json.dumps(blob))))),
-                ('_ensure_visits_table', lambda: None),
-                ('_ensure_registry_columns', lambda: None)):
+                     ('insert', aid, json.loads(json.dumps(blob)))))):
             p = unittest.mock.patch.object(serve, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -620,19 +618,47 @@ class Visits(unittest.TestCase):
         r = client().post('/api/villages/north/return-visitor', headers=TOKEN,
                           json={'agentId': 'warren'})
         self.assertEqual(r.status_code, 409, r.text)
-        # forced early return: the surgery is mocked; the record closes
+        # forced early return: the surgery runs for real against a
+        # throwaway postgres village DB (the actual SQL, not a stub)
+        import psycopg2
+        admin = psycopg2.connect('postgresql://poole86@/postgres')
+        admin.autocommit = True
+        acur = admin.cursor()
+        acur.execute('DROP DATABASE IF EXISTS tcv_village_tmp')
+        acur.execute('CREATE DATABASE tcv_village_tmp')
+        admin.commit()
+        acur.close()
+        admin.close()
+
+        # no DROP on teardown: a lingering pooled session can hold the
+        # tmp DB busy; the next run recreates it from scratch anyway
+        vdb = psycopg2.connect('postgresql://poole86@/tcv_village_tmp')
+        vcur = vdb.cursor()
+        vcur.execute('CREATE TABLE roster_agent (id TEXT PRIMARY KEY,'
+                     ' seq INTEGER, blob TEXT, updated_at REAL)')
+        vcur.execute('CREATE TABLE live_agent (id TEXT PRIMARY KEY,'
+                     ' seq INTEGER, blob TEXT, updated_at REAL)')
+        vcur.execute('CREATE TABLE agent_keys (agent_id TEXT PRIMARY KEY,'
+                     ' secret_key TEXT, created_at REAL)')
+        vcur.execute('INSERT INTO roster_agent VALUES (%s, %s, %s, %s)',
+                     ('warren', 0, json.dumps({'id': 'warren'}), 0.0))
+        vcur.execute('INSERT INTO live_agent VALUES (%s, %s, %s, %s)',
+                     ('warren', 0, json.dumps(
+                         {'mailbox': [], '_visitReturnAt': 1}), 0.0))
+        vcur.execute('INSERT INTO agent_keys VALUES (%s, %s, %s)',
+                     ('warren', 'key-warren', 0.0))
+        vdb.commit()
+        vcur.close()
+        vdb.close()
+        with serve._db() as conn:
+            conn.execute('UPDATE villages_registry SET db_url = ?'
+                         " WHERE id = 'north'",
+                         ('postgresql://poole86@/tcv_village_tmp',))
         for name, val in (
                 ('_bootout', lambda label: None),
                 ('_bootstrap', lambda label: None),
-                ('_wait_port', lambda port, want, secs: True),
-                ('_village_port', lambda label: 8938),
-                ('_village_extract_agent',
-                 lambda dsn, aid: {
-                     'roster': (0, json.dumps({'id': 'warren'}), 0.0),
-                     'live': (0, json.dumps(
-                         {'mailbox': [], '_visitReturnAt': 1}), 0.0),
-                     'keys': [], 'ltm': []}),
-                ('_village_remove_agent', lambda dsn, aid: None)):
+                ('_wait_port', lambda *a, **k: True),
+                ('_village_port', lambda label: 8938)):
             p = unittest.mock.patch.object(serve, name, val)
             p.start()
             self.addCleanup(p.stop)
@@ -645,5 +671,164 @@ class Visits(unittest.TestCase):
                 ' WHERE agent_id = ?', ('warren',)).fetchone()[0]
         self.assertIsNotNone(returned)
         self.assertIn('warren', self.st['agents'])  # back home
+        # the HOME mail rode in her live blob (the real parent insert)
+        with serve._db() as conn:
+            blob = json.loads(conn.execute(
+                "SELECT blob FROM live_agent WHERE id = 'warren'"
+            ).fetchone()[0])
         self.assertTrue(any('HOME' in str(m.get('text'))
-                            for m in self.st['agents']['warren']['mailbox']))
+                            for m in blob.get('mailbox', [])))
+        import psycopg2
+        vdb = psycopg2.connect('postgresql://poole86@/tcv_village_tmp')
+        vcur = vdb.cursor()
+        vcur.execute('SELECT count(*) FROM roster_agent')
+        self.assertEqual(vcur.fetchone()[0], 0)  # really gone from there
+        vcur.close()
+        vdb.close()
+
+
+class AgentInitiatedVisits(unittest.TestCase):
+    """An agent asks to visit with her own key; the guardrails are the
+    policy, so they must hold: no open task, cooldown, org concurrency,
+    a real reason. She can also walk herself home early."""
+
+    def setUp(self):
+        os.environ['THINK_TANK_PARENT_TOKEN'] = 'tok-1'
+        self.addCleanup(os.environ.pop, 'THINK_TANK_PARENT_TOKEN', None)
+        for name, val in (('log_action', lambda *a, **k: None),
+                          ('save_state_to_db', lambda s: None),
+                          ('_state_begin', lambda: self.st),
+                          ('check_rate_limit', lambda aid: True),
+                          # the surgery primitives: launchctl, port
+                          # probes, and the village DB writes
+                          ('_bootout', lambda label: None),
+                          ('_bootstrap', lambda label: None),
+                          ('_wait_port', lambda *a, **k: True),
+                          ('_village_port', lambda label: 8938),
+                          ('_village_insert_agent',
+                           lambda dsn, aid, rows, blob: None)):
+            p = unittest.mock.patch.object(serve, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        serve._ensure_visits_table()
+        with serve._db() as conn:
+            conn.execute('DELETE FROM villages_visits')
+            conn.execute(
+                "INSERT INTO villages_registry (id, name, api_base,"
+                " created_at, launchd_label, db_url) VALUES"
+                " ('north', 'north', 'http://x:1', 0.0, 'lbl-1',"
+                " 'postgresql://x/north')"
+                " ON CONFLICT(id) DO UPDATE SET launchd_label = 'lbl-1',"
+                " db_url = 'postgresql://x/north'")
+
+    def _state(self, **extra):
+        st = {'agents': {'theo': {'mailbox': []}, 'ben': {}},
+              'agentRoster': [{'id': 'theo', 'isAdmin': True},
+                              {'id': 'ben'}],
+              'teams': [], 'tasks': {}, 'workQueue': []}
+        st.update(extra)
+        self.st = st
+        return st
+
+    def _key(self, agent_id):
+        with serve._db() as conn:
+            conn.execute('INSERT INTO agent_keys (agent_id, secret_key,'
+                         ' created_at) VALUES (?, ?, ?) ON CONFLICT'
+                         ' (agent_id) DO UPDATE SET secret_key ='
+                         ' EXCLUDED.secret_key',
+                         (agent_id, f'key-{agent_id}', 0.0))
+
+    def _post(self, path, agent_id=None, payload=None, headers=None):
+        h = dict(headers or {})
+        if agent_id:
+            h['X-Agent-Key'] = f'key-{agent_id}'
+        return client().post(path, headers=h, json=payload or {})
+
+    def test_requires_an_agent_key(self):
+        self._state()
+        r = self._post('/api/visit-requests', payload={
+            'villageId': 'north', 'reason': 'learn the review flow there'})
+        self.assertEqual(r.status_code, 401, r.text)
+
+    def test_refuses_a_thin_reason(self):
+        self._state()
+        self._key('ben')
+        r = self._post('/api/visit-requests', 'ben',
+                       {'villageId': 'north', 'reason': 'because'})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn('real reason', r.json()['error'])
+
+    def test_refuses_while_holding_an_open_task(self):
+        self._state(tasks={'t1': {'assignedTo': 'ben',
+                                  'status': 'working'}})
+        self._key('ben')
+        r = self._post('/api/visit-requests', 'ben', {
+            'villageId': 'north',
+            'reason': 'learn the review flow used by the moved team'})
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_enforces_the_twelve_hour_cooldown(self):
+        self._state()
+        self._key('ben')
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO villages_visits (agent_id, from_village,'
+                ' to_village, started_at, return_at, returned_at) VALUES'
+                " ('ben', 'main', 'north', ?, ?, ?)",
+                (serve.time.time() - 3600, serve.time.time() - 1800,
+                 serve.time.time() - 1800))
+        r = self._post('/api/visit-requests', 'ben', {
+            'villageId': 'north',
+            'reason': 'learn the review flow used by the moved team'})
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertIn('12h', r.json()['error'])
+
+    def test_enforces_the_org_wide_visitor_cap(self):
+        self._state()
+        self._key('ben')
+        with serve._db() as conn:
+            for aid in ('v1', 'v2', 'v3'):
+                conn.execute(
+                    'INSERT INTO villages_visits (agent_id, from_village,'
+                    ' to_village, started_at, return_at) VALUES'
+                    " (?, 'main', 'north', 0, ?)",
+                    (aid, serve.time.time() + 3600))
+        r = self._post('/api/visit-requests', 'ben', {
+            'villageId': 'north',
+            'reason': 'learn the review flow used by the moved team'})
+        self.assertEqual(r.status_code, 429, r.text)
+        self.assertIn('visiting', r.json()['error'])
+
+    def test_grants_and_tells_theo(self):
+        self._state()
+        self._key('ben')
+        with serve._db() as conn:
+            for sql, args in (
+                    ('INSERT INTO roster_agent (id, seq, blob, updated_at)'
+                     ' VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
+                     ('ben', 0, json.dumps({'id': 'ben'}), 0.0)),
+                    ('INSERT INTO live_agent (id, seq, blob, updated_at)'
+                     ' VALUES (?, ?, ?, ?) ON CONFLICT (id) DO NOTHING',
+                     ('ben', 0, json.dumps({'mailbox': []}), 0.0))):
+                conn.execute(sql, args)
+        r = self._post('/api/visit-requests', 'ben', {
+            'villageId': 'north',
+            'reason': 'learn the review flow used by the moved team'})
+        self.assertEqual(r.status_code, 200, r.text)
+        box = self.st['agents']['theo']['mailbox']
+        self.assertIn('ben asked to visit village north', box[-1]['text'])
+        with serve._db() as conn:
+            visit = conn.execute(
+                'SELECT to_village, returned_at FROM villages_visits'
+                ' WHERE agent_id = ?', ('ben',)).fetchone()
+        self.assertEqual(visit[0], 'north')
+        self.assertIsNone(visit[1])
+
+    def test_an_agent_returns_only_herself(self):
+        self._state()
+        self._key('ben')
+        self._key('ava')
+        r = self._post('/api/visit-requests/return', 'ava')
+        # ava has no visit: the refusal names HER, not ben
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn('ava', r.json()['error'])

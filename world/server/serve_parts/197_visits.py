@@ -158,6 +158,7 @@ def _village_extract_agent(dsn, agent_id):
 
 def _village_remove_agent(dsn, agent_id):
     conn = psycopg2.connect(dsn)
+    conn.autocommit = True
     cur = conn.cursor()
     for sql in ('DELETE FROM roster_agent WHERE id = %s',
                 'DELETE FROM live_agent WHERE id = %s',
@@ -166,8 +167,10 @@ def _village_remove_agent(dsn, agent_id):
         try:
             cur.execute(sql, (agent_id,))
         except Exception:
-            pass
-    conn.commit()
+            # per-statement autocommit: one missing table (e.g. no LTM
+            # yet) must not abort the transaction and silently roll back
+            # the other three deletes -- the classic postgres trap
+            conn.rollback()
     cur.close()
     conn.close()
 
@@ -227,42 +230,19 @@ def _has_open_task(state, agent_id):
     return False
 
 
-@app.post('/api/admin/send-visitor')
-async def admin_send_visitor(request: Request):
-    from serve import verify_session, SESSION_COOKIE_NAME, log_action, \
-        save_state_to_db
-    key = request.headers.get('X-Agent-Key')
-    actor = _is_tank_admin(request) if key else None
-    if not actor and not _visit_token_ok(request) and \
-            not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
-        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+def _perform_visit(state, agent_id, village_id, hours, reason, actor):
+    """The whole visit surgery, run under the caller's held state lock.
+    Returns a result dict, or a JSONResponse on refusal/failure."""
+    from serve import log_action, save_state_to_db
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({'error': 'malformed body'}, status_code=400)
-    agent_id = str((body or {}).get('agentId') or '').strip()
-    village_id = str((body or {}).get('villageId') or '').strip()
-    try:
-        hours = float((body or {}).get('hours') or 8)
-    except (TypeError, ValueError):
-        hours = 8.0
-    hours = max(0.01, min(hours, 24 * 14))
-    reason = str((body or {}).get('reason') or '').strip()[:300]
-    if not agent_id or not village_id:
-        return JSONResponse({'error': 'agentId and villageId required'},
-                            status_code=400)
-    transport = _village_transport(village_id)
-    if transport is None:
-        return JSONResponse(
-            {'error': f'village {village_id} has no launchd label or DB '
-                      'url registered; run tools/village_plist.py '
-                      '--install again'}, status_code=409)
-    label, dsn, host = transport
-    _ensure_visits_table()
-    state = _state_begin()
-    if not state:
-        return JSONResponse({'error': 'state unavailable'}, status_code=503)
-    try:
+        transport = _village_transport(village_id)
+        if transport is None:
+            return JSONResponse(
+                {'error': f'village {village_id} has no launchd label or '
+                          'DB url registered; run tools/village_plist.py '
+                          '--install again'}, status_code=409)
+        label, dsn, host = transport
+        _ensure_visits_table()
         roster_ids = {r.get('id') for r in (state.get('agentRoster') or [])
                       if isinstance(r, dict)}
         if agent_id not in roster_ids:
@@ -375,34 +355,28 @@ async def admin_send_visitor(request: Request):
                     'hours': hours, 'reason': reason}, authorized=True)
         return {'ok': True, 'agent': agent_id, 'village': village_id,
                 'returnAt': int(return_at * 1000)}
-    finally:
-        _state_abort()
+    except Exception as exc:
+        return JSONResponse({'error': f'{type(exc).__name__}: '
+                                      f'{exc}'[:200]}, status_code=500)
 
 
-@app.post('/api/villages/{village_id}/return-visitor')
-async def village_return_visitor(village_id: str, request: Request):
-    """Bring a visiting agent HOME. Fired by the village's heartbeat when
-    her _visitReturnAt comes due, or called directly for an early return
-    (force)."""
-    if not _visit_token_ok(request):
-        return JSONResponse({'error': 'bad village token'}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({'error': 'malformed body'}, status_code=400)
-    agent_id = str((body or {}).get('agentId') or '').strip()
-    force = bool((body or {}).get('force'))
-    if not agent_id:
-        return JSONResponse({'error': 'agentId required'}, status_code=400)
+def _perform_return(agent_id, actor, forced=False):
+    """Bring a visiting agent HOME. The record checks and the launchctl
+    surgery run WITHOUT the state lock; the lock is taken only for the
+    short final state write. `forced` skips the not-due-yet refusal (the
+    village heartbeat only fires when its own blob check says due, and an
+    early return is always explicit)."""
+    from serve import save_state_to_db, log_action
     _ensure_visits_table()
     with _db() as conn:
         visit = conn.execute(
-            'SELECT from_village, return_at, returned_at FROM'
+            'SELECT to_village, return_at, returned_at FROM'
             ' villages_visits WHERE agent_id = ?', (agent_id,)).fetchone()
     if visit is None or visit[2]:
         return JSONResponse(
             {'error': f'{agent_id} has no open visit'}, status_code=409)
-    if not force and time.time() < visit[1]:
+    village_id = visit[0]
+    if not forced and time.time() < visit[1]:
         return JSONResponse(
             {'error': f"{agent_id}'s visit is not due yet"},
             status_code=409)
@@ -472,20 +446,79 @@ async def village_return_visitor(village_id: str, request: Request):
             conn.execute(
                 'UPDATE villages_visits SET returned_at = ?'
                 ' WHERE agent_id = ?', (time.time(), agent_id))
+        agent = (state.get('agents') or {}).get(agent_id)
+        if isinstance(agent, dict):
+            # Her live blob was just re-inserted; the state read may
+            # predate it, so make sure the assembled dict knows her.
+            agent.setdefault('mailbox', [])
         theo = (state.get('agents') or {}).get('theo')
         if isinstance(theo, dict):
             box = theo.setdefault('mailbox', [])
             box.append({'kind': 'visit_returned', 'read': False,
                         'ts': int(time.time() * 1000),
                         'text': f'{agent_id} returned from village '
-                                f'{village_id}.'})
+                                f'{village_id}.'
+                                + (' (early return, on her own request)'
+                                   if forced and actor == agent_id else '')})
             del box[:-200]
-        from serve import save_state_to_db, log_action
         save_state_to_db(state)
-        log_action('village-heartbeat' if not force else 'operator',
+        log_action('agent-self' if actor == agent_id else actor,
                    'visitor_returned',
                    {'agent': agent_id, 'village': village_id},
                    authorized=True)
         return {'ok': True, 'agent': agent_id, 'home': 'main'}
+    finally:
+        _state_abort()
+
+
+@app.post('/api/villages/{village_id}/return-visitor')
+async def village_return_visitor(village_id: str, request: Request):
+    """Bring a visiting agent HOME. Fired by the village's heartbeat when
+    her _visitReturnAt comes due, or called directly (force) by the
+    operator."""
+    if not _visit_token_ok(request):
+        return JSONResponse({'error': 'bad village token'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    agent_id = str((body or {}).get('agentId') or '').strip()
+    if not agent_id:
+        return JSONResponse({'error': 'agentId required'}, status_code=400)
+    forced = bool((body or {}).get('force'))
+    return _perform_return(agent_id, 'operator', forced=forced)
+
+
+@app.post('/api/admin/send-visitor')
+async def admin_send_visitor(request: Request):
+    """The operator's send-visitor: same surgery as an agent's own
+    request, but any agent, any duration."""
+    from serve import verify_session, SESSION_COOKIE_NAME
+    key = request.headers.get('X-Agent-Key')
+    actor = _is_tank_admin(request) if key else None
+    if not actor and not _visit_token_ok(request) and \
+            not verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({'error': 'malformed body'}, status_code=400)
+    agent_id = str((body or {}).get('agentId') or '').strip()
+    village_id = str((body or {}).get('villageId') or '').strip()
+    try:
+        hours = float((body or {}).get('hours') or 8)
+    except (TypeError, ValueError):
+        hours = 8.0
+    hours = max(0.01, min(hours, 24 * 14))
+    reason = str((body or {}).get('reason') or '').strip()[:300]
+    if not agent_id or not village_id:
+        return JSONResponse({'error': 'agentId and villageId required'},
+                            status_code=400)
+    state = _state_begin()
+    if not state:
+        return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    try:
+        return _perform_visit(state, agent_id, village_id, hours, reason,
+                              actor or 'operator')
     finally:
         _state_abort()
