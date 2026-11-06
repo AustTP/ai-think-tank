@@ -58,7 +58,10 @@ def _village_row_exists(conn, vid):
 async def register_village(request: Request):
     from serve import verify_session, SESSION_COOKIE_NAME, log_action
     authed = verify_session(request.cookies.get(SESSION_COOKIE_NAME))
-    if not authed:
+    # The village_new tool is operator tooling holding the same shared
+    # secret the village heartbeat uses -- it registers without a browser
+    # session.
+    if not authed and not _heartbeat_token_ok(request):
         return JSONResponse({'error': 'player session required'},
                             status_code=401)
     try:

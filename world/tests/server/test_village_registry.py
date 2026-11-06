@@ -67,25 +67,20 @@ class VillageRegistry(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
     def test_registered_village_heartbeat_lands_and_alerts_reach_theo(self):
+        # The village_new tool registers with the shared parent token, no
+        # browser session needed.
         r = client().post(
             '/api/villages/registry',
-            json={'id': 'north', 'name': 'North', 'apiBase': 'http://x:1'})
-        self.assertEqual(r.status_code, 401)  # player session required
-        # register through the simulated player session
-        with unittest.mock.patch.object(serve, 'verify_session',
-                                        lambda s: True), \
-                unittest.mock.patch.object(serve, 'log_action',
-                                           lambda *a, **k: None), \
+            json={'id': 'north', 'name': 'North', 'apiBase': 'http://x:1'},
+            headers={'X-Parent-Token': 'tok-123'})
+        self.assertEqual(r.status_code, 200, r.text)
+        with unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: None), \
                 unittest.mock.patch.object(
                     serve, 'save_state_to_db', lambda s: None), \
                 unittest.mock.patch.object(
                     serve, '_state_begin',
                     lambda: {'agents': {'theo': {'mailbox': []}}}):
-            r = client().post(
-                '/api/villages/registry',
-                json={'id': 'north', 'name': 'North',
-                      'apiBase': 'http://x:1'})
-            self.assertEqual(r.status_code, 200, r.text)
             r = client().post(
                 '/api/villages/north/heartbeat',
                 json={'ok': True, 'openTasks': 3, 'queued': 1,
