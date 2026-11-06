@@ -234,14 +234,13 @@ def _supervisor_brief_step(state, now, now_ms):
                              'Do not do the work or edit code.'),
         }])
         state.setdefault('_supervisorCardAt', {})[tid] = now_ms
-    # The cross-team oversight card: the SENIOR-MOST DIRECTOR holds it --
-    # the top of the recursive director-of-director chain, NOT the regional
-    # VP (she stands alone with her own instruments). Until a senior-most
-    # director exists the chief of staff holds the card (operator model,
-    # 2026-11-06).
+    # The cross-team oversight card: the CHIEF OF STAFF holds it (operator
+    # model, 2026-11-06). The twelve directors stand EQUAL -- there is no
+    # senior-most director and there never will be one; the regional VP
+    # stands alone with her own instruments and never holds these cards.
     admin = next((d.get('id') for d in (state.get('agentRoster') or [])
                   if d.get('isAdmin')), None)
-    holder = _senior_most_director(state) or admin
+    holder = admin
     if not holder or holder not in (state.get('agents') or {}):
         return
     reasons = []
@@ -352,47 +351,6 @@ def _sm_standing_touch(state, now_ms=None):
         touched[tid] = now_ms
         queued += 1
     return queued
-
-
-def _senior_most_director(state):
-    """The TOP of the recursive director chain -- the supervisor of the
-    supervisors (operator model, 2026-11-06).
-
-    The regional VP does NOT sit in this recursion: she stands alone with
-    her own instruments (the village scan, senior-tier split routing). The
-    director-of-a-director chain is recursive and its top is the
-    SENIOR-MOST DIRECTOR.
-
-    Derivation, not appointment: the roster's `director` pointer already
-    encodes the tree for workers, and a director points at the director
-    above her the same way. A director is a ROOT when her own pointer is
-    empty or points at an admin, and she has at least one DIRECTOR
-    reporting to her (workers alone make her a team director, not a senior
-    one). Several roots: the one supervising the most directors is the
-    senior-most. No qualifying root (nobody appointed above the directors
-    yet) returns None and the cross-team oversight card falls back to the
-    chief of staff."""
-    roster = [r for r in (state.get('agentRoster') or []) if isinstance(r, dict)]
-    directors = {r.get('id') for r in roster
-                 if r.get('id') and r.get('isDirector') and not r.get('isAdmin')}
-    admin_ids = {r.get('id') for r in roster if r.get('isAdmin')}
-    reports = {}
-    for r in roster:
-        if r.get('id') in directors and r.get('director') in directors:
-            reports.setdefault(r['director'], []).append(r['id'])
-    roots = []
-    for did in sorted(directors):
-        row = next(r for r in roster if r.get('id') == did)
-        parent = row.get('director')
-        if parent and parent not in directors and parent not in admin_ids:
-            continue  # points at neither a director nor an admin: malformed
-        if did in reports:
-            roots.append((did, len(reports[did])))
-    if not roots:
-        return None
-    roots.sort(key=lambda kr: (-kr[1], kr[0]))
-    top = roots[0][0]
-    return top if top in (state.get('agents') or {}) else None
 
 
 DIRECTOR_ROLLUP_CADENCE_MS = 60 * 60 * 1000
