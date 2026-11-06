@@ -201,9 +201,20 @@ def _village_insert_agent(dsn, agent_id, rows, live_blob):
 
 
 def _has_open_task(state, agent_id):
+    """Terminal means closed in the org's vocabulary AND in the archive:
+    the merged read includes 12k archived rows whose statuses (e.g.
+    'failed') are historical, so an archive-table membership check keeps
+    an old failure from blocking a visit forever."""
     for t in (state.get('tasks') or {}).values():
-        if isinstance(t, dict) and t.get('assignedTo') == agent_id \
-                and t.get('status') not in ('done', 'cancelled', 'abandoned'):
+        if not isinstance(t, dict) or t.get('assignedTo') != agent_id:
+            continue
+        if t.get('status') in ('done', 'cancelled', 'abandoned', 'failed'):
+            continue
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT 1 FROM task_archive WHERE id = ?',
+                (t.get('id'),)).fetchone()
+        if row is None:
             return True
     return False
 
