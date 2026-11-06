@@ -348,7 +348,44 @@ from core.evidence import (  # noqa: E402,F401
     record_source_claim,
     search_since_ms,
     source_identity,
+    supersede_claim,
     update_claim,
+)
+# The Question Registry (core/questions.py): durable status-tracked open
+# questions over the work, re-exported so the stable public surface the
+# endpoints and tests use is `serve._questions_read` etc.
+from core.questions import (  # noqa: E402,F401
+    OPEN_STATUSES,
+    QUESTION_STATUSES,
+    _questions_read,
+    _questions_write,
+    answer_question,
+    contradict_question,
+    get_question,
+    open_questions,
+    prepare_conversation,
+    raise_conflict,
+    record_question,
+    questions_for_person,
+    registry_brief,
+)
+# The Stakeholder Graph (core/stakeholders.py): who knows what, who decided
+# what. Re-exported for the same reason as the evidence surface above.
+from core.stakeholders import (  # noqa: E402,F401
+    all_persons,
+    get_person,
+    persons_knowing,
+    record_person,
+)
+# Objectives (core/objectives.py): the computed coverage chain
+# (objective -> requirement -> evidence -> implementation -> validation ->
+# owner -> gap). Re-exported for the same reason.
+from core.objectives import (  # noqa: E402,F401
+    all_objectives,
+    get_objective,
+    objective_coverage,
+    record_objective,
+    requirement_coverage,
 )
 # Sublow experiment grants (see DESIGN.md "Sublow experiment grants" and
 # sublow.py): rotating server-side tokens gating sublow-model inference

@@ -560,3 +560,76 @@ class RecordRunFailureEdges(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class Supersession(unittest.TestCase):
+    """A correction is NOT a repost: repost dedup means 'the same source said
+    it again'; supersession means 'a different source says it is no longer
+    true.' The old record stays readable history but must never read as
+    current truth."""
+
+    def setUp(self):
+        self.store = _patch_ledgers()
+        first = evidence.record_source_claim(_claim(
+            source_url='https://a.example/orig',
+            claim='Ingestion of Guardian findings is a gap.'))
+        self.old_id = first['id']
+
+    def tearDown(self):
+        unittest.mock.patch.stopall()
+
+    def test_supersede_records_replacement_and_retires_old(self):
+        result = evidence.supersede_claim(self.old_id, _claim(
+            source_url='https://b.example/correction',
+            claim='Guardian findings are already searchable in the SIEM.'))
+        self.assertTrue(result['superseded'])
+        old = evidence.get_claim(self.old_id)
+        new = evidence.get_claim(result['new_id'])
+        self.assertEqual(old['status'], 'superseded')
+        self.assertEqual(old['superseded_by'], result['new_id'])
+        self.assertIn(self.old_id, new.get('supersedes', []))
+
+    def test_superseded_old_record_is_not_cleared(self):
+        result = evidence.supersede_claim(self.old_id, _claim(
+            source_url='https://b.example/correction',
+            claim='Correction text.'))
+        old = evidence.get_claim(self.old_id)
+        self.assertNotEqual(old['status'], 'cleared')
+
+    def test_supersede_unknown_old_claim_keeps_replacement(self):
+        result = evidence.supersede_claim('ev-doesnotexist', _claim(
+            source_url='https://b.example/correction',
+            claim='Replacement stands alone.'))
+        self.assertFalse(result['superseded'])
+        self.assertEqual(result['reason'], 'unknown_claim')
+        self.assertTrue(result['new_id'])
+
+    def test_supersede_invalid_replacement_records_nothing(self):
+        before = dict(self.store['evidence'])
+        result = evidence.supersede_claim(self.old_id, {'source_url': ''})
+        self.assertFalse(result['superseded'])
+        self.assertEqual(result['reason'], 'replacement_not_recorded')
+        self.assertEqual(self.store['evidence'], before)
+
+    def test_superseded_is_a_valid_status(self):
+        self.assertIn('superseded', evidence.CLAIM_STATUSES)
+
+    def test_claim_record_accepts_confidence_and_supersedes(self):
+        _patch_ledgers()
+        result = evidence.record_source_claim(_claim(
+            confidence=0.8, supersedes=['ev-older']))
+        rec = evidence.get_claim(result['id'])
+        self.assertEqual(rec['confidence'], 0.8)
+        self.assertEqual(rec['supersedes'], ['ev-older'])
+
+    def test_claim_record_rejects_bad_confidence(self):
+        _patch_ledgers()
+        result = evidence.record_source_claim(_claim(confidence=2.0))
+        self.assertFalse(result['recorded'])
+        self.assertEqual(result['reason'], 'invalid')
+
+    def test_claim_record_rejects_bad_supersedes(self):
+        _patch_ledgers()
+        result = evidence.record_source_claim(_claim(supersedes='ev-older'))
+        self.assertFalse(result['recorded'])
+        self.assertEqual(result['reason'], 'invalid')

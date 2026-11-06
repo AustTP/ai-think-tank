@@ -54,8 +54,10 @@ def _serialized(fn):
             return fn(*args, **kwargs)
     return wrapper
 
-# The lifecycle statuses a claim record can take.
-CLAIM_STATUSES = frozenset({'needs_review', 'cleared', 'blocked'})
+# The lifecycle statuses a claim record can take. 'superseded' is set only by
+# supersede_claim(): a later source corrected the claim, and the old record is
+# kept (readable history) but must never be counted as current truth.
+CLAIM_STATUSES = frozenset({'needs_review', 'cleared', 'blocked', 'superseded'})
 # The article's claim-type taxonomy. `unclassified` is the honest default at
 # crawl time -- classification is a Verifier job, not a crawl-time guess.
 CLAIM_TYPES = frozenset({'official_announcement', 'user_report', 'opinion',
@@ -72,8 +74,11 @@ COVERAGE_STATUSES = frozenset({'pending_review', 'covered', 'failed', 'blocked'}
 # never rewrite or erase history, so the audit is the trustworthy trail the
 # operator reads. It also powers the per-actor covered-flip rate cap below.
 AUDIT_ACTIONS = frozenset({'claim_recorded', 'claim_observed', 'claim_reviewed',
+                           'claim_superseded',
                            'coverage_pending_review', 'coverage_covered',
-                           'coverage_failed'})
+                           'coverage_failed',
+                           'question_recorded', 'question_answered',
+                           'question_contradicted'})
 
 # Per-actor cap on COVERED flips within the window: a compromised Verifier
 # cannot silently flip the whole ledger to covered in one pass. When an agent
@@ -348,6 +353,16 @@ def _unique_claim_id(claims, base_id):
     return f'{base_id}-{n}'
 
 
+def _validate_confidence(confidence):
+    try:
+        c = float(confidence)
+    except (TypeError, ValueError):
+        raise ValueError('confidence must be a number between 0.0 and 1.0')
+    if not (0.0 <= c <= 1.0):
+        raise ValueError('confidence must be a number between 0.0 and 1.0')
+    return round(c, 4)
+
+
 def _validate_claim_record(record):
     """Reject a claim record that cannot be acted on. A claim with no source
     or no claim text is not a claim -- it is noise, and a ledger of noise is
@@ -367,6 +382,12 @@ def _validate_claim_record(record):
     obs_list = record.get('observations')
     if obs_list is not None and not isinstance(obs_list, list):
         raise ValueError('observations must be a list')
+    if record.get('confidence') is not None:
+        _validate_confidence(record['confidence'])
+    supersedes = record.get('supersedes')
+    if supersedes is not None:
+        if not isinstance(supersedes, list) or not all(isinstance(s, str) for s in supersedes):
+            raise ValueError('supersedes must be a list of claim ids')
 
 
 @_serialized
@@ -447,6 +468,8 @@ def record_source_claim(record, actor=None):
     rec.setdefault('status', 'needs_review')
     rec.setdefault('decision', None)
     rec.setdefault('open_questions', [])
+    rec.setdefault('confidence', None)
+    rec.setdefault('supersedes', [])
     rec['created_ts'] = now
     rec['updated_ts'] = now
     claims[new_id] = rec
@@ -523,6 +546,44 @@ def record_observation_change(claim_id, field, before, after, *, source_url=None
     if result.get('recorded'):
         result['appended'] = True
     return result
+
+
+@_serialized
+def supersede_claim(old_claim_id, replacement, *, actor=None):
+    """The correction move: a later source corrects an earlier claim. The
+    replacement is recorded as a normal new claim (its own source identity),
+    the old claim's status becomes 'superseded' (kept -- readable history,
+    but never current truth), and the link is written on BOTH sides: the new
+    claim's `supersedes` lists the old id, the old record's `superseded_by`
+    names the new id.
+
+    A correction is NOT a repost: repost dedup means "the same source said it
+    again"; supersession means "a different source says it is no longer true."
+    Returns {'superseded': True, 'old_id', 'new_id'} or
+    {'superseded': False, 'reason', ...}."""
+    result = record_source_claim(replacement, actor=actor)
+    if not result.get('recorded'):
+        return {'superseded': False, 'reason': 'replacement_not_recorded',
+                'detail': result}
+    new_id = result['id']
+    claims = _evidence_read()
+    old = claims.get(old_claim_id)
+    if old is None:
+        # The replacement still stands; there is just nothing to retire.
+        return {'superseded': False, 'reason': 'unknown_claim', 'new_id': new_id}
+    old = dict(old)
+    old['status'] = 'superseded'
+    old['superseded_by'] = new_id
+    old['updated_ts'] = time.time()
+    claims[old_claim_id] = old
+    rec = dict(claims.get(new_id) or {})
+    rec['supersedes'] = sorted(set(list(rec.get('supersedes') or []) + [old_claim_id]))
+    claims[new_id] = rec
+    _evidence_write(claims)
+    append_audit(actor, 'claim_superseded', claim_id=old_claim_id,
+                 identity=old.get('identity'),
+                 detail={'superseded_by': new_id})
+    return {'superseded': True, 'old_id': old_claim_id, 'new_id': new_id}
 
 
 def _material_update(covered, material_ms):

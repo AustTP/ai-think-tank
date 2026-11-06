@@ -563,6 +563,25 @@ def _parse_memories(reply):
     return out
 
 
+def _promote_unresolved_questions(memories, session_id):
+    """Best-effort promotion of 'unresolved_question' LTM memories into the
+    Question Registry (core/questions.py). The registry is the durable,
+    status-tracked view the whole system can route against; LTM recall is
+    conversation-scoped. Promotion is fire-and-forget: it must never gate the
+    LTM insert itself."""
+    try:
+        import core.questions as questions
+        for mem_type, content, _confidence, _source in memories:
+            if (mem_type or '').strip() != 'unresolved_question':
+                continue
+            text = _redact_secrets((content or '').strip())
+            if not text:
+                continue
+            questions.record_question(text, source=session_id, actor='ltm_promotion')
+    except Exception as e:
+        print(f'[memory] question promotion failed: {e}', flush=True)
+
+
 def _insert_memories(session_id, memories):
     """Insert new LTM memories, deduplicated against the active set, and cap the
     session's store so an aging conversation cannot grow the table without
@@ -572,6 +591,7 @@ def _insert_memories(session_id, memories):
     re-injected into a later ask."""
     import serve as _serve
     cap = int(getattr(_serve, 'LTM_MAX_PER_SESSION', 200) or 200)
+    _promote_unresolved_questions(memories, session_id)
     try:
         now = time.time()
         with _serve._db() as conn:

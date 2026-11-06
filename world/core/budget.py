@@ -187,3 +187,53 @@ def overrun_factor(state, room=None, team_id=None, product_id=None,
                 ratios.append(float(ratio) * weight)
             return max(1.0, min(OVERRUN_FACTOR_MAX, statistics.median(ratios)))
     return 1.0
+
+
+# ---------------------------------------------------------------------------
+# Human attention budget.
+#
+# Model spend is not the only scarce resource: a colleague's attention is.
+# Outreach recommendations are priced so the planner prefers answering from
+# existing evidence before spending someone's time, penalizes repeats
+# (the same question asked twice) and answerable-from-documents asks hardest.
+
+ATTENTION_COSTS = {
+    'email': 1.0,
+    'teams': 1.0,
+    '15_minute_meeting': 3.0,
+    '30_minute_meeting': 5.0,
+    'executive_interruption': 10.0,
+}
+ATTENTION_REPEAT_PENALTY = 2.0
+ATTENTION_ANSWERED_PENALTY = 10.0
+
+
+def attention_quote(person, *, channel='email', question_text=None,
+                    asked_before=False, answerable_from_evidence=False):
+    """Price one ask before it is made. Returns {'person', 'channel', 'cost',
+    'reasons'} where reasons explain the price -- the planner shows this, not
+    a bare number. `answerable_from_evidence` is the strongest signal the ask
+    should NOT happen: documents/conversations already contain the answer."""
+    base = ATTENTION_COSTS.get(channel)
+    if base is None:
+        raise ValueError(f'unknown channel: {channel}')
+    cost = base
+    reasons = []
+    if asked_before:
+        cost += ATTENTION_REPEAT_PENALTY
+        reasons.append('repeat question')
+    if answerable_from_evidence:
+        cost += ATTENTION_ANSWERED_PENALTY
+        reasons.append('answerable from existing evidence')
+    return {'person': person, 'channel': channel, 'cost': cost,
+            'reasons': reasons, 'question_text': question_text}
+
+
+def cheapest_ask(quotes):
+    """The lowest-priced ask from a list of attention_quote() results, or
+    None. Ties break by insertion order (stable sort), so the planner's
+    preference order survives."""
+    quotes = [q for q in (quotes or []) if isinstance(q, dict) and 'cost' in q]
+    if not quotes:
+        return None
+    return sorted(quotes, key=lambda q: q['cost'])[0]
