@@ -24,7 +24,6 @@ _PATCHER = None
 def setUpModule():
     global _TMP_DIR, _PATCHER
     import tempfile
-    import shutil
     _TMP_DIR = tempfile.mkdtemp(prefix='think-tank-cross-village-test-')
     _PATCHER = unittest.mock.patch.multiple(
         serve,
@@ -258,3 +257,132 @@ class MoveTeam(unittest.TestCase):
         r = client().post('/api/admin/move-team-to-village', headers=TOKEN,
                           json={'teamId': 'eli', 'villageId': 'ghost'})
         self.assertEqual(r.status_code, 404)
+
+
+class MoveSemantics(unittest.TestCase):
+    """The 2026-11-06 eli-move lesson: assignee-based collection dragged
+    five parent-team cards into a village. The move takes ONLY the team's
+    own cards; foreign cards stay home with their assignee cleared."""
+
+    def setUp(self):
+        os.environ['THINK_TANK_PARENT_TOKEN'] = 'tok-1'
+        self.addCleanup(os.environ.pop, 'THINK_TANK_PARENT_TOKEN', None)
+        for name, val in (('log_action', lambda *a, **k: None),
+                          ('save_state_to_db', lambda s: None),
+                          ('_state_begin', lambda: self.st),
+                          ('check_rate_limit', lambda aid: True)):
+            self._p = unittest.mock.patch.object(serve, name, val)
+            self._p.start()
+            self.addCleanup(self._p.stop)
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps({'ok': True}).encode()
+        self.sent = []
+
+        def _fake_post(req, timeout=30, **kw):
+            self.sent.append(json.loads(req.data))
+            return _FakeResp()
+        self._p2 = unittest.mock.patch.object(
+            serve.urllib.request, 'urlopen', _fake_post)
+        self._p2.start()
+        self.addCleanup(self._p2.stop)
+
+    def _state(self):
+        self.st = {
+            'agents': {'theo': {'mailbox': []}, 'eli': {'mailbox': []},
+                       'callie': {'mailbox': []}},
+            'agentRoster': [
+                {'id': 'theo', 'isAdmin': True},
+                {'id': 'eli', 'isDirector': True},
+                {'id': 'callie', 'director': 'eli'}],
+            'teams': [{'id': 'eli', 'name': "Eli's Team",
+                       'directorId': 'eli', 'members': ['callie']}],
+            'sprints': {},
+            'tasks': {
+                'own': {'id': 'own', 'teamId': 'eli', 'status': 'working',
+                        'assignedTo': 'callie'},
+                'foreign': {'id': 'foreign', 'teamId': 'ben',
+                            'status': 'working', 'assignedTo': 'callie'},
+                'loose': {'id': 'loose', 'teamId': None, 'status': 'walking',
+                          'assignedTo': 'callie'},
+            },
+            'workQueue': [],
+        }
+        return self.st
+
+    def test_move_takes_only_the_teams_own_cards(self):
+        self._state()
+        _register_village()
+        r = client().post('/api/admin/move-team-to-village', headers=TOKEN,
+                          json={'teamId': 'eli', 'villageId': 'north'})
+        self.assertEqual(r.status_code, 200, r.text)
+        sent = self.sent[0]
+        self.assertIn('own', sent['tasks'])
+        self.assertNotIn('foreign', sent['tasks'])
+        self.assertEqual(sent['reassignedElsewhere'], ['foreign'])
+        # the loose card follows its worker (worker-owned, teamless)
+        self.assertIn('loose', sent['tasks'])
+        # foreign card stays home, assignee cleared for re-staffing
+        self.assertIn('foreign', self.st['tasks'])
+        self.assertIsNone(self.st['tasks']['foreign']['assignedTo'])
+
+    def test_return_village_cards_rehomes_them(self):
+        self._state()
+        _register_village()
+
+        released = {}
+
+        class _RelResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {'ok': True,
+                     'released': {'foreign': dict(
+                         self.st['tasks']['foreign'])}}).encode()
+        state_holder = self
+
+        def _fake_post(req, timeout=30, **kw):
+            released.update(json.loads(req.data))
+            st = state_holder.st
+            card = st['tasks'].get('foreign')
+            st['tasks'].pop('foreign', None)
+            payload = json.dumps({'ok': True,
+                                  'released': {'foreign': card}}).encode()
+
+            class _R:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *a):
+                    return False
+
+                def read(self):
+                    return payload
+            return _R()
+        self._p2.set_secs = None
+        self._p2.stop()
+        self._p2 = unittest.mock.patch.object(
+            serve.urllib.request, 'urlopen', _fake_post)
+        self._p2.start()
+        self.addCleanup(self._p2.stop)
+        self.st['tasks']['foreign']['assignedTo'] = 'callie'
+        r = client().post('/api/admin/return-village-cards', headers=TOKEN,
+                          json={'villageId': 'north',
+                                'taskIds': ['foreign']})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['restored'], ['foreign'])
+        card = self.st['tasks']['foreign']
+        self.assertIsNone(card['assignedTo'])
+        self.assertIn('returned from village north', card['note'])
