@@ -424,6 +424,56 @@ def _coaching_loop_step(state, now_ms):
     return checked
 
 
+def _repair_stale_holds(state):
+    """Clear stale busy/task holds before the idle gate short-circuits.
+
+    A `busy` flag is a hold on an IN-FLIGHT ('working') task; if the referenced
+    task already ended or is missing, or the agent is busy with no task at all,
+    the hold is stale and -- left alone -- wedges the agent permanently (the
+    sim's read-side invariant in the snapshot builder only HIDES this; it must
+    be repaired, or the roster bleeds idle workers over time). Server restarts
+    mid-flight + task-completion-out-of-band are the usual culprits.
+    Clearing a non-'working' hold is safe: a 'working' task is the only
+    legitimate reason to be busy."""
+    agents = state.get('agents') or {}
+    tasks = state.get('tasks') or {}
+    for aid, a in list(agents.items()):
+        if not isinstance(a, dict):
+            continue
+        tid = a.get('task')
+        # W1: a PAIR NAVIGATOR is busy with no task of her own -- she rides
+        # along on the driver's (pairTaskId). Clearing her busy as a stale
+        # token would yank her out of a live pair session mid-work. Only a
+        # true stale hold (busy referencing a gone/non-working task, or busy
+        # with no task AND no pair session) is a legitimate repair target.
+        nav_tid = a.get('pairTaskId')
+        if (nav_tid and not a.get('task')
+                and (tasks.get(nav_tid) or {}).get('status') == 'working'):
+            continue  # a paired navigator mid-session -- leave the hold alone
+        if tid and (tasks.get(tid) or {}).get('status') in ('working',):
+            continue  # legitimately mid-task -- leave the hold alone
+        # A stale TASK ref without busy is the same wedge, invisible to the
+        # old gate: bulk sweeps archive the card while the agent keeps
+        # task=<gone id>, so she is never "fully idle" (no dispersal, no
+        # parking) and never repaired (busy is False) -- an immortal
+        # loiterer. 19 of them stacked at the observatory mouth and every
+        # walk into the room died at pathIndex 0 (2026-11-06). Clear the
+        # ref when the referenced row is gone or terminally archived; a
+        # 'walking' row is a live walk (never touch it).
+        if not a.get('busy') and tid:
+            ref = tasks.get(tid) or {}
+            if ref.get('status') not in ('walking', 'working', 'needs_review',
+                                         'blocked', 'repairing', 'queued'):
+                a['task'] = None
+                a['inRoom'] = None
+                continue
+        if not a.get('busy'):
+            continue
+        a['busy'] = False
+        a['task'] = None
+        a['inRoom'] = None
+
+
 def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     """The server-side heart of Phase 3 slice 1: one consumption pass over the
     persistent workQueue, mirroring the browser's runTaskCycleBody (tasks.js:350),
@@ -592,35 +642,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     work_queue = state.get('workQueue')
     if not isinstance(work_queue, list):
         work_queue = state['workQueue'] = []
-    # Repair stale busy tokens BEFORE the idle gate short-circuits.
-    # A `busy` flag is a hold on an IN-FLIGHT ('working') task; if the referenced
-    # task already ended (done / needs_review) or is missing, or the agent is
-    # busy with no task at all, the hold is stale and -- left alone -- wedges the
-    # agent permanently (the sim's read-side invariant in the snapshot builder
-    # only HIDES this; it must be repaired, or the roster bleeds idle workers over
-    # time). Server restarts mid-flight + task-completion-out-of-band are the
-    # usual culprits: an agent's busy persists in the DB while its task's status
-    # moved to done independently. Clearing a non-'working' hold is safe: a
-    # 'working' task is the only legitimate reason to be busy.
-    for aid, a in list(agents.items()):
-        if not isinstance(a, dict) or not a.get('busy'):
-            continue
-        tid = a.get('task')
-        tasks = state.get('tasks') or {}
-        # W1: a PAIR NAVIGATOR is busy with no task of her own -- she rides
-        # along on the driver's (pairTaskId). Clearing her busy as a stale
-        # token would yank her out of a live pair session mid-work. Only a
-        # true stale hold (busy referencing a gone/non-working task, or busy
-        # with no task AND no pair session) is a legitimate repair target.
-        nav_tid = a.get('pairTaskId')
-        if (nav_tid and not a.get('task')
-                and (tasks.get(nav_tid) or {}).get('status') == 'working'):
-            continue  # a paired navigator mid-session -- leave the hold alone
-        if tid and (tasks.get(tid) or {}).get('status') in ('working',):
-            continue  # legitimately mid-task -- leave the hold alone
-        a['busy'] = False
-        a['task'] = None
-        a['inRoom'] = None
+    # Repair stale busy/task tokens BEFORE the idle gate short-circuits.
+    _repair_stale_holds(state)
     # Park fully-idle on-duty wanderers once the queue has no work
     # to hand them. Nothing queued (or only not-yet-due work) + nobody active is
     # exactly the residue case: a woken-but-never-assigned agent lingers visible
