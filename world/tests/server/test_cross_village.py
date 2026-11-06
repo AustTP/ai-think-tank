@@ -30,11 +30,19 @@ def setUpModule():
         DB_PATH=os.path.join(_TMP_DIR, 'test.db'),
         THINK_TANK_DIR=_TMP_DIR,
     )
+    # 2026-11-06, CRITICAL ISOLATION FIX: since the store moved to
+    # postgres, patching DB_PATH alone no longer isolates anything --
+    # _db() goes to postgres whenever THINK_TANK_DB is unset, so these
+    # tests were READING AND WRITING THE LIVE DATABASE (they overwrote
+    # the real villages_registry row and wiped villages_visits). The
+    # documented precedence is: THINK_TANK_DB set -> SQLite, always.
+    os.environ['THINK_TANK_DB'] = os.path.join(_TMP_DIR, 'test.db')
     _PATCHER.start()
     serve.init_db()
 
 
 def tearDownModule():
+    os.environ.pop('THINK_TANK_DB', None)
     _PATCHER.stop()
     import shutil
     shutil.rmtree(_TMP_DIR, ignore_errors=True)
@@ -832,3 +840,88 @@ class AgentInitiatedVisits(unittest.TestCase):
         # ava has no visit: the refusal names HER, not ben
         self.assertEqual(r.status_code, 409, r.text)
         self.assertIn('ava', r.json()['error'])
+
+
+class SelfReturnFromAVillage(unittest.TestCase):
+    """A visiting agent's key lives in the VILLAGE she is in, so her
+    early return goes through her local server: the village verifies her
+    and fires the parent's machinery in a background thread (the parent
+    bootouts this process mid-surgery, so the HTTP answer cannot wait)."""
+
+    def setUp(self):
+        os.environ['THINK_TANK_PARENT_TOKEN'] = 'tok-1'
+        self.addCleanup(os.environ.pop, 'THINK_TANK_PARENT_TOKEN', None)
+        self.fired = []
+
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def _fake_urlopen(req, timeout=0, **kw):
+            self.fired.append(json.loads(req.data.decode()))
+            return _Resp()
+        p = unittest.mock.patch('urllib.request.urlopen', _fake_urlopen)
+        p.start()
+        self.addCleanup(p.stop)
+        for name, val in (('log_action', lambda *a, **k: None),
+                          ('save_state_to_db', lambda s: None),
+                          ('check_rate_limit', lambda aid: True)):
+            p = unittest.mock.patch.object(serve, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        self._vm = unittest.mock.patch.object(serve, 'VILLAGE_MODE', True)
+        self._vm.start()
+        self.addCleanup(self._vm.stop)
+        self._vi = unittest.mock.patch.object(
+            serve, 'VILLAGE_ID', 'north')
+        self._vi.start()
+        self.addCleanup(self._vi.stop)
+        self._pu = unittest.mock.patch.object(
+            serve, 'PARENT_URL', 'http://parent:1')
+        self._pu.start()
+        self.addCleanup(self._pu.stop)
+
+    def _seed(self, agent_id, visiting=True):
+        with serve._db() as conn:
+            conn.execute('INSERT INTO agent_keys (agent_id, secret_key,'
+                         ' created_at) VALUES (?, ?, ?) ON CONFLICT'
+                         ' (agent_id) DO UPDATE SET secret_key ='
+                         ' EXCLUDED.secret_key',
+                         (agent_id, f'key-{agent_id}', 0.0))
+            blob = {'mailbox': []}
+            if visiting:
+                blob['_visitReturnAt'] = 1
+            conn.execute('INSERT INTO live_agent (id, seq, blob,'
+                         ' updated_at) VALUES (?, ?, ?, ?) ON CONFLICT'
+                         ' (id) DO UPDATE SET blob = EXCLUDED.blob',
+                         (agent_id, 0, json.dumps(blob), 0.0))
+
+    def test_a_visitor_walks_herself_home(self):
+        self._seed('ben')
+        r = client().post('/api/villages-self/return-me',
+                          headers={'X-Agent-Key': 'key-ben'}, json={})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()['walking'])
+        import time as _time
+        deadline = _time.time() + 5
+        while not self.fired and _time.time() < deadline:
+            _time.sleep(0.1)
+        self.assertEqual(self.fired, [{'agentId': 'ben'}])
+
+    def test_a_non_visitor_is_refused(self):
+        self._seed('pax', visiting=False)
+        r = client().post('/api/villages-self/return-me',
+                          headers={'X-Agent-Key': 'key-pax'}, json={})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertIn('not visiting', r.json()['error'])
+
+    def test_an_unknown_key_is_refused(self):
+        r = client().post('/api/villages-self/return-me',
+                          headers={'X-Agent-Key': 'key-ghost'}, json={})
+        self.assertEqual(r.status_code, 401, r.text)

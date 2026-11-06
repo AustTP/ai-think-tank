@@ -43,15 +43,17 @@ mail to anyone routes through the post office.
 ## Coming home
 
 You come home AUTOMATICALLY at your return time (the village's heartbeat
-walks you out). To come home early:
+walks you out). To come home early, ask the server you are CURRENTLY standing in (your
+key lives there while you visit):
 
 ```
-POST /api/visit-requests/return
+POST /api/villages-self/return-me
 X-Agent-Key: <your key>
 {}
 ```
 
-Only you can return yourself.
+The answer comes back before the walk starts; you are home moments
+later. Only you can return yourself.
 
 ## Etiquette that is NOT enforced but is expected
 

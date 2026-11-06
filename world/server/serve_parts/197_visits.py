@@ -523,3 +523,45 @@ async def admin_send_visitor(request: Request):
                               actor or 'operator')
     finally:
         _state_abort()
+
+
+@app.post('/api/villages-self/return-me')
+async def village_self_return_me(request: Request):
+    """A VISITING agent walks herself home through her LOCAL server: her
+    key lives in the village she is visiting (the parent can no longer
+    verify it), so the village authenticates her, then hands off to the
+    parent's return machinery in a background thread -- the parent will
+    bootout THIS process mid-surgery, so the HTTP answer must not wait
+    for it."""
+    from serve import VILLAGE_MODE
+    if not VILLAGE_MODE:
+        return JSONResponse({'error': 'village process only'},
+                            status_code=404)
+    key_owner = _agent_id_for_key(request.headers.get('X-Agent-Key'))
+    if not key_owner:
+        return JSONResponse({'error': 'agent key required'}, status_code=401)
+    with _db() as conn:
+        row = conn.execute(
+            'SELECT blob FROM live_agent WHERE id = ?',
+            (key_owner,)).fetchone()
+    if not row or not json.loads(row[0]).get('_visitReturnAt'):
+        return JSONResponse(
+            {'error': 'you are not visiting here'}, status_code=409)
+    import threading
+    import urllib.request
+
+    def _fire():
+        try:
+            req = urllib.request.Request(
+                f'{PARENT_URL}/api/villages/{VILLAGE_ID}/return-visitor',
+                data=json.dumps({'agentId': key_owner}).encode(),
+                method='POST',
+                headers={'Content-Type': 'application/json',
+                         'X-Parent-Token':
+                         os.environ.get('THINK_TANK_PARENT_TOKEN') or ''})
+            urllib.request.urlopen(req, timeout=20)
+        except Exception:
+            pass
+    threading.Thread(target=_fire, daemon=True).start()
+    return {'ok': True, 'walking': True,
+            'agent': key_owner, 'home': '_visitFrom'}
