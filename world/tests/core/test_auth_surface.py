@@ -63,6 +63,19 @@ EXPECTED_PUBLIC = (
     # THINK_TANK_MCP_TOKEN is unset. The tool set is read-only board
     # projections -- no mutating tool exists on the surface.
     '/mcp',
+    # Cross-village API (195/196/197). Public HERE because villages are
+    # separate PROCESSES, not browser sessions: they authenticate with the
+    # shared THINK_TANK_PARENT_TOKEN in-handler (401 on a wrong/missing
+    # token), the admin move/visit endpoints require an admin agent key or
+    # the parent token, and every mutating handler validates the target
+    # village and records a governance log entry. The agent visit-request
+    # endpoint authenticates with the caller's X-Agent-Key.
+    '/api/villages/',
+    '/api/villages-self/',
+    '/api/admin/move-team-to-village',
+    '/api/admin/return-village-cards',
+    '/api/admin/send-visitor',
+    '/api/visit-requests',
 )
 
 # Routes that must stay reachable without a session (login page + assets).

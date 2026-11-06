@@ -135,22 +135,19 @@ def record_question(text, *, objective=None, people_who_may_know=None,
     existing = questions.get(qid)
     if existing is not None:
         # Same question, possibly a second observer or new routing hint.
-        changed = False
+        # (A 'changed' flag was set here but never read; the merge always
+        # persists, which is the behavior the caller expects.)
         for p in people:
             if p not in existing.get('people_who_may_know', []):
                 existing.setdefault('people_who_may_know', []).append(p)
-                changed = True
         for c in claims:
             if c not in existing.get('evidence_claim_ids', []):
                 existing.setdefault('evidence_claim_ids', []).append(c)
-                changed = True
         for r in related:
             if r not in existing.get('related_question_ids', []):
                 existing.setdefault('related_question_ids', []).append(r)
-                changed = True
         if objective and objective != existing.get('objective'):
             existing['objective'] = objective
-            changed = True
         existing.setdefault('asked_by', []).append(_clean_person(source) or actor or 'unknown')
         existing['updated_ts'] = now
         questions[qid] = existing
