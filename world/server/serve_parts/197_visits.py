@@ -40,7 +40,11 @@ import time
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-import psycopg2
+# psycopg2 is imported lazily inside the three village-DB helpers, like
+# pg_migrate.py: parts are exec'd at serve import time (guard harnesses,
+# CI without the deployment's database driver), and a module-level import
+# here made EVERY serve import require psycopg2 -- which broke CI for a
+# day (run 42289065410: conftest could not import serve at all).
 
 
 def _visit_token_ok(request: Request) -> bool:
@@ -132,6 +136,7 @@ def _wait_port(host, port, want_open, seconds):
 
 def _village_extract_agent(dsn, agent_id):
     """Her full footprint from the village DB, with her live blob."""
+    import psycopg2
     conn = psycopg2.connect(dsn)
     cur = conn.cursor()
     out = {}
@@ -157,6 +162,7 @@ def _village_extract_agent(dsn, agent_id):
 
 
 def _village_remove_agent(dsn, agent_id):
+    import psycopg2
     conn = psycopg2.connect(dsn)
     conn.autocommit = True
     cur = conn.cursor()
@@ -179,6 +185,7 @@ def _village_insert_agent(dsn, agent_id, rows, live_blob):
     """Write a visiting agent into a STOPPED village's DB. `live_blob` is
     her full live blob as she should exist there (visit stamps + the
     visit mail already inside)."""
+    import psycopg2
     conn = psycopg2.connect(dsn)
     cur = conn.cursor()
     cur.execute('INSERT INTO roster_agent (id, seq, blob, updated_at)'

@@ -15,6 +15,23 @@ jobs:
     # default is 360 minutes, which would burn the whole Actions budget on
     # one hung test. 30 minutes is ~10x the healthy runtime.
     timeout-minutes: 30
+    # The visit-return surgery test (tests/server/test_cross_village.py)
+    # exercises the real psycopg2 stop -> write -> restart SQL against a
+    # throwaway village database; a real postgres makes that a live
+    # verification instead of a skip.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
         with:

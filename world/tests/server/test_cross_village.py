@@ -627,20 +627,36 @@ class Visits(unittest.TestCase):
                           json={'agentId': 'warren'})
         self.assertEqual(r.status_code, 409, r.text)
         # forced early return: the surgery runs for real against a
-        # throwaway postgres village DB (the actual SQL, not a stub)
+        # throwaway postgres village DB (the actual SQL, not a stub).
+        # The DSN comes from THINK_TANK_TEST_PG_DSN so CI can point it at
+        # its service container; with no reachable postgres the test
+        # skips rather than pretending.
+        import getpass
         import psycopg2
-        admin = psycopg2.connect('postgresql://poole86@/postgres')
+        from urllib.parse import urlsplit, urlunsplit
+        base = os.environ.get('THINK_TANK_TEST_PG_DSN') or (
+            'postgresql://' + getpass.getuser() + '@/postgres')
+        try:
+            probe = psycopg2.connect(base, connect_timeout=3)
+        except Exception as exc:
+            self.skipTest(f'no reachable postgres for the real surgery '
+                          f'test: {type(exc).__name__}')
+        probe.close()
+        parts = urlsplit(base)
+        vdb_dsn = urlunsplit(parts._replace(
+            path=(parts.path or '/postgres').rsplit('/', 1)[0]
+            + '/tcv_village_tmp'))
+        admin = psycopg2.connect(base)
         admin.autocommit = True
         acur = admin.cursor()
         acur.execute('DROP DATABASE IF EXISTS tcv_village_tmp')
         acur.execute('CREATE DATABASE tcv_village_tmp')
-        admin.commit()
         acur.close()
         admin.close()
 
         # no DROP on teardown: a lingering pooled session can hold the
         # tmp DB busy; the next run recreates it from scratch anyway
-        vdb = psycopg2.connect('postgresql://poole86@/tcv_village_tmp')
+        vdb = psycopg2.connect(vdb_dsn)
         vcur = vdb.cursor()
         vcur.execute('CREATE TABLE roster_agent (id TEXT PRIMARY KEY,'
                      ' seq INTEGER, blob TEXT, updated_at REAL)')
@@ -660,8 +676,7 @@ class Visits(unittest.TestCase):
         vdb.close()
         with serve._db() as conn:
             conn.execute('UPDATE villages_registry SET db_url = ?'
-                         " WHERE id = 'north'",
-                         ('postgresql://poole86@/tcv_village_tmp',))
+                         " WHERE id = 'north'", (vdb_dsn,))
         for name, val in (
                 ('_bootout', lambda label: None),
                 ('_bootstrap', lambda label: None),
@@ -686,8 +701,7 @@ class Visits(unittest.TestCase):
             ).fetchone()[0])
         self.assertTrue(any('HOME' in str(m.get('text'))
                             for m in blob.get('mailbox', [])))
-        import psycopg2
-        vdb = psycopg2.connect('postgresql://poole86@/tcv_village_tmp')
+        vdb = psycopg2.connect(vdb_dsn)
         vcur = vdb.cursor()
         vcur.execute('SELECT count(*) FROM roster_agent')
         self.assertEqual(vcur.fetchone()[0], 0)  # really gone from there
@@ -912,7 +926,8 @@ class SelfReturnFromAVillage(unittest.TestCase):
         deadline = _time.time() + 5
         while not self.fired and _time.time() < deadline:
             _time.sleep(0.1)
-        self.assertEqual(self.fired, [{'agentId': 'ben'}])
+        self.assertEqual(self.fired, [{'agentId': 'ben',
+                                        'force': True}])
 
     def test_a_non_visitor_is_refused(self):
         self._seed('pax', visiting=False)
