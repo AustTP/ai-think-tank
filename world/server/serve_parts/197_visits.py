@@ -71,16 +71,24 @@ def _ensure_registry_columns():
 
 
 def _village_transport(village_id):
-    """(launchd_label, db_url) for a registered village; None when the
-    village was registered before the mobility build (re-run
-    tools/village_plist.py --install to attach them)."""
+    """(launchd_label, db_url, host) for a registered village; None when
+    the village was registered before the mobility build (re-run
+    tools/village_plist.py --install to attach them). The host is the
+    address the village actually SERVES on (the registry's api_base) --
+    villages bind their Tailscale IP, not loopback, so port probes MUST
+    use the same interface or every stop/start wait lies."""
     _ensure_registry_columns()
     with _db() as conn:
         row = conn.execute(
-            'SELECT launchd_label, db_url FROM villages_registry'
+            'SELECT launchd_label, db_url, api_base FROM villages_registry'
             ' WHERE id = ?', (village_id,)).fetchone()
     if row and row[0] and row[1]:
-        return row[0], row[1]
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(row[2]).hostname or '127.0.0.1'
+        except Exception:
+            host = '127.0.0.1'
+        return row[0], row[1], host
     return None
 
 
@@ -107,12 +115,12 @@ def _bootstrap(label):
                    capture_output=True)
 
 
-def _wait_port(port, want_open, seconds):
+def _wait_port(host, port, want_open, seconds):
     import socket
     deadline = time.time() + seconds
     while time.time() < deadline:
         try:
-            with socket.create_connection(('127.0.0.1', port), timeout=1.5):
+            with socket.create_connection((host, port), timeout=1.5):
                 if want_open:
                     return True
         except OSError:
@@ -249,7 +257,7 @@ async def admin_send_visitor(request: Request):
             {'error': f'village {village_id} has no launchd label or DB '
                       'url registered; run tools/village_plist.py '
                       '--install again'}, status_code=409)
-    label, dsn = transport
+    label, dsn, host = transport
     _ensure_visits_table()
     state = _state_begin()
     if not state:
@@ -313,7 +321,7 @@ async def admin_send_visitor(request: Request):
         del box[:-200]
         port = _village_port(label)
         _bootout(label)
-        if port and not _wait_port(port, False, 30):
+        if port and not _wait_port(host, port, False, 30):
             _bootstrap(label)
             return JSONResponse(
                 {'error': f'village {village_id} would not stop; visit '
@@ -326,7 +334,7 @@ async def admin_send_visitor(request: Request):
                 {'error': f'village insert failed: '
                           f'{type(exc).__name__}'[:160]}, status_code=502)
         _bootstrap(label)
-        if port and not _wait_port(port, True, 90):
+        if port and not _wait_port(host, port, True, 90):
             return JSONResponse(
                 {'error': f'village did not come back on port {port}; '
                           f'{agent_id} is IN the village DB -- check '
@@ -402,7 +410,7 @@ async def village_return_visitor(village_id: str, request: Request):
     if transport is None:
         return JSONResponse({'error': 'village not transportable'},
                             status_code=409)
-    label, dsn = transport
+    label, dsn, host = transport
     rows = _village_extract_agent(dsn, agent_id)
     if not rows.get('roster') or not rows.get('live'):
         return JSONResponse(
@@ -414,7 +422,7 @@ async def village_return_visitor(village_id: str, request: Request):
         live_blob.pop(k, None)
     port = _village_port(label)
     _bootout(label)
-    if port and not _wait_port(port, False, 30):
+    if port and not _wait_port(host, port, False, 30):
         _bootstrap(label)
         return JSONResponse({'error': 'village would not stop'},
                             status_code=502)
@@ -423,7 +431,7 @@ async def village_return_visitor(village_id: str, request: Request):
     finally:
         _bootstrap(label)
         if port:
-            _wait_port(port, True, 90)
+            _wait_port(host, port, True, 90)
     state = _state_begin()
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)

@@ -54,9 +54,9 @@ def _post(path, payload, timeout=60):
         return json.loads(resp.read())
 
 
-def _port_open(port, timeout=2.0):
+def _port_open(host, port, timeout=2.0):
     try:
-        with socket.create_connection(('127.0.0.1', port), timeout=timeout):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -73,7 +73,12 @@ def _village_running(village_id):
                         LABEL.format(id=village_id) + '.plist')
     with open(path, 'rb') as fh:
         plist = plistlib.load(fh)
-    return int(plist['ProgramArguments'][2])
+    port = int(plist['ProgramArguments'][2])
+    # Villages bind their Tailscale IP, not loopback -- probe the host the
+    # village actually serves on, or every stop/start wait lies.
+    host = ((plist.get('EnvironmentVariables') or {})
+            .get('THINK_TANK_HOST') or '127.0.0.1')
+    return port, host
 
 
 def _stop_village(village_id):
@@ -81,27 +86,27 @@ def _stop_village(village_id):
     if not info:
         raise SystemExit(f'village {village_id} is not a running launchd '
                          'service; start it with village_plist.py first')
-    port, plist = info
+    port, host = info
     subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/'
                     f'{LABEL.format(id=village_id)}'], capture_output=True)
     deadline = time.time() + 30
-    while time.time() < deadline and _port_open(port):
+    while time.time() < deadline and _port_open(host, port):
         time.sleep(1)
-    if _port_open(port):
+    if _port_open(host, port):
         raise SystemExit(f'port {port} still listening after bootout')
     print(f'      village stopped (port {port} free)')
-    return port
+    return port, host
 
 
-def _start_village(village_id, port):
+def _start_village(village_id, port, host):
     path = os.path.join(os.path.expanduser('~'), 'Library', 'LaunchAgents',
                         LABEL.format(id=village_id) + '.plist')
     subprocess.run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', path],
                    capture_output=True)
     deadline = time.time() + 60
-    while time.time() < deadline and not _port_open(port):
+    while time.time() < deadline and not _port_open(host, port):
         time.sleep(2)
-    if not _port_open(port):
+    if not _port_open(host, port):
         raise SystemExit(f'village did not come back on port {port}')
     print(f'      village restarted (port {port} serving)')
 
@@ -189,11 +194,11 @@ def main():
         print('[dry-run] nothing moved')
         return
     print(f'[2/5] stopping village {args.village} ...')
-    port = _stop_village(args.village)
+    port, host = _stop_village(args.village)
     print('[3/5] writing the team into the village DB ...')
     _insert_into_village(plan, args.village_dsn)
     print('[4/5] restarting the village ...')
-    _start_village(args.village, port)
+    _start_village(args.village, port, host)
     print('[5/5] committing the parent-side removal ...')
     result = _post('/api/admin/move-team-commit',
                    {'villageId': args.village, 'plan': plan})
