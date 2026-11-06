@@ -403,7 +403,7 @@ def _card_pattern_key(task):
 def _card_pattern_failures(state, key, now_ms):
     if not key:
         return []
-    recent = []
+    recent = {}
     for t in (state.get('tasks') or {}).values():
         if t.get('status') not in ('failed', 'blocked', 'abandoned'):
             continue
@@ -411,8 +411,15 @@ def _card_pattern_failures(state, key, now_ms):
             continue
         ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
         if now_ms - int(ts) <= CARD_PATTERN_WINDOW_MS:
-            recent.append(t)
-    return recent
+            recent[t.get('id')] = int(ts)
+    # Same ledger union: archived failures must keep counting (2026-11-05).
+    for e in (state.get('_repairFailureLog') or []):
+        if e.get('key') != key:
+            continue
+        ts = int(e.get('ts') or 0)
+        if now_ms - ts <= CARD_PATTERN_WINDOW_MS:
+            recent[e.get('taskId') or f"log:{ts}"] = ts
+    return [{'id': k, 'ts': v} for k, v in recent.items()]
 
 
 def _card_pattern_suppressed(state, task, now_ms):
@@ -423,7 +430,8 @@ def _card_pattern_suppressed(state, task, now_ms):
     if len(failures) < CARD_PATTERN_FAILURE_LIMIT:
         return None
     return {'key': key, 'failures': len(failures),
-            'taskIds': [t.get('id') for t in failures][:8]}
+            'taskIds': [(t.get('id') if isinstance(t, dict) else t.get('id'))
+                        for t in failures][:8]}
 
 
 def _stop_card_pattern(state, task, info, author):
@@ -465,13 +473,36 @@ def _stop_card_pattern(state, task, info, author):
             pass
 
 
+def _record_repair_failure(state, task, now_ms):
+    """Durable, in-state failure ledger for the loop guards.
+
+    The guards used to count only live task rows with status failed/blocked;
+    terminal cards are archived by the watchdog within minutes, so the
+    counters kept forgetting and the re-card pump minted a fresh generation
+    every refusal (live 2026-11-05: ~50 repair children in 20 minutes while
+    the counters always read zero). One bounded ledger entry per refusal
+    event, pruned to the longest window on write."""
+    if not isinstance(task, dict):
+        return
+    root = _fix_title_root(str(task.get('title') or ''))
+    log = state.get('_repairFailureLog')
+    if not isinstance(log, list):
+        log = state['_repairFailureLog'] = []
+    log.append({'root': root,
+                'key': _card_pattern_key(task),
+                'taskId': task.get('id'),
+                'ts': int(now_ms)})
+    oldest = now_ms - max(REPAIR_LOOP_WINDOW_MS, CARD_PATTERN_WINDOW_MS) - 60_000
+    state['_repairFailureLog'] = [e for e in log if int(e.get('ts') or 0) >= oldest][-400:]
+
+
 def _repair_loop_should_stop(state, title, now_ms):
     """Same root failed twice inside the window. A third fix card would repeat
     the same contract, so stop and hand the mismatch to the director."""
     root = _fix_title_root(title)
     if not root:
         return None
-    recent = []
+    recent = {}
     for t in (state.get('tasks') or {}).values():
         if t.get('status') not in ('failed', 'abandoned'):
             continue
@@ -479,11 +510,19 @@ def _repair_loop_should_stop(state, title, now_ms):
             continue
         ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
         if now_ms - int(ts) <= REPAIR_LOOP_WINDOW_MS:
-            recent.append(t)
+            recent[t.get('id')] = int(ts)
+    # The in-state ledger survives watchdog archiving of failed rows, which
+    # used to reset the counters between generations.
+    for e in (state.get('_repairFailureLog') or []):
+        if e.get('root') != root:
+            continue
+        ts = int(e.get('ts') or 0)
+        if now_ms - ts <= REPAIR_LOOP_WINDOW_MS:
+            recent[e.get('taskId') or f"log:{ts}"] = ts
     if len(recent) < REPAIR_LOOP_MIN_FAILURES:
         return None
     return {'root': root, 'failures': len(recent),
-            'taskIds': [t.get('id') for t in recent][:6]}
+            'taskIds': [str(k) for k in recent][:6]}
 
 
 def _repair_loop_director(state, task):
@@ -938,6 +977,10 @@ def _send_back_after_failure(state, task, fail_note=None, is_infra=None):
         task['status'] = 'failed'
         task['failedAt'] = now_ms
         task['failNote'] = note[:300]
+        try:
+            _record_repair_failure(state, task, now_ms)
+        except Exception:
+            pass  # the live-row scan remains the backstop
         pattern = _card_pattern_suppressed(state, task, now_ms)
         if pattern:
             _stop_card_pattern(state, task, pattern, author)

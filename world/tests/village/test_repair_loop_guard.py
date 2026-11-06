@@ -82,3 +82,26 @@ def test_send_back_stops_minting_a_third_fix(monkeypatch):
     assert queued == [], 'a third fix card must not be minted'
     assert task['status'] == 'blocked'
     assert task['blockedReason'] == 'repair_loop'
+
+
+def test_ledger_survives_archiving():
+    """A failed card is archived (its row leaves state) within minutes, but
+    the repair-loop guard must still count it -- the 2026-11-05 pump minted
+    ~50 repair children in 20 minutes because archived failures reset the
+    counters between generations."""
+    st = {}
+    t1 = {'id': 'task-1', 'title': 'Fix: Fix disk-full failure on task-12270 staged git write',
+          'status': 'failed', 'failedAt': int(time.time() * 1000) - 60_000}
+    st['tasks'] = {'task-1': t1}
+    sim._record_repair_failure(st, t1, int(time.time() * 1000) - 60_000)
+    # The watchdog archives the row: it leaves the live state.
+    del st['tasks']['task-1']
+    t2 = {'id': 'task-2', 'title': 'Fix: Fix disk-full failure on task-12270 staged git write',
+          'status': 'failed', 'failedAt': int(time.time() * 1000)}
+    st['tasks']['task-2'] = t2
+    sim._record_repair_failure(st, t2, int(time.time() * 1000))
+    info = sim._repair_loop_should_stop(
+        st, t2['title'], int(time.time() * 1000))
+    assert info, 'archived failure must still count toward the stop'
+    assert info['failures'] >= 2, info
+    assert 'task-1' in info['taskIds'], info

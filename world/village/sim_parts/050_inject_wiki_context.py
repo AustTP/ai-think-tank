@@ -1066,6 +1066,10 @@ def finish_task(state, agent_id, grid=None):
             completion_gap = _completion_evidence_gap(task)
             task['status'] = 'failed'
             task['failNote'] = f'Completion blocked: {completion_gap}.'
+            try:
+                _record_repair_failure(state, task, int(time.time() * 1000))
+            except Exception:
+                pass  # the live-row scan remains the backstop
             task['nextAction'] = 'Save or record the deliverable and re-run the acceptance checks.'
             task['deliveryState'] = 'blocked'
             task['manualAttention'] = False
