@@ -246,7 +246,11 @@ def _director_backfill_map():
     A chief of staff id is an invalid director target. The boot repair sweep
     re-points any pure worker under a chief of staff to the senior director.
     """
-    raw = _load_env().get('SEED_DIRECTOR_MAP', '').strip()
+    # Village-worker mode takes its tier overrides from the launch
+    # command's THINK_TANK_* env keys so a village does not inherit the
+    # parent's identity graph through the shared .env file.
+    raw = (os.environ.get('THINK_TANK_SEED_DIRECTOR_MAP')
+           or _load_env().get('SEED_DIRECTOR_MAP', '')).strip()
     out = {}
     for pair in (raw.split(',') if raw else []):
         pair = pair.strip()
@@ -283,12 +287,14 @@ def _director_backfill_map():
 # They are only evaluated at backfill time (via the helpers below), not at
 # import time, because _load_env is defined later in this module.
 def _admin_ids():
-    raw = _load_env().get('SEED_ADMIN_IDS', '').strip()
+    raw = (os.environ.get('THINK_TANK_SEED_ADMIN_IDS')
+           or _load_env().get('SEED_ADMIN_IDS', '')).strip()
     return {x.strip() for x in raw.split(',') if x.strip()}
 
 
 def _senior_director_id():
-    return _load_env().get('SEED_SENIOR_DIRECTOR', '').strip() or None
+    return (os.environ.get('THINK_TANK_SEED_SENIOR_DIRECTOR')
+            or _load_env().get('SEED_SENIOR_DIRECTOR', '')).strip() or None
 
 def _backfill_directors_in_db():
     state = get_state_from_db()
