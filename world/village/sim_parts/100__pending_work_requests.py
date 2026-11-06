@@ -875,6 +875,15 @@ def _notify_card_failure(state, task, reason, category='failed', now_ms=None):
     """
     if not isinstance(task, dict):
         return None
+    # Every failure path funnels here, so this is the one complete place to
+    # feed the loop guards' in-state ledger: terminal failed rows are archived
+    # within minutes, and counters that only scan live rows forget each
+    # generation (the 2026-11-05 pump minted ~50 repair children in 20
+    # minutes while every counter read zero).
+    try:
+        _record_repair_failure(state, task, int(now_ms or time.time() * 1000))
+    except Exception:
+        pass  # the live-row scan remains the backstop
     task_id = task.get('id') or task.get('taskId')
     title = (task.get('title') or task_id or 'untitled card').strip()
     issue = (task.get('issueKey') or '').strip()
