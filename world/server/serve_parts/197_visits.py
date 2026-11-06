@@ -416,10 +416,20 @@ async def village_return_visitor(village_id: str, request: Request):
         return JSONResponse(
             {'error': f"{agent_id} is not in {village_id}'s DB"},
             status_code=404)
-    # Un-stamp before she goes home.
+    # Un-stamp before she goes home -- and put the HOME mail in her blob
+    # NOW: the parent's state was read before her row exists again, so a
+    # mailbox append after the insert would silently land nowhere.
     live_blob = json.loads(rows['live'][1])
     for k in ('_visitFrom', '_visitReturnAt', '_visitReason'):
         live_blob.pop(k, None)
+    box = live_blob.setdefault('mailbox', [])
+    box.append({
+        'kind': 'visit', 'read': False, 'ts': int(time.time() * 1000),
+        'text': f'You are HOME from village {village_id}. Your footprint'
+                ' is back where it belongs; your team and tasks are as'
+                ' you left them.',
+    })
+    del box[:-200]
     port = _village_port(label)
     _bootout(label)
     if port and not _wait_port(host, port, False, 30):
@@ -462,17 +472,6 @@ async def village_return_visitor(village_id: str, request: Request):
             conn.execute(
                 'UPDATE villages_visits SET returned_at = ?'
                 ' WHERE agent_id = ?', (time.time(), agent_id))
-        agent = (state.get('agents') or {}).get(agent_id)
-        if isinstance(agent, dict):
-            box = agent.setdefault('mailbox', [])
-            box.append({
-                'kind': 'visit', 'read': False,
-                'ts': int(time.time() * 1000),
-                'text': f'You are HOME from village {village_id}. Your'
-                        ' footprint is back where it belongs; your team'
-                        ' and tasks are as you left them.',
-            })
-            del box[:-200]
         theo = (state.get('agents') or {}).get('theo')
         if isinstance(theo, dict):
             box = theo.setdefault('mailbox', [])
