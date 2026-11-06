@@ -783,6 +783,7 @@ AUTH_PUBLIC_PATHS = (
     '/api/file-grants', '/api/app-grants',
     '/api/device/checkin',                              # X-Device-Key
     '/api/webhook/',                                    # X-Webhook-Key (external watchers, any channel)
+    '/api/villages/',                                   # village heartbeat: X-Parent-Token, in-handler (194)
     '/api/task-budget', '/api/budget', '/api/env/reload',
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',

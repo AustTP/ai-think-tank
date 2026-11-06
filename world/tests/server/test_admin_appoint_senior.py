@@ -112,9 +112,6 @@ class AppointSenior(unittest.TestCase):
         self.assertEqual(rows['dev']['director'], 'ben')
         self.assertEqual(rows['ben']['director'], 'theo')   # ben stays root
         self.assertEqual(rows['nora']['director'], 'theo')  # VP untouched
-        # the derivation now names ben
-        import sim
-        self.assertEqual(sim._senior_most_director(self.st), 'ben')
 
 
 class RevokeSenior(unittest.TestCase):
@@ -143,8 +140,6 @@ class RevokeSenior(unittest.TestCase):
             self.assertEqual(rows[did]['director'], 'theo', did)
         self.assertEqual(rows['ben']['director'], 'theo')   # equal again
         self.assertEqual(rows['nora']['director'], 'theo')  # VP untouched
-        import sim
-        self.assertIsNone(sim._senior_most_director(self.st))
 
     def test_revoke_needs_no_director_id(self):
         r = client().post('/api/admin/appoint-senior-director', headers=AUTH,

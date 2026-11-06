@@ -90,7 +90,20 @@ def test_brief_step_mails_once_per_interval():
     assert len(state['agents']['nora']['mailbox']) == 2
 
 
-def test_brief_step_skips_teams_without_an_active_sprint():
+def test_brief_step_scans_a_worker_team_even_without_a_sprint():
+    # Operator floor (2026-11-06): supervision must not be sprint-gated --
+    # a team with active workers gets an hourly scan regardless of sprint.
+    # ben's team has clara working t2, so ben gets a brief at 1000.
     state = _state()
+    sim._supervisor_brief_step(state, 0, 1000)
+    kinds = [m.get('kind') for m in state['agents']['ben']['mailbox']]
+    assert 'supervisor_brief' in kinds
+
+
+def test_brief_step_skips_an_idle_workerless_team():
+    # The other half of the floor: no sprint AND no active workers means
+    # nothing to supervise -- no brief, no spend.
+    state = _state()
+    state['tasks'] = {}  # nobody is working anywhere
     sim._supervisor_brief_step(state, 0, 1000)
     assert state['agents']['ben']['mailbox'] == []

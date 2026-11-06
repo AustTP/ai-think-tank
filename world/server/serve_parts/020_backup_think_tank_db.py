@@ -1521,7 +1521,11 @@ def _default_roster_definitions():
     # once seeded, in think_tank.db. Format per entry (comma-separated):
     #   id|name|color|role|model
     # e.g.  ada|Ada|#e06666|Research|small
-    raw = _load_env().get('SEED_ROSTER', '').strip()
+    # Village-worker mode seeds its OWN roster from THINK_TANK_SEED_ROSTER
+    # (passed on the launch command), so a village process does not inherit
+    # the parent's roster identity through the shared .env file.
+    raw = (os.environ.get('THINK_TANK_SEED_ROSTER')
+           or _load_env().get('SEED_ROSTER', '')).strip()
     roster = []
     for entry in (raw.split(',') if raw else []):
         entry = entry.strip()

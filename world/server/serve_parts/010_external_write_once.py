@@ -859,6 +859,17 @@ def init_db():
             message TEXT NOT NULL,
             ts REAL NOT NULL
         )''')
+        # The village registry (194, 2026-11-06): one row per village
+        # PROCESS the parent knows about, with heartbeat bookkeeping that
+        # turns "the village process is alive" into an observable fact.
+        conn.execute('''CREATE TABLE IF NOT EXISTS villages_registry (
+            id TEXT PRIMARY KEY,
+            name TEXT,
+            api_base TEXT,
+            created_at REAL,
+            last_heartbeat_at REAL,
+            last_status TEXT
+        )''')
         # Judge-vs-anchor calibration samples (self-evolve
         # selfdeception.py -- "judge the judge"). One row per review-checklist
         # grade where Jev's SUBJECTIVE verdict (meets/fails) can be checked

@@ -11,6 +11,15 @@ import sys as _sys
 if any(a == '--read-only' for a in _sys.argv):
     _os.environ.setdefault('THINK_TANK_READ_ONLY', '1')
     print('[args] --read-only: replica mode (writes refused, loops off)', flush=True)
+# --village=<id> (2026-11-06): start this process as a VILLAGE WORKER: its
+# own DB (THINK_TANK_DB_URL decides which), its own sim, no operator
+# console, no org-level roles. The parent (control plane) learns about it
+# through the heartbeat this mode sends. Parsed BEFORE the parts exec so
+# 00_header sees it at import.
+for _a in _sys.argv:
+    if _a.startswith('--village='):
+        _os.environ.setdefault('THINK_TANK_VILLAGE', _a.split('=', 1)[1])
+        print(f'[args] village mode: {_a}', flush=True)
 # kill -USR1 <pid> dumps all python thread stacks to stderr (found the RSS
 # spin tonight; keep it as standing incident tooling).
 faulthandler.register(signal.SIGUSR1)

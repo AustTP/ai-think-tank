@@ -43,6 +43,17 @@ if __name__ == '__main__':
 # db_backend guard is the hard backstop: even a stray code path cannot
 # issue a mutating statement in this process.
 READ_ONLY_MODE = bool(os.environ.get('THINK_TANK_READ_ONLY'))
+
+# Village-worker mode (2026-11-06): `serve.py --village=<id>` runs this
+# process as ONE village with its OWN database (THINK_TANK_DB_URL selects
+# it) and its own sim. The org-level roles (chief of staff, regional VP)
+# live in the parent process; this process reports to it by heartbeat
+# (THINK_TANK_PARENT_URL) and refuses the operator console. The main
+# deployment sets none of these: one process, villages are state
+# partitions inside it -- until a village is spun out.
+VILLAGE_ID = (os.environ.get('THINK_TANK_VILLAGE') or '').strip() or None
+VILLAGE_MODE = VILLAGE_ID is not None
+PARENT_URL = (os.environ.get('THINK_TANK_PARENT_URL') or '').strip().rstrip('/')
 if READ_ONLY_MODE:
     try:
         import db_backend as _db_backend_ro
