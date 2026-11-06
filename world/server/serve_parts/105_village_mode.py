@@ -102,6 +102,55 @@ async def _village_heartbeat_loop():
                 urllib.request.urlopen, req, None, 10)
         except Exception:
             pass  # the parent being down must never take the village down
+        # Consume the parent -> village outbox: org directives for THIS
+        # village's people (chief-of-staff replies, routing decisions).
+        # At-most-once: the parent deletes rows as it serves them.
+        try:
+            req = urllib.request.Request(
+                f'{PARENT_URL}/api/villages/{VILLAGE_ID}/inbox',
+                headers={'X-Parent-Token': token})
+            resp = await asyncio.to_thread(
+                urllib.request.urlopen, req, None, 10)
+            items = json.loads(await asyncio.to_thread(resp.read)).get(
+                'items') or []
+            if items:
+                _village_deliver_inbox(items)
+        except Exception:
+            pass
+
+
+def _village_deliver_inbox(items):
+    """Deliver org->village mail into local agents' mailboxes. Runs in the
+    village process only; never wakes or blocks the sim."""
+    try:
+        from serve import _state_begin, _state_abort, save_state_to_db
+        state = _state_begin()
+        if not state:
+            return
+        try:
+            agents = state.get('agents') or {}
+            changed = False
+            import time as _time
+            now_ms = int(_time.time() * 1000)
+            for item in items:
+                agent = agents.get(item.get('to') or '')
+                if not isinstance(agent, dict):
+                    continue  # unknown recipient: dropped (parent was told)
+                box = agent.setdefault('mailbox', [])
+                box.append({
+                    'kind': item.get('kind') or 'directive',
+                    'read': False,
+                    'ts': now_ms,
+                    'text': f'Chief of staff (org): {item.get("text")}',
+                })
+                del box[:-200]
+                changed = True
+            if changed:
+                save_state_to_db(state)
+        finally:
+            _state_abort()
+    except Exception:
+        pass
 
 
 if VILLAGE_MODE:

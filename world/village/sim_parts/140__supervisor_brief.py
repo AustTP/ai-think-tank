@@ -95,15 +95,25 @@ def _supervisor_brief(state, team_id, now_ms=None):
 
 
 def _deliver_supervisor_brief(state, team_id, now_ms=None):
-    """Append the brief to the team director's mailbox. Never wakes or blocks."""
+    """Append the brief to the team director's mailbox. Never wakes or blocks.
+
+    CROSS-VILLAGE (2026-11-06): a team may live in a village whose DB does
+    not hold its director's agent row (her home is the parent or another
+    village). When the director is not present locally, the brief is
+    RELAYED through the parent's cross-village API instead of dropped --
+    the village's workers still get supervised from wherever the director
+    actually lives."""
     team = _team_row(state, team_id)
     director_id = (team or {}).get('directorId')
     agent = (state.get('agents') or {}).get(director_id)
-    if not director_id or not agent:
+    if not director_id:
         return False
     brief = _supervisor_brief(state, team_id, now_ms)
     if not brief:
         return False
+    if not agent:
+        return _relay_supervisor_brief(state, team, director_id, brief,
+                                       now_ms)
     _append_mailbox(agent, {
         'kind': 'supervisor_brief',
         'about': team_id,
@@ -112,6 +122,37 @@ def _deliver_supervisor_brief(state, team_id, now_ms=None):
         'createdAt': int(time.time() * 1000) if now_ms is None else int(now_ms),
     })
     return True
+
+
+def _relay_supervisor_brief(state, team, director_id, brief, now_ms=None):
+    """Village mode only: POST a supervisor brief for a director whose
+    agent row lives elsewhere (parent or another village). Fire-and-forget;
+    a failed relay is retried on the next brief pass."""
+    try:
+        from serve import VILLAGE_ID, PARENT_URL  # village-mode only
+        import os as _os
+        import json as _json
+        import urllib.request as _url
+        if not (VILLAGE_ID and PARENT_URL):
+            return False
+        body = _json.dumps({
+            'directorId': director_id,
+            'villageId': VILLAGE_ID,
+            'teamId': team.get('id'),
+            'teamName': team.get('name') or team.get('id'),
+            'text': brief.get('text') or '',
+            'ts': int(now_ms) if now_ms is not None else int(time.time() * 1000),
+        }).encode()
+        req = _url.Request(
+            f'{PARENT_URL}/api/villages/{VILLAGE_ID}/relay-brief',
+            data=body, method='POST',
+            headers={'Content-Type': 'application/json',
+                     'X-Parent-Token':
+                     _os.environ.get('THINK_TANK_PARENT_TOKEN') or ''})
+        _url.urlopen(req, timeout=10)
+        return True
+    except Exception:
+        return False
 
 
 def _first_week_onboard_review_step(state, now_ms):

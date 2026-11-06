@@ -784,6 +784,8 @@ AUTH_PUBLIC_PATHS = (
     '/api/device/checkin',                              # X-Device-Key
     '/api/webhook/',                                    # X-Webhook-Key (external watchers, any channel)
     '/api/villages/',                                   # village heartbeat: X-Parent-Token, in-handler (194)
+    '/api/villages-self/',                              # village move-in: X-Parent-Token, in-handler (196)
+    '/api/admin/move-team-to-village',                  # admin key OR parent token, in-handler (196)
     '/api/task-budget', '/api/budget', '/api/env/reload',
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',
