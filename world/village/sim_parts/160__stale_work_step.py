@@ -132,6 +132,15 @@ def _requeue_paused_work(state, task, now_ms):
     where the card was already pinned.
     """
     room = task.get('room') or _resolve_assignment_room(task)
+    # Escalating backoff (2026-11-05): an immediately-due parked card spins
+    # assign -> run -> park every 6-second pass (126 cycles per 10 minutes
+    # live while the free pool was quota-saturated), burning worker walks and
+    # refilling nothing. Park it out for 2 minutes on the first park, doubling
+    # to a 15-minute ceiling; the free-tier quota windows refill between
+    # attempts instead of under the spin.
+    parks = int(task.get('_pauseParks') or 0) + 1
+    task['_pauseParks'] = parks
+    not_before = now_ms + min(2 * 60_000 * parks, 15 * 60_000)
     queue_work(state, [{
         'title': task.get('title'),
         # reissueOf marks this as the SAME work continuing, not a new card:
@@ -143,7 +152,10 @@ def _requeue_paused_work(state, task, now_ms):
         'taskType': task.get('taskType') or 'code',
         'projectLabel': task.get('projectLabel'),
         'priority': task.get('priority'),
-        'notBefore': now_ms,
+        'notBefore': not_before,
+        # The park count rides the item so the backoff escalates across
+        # reissue cycles instead of resetting each park.
+        '_pauseParks': parks,
         'sizeEstimate': task.get('sizeEstimate'),
         'teamId': task.get('teamId'),
         'productId': task.get('productId'),

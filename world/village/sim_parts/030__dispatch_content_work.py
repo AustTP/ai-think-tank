@@ -327,6 +327,10 @@ def queue_work(state, items):
             # traces to the original and dedup can see the link. Same class of
             # whitelist gap as 'distill'/'checklist'.
             'reissueOf': item.get('reissueOf') or None,
+            # Credits-pause park counter (160__stale_work_step's escalating
+            # backoff): survives the round trip so the backoff escalates
+            # across reissue cycles instead of resetting each park.
+            '_pauseParks': int(item.get('_pauseParks') or 0),
             # DEV-109: agents who already failed this card's walk (stuck
             # cancel, tracked by _requeue_unreachable_work). Assignment skips
             # them so a stranded body is never re-picked into the same wall.
