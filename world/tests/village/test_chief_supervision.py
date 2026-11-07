@@ -71,16 +71,22 @@ def test_cross_team_cards_go_to_the_chief_of_staff_never_the_vp():
 
 
 def test_routine_sweep_is_daily_and_carries_the_rollup():
+    # The interval is PINNED on purpose: this test specifies the sweep's
+    # rhythm and payload, not the policy-reload pipeline (test_config owns
+    # that). In one long pytest process some reload path can leave the sim
+    # mirror holding the policy default; pinning makes the spec immune.
+    import unittest.mock as mock
     st = _mk()
     # A live-but-unremarkable board: no attention reasons, but work exists
     # (the drained-board invariant keeps the sweep off an EMPTY board).
     st['tasks'] = {'t9': {'teamId': 'ben', 'status': 'working',
                           'title': 'steady work', 'ownSpendUsd': 0.1}}
     queued = []
-    import unittest.mock as mock
     with mock.patch.object(sim, 'queue_work', lambda s, q: queued.extend(q)), \
             mock.patch.object(sim, '_supervisor_admin_card_open',
-                              lambda s: False):
+                              lambda s: False), \
+            mock.patch.object(sim, 'CHIEF_MONITOR_INTERVAL_MS',
+                              24 * 60 * 60 * 1000):
         sim._supervisor_brief_step(st, 0, 10 ** 9)
         assert queued and queued[0]['assignedTo'] == 'theo'
         assert 'routine sweep' in queued[0]['title']

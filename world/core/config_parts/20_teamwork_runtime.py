@@ -66,7 +66,7 @@ AGENT_EDITABLE_POLICY_KEYS: frozenset = frozenset({
 # that did `from config import OPERATOR_POLICY` see reloads immediately).
 OPERATOR_POLICY: dict = dict(OPERATOR_POLICY_DEFAULT)
 
-_OPERATOR_CACHE = {'mtime': None, 'data': None}
+_OPERATOR_CACHE = {'mtime': None, 'data': None, 'path': None}
 
 # Consumer refresh hooks. Operator-policy scalars now bind declaratively via
 # bind_policy()/POLICY_BINDINGS below, so sim/serve/content/sublow no longer
@@ -214,13 +214,24 @@ def get_operator_policy():
     """Return the current operator_policy.json contents, re-reading the file
     whenever its mtime changes -- the same live-reload pattern as
     get_grants_config. Also refreshes the module-level OPERATOR_POLICY dict in
-    place so `from config import OPERATOR_POLICY` consumers see the edit."""
+    place so `from config import OPERATOR_POLICY` consumers see the edit.
+
+    The cache key includes the PATH, not just the mtime: tests redirect
+    OPERATOR_POLICY_PATH at temp files and restore it right after, and a
+    same-second mtime collision between the temp file and the shipped one
+    made the post-restore reload a silent no-op -- the shipped file then
+    served the temp file's values, leaking a test's 40-minute chief-sweep
+    interval into every later test in the process (CI's chief-supervision
+    red since the supervisor work; fast runners collide, slow laptops
+    don't)."""
     try:
         mtime = os.path.getmtime(OPERATOR_POLICY_PATH)
     except OSError:
         mtime = -1
-    if _OPERATOR_CACHE['mtime'] != mtime:
+    if (_OPERATOR_CACHE['mtime'] != mtime
+            or _OPERATOR_CACHE.get('path') != OPERATOR_POLICY_PATH):
         _OPERATOR_CACHE['mtime'] = mtime
+        _OPERATOR_CACHE['path'] = OPERATOR_POLICY_PATH
         _OPERATOR_CACHE['data'] = _load_operator_policy(OPERATOR_POLICY_PATH)
         OPERATOR_POLICY.clear()
         OPERATOR_POLICY.update(_OPERATOR_CACHE['data'])

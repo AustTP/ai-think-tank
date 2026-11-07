@@ -175,7 +175,13 @@ OPERATOR_POLICY_DEFAULT: dict = {
     # per-monitoring-card price are rhythm/economics, not safety gates.
     'supervisorBriefIntervalMs': 15 * 60 * 1000,
     'supervisorCardIntervalMs': 30 * 60 * 1000,
-    'chiefMonitorIntervalMs': 60 * 60 * 1000,
+    # The chief's routine cross-team sweep is DAILY (operator 2026-11-06,
+    # see 130__start_breakdown's CHIEF_MONITOR_INTERVAL_MS note). The
+    # default matches the shipped operator_policy.json; the old 1h default
+    # contradicted it and only ever showed up where the shipped file was
+    # absent -- and in test processes, where a reload-without-bind left the
+    # sim mirror holding this default.
+    'chiefMonitorIntervalMs': 24 * 60 * 60 * 1000,
     'supervisorCardBudgetUsd': 0.05,
     # Delegation and budget-top-up bounds. Operational spend shape, not the
     # tank-wide spend ceiling (that stays in .env / POST /api/budget).
