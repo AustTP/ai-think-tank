@@ -3,6 +3,35 @@ commands (/plans, /approve, /reject, /status). Split out of the
 capability-handle part so no single part exceeds 1,000 lines."""
 
 
+def _log_telegram_send(method, params, ok):
+    """One audit row per Telegram MESSAGE aimed at the operator's chat --
+    sendMessage text and sendPhoto captions, success or failure. Measured
+    2026-11-07: the operator asked 'what did you send me on Telegram' and the
+    honest answer required reconstructing pushes from the outbox queue-time
+    ledger, while command replies were not recorded anywhere. This makes the
+    answer one action_log query. Non-message API calls (getUpdates,
+    setMyCommands, ...) stay out of the log. Best-effort: a logging failure
+    must never break a send. Preview is secret-redacted and bounded."""
+    try:
+        if method not in ('sendMessage', 'sendPhoto'):
+            return
+        text = str((params or {}).get('text') or (params or {}).get('caption') or '')
+        try:
+            from serve import _redact_secrets as _redact
+            text = _redact(text)
+        except Exception:
+            pass
+        log_action('', 'telegram_sent', {
+            'method': method,
+            'chatId': str((params or {}).get('chat_id') or ''),
+            'ok': bool(ok),
+            'chars': len(text),
+            'preview': text[:200],
+        }, authorized=True)
+    except Exception:
+        pass
+
+
 def _telegram_api_sync(method, params=None, timeout=30):
     """Real, direct call to Telegram's Bot API -- not a self-loopback, so no
     asyncio.to_thread deadlock risk here (that class of bug only applies to
@@ -23,13 +52,17 @@ def _telegram_api_sync(method, params=None, timeout=30):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- fixed Telegram API host
             body = json.loads(resp.read().decode('utf-8', errors='replace'))
-            return body.get('result') if body.get('ok') else None
+            ok = bool(body.get('ok'))
+            _log_telegram_send(method, params, ok)
+            return body.get('result') if ok else None
     except urllib.error.HTTPError as e:
+        _log_telegram_send(method, params, False)
         if e.code == 409:
             raise _TelegramConflictError(str(e))
         print(f'[telegram] {method} failed: {e}', flush=True)
         return None
     except Exception as e:
+        _log_telegram_send(method, params, False)
         print(f'[telegram] {method} failed: {e}', flush=True)
         return None
 

@@ -143,6 +143,66 @@ class TelegramApiSync(unittest.TestCase):
                                         side_effect=ConnectionError('no')):
             self.assertIsNone(serve._telegram_api_sync('getUpdates', {}))
 
+    def test_send_message_success_logs_one_audit_row(self):
+        body = json.dumps({'ok': True, 'result': {'message_id': 7}})
+        rows = []
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=_FakeResp(body)), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append((a, k))):
+            self.assertEqual(serve._telegram_api_sync(
+                'sendMessage', {'chat_id': '111', 'text': 'hello world'}),
+                {'message_id': 7})
+        self.assertEqual(len(rows), 1)
+        args, kwargs = rows[0]
+        self.assertEqual(args[0], '')
+        self.assertEqual(args[1], 'telegram_sent')
+        details = args[2]
+        self.assertEqual(details['method'], 'sendMessage')
+        self.assertEqual(details['chatId'], '111')
+        self.assertTrue(details['ok'])
+        self.assertEqual(details['preview'], 'hello world')
+
+    def test_send_message_failure_logs_ok_false(self):
+        rows = []
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        side_effect=_http_error(500)), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append(a)):
+            self.assertIsNone(serve._telegram_api_sync(
+                'sendMessage', {'chat_id': '111', 'text': 'x'}))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], 'telegram_sent')
+        self.assertFalse(rows[0][2]['ok'])
+
+    def test_polling_and_setup_never_log(self):
+        body = json.dumps({'ok': True, 'result': []})
+        calls = []
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=_FakeResp(body)), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: calls.append(a)):
+            self.assertEqual(serve._telegram_api_sync('getUpdates', {}), [])
+            serve._telegram_api_sync('setMyCommands', {'commands': []})
+        self.assertEqual(calls, [])
+
+    def test_send_photo_logs_caption(self):
+        body = json.dumps({'ok': True, 'result': {'message_id': 9}})
+        rows = []
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=_FakeResp(body)), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append(a)):
+            serve._telegram_api_sync(
+                'sendPhoto', {'chat_id': '111', 'caption': 'the shot'})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][1], 'telegram_sent')
+        self.assertEqual(rows[0][2]['preview'], 'the shot')
+
 
 class TelegramPollLoop(unittest.TestCase):
     def test_processes_updates_then_handles_conflict(self):
