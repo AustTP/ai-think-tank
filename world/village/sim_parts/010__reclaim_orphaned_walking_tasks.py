@@ -296,6 +296,13 @@ class SimEngine:
                     _tick_phase_stamp(state, 'task_cycle')
                     _task_cycle(state, now=now, grid=self._grid, doors=self._doors,
                                 task_id_holder=_TASK_ID_HOLDER)
+                # Scheduled items (425_scheduled_items stores them; this
+                # engine mints their cards): owner-role recurring duties --
+                # the regional VP's daily Telegram alert scan first. Same
+                # pass, same read-modify-write, so the minted cards join
+                # this pass's queue snapshot.
+                _tick_phase_stamp(state, 'scheduled_items')
+                _scheduled_items_pass(state, now_ms=int(now * 1000))
 
                 # Heal agents stranded in unreachable outdoor cells
                 # (the reachability-gap bug). Runs AFTER movement + task cycle so

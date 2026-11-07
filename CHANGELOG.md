@@ -44,6 +44,30 @@
   grants ONE bounded final extension (TASK_CONTENT_GRACE_FINAL_S=600s,
   once per run) to a fresh-heartbeat run before the cap goes hard again.
   A dead thread still falls through to the honest fallback immediately.
+- Scheduled items (team-owned recurring cards): state['scheduledItems']
+  stores {title, ownerRole, cadence, deliverable, ...}; the sim engine
+  (165__scheduled_items) resolves the owner role -- chief-of-staff,
+  regional-vp, senior-director, recursive-director, or a named worker --
+  to live agents each period and mints ONE directed card per owner through
+  queue_work (dedup, refinement pins, and the completion gate all apply).
+  API: POST /api/intent/schedule-recurring, PATCH/DELETE
+  /api/schedules/item/{id}, listed in GET /api/schedules. Operator-gated
+  (player session or director/admin agent), so a team's director can
+  schedule the team's own standing duties (e.g. a quarterly review of the
+  technical agreements).
+- Seeded standing item (operator direction, 2026-11-07): each regional
+  VP's DAILY Telegram alert scan. The engine lands the last 24h of
+  telegram_sent rows in the Library first
+  (write_telegram_alert_digest -> analysis/telegram-alert-digest-<day>.md,
+  grouped by alert class), then mints the RVP a directed report card:
+  triage which alerts were real issues the tank should have handled
+  itself, and file one issue per genuine problem for the owning director.
+- UI style guide: library/reports/ui-style-guide.md, derived by a vision
+  pass (gemini-flash-lite-latest) over the operator's 8 most recent saved
+  iCloud Photos (dark dashboard aesthetic: #0a0b0e background, #10b981
+  mint accent, mono+Inter type, 8px-grid bento layout, glyph icons,
+  pill chips; mood: autonomous, tactical, high-velocity, analytical,
+  immersive).
 - Standing rate-limit policy, made explicit: the village ALWAYS observes the
   free providers' published limits, paid credits or not. The pool already runs
   free-first -- free endpoints serve within their rpm/rpd/tpm windows, and the

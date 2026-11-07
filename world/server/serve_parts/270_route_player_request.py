@@ -225,7 +225,18 @@ async def list_schedules(request: Request):
             'status': task.get('status'),
         })
     one_offs.sort(key=lambda x: int(x.get('at') or 0))
-    return JSONResponse({'ok': True, 'topics': topics, 'oneOffs': one_offs})
+    items = [{
+        'id': i.get('id'), 'title': i.get('title'),
+        'ownerRole': i.get('ownerRole'), 'cadence': i.get('cadence'),
+        'deliverable': i.get('deliverable'),
+        'villageId': i.get('villageId'), 'teamId': i.get('teamId'),
+        'agentId': i.get('agentId'),
+        'enabled': i.get('enabled', True) is not False,
+        'lastRunAtMs': i.get('lastRunAtMs') or 0,
+        'lastRunSkipped': i.get('lastRunSkipped'),
+    } for i in (state.get('scheduledItems') or []) if isinstance(i, dict)]
+    return JSONResponse({'ok': True, 'topics': topics, 'oneOffs': one_offs,
+                         'items': items})
 
 
 @app.patch('/api/schedules/topic/{topic_id}')
