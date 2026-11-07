@@ -487,7 +487,7 @@ def _maybe_notify_failure(agent_id, action, details):
         severity, 900)
     now = time.time()
     key = _failure_notice_key(action, details)
-    if severity == 'low':
+    if severity in ('low', 'medium'):
         # Measured 2026-11-07: 183 pushes reached the player in about six
         # hours, mostly low-severity 'review or gate rejected' notices keyed
         # per distinct task/agent -- the operator's channel drowned. Low
@@ -495,7 +495,7 @@ def _maybe_notify_failure(agent_id, action, details):
         # normally, later ones accumulate, and the next send after the window
         # expires reports the total plus up to five recent sources. Medium
         # and above keep their per-key cooldowns.
-        low_key = f'__low__|{label}'
+        low_key = f'__batched__|{severity}|{label}'
         with _FAILURE_NOTICE_LOCK:
             bucket = _FAILURE_NOTICE_STATE.get(low_key)
             if bucket and now - bucket['last'] < cooldown:
@@ -524,6 +524,8 @@ def _maybe_notify_failure(agent_id, action, details):
             return
         # First failure in this label's window: fall through to the shared
         # per-key path so the ordinary notice still carries its own detail.
+        # Medium keeps a shorter window than low so per-event detail is not
+        # starved; critical and high always take the per-key path.
     with _FAILURE_NOTICE_LOCK:
         state = _FAILURE_NOTICE_STATE.get(key)
         if state and now - state['last'] < cooldown:

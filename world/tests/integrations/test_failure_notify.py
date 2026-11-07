@@ -107,7 +107,7 @@ class LowSeverityBatchingTest(unittest.TestCase):
                 serve._maybe_notify_failure(
                     f'agent{i}', 'quality_gate_reject', {'taskId': f'task-{i}'})
         self.assertEqual(len(sent), 1)
-        bucket = serve._FAILURE_NOTICE_STATE['__low__|A review or gate rejected work']
+        bucket = serve._FAILURE_NOTICE_STATE['__batched__|low|A review or gate rejected work']
         self.assertEqual(bucket['suppressed'], 3)
         self.assertEqual(len(bucket['keys']), 3)
 
@@ -135,7 +135,10 @@ class LowSeverityBatchingTest(unittest.TestCase):
         self.assertIn('task-2', body)
         self.assertIn('task-1', body)
 
-    def test_medium_keeps_per_key_cooldown(self):
+    def test_medium_failures_batch_per_label_not_per_key(self):
+        # Medium used to keep per-key cooldowns, but distinct keys per
+        # agent/task defeated them (measured 2026-11-07: ~30 pushes/hour).
+        # Medium now batches per label like low; high stays per-event.
         sent = []
         serve._FAILURE_NOTICE_STATE.clear()
         with mock.patch.object(serve, 'send_player_telegram_sync',
@@ -147,4 +150,41 @@ class LowSeverityBatchingTest(unittest.TestCase):
                                         {'decision': 'denied', 'taskId': 't1'})
             serve._maybe_notify_failure('b', 'browse',
                                         {'decision': 'denied', 'taskId': 't2'})
-        self.assertEqual(len(sent), 2)
+        self.assertEqual(len(sent), 1)
+        bucket = serve._FAILURE_NOTICE_STATE[
+            '__batched__|medium|An operation failed or was blocked']
+        self.assertEqual(bucket['suppressed'], 1)
+    def test_medium_digest_after_window_reports_total_in_body(self):
+        sent = []
+        serve._FAILURE_NOTICE_STATE.clear()
+        clock = {'t': 1000.0}
+        with mock.patch.object(serve, 'send_player_telegram_sync',
+                               side_effect=lambda s, b: sent.append((s, b))), \
+             mock.patch.object(serve.time, 'time',
+                               side_effect=lambda: clock['t']), \
+             mock.patch.object(serve.threading, 'Thread',
+                               self._fake_thread(sent)):
+            for i in range(3):
+                serve._maybe_notify_failure(
+                    f'agent{i}', 'tool_use_refused', {'taskId': f'task-{i}'})
+            self.assertEqual(len(sent), 1)
+            clock['t'] += 901
+            serve._maybe_notify_failure(
+                'agent9', 'tool_use_refused', {'taskId': 'task-9'})
+            self.assertEqual(len(sent), 2)
+            # The digest count lives in the body, not the subject.
+            self.assertIn('2 more', sent[1][1])
+
+    def test_high_failures_still_send_per_event(self):
+        sent = []
+        serve._FAILURE_NOTICE_STATE.clear()
+        with mock.patch.object(serve, 'send_player_telegram_sync',
+                               side_effect=lambda s, b: sent.append((s, b))), \
+             mock.patch.object(serve.time, 'time', return_value=1000.0), \
+             mock.patch.object(serve.threading, 'Thread',
+                               self._fake_thread(sent)):
+            for i in range(3):
+                serve._maybe_notify_failure(
+                    f'agent{i}', 'content_run_abandoned',
+                    {'taskId': f'task-{i}'})
+            self.assertEqual(len(sent), 3)
