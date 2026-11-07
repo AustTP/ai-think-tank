@@ -932,3 +932,19 @@ class OnboardCeremony(SimIsolation):
 
 if __name__ == '__main__':
     unittest.main()
+
+def test_heal_agent_identity_prunes_id_less_roster_rows():
+    # Measured 2026-11-07: a bare {'director': 'theo'} hire row in the
+    # roster crashed EVERY sim tick at _stable_fallback_color(None),
+    # freezing the sim while HTTP kept serving. The heal pass exists to
+    # normalize drift, so an id-less entry is pruned, not fatal.
+    import serve
+    state = {'agentRoster': [
+        {'id': 'ada', 'name': 'Ada'},
+        {'director': 'theo'},
+        {'id': 'ben', 'name': 'Ben', 'color': '#123456', 'model': 'small'},
+    ], 'agents': {}}
+    serve._heal_agent_identity(state)
+    roster = state['agentRoster']
+    assert [d.get('id') for d in roster] == ['ada', 'ben']
+    assert roster[0].get('color')  # backfilled for the surviving entry

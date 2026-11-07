@@ -812,8 +812,19 @@ def _heal_agent_identity(state):
     # The roster entries themselves can predate `color`/`model` too (ada/
     # ben/theo's roster defs have neither) -- fix those first since the
     # agents loop below sources its own backfill from the roster.
-    for d in roster:
+    for d in list(roster):
         aid = d.get('id')
+        if not aid:
+            # A hire/appointment flow once landed a bare {'director': ...}
+            # row in the roster. An id-less entry can never be addressed by
+            # anything (no key, no mail, no task assignment), so the heal
+            # pass prunes it -- measured 2026-11-07: this exact row crashed
+            # EVERY tick here via _stable_fallback_color(None), freezing the
+            # whole sim while HTTP kept serving. Prune, not crash: the
+            # invariant this pass exists for.
+            roster.remove(d)
+            changed = True
+            continue
         seed = defaults_by_id.get(aid, {})
         if not d.get('color'):
             d['color'] = seed.get('color') or _stable_fallback_color(aid)
