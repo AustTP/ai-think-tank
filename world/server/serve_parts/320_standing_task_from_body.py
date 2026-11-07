@@ -571,6 +571,20 @@ async def containers_switch(container_id: str, request: Request):
     return JSONResponse({'ok': True, 'containerId': container_id})
 
 
+# Read-only API-to-browser fallback for /api/browse (operator pitch, the
+# smallest slice that survives the grill): agents whose fetch of an
+# already-approved URL dies with 404/410 -- the signature of a moved
+# endpoint or an SPA route that only exists behind a real browser -- get
+# the SAME url retried through the headless browser the render path
+# already uses. No second, unvetted URL is ever fetched (a host-root
+# variant would need its own Jev classify and stays out of this slice),
+# a render is read-only navigation (no clicks, no forms), and the whole
+# behavior switches off in one place here. Defaults to enabled; set
+# BROWSER_FALLBACK_ENABLED=false in ~/ai-think-tank/.env to shut it off.
+BROWSER_FALLBACK_ENABLED = _load_env().get('BROWSER_FALLBACK_ENABLED', 'true').strip().lower() != 'false'
+_BROWSER_FALLBACK_CODES = frozenset({404, 410})
+
+
 @app.post('/api/browse')
 async def browse(request: Request):
     # Real internet access for agents: accept
@@ -708,6 +722,39 @@ async def browse(request: Request):
         if via_vpn_country not in MULLVAD_COUNTRY_ALLOWLIST:
             return JSONResponse({'allowed': False, 'reason': f'"{via_vpn_country}" is not on MULLVAD_COUNTRY_ALLOWLIST in .env.'})
 
+    fallback_state = {'used': False}
+
+    async def _do_fetch_with_browser_fallback():
+        """Plain-path fetch, then one read-only browser retry of the SAME
+        approved url on a 404/410. Deliberately NOT wired into the VPN
+        branches: a rerouted render mixes two knobs in one failure and this
+        slice stays narrow. The retry shares the outer gate's approval --
+        the url was cleared before the first fetch -- and flows through the
+        same redirect re-gate below, so the browser's final landing host is
+        re-judged exactly like a plain redirect would be. The one real
+        cost: a fallback consumes a second page fetch while the monthly
+        budget counts one; accepted for the rarity of the trigger."""
+        try:
+            return await _do_fetch()
+        except urllib.error.HTTPError as http_err:
+            if (http_err.code not in _BROWSER_FALLBACK_CODES
+                    or not BROWSER_FALLBACK_ENABLED
+                    or sync_playwright is None):
+                raise
+            # The except-bound name is deleted on block exit; keep the code.
+            fallback_status = http_err.code
+        log_action(agent_id, 'browse',
+                   {'url': url, 'purpose': purpose,
+                    'decision': 'browser_fallback_attempt',
+                    'status': fallback_status},
+                   authorized=authorized, trace_id=trace_id)
+        fb_final, fb_text, fb_links = await asyncio.to_thread(
+            _fetch_rendered_page_sync, url)
+        fb_text = fb_text[:20000]
+        fallback_state['used'] = True
+        return (fb_final, 'text/html (rendered)', fb_text,
+                len(fb_text) >= 20000, None, fb_text, fb_links)
+
     async def _do_fetch(proxy=None):
         if render:
             if sync_playwright is None:
@@ -756,7 +803,7 @@ async def browse(request: Request):
                     # try still runs this finally, so no exit path skips it.
                     await asyncio.to_thread(_mullvad_disconnect_sync)
         else:
-            final_url, content_type, raw_body, truncated, last_modified, text, links = await _do_fetch()
+            final_url, content_type, raw_body, truncated, last_modified, text, links = await _do_fetch_with_browser_fallback()
     except Exception as e:
         log_action(agent_id, 'browse', {'url': url, 'purpose': purpose, 'decision': 'allowed_but_fetch_failed', 'reason': str(e), 'render': render, 'viaVpnCountry': via_vpn_country or None, 'viaVpnExit': via_vpn_exit or None}, authorized=authorized, trace_id=trace_id)
         return JSONResponse({'allowed': True, 'error': f'Approved, but the page could not be loaded: {e}'})
@@ -802,7 +849,7 @@ async def browse(request: Request):
         except Exception:
             image_b64 = None  # visual capture is best-effort -- text results above still stand either way
 
-    log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed', 'contentType': content_type, 'bytes': len(raw_body), 'visual': bool(image_b64), 'render': render, 'viaVpnCountry': via_vpn_country or None, 'viaVpnExit': via_vpn_exit or None}, authorized=authorized, trace_id=trace_id)
+    log_action(agent_id, 'browse', {'url': url, 'finalUrl': final_url, 'purpose': purpose, 'decision': 'allowed', 'contentType': content_type, 'bytes': len(raw_body), 'visual': bool(image_b64), 'render': render, 'viaBrowserFallback': fallback_state['used'], 'viaVpnCountry': via_vpn_country or None, 'viaVpnExit': via_vpn_exit or None}, authorized=authorized, trace_id=trace_id)
     # One real external fetch happened -- count it against the monthly page-
     # request budget. Best-effort accounting, never blocks the
     # response (the pre-fetch check already refused if the budget was spent).
@@ -817,6 +864,7 @@ async def browse(request: Request):
         # epoch ms, or null when the response never set one (common) or
         # this was a headless render instead of a raw fetch.
         'lastModified': last_modified,
+        'viaBrowserFallback': fallback_state['used'],
     })
 
 
