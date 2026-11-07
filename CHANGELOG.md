@@ -44,6 +44,12 @@
   grants ONE bounded final extension (TASK_CONTENT_GRACE_FINAL_S=600s,
   once per run) to a fresh-heartbeat run before the cap goes hard again.
   A dead thread still falls through to the honest fallback immediately.
+- Grader sees the report lane: _deliverable_evidence_lines and
+  _artifact_evidence_present now include task.reportPath, and the grade
+  prompt embeds the report body (read from the Library, capped). The RVP's
+  first Telegram-scan triage landed a solid report and graded 0 because the
+  grader judged the work order alone -- same evidence gap class as the
+  completion gate's reportPath refusal.
 - Scheduled items (team-owned recurring cards): state['scheduledItems']
   stores {title, ownerRole, cadence, deliverable, ...}; the sim engine
   (165__scheduled_items) resolves the owner role -- chief-of-staff,

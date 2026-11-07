@@ -587,6 +587,22 @@ def _deliverable_evidence_lines(task):
     lib = (task.get('libraryPath') or '').strip()
     if lib:
         lines.append('Library artifact: ' + lib)
+    # Report-lane cards record reportPath (not libraryPath); a grader that
+    # never saw it judged a good report from its work order alone and graded
+    # 0 (the 2026-11-07 RVP Telegram-scan card). The path line names the
+    # artifact; the body excerpt is what the grader can actually judge.
+    report_path = (task.get('reportPath') or '').strip()
+    if report_path:
+        lines.append('Report artifact: ' + report_path)
+        body = None
+        try:
+            import serve as _serve_mod
+            with open(_serve_mod._safe_library_path(report_path)) as _rf:
+                body = _rf.read(_GRADE_BODY_CAP)
+        except Exception:
+            body = None
+        if body:
+            lines.append('Report body (from the report artifact):\n' + body)
     wiki = (task.get('wikiPage') or '').strip()
     if wiki:
         lines.append('Wiki page: ' + wiki)
@@ -829,6 +845,7 @@ def _artifact_evidence_present(task):
                 or (task.get('note') or '').strip()
                 or task.get('writtenPy')
                 or (task.get('libraryPath') or '').strip()
+                or (task.get('reportPath') or '').strip()
                 or (task.get('wikiPage') or '').strip()
                 or task.get('sourceUrls'))
 

@@ -13,7 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
-import unittest.mock
+import unittest.mock as mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -70,6 +70,7 @@ class ArtifactEvidence(unittest.TestCase):
                              ('note', 'Wrote the page.'),
                              ('writtenPy', ['a.py']),
                              ('libraryPath', 'library/x'),
+                             ('reportPath', 'archive/2026-report-task-1.md'),
                              ('wikiPage', 'state-of-knowledge'),
                              ('sourceUrls', ['https://example.test'])):
             self.assertTrue(sim._artifact_evidence_present(_task(**{field: value})),
@@ -79,6 +80,27 @@ class ArtifactEvidence(unittest.TestCase):
         self.assertFalse(sim._artifact_evidence_present(
             _task(wikiPage='', note='')))
         self.assertFalse(sim._artifact_evidence_present(None))
+
+    def test_grade_evidence_includes_report_path_and_body(self):
+        # The RVP Telegram-scan report landed via reportPath; the grader used
+        # to judge from the work order alone and graded a good triage 0.
+        report = '# Triage report\n\nClass 1 is a real systemic problem.'
+        with mock.patch.object(serve, '_safe_library_path',
+                               return_value='/tmp/report.md'), \
+                mock.patch('builtins.open',
+                           mock.mock_open(read_data=report)):
+            lines = sim._deliverable_evidence_lines(
+                _task(reportPath='archive/2026-report-task-1.md'))
+        joined = '\n'.join(lines)
+        self.assertIn('Report artifact: archive/2026-report-task-1.md', joined)
+        self.assertIn('Class 1 is a real systemic problem', joined)
+
+    def test_grade_evidence_survives_a_missing_report_file(self):
+        with mock.patch.object(serve, '_safe_library_path',
+                               return_value='/tmp/gone.md'):
+            lines = sim._deliverable_evidence_lines(
+                _task(reportPath='archive/gone.md'))
+        self.assertIn('Report artifact: archive/gone.md', '\n'.join(lines))
 
 
 class CalibrationAudit(unittest.TestCase):
