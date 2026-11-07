@@ -303,6 +303,12 @@ class SimEngine:
                 # this pass's queue snapshot.
                 _tick_phase_stamp(state, 'scheduled_items')
                 _scheduled_items_pass(state, now_ms=int(now * 1000))
+                # Programs (430_programs stores them): roll every piece's
+                # status up and mint the owner's planning/change-request
+                # cards at the lifecycle edges. Same pass, same
+                # read-modify-write.
+                _tick_phase_stamp(state, 'programs')
+                _programs_pass(state, now_ms=int(now * 1000))
 
                 # Heal agents stranded in unreachable outdoor cells
                 # (the reachability-gap bug). Runs AFTER movement + task cycle so
