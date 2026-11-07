@@ -737,10 +737,30 @@ class ContentRunGraceTimeout(unittest.TestCase):
         self.assertTrue(recovered, 'late-report recovery must be logged')
         self.assertFalse(abandoned, 'recovered work must not be logged as abandoned')
 
-    def test_grace_cap_bounds_the_extension(self):
-        # Even a permanently-fresh heartbeat cannot extend past the total cap:
-        # once TASK_CONTENT_GRACE_MAX_S is spent the run falls back.
+    def test_grace_cap_grants_one_final_extension_for_a_live_run(self):
+        # 2026-11-07 contract: the 300s step-grace cap no longer kills a run
+        # whose heartbeat is fresh -- the shard triage churn was exactly that
+        # abandonment (a slow-but-alive synthesis killed mid-write). Instead
+        # the cap buys ONE final extension (TASK_CONTENT_GRACE_FINAL_S, 600s),
+        # once per run. The total budget is still bounded (next test).
         task = self._spike(_contentGraceUsed=sim.TASK_CONTENT_GRACE_MAX_S)
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - 1.0
+        self._cycle(state, now)
+        self.assertEqual(task['status'], 'working',
+                         'a live run at the cap gets the one final extension')
+        self.assertEqual(task['workUntil'], (now - 1.0) + sim.TASK_CONTENT_GRACE_FINAL_S)
+        self.assertTrue(task.get('_contentFinalGraceUsed'))
+
+    def test_after_the_final_extension_the_budget_fails_closed(self):
+        # Even a permanently-fresh heartbeat cannot extend past the final
+        # extension: once it is spent the run falls back -- fail closed, not
+        # fabricate done.
+        task = self._spike(_contentGraceUsed=sim.TASK_CONTENT_GRACE_MAX_S
+                           + sim.TASK_CONTENT_GRACE_FINAL_S,
+                           _contentFinalGraceUsed=True)
         state, now_ms = self._quiet_base(task)
         now = now_ms / 1000.0
         task['workUntil'] = now - 1.0

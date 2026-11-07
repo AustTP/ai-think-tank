@@ -170,11 +170,18 @@ def test_clean_approval_pushes_to_main(fake_repo, monkeypatch):
     assert f'selfedit: change window {window_id}' in commit[2]
     assert 'Implemented by worker; validated by reviewer.' in commit[2]
     assert ['push', 'origin', 'main'] in calls
-    assert selfedit._window_field(window_id, 'push_status') == 'pushed'
+    # 2026-11-07 CI gate: the push lands awaiting_ci; a green CI sweep
+    # completes the change request as successful.
+    assert selfedit._window_field(window_id, 'push_status') == 'awaiting_ci'
     assert selfedit._window_field(window_id, 'push_category') == 'successful'
     assert selfedit._window_field(window_id, 'push_sha') == 'abcdef123456'
     assert any('SUCCESSFUL' in body and 'UNSUCCESSFUL' not in body
                for _s, body in telegrams)
+    monkeypatch.setattr(selfedit, '_gh_run_json', lambda sha: [
+        {'databaseId': 1, 'status': 'completed', 'conclusion': 'success'}])
+    selfedit._ci_sweep_pushed_windows()
+    assert selfedit._window_field(window_id, 'push_status') == 'pushed'
+    assert 'CI green' in (selfedit._window_field(window_id, 'push_note') or '')
     with sqlite3.connect(serve.DB_PATH) as conn:
         events = [r[0] for r in conn.execute(
             'SELECT details FROM action_log WHERE agent_id = ? '
@@ -744,4 +751,9 @@ def test_admin_mode_still_needs_both_approvals(fake_repo, monkeypatch):
     # The admin's approval then completes the same window.
     ok, payload = selfedit.admin_approve_window('chief', window_id, True, 'ok')
     assert ok is True and payload['status'] == 'successful', payload
+    # 2026-11-07 CI gate: the push lands awaiting_ci; a green sweep closes it.
+    assert selfedit._window_field(window_id, 'push_status') == 'awaiting_ci'
+    monkeypatch.setattr(selfedit, '_gh_run_json', lambda sha: [
+        {'databaseId': 1, 'status': 'completed', 'conclusion': 'success'}])
+    selfedit._ci_sweep_pushed_windows()
     assert selfedit._window_field(window_id, 'push_status') == 'pushed'

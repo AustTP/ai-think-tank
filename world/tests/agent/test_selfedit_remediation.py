@@ -102,6 +102,12 @@ def test_window_remediation_fix_recheck_recover(monkeypatch, fake_repo):
     commit = next(c for c in git_calls if c and c[0] == 'commit')
     assert 'Implemented by worker; validated by reviewer.' in commit[2]
     assert any('SUCCESSFUL WITH ISSUES' in body for _s, body in telegrams)
+    # 2026-11-07 CI gate: resolve the awaiting_ci push with a green sweep
+    # before the window closes.
+    monkeypatch.setattr(selfedit, '_gh_run_json', lambda sha: [
+        {'databaseId': 1, 'status': 'completed', 'conclusion': 'success'}])
+    selfedit._ci_sweep_pushed_windows()
+    assert selfedit._window_field(window_id, 'push_status') == 'pushed'
     # a healthy ending: no rollback file trash, window closes as done
     selfedit._update_window(window_id, end_ts=selfedit.time.time() - 10)
     selfedit.window_tick()

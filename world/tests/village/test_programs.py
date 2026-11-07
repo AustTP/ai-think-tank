@@ -80,8 +80,10 @@ class EnginePassTests(unittest.TestCase):
         self.assertTrue(item['directedTo'])
         self.assertEqual(item['priority'], 'high')
         self.assertIn('[PLAN]', item['title'])
-        self.assertIn('Confer with the senior directors', item['instructions'])
-        self.assertIn('create the necessary teams', item['instructions'])
+        self.assertIn('CHIEF OF STAFF', item['instructions'])
+        self.assertIn('convene and delegate', item['instructions'])
+        self.assertIn('MEETING card', item['instructions'])
+        self.assertIn('CI is green', item['instructions'])
         self.assertIn('sprints', item['instructions'])
         self.assertIn('write_report', item['instructions'],
                       'the plan must be filed as a Library report, not state surgery')

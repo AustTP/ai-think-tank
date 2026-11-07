@@ -107,6 +107,11 @@ def window_tick():
     of the slot. Returns the list of window ids newly fired."""
     serve = _s()
     now = time.time()
+    try:
+        _ci_sweep_pushed_windows()
+    except Exception as exc:  # noqa: BLE001 -- the sweep must never break the tick
+        serve.log_action('system', 'ci_sweep_error', {'error': str(exc)[:200]},
+                         authorized=False)
     with serve._db() as conn:
         _ensure_windows_table(conn)
         missed = conn.execute(

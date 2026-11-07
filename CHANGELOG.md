@@ -50,6 +50,16 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- CI gate on change requests (operator direction): a pushed selfedit
+  window is no longer successful until the repo's GitHub Actions run on
+  the pushed sha is green. window_tick sweeps awaiting_ci windows via the
+  gh CLI; a red (or timed-out) CI reverts the push so main never sits red,
+  and the operator gets the verdict over Telegram. Missing gh tooling is
+  recorded as 'CI unverified' rather than claimed green.
+- Program planning card contract: the chief of staff convenes and
+  delegates (a MEETING card for the senior directors, who claim pieces and
+  propose incorporation), the consolidated plan lands as a Library report,
+  and a change request is only successful when CI is green.
 - Programs: the program-level roll-up for multi-team work
   (430_programs API + 166__programs engine). A program = {title, goal,
   ownerAgentId (chief of staff), pieces: [{title, teamId?, taskType?,
