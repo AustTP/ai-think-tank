@@ -70,11 +70,20 @@ class PieceStateTests(unittest.TestCase):
 
 class EnginePassTests(unittest.TestCase):
     def test_planning_card_minted_once_directed_to_owner(self):
+        # pass 1: PLAN card; pass 2: the follow-through EXECUTE card (new
+        # contract); pass 3: nothing. The PLAN card itself mints once.
         st = _state([_program()])
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
-            sim._programs_pass(st, now_ms=20_000)
         self.assertEqual(qw.call_count, 1, 'the planning card mints once')
+        item = qw.call_args[0][1][0]
+        self.assertIn('[PLAN]', item['title'])
+        # pass 2 with all pieces unminted mints the follow-through card;
+        # both PLAN and EXECUTE are directed to the owner.
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw2:
+            sim._programs_pass(st, now_ms=20_000)
+        self.assertEqual(qw2.call_count, 1)
+        self.assertEqual(qw2.call_args[0][1][0]['assignedTo'], 'theo')
         item = qw.call_args[0][1][0]
         self.assertEqual(item['assignedTo'], 'theo')
         self.assertTrue(item['directedTo'])
@@ -95,7 +104,7 @@ class EnginePassTests(unittest.TestCase):
 
     def test_cr_card_only_when_every_piece_is_done(self):
         st = _state([_program(status='planning-card-minted',
-                              planningCardMinted=True)])
+                              planningCardMinted=True, followupMinted=True)])
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
         self.assertFalse(qw.called, 'one piece still open: no CR yet')
@@ -113,6 +122,21 @@ class EnginePassTests(unittest.TestCase):
         self.assertIn('selfedit push window', item['instructions'])
         self.assertEqual(st['programs'][0]['status'], 'ready-for-cr')
         self.assertTrue(st['programs'][0]['crRequested'])
+
+    def test_stalled_plan_gets_one_follow_through_card(self):
+        # The plan landed but no piece moved (prog-2 sat complete with zero
+        # sprints): the owner gets ONE follow-through card, not a loop.
+        st = _state([_program(status='planning-card-minted',
+                              planningCardMinted=True)])
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000)
+            sim._programs_pass(st, now_ms=20_000)
+        self.assertEqual(qw.call_count, 1)
+        item = qw.call_args[0][1][0]
+        self.assertIn('[EXECUTE]', item['title'])
+        self.assertEqual(item['assignedTo'], 'theo')
+        self.assertIn('no piece has moved', item['instructions'])
+        self.assertTrue(st['programs'][0]['followupMinted'])
 
     def test_engine_never_mints_piece_cards_itself(self):
         st = _state([_program()])

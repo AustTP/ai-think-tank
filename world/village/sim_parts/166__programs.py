@@ -58,9 +58,13 @@ def _program_piece_states(program, state):
 
 
 def _program_card_item(program, kind, instructions, now_ms):
-    title = f"[{kind}] Program {program.get('id')}: {program.get('title')}" \
-        if kind == 'PLAN' else \
-        f"[CHANGE-REQUEST] Program {program.get('id')}: {program.get('title')}"
+    if kind == 'PLAN':
+        title = f"[{kind}] Program {program.get('id')}: {program.get('title')}"
+    elif kind == 'EXECUTE':
+        title = (f"[{kind}] Program {program.get('id')}: "
+                 f"{program.get('title')}")
+    else:
+        title = f"[CHANGE-REQUEST] Program {program.get('id')}: {program.get('title')}"
     return {
         'title': title,
         'room': None,
@@ -91,12 +95,12 @@ def _programs_pass(state, now_ms=None):
         owner = program.get('ownerAgentId')
         if not owner:
             continue
+        by_title = {p.get('title'): p for p in (program.get('pieces') or [])}
+        piece_lines = '\n'.join(
+            '- ' + t + ' (team: '
+            + ((by_title.get(t) or {}).get('teamId') or 'unassigned') + ')'
+            for t in states)
         if not program.get('planningCardMinted'):
-            by_title = {p.get('title'): p for p in (program.get('pieces') or [])}
-            piece_lines = '\n'.join(
-                '- ' + t + ' (team: '
-                + ((by_title.get(t) or {}).get('teamId') or 'unassigned') + ')'
-                for t in states)
             instructions = (
                 "You own this program -- and you are the CHIEF OF STAFF: your "
                 "job is to convene and delegate, not to do the analysis "
@@ -132,6 +136,32 @@ def _programs_pass(state, now_ms=None):
             program['planningCardMinted'] = True
             program['status'] = 'planning-card-minted'
             _log_governance(state, None, 'program_planning_card_minted',
+                            {'id': program.get('id'), 'owner': owner})
+        elif program.get('status') == 'planning-card-minted' \
+                and not program.get('followupMinted') \
+                and all(s[0] == 'unminted' for s in states.values()) \
+                and states:
+            # The plan landed but nothing moved: mint the owner a
+            # follow-through card once. Execution stalls exactly here
+            # otherwise (prog-2's plan sat complete with zero sprints and
+            # the owner idle).
+            instructions = (
+                "Your program plan has landed but no piece has moved: no "
+                "teams/sprints created, no piece cards minted. Execute the "
+                "plan now, by delegation:\n"
+                "1. File the senior-director MEETING card your plan specified "
+                "(ownership + sequencing ratification).\n"
+                "2. Have each owning senior director author their piece's "
+                "sprint cards and mint the piece card (refinement / director "
+                "governance -- not self_edit).\n"
+                "3. The pieces must carry the titles below verbatim so the "
+                "program roll-up can track them.\n\n"
+                f"Pieces:\n{piece_lines}\n\n"
+                + (('Plan context: ' + (program.get('goal') or '') + '\n') if program.get('goal') else ''))
+            minted += queue_work(state, [
+                _program_card_item(program, 'EXECUTE', instructions, now_ms)])
+            program['followupMinted'] = True
+            _log_governance(state, None, 'program_followup_minted',
                             {'id': program.get('id'), 'owner': owner})
         elif program.get('status') != 'ready-for-cr' and all_done \
                 and (program.get('pieces')):

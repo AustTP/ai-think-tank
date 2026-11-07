@@ -50,6 +50,10 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- Program follow-through: when the owner's plan has landed but no piece
+  has moved (no teams/sprints/piece cards), the engine mints ONE [EXECUTE]
+  card telling the owner to run the delegation steps from their own plan
+  (prog-2 stalled exactly there).
 - CI gate on change requests (operator direction): a pushed selfedit
   window is no longer successful until the repo's GitHub Actions run on
   the pushed sha is green. window_tick sweeps awaiting_ci windows via the
