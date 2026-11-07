@@ -83,6 +83,10 @@ class EnginePassTests(unittest.TestCase):
         self.assertIn('Confer with the senior directors', item['instructions'])
         self.assertIn('create the necessary teams', item['instructions'])
         self.assertIn('sprints', item['instructions'])
+        self.assertIn('write_report', item['instructions'],
+                      'the plan must be filed as a Library report, not state surgery')
+        self.assertIn('NEVER overwrite a report you already wrote', item['instructions'])
+        self.assertNotIn('self_edit is', item['instructions'])
         self.assertEqual(st['programs'][0]['planningCardMinted'], True)
         self.assertEqual(st['programs'][0]['pieceStatus']
                          ['Piece A: orchestration lane'], 'unminted')
