@@ -28,8 +28,10 @@ from fastapi.responses import JSONResponse
 
 OWNER_ROLES = ('chief-of-staff', 'regional-vp', 'senior-director',
                'recursive-director', 'worker')
-CADENCES = ('daily', 'weekly', 'monthly', 'quarterly')
+CADENCES = ('30min', 'hourly', 'daily', 'weekly', 'monthly', 'quarterly')
 _CADENCE_MS = {
+    '30min': 30 * 60 * 1000,
+    'hourly': 3600 * 1000,
     'daily': 24 * 3600 * 1000,
     'weekly': 7 * 24 * 3600 * 1000,
     'monthly': 30 * 24 * 3600 * 1000,
@@ -43,13 +45,17 @@ def telegram_digest_path(day=None):
     return f'analysis/telegram-alert-digest-{day}.md'
 
 
-def write_telegram_alert_digest(now=None):
+def write_telegram_alert_digest(now=None, since_ts=None):
     """Land the last 24h of outbound Telegram alerts into the Library so the
     regional VP's daily scan card can read them with read_library_file.
     Returns the stored path, or None when nothing fired (an empty day is a
     real result the digest still records -- write it anyway, cheap and it
     proves the scan ran rather than silently skipping)."""
-    cutoff = (now or time.time()) - 24 * 3600
+    now = now or time.time()
+    # Incremental scan window: a scheduled item stamps lastRunAtMs each
+    # period, so a high-frequency scan (30min) reads only what fired SINCE
+    # the last scan instead of re-reading the same 24h. First run: 24h.
+    cutoff = max(since_ts or 0, now - 24 * 3600) if since_ts else now - 24 * 3600
     rows = []
     try:
         with _db() as conn:
@@ -73,8 +79,9 @@ def write_telegram_alert_digest(now=None):
         by_class.setdefault(headline, []).append(
             (int(ts), preview.split('\n', 3)[-1][:220]))
     day = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+    window_h = max(0.25, round((now - cutoff) / 3600.0, 2))
     lines = [
-        f'# Telegram alert digest, last 24h (UTC {day})',
+        f'# Telegram alert digest, last {window_h}h (UTC {day})',
         '',
         f'Source: action_log rows action=telegram_sent since UTC '
         f'{datetime.datetime.fromtimestamp(cutoff, datetime.timezone.utc).strftime("%Y-%m-%d %H:%M")}. '

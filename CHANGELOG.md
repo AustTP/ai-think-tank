@@ -50,6 +50,22 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- Programs: the program-level roll-up for multi-team work
+  (430_programs API + 166__programs engine). A program = {title, goal,
+  ownerAgentId (chief of staff), pieces: [{title, teamId?, taskType?,
+  deliverable?, dependsOn?}], contextFiles?}. The engine rolls every
+  piece's status up each pass (matched by title), mints the owner's
+  PLANNING card once (confer with the senior directors, create teams,
+  break into sprints; overlapping pieces pull from the shared backlog;
+  peer approvals apply), and mints the CHANGE-REQUEST card only when
+  every piece is done/validated (create the selfedit push window(s)).
+  API: POST /api/intent/programs, GET /api/programs (with derived
+  roll-up), DELETE /api/programs/{id}.
+- Scheduled items: finer cadences '30min' and 'hourly' (the regional VP
+  may set the Telegram-scan frequency itself via the PATCH endpoint,
+  operator gate). The digest window is incremental: the scan reads only
+  alerts since the item's lastRunAtMs (first run and gaps: last 24h), so
+  a 30-minute scan stops re-reading the same day.
 - Scheduled items (team-owned recurring cards): state['scheduledItems']
   stores {title, ownerRole, cadence, deliverable, ...}; the sim engine
   (165__scheduled_items) resolves the owner role -- chief-of-staff,

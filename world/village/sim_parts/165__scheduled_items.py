@@ -19,6 +19,8 @@ file one issue per genuine problem for the owning director.
 import time
 
 SCHEDULED_CADENCE_MS = {
+    '30min': 30 * 60 * 1000,
+    'hourly': 3600 * 1000,
     'daily': 24 * 3600 * 1000,
     'weekly': 7 * 24 * 3600 * 1000,
     'monthly': 30 * 24 * 3600 * 1000,
@@ -129,7 +131,8 @@ def _scheduled_items_pass(state, now_ms=None):
         if item.get('digest') == 'telegram' or item.get('id') == 'sch-rvp-telegram-digest':
             try:
                 import serve
-                digest_path = serve.write_telegram_alert_digest()
+                digest_path = serve.write_telegram_alert_digest(
+                    since_ts=(item.get('lastRunAtMs') or 0) / 1000.0 or None)
             except Exception:
                 digest_path = None
         instructions = item.get('instructions') or f"Pick whoever is best suited for: {item['title']}"
