@@ -77,3 +77,74 @@ class ChangeRequestOutcomeTest(unittest.TestCase):
         self.assertIn('Change request ended: SUCCESSFUL WITH ISSUES', subject)
         self.assertIn('Outcome: SUCCESSFUL WITH ISSUES', body)
         self.assertIn('Explanation: one file had a warning', body)
+
+
+class LowSeverityBatchingTest(unittest.TestCase):
+    """2026-11-07: low-severity failure notices keyed per task/agent pushed
+    183 Telegram messages in six hours. Low severity now shares one window
+    per label; medium and above keep per-key cooldowns."""
+
+    @staticmethod
+    def _fake_thread(sent):
+        class FakeThread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+        return FakeThread
+
+    def test_first_low_failure_sends_once_and_rest_accumulate(self):
+        sent = []
+        serve._FAILURE_NOTICE_STATE.clear()
+        with mock.patch.object(serve, 'send_player_telegram_sync',
+                               side_effect=lambda s, b: sent.append((s, b))), \
+             mock.patch.object(serve.time, 'time', return_value=1000.0), \
+             mock.patch.object(serve.threading, 'Thread',
+                               self._fake_thread(sent)):
+            for i in range(4):
+                serve._maybe_notify_failure(
+                    f'agent{i}', 'quality_gate_reject', {'taskId': f'task-{i}'})
+        self.assertEqual(len(sent), 1)
+        bucket = serve._FAILURE_NOTICE_STATE['__low__|A review or gate rejected work']
+        self.assertEqual(bucket['suppressed'], 3)
+        self.assertEqual(len(bucket['keys']), 3)
+
+    def test_low_digest_after_window_names_sources(self):
+        sent = []
+        serve._FAILURE_NOTICE_STATE.clear()
+        clock = {'t': 1000.0}
+        with mock.patch.object(serve, 'send_player_telegram_sync',
+                               side_effect=lambda s, b: sent.append((s, b))), \
+             mock.patch.object(serve.time, 'time',
+                               side_effect=lambda: clock['t']), \
+             mock.patch.object(serve.threading, 'Thread',
+                               self._fake_thread(sent)):
+            for i in range(3):
+                serve._maybe_notify_failure(
+                    f'agent{i}', 'quality_gate_reject', {'taskId': f'task-{i}'})
+            self.assertEqual(len(sent), 1)
+            clock['t'] = 5000.0  # the 3600s low window has expired
+            serve._maybe_notify_failure(
+                'agent9', 'quality_gate_reject', {'taskId': 'task-9'})
+        self.assertEqual(len(sent), 2)
+        subject, body = sent[1]
+        self.assertIn('A review or gate rejected work', subject)
+        self.assertIn('2 more low-severity', body)
+        self.assertIn('task-2', body)
+        self.assertIn('task-1', body)
+
+    def test_medium_keeps_per_key_cooldown(self):
+        sent = []
+        serve._FAILURE_NOTICE_STATE.clear()
+        with mock.patch.object(serve, 'send_player_telegram_sync',
+                               side_effect=lambda s, b: sent.append((s, b))), \
+             mock.patch.object(serve.time, 'time', return_value=1000.0), \
+             mock.patch.object(serve.threading, 'Thread',
+                               self._fake_thread(sent)):
+            serve._maybe_notify_failure('a', 'browse',
+                                        {'decision': 'denied', 'taskId': 't1'})
+            serve._maybe_notify_failure('b', 'browse',
+                                        {'decision': 'denied', 'taskId': 't2'})
+        self.assertEqual(len(sent), 2)

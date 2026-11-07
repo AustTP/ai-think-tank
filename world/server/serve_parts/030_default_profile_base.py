@@ -487,6 +487,43 @@ def _maybe_notify_failure(agent_id, action, details):
         severity, 900)
     now = time.time()
     key = _failure_notice_key(action, details)
+    if severity == 'low':
+        # Measured 2026-11-07: 183 pushes reached the player in about six
+        # hours, mostly low-severity 'review or gate rejected' notices keyed
+        # per distinct task/agent -- the operator's channel drowned. Low
+        # severity now shares ONE window per label: the first failure sends
+        # normally, later ones accumulate, and the next send after the window
+        # expires reports the total plus up to five recent sources. Medium
+        # and above keep their per-key cooldowns.
+        low_key = f'__low__|{label}'
+        with _FAILURE_NOTICE_LOCK:
+            bucket = _FAILURE_NOTICE_STATE.get(low_key)
+            if bucket and now - bucket['last'] < cooldown:
+                bucket['suppressed'] = bucket.get('suppressed', 0) + 1
+                recent = bucket.setdefault('keys', [])
+                if key not in recent:
+                    recent.insert(0, key)
+                    del recent[5:]
+                return
+            total = (bucket or {}).get('suppressed', 0)
+            sources = list((bucket or {}).get('keys', []))[:5]
+            _FAILURE_NOTICE_STATE[low_key] = {
+                'last': now, 'suppressed': 0, 'keys': []}
+        if total:
+            summary = '; '.join(s.split('|', 2)[-1][:70] for s in sources) \
+                or 'no sources recorded'
+            digest = {
+                'summary': f'{total} more low-severity "{label}" failures were '
+                           f'suppressed since the previous notice. '
+                           f'Recent sources: {summary}',
+            }
+            subject, body = _failure_notice_message(
+                '', action, digest, label, severity, count=total + 1)
+            threading.Thread(target=_send_failure_notice,
+                             args=(subject, body), daemon=True).start()
+            return
+        # First failure in this label's window: fall through to the shared
+        # per-key path so the ordinary notice still carries its own detail.
     with _FAILURE_NOTICE_LOCK:
         state = _FAILURE_NOTICE_STATE.get(key)
         if state and now - state['last'] < cooldown:
