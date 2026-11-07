@@ -799,6 +799,16 @@ async def chat(request: Request):
             if model == _high_tier_slug():
                 _accrue_high_tier_spend(usage_cost)
         log_action(agent_id, 'chat', {'model': model, 'service': service, 'cost': float(usage_cost) if isinstance(usage_cost, (int, float)) else 0.0, 'best_of': best_n}, authorized=authorized)
+        # includeUsage: the caller already authenticated and the cost is
+        # already accrued and logged here -- letting the same caller see the
+        # number it paid leaks nothing. Off by default so existing consumers
+        # keep the reply-only contract.
+        if body.get('includeUsage'):
+            return JSONResponse({
+                'reply': reply,
+                'usage': {'cost': float(usage_cost)
+                          if isinstance(usage_cost, (int, float)) else None},
+            })
         return JSONResponse({'reply': reply})
     except OpenRouterCreditsPaused as e:
         return JSONResponse({'error': str(e), 'creditsPaused': True}, status_code=503)
