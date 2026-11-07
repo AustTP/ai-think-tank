@@ -200,6 +200,14 @@ def _rag_index_pass(budget=60):
         known = {}
     pending = []
     for doc_id, source, ref, title, room, village, text in _rag_candidates():
+        # Postgres refuses NUL bytes inside text parameters (sqlite tolerated
+        # them): a library file with a stray 0x00 killed every indexing pass
+        # with "A string literal cannot contain NUL (0x00) characters" and
+        # the calibration loop surfaced it every 30 minutes. Strip NULs
+        # BEFORE the content hash so the stored digest always matches the
+        # stored text (2026-11-07).
+        text = (text or '').replace('\x00', '')
+        title = (title or '').replace('\x00', '')
         digest = hashlib.sha256(text.encode('utf-8', errors='replace')).hexdigest()
         entry = known.get(doc_id)
         if entry and entry[0] == digest:

@@ -692,7 +692,8 @@ def _run_docker_sandbox(docker_cmd, timeout_s):
             pass
 
 
-def _run_in_sandbox_sync(sandbox_dir, command, limits=None):
+def _run_in_sandbox_sync(sandbox_dir, command, limits=None, purpose=None,
+                         agent_id='unknown'):
     # Backend dispatch: SANDBOX_EXECUTION chooses WHERE agent
     # commands run. `local` (default) -> the local Docker sandbox below;
     # `digitalocean` -> a provisioned Droplet. The digitalocean branch FAILS
@@ -744,6 +745,16 @@ def _run_in_sandbox_sync(sandbox_dir, command, limits=None):
     try:
         result = _run_docker_sandbox(
             docker_cmd, int(limits.get('timeoutS') or SANDBOX_TIMEOUT_S))
+        if result.returncode == 125 and _docker_unavailable(
+                result.returncode, result.stderr):
+            # Docker daemon down, not a failed command: reroute the SAME
+            # command to the Colab fallback (Jev-guarded, workspace shipped,
+            # result marked ranOn=colab). A command that RAN and exited
+            # non-zero never takes this path.
+            fallback = globals().get('_run_on_colab_sandbox_sync')
+            if fallback:
+                return fallback(agent_id, sandbox_dir, command, purpose,
+                                int(limits.get('timeoutS') or SANDBOX_TIMEOUT_S))
         return {
             'exitCode': result.returncode,
             'stdout': _compact_command_output(result.stdout),
@@ -752,6 +763,13 @@ def _run_in_sandbox_sync(sandbox_dir, command, limits=None):
         }
     except subprocess.TimeoutExpired as e:
         return {'exitCode': None, 'stdout': _compact_command_output(e.stdout or ''), 'stderr': _compact_command_output(e.stderr or ''), 'timedOut': True}
+    except FileNotFoundError:
+        # docker binary itself missing: same fallback as a dead daemon.
+        fallback = globals().get('_run_on_colab_sandbox_sync')
+        if fallback:
+            return fallback(agent_id, sandbox_dir, command, purpose,
+                            int(limits.get('timeoutS') or SANDBOX_TIMEOUT_S))
+        raise
 
 
 def run_cron_script_sandboxed(script_relpath, timeout_s, env):

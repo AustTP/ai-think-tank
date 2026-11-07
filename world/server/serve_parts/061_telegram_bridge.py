@@ -105,7 +105,12 @@ def _telegram_send_photo_sync(png_bytes, caption):
                 payload = json.loads(resp.read().decode('utf-8', errors='replace'))
                 if payload.get('ok'):
                     sent += 1
+                _log_telegram_send('sendPhoto',
+                                   {'chat_id': chat_id, 'caption': caption[:1024]},
+                                   bool(payload.get('ok')))
         except Exception as e:
+            _log_telegram_send('sendPhoto',
+                               {'chat_id': chat_id, 'caption': caption[:1024]}, False)
             print(f'[telegram] sendPhoto failed for {chat_id}: {e}', flush=True)
     return sent
 

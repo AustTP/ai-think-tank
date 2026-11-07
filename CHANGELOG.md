@@ -4,6 +4,31 @@
 
 ### Features
 
+- Docker-down fallback for `/api/execute`: when the local Docker sandbox
+  cannot start (daemon down, binary missing), the same Jev-approved command
+  reroutes to the player's Colab CPU runtime -- workspace shipped as a
+  bounded tar.gz, changed files pulled back, and the result marked
+  `ranOn: colab` so the agent is never misled about its backend. Bug bounty
+  / scan / exploit tooling and other account-risk work is refused on Colab
+  by the existing `_colab_denied` classes (Jev still gates everything);
+  that work waits for Docker instead.
+- RAG indexing no longer dies on Postgres. A library file with a stray NUL
+  byte made every `_rag_index_pass` insert fail with "A string literal
+  cannot contain NUL (0x00) characters", so the calibration loop surfaced
+  the same error every 30 minutes and the 4.5k-document index backlog never
+  drained. NULs are stripped before hashing, so stored digest and text stay
+  in agreement.
+- State saves no longer wedge on a poisoned snapshot. The coalescing save
+  worker serializes state structures the sim thread mutates concurrently;
+  a serialize race ("dictionary changed size during iteration") or a
+  mid-flight task mutation (KeyError in the archive split) made the same
+  snapshot fail and re-queue forever, stalling persistence for minutes
+  while the tank looked alive. The archive split now iterates list
+  snapshots and never re-indexes by an earlier id, the serialize retries
+  transient resizes before failing, the checksum reuses the same
+  serialized text (a second dumps walk would race again and could disagree
+  with the stored blob), and a snapshot that fails three times yields to
+  the next fresh one.
 - Outbound webhooks: the tank can notify external systems. A subscribed URL
   with an optional shared secret receives signed POSTs (`X-Tank-Signature`:
   sha256 HMAC over the exact body) when an action-log kind matches its event
@@ -15,6 +40,22 @@
 
 ### Fixes
 
+- Sandbox growth is bounded for real now. `_refresh_sandbox_liveness`
+  trusted `stage-*.runtime.json` / `.repair.json` markers unconditionally,
+  but nothing ever unlinks a marker once written, so every provisioned stage
+  stayed "live" forever: 178 sandboxes pinned 59 GiB, most of it 2.3 GB git
+  histories, while the disk-hygiene loop dutifully skipped them. A marker
+  now vouches for liveness only while its workspace shows activity inside
+  the same 6 h grace window, orphan markers are reaped, and a hard count
+  ceiling (`_SANDBOX_MAX_DIRS = 32`) evicts oldest-first beyond the cap.
+- `github_list_issues` and `github_get_issue` are read-only GET wrappers but
+  were missing from the tool-policy read-only set, so they classified as
+  commit-tier and were hard-denied on every research/bug card that tried to
+  diagnose a CI failure (the 2026-11-06/07 alert storm includes 2 such
+  denials). They are now in `_READ_ONLY_TOOLS`.
+- `sendPhoto` pushes (CAPTCHA screenshots) bypassed the Telegram audit log
+  because they hand-roll the multipart upload instead of going through
+  `_telegram_api_sync`. They now write the same `telegram_sent` audit row.
 - Meeting scribes now read the real documents: issue filings carry
   `sourceFiles` (normalized, capped at 5), the groomed agenda emits a
   `READ:` line per file, and the meeting executor inlines the actual file

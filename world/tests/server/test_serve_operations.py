@@ -29,8 +29,8 @@ class PipelineTest(unittest.TestCase):
         req.json = mock.AsyncMock(return_value=body)
         req.headers = {'X-Agent-Key': 'k'}
 
-        async def fake_to_thread(f, *a):
-            return f(*a)
+        async def fake_to_thread(f, *a, **k):
+            return f(*a, **k)
         with mock.patch.object(serve, 'EXECUTION_ENABLED', True), \
              mock.patch.object(serve, '_village_sandbox_id',
                                side_effect=lambda a, s: s), \
@@ -615,8 +615,8 @@ class SandboxDownloadTest(unittest.TestCase):
                                mock.MagicMock(match=lambda s: None)):
             self.assertEqual(asyncio.run(serve.sandbox_download(
                 req)).status_code, 400)
-        async def fake_to_thread(f, *a):
-            return f(*a)
+        async def fake_to_thread(f, *a, **k):
+            return f(*a, **k)
         with mock.patch.object(serve, 'BROWSING_ENABLED', True), \
              mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
              mock.patch.object(serve, '_village_sandbox_id',

@@ -165,6 +165,13 @@ async def _log_prune_loop():
 _SANDBOX_GRACE_S = 6 * 3600
 _SANDBOX_GC_PER_RUN = 6
 _SANDBOX_MIN_FREE_GIB = 20.0
+# Hard count ceiling for stage sandboxes. Liveness and grace windows bound
+# STALE work; this bounds the LIVE tail too, so the directory can never grow
+# unbounded again no matter how the tank is driven (2026-11-07: 3.8k entries,
+# 61 GiB, was the second ENOSPC scare). Anything above the cap is reaped
+# oldest-first the same way the grace window reaps, so a burst of fresh
+# provisioning evicts the oldest idle workspace instead of filling the disk.
+_SANDBOX_MAX_DIRS = 32
 
 
 def _sandbox_task_status(workspace):
@@ -197,6 +204,7 @@ def _prune_sandboxes():
         return
     now = time.time()
     reaped, gced = 0, 0
+    stages = []
     for name in names:
         path = os.path.join(sandboxes_dir, name)
         if not os.path.isdir(path):
@@ -208,6 +216,8 @@ def _prune_sandboxes():
             continue
         if not name.startswith('stage-'):
             continue
+        stages.append((name, path))
+    for name, path in stages:
         if name not in _SANDBOX_LIVE_IDS:
             # Not referenced by anything right now. Reap after the grace
             # window (mtime is the last real activity on the workspace).
@@ -229,6 +239,14 @@ def _prune_sandboxes():
                     gced += 1
                 except Exception:
                     pass
+    # Count ceiling after the grace pass: even live-vouched workspaces must
+    # fit under the cap. Oldest-first, so a burst of new provisioning evicts
+    # the longest-idle survivor rather than the newest work.
+    if len(stages) > _SANDBOX_MAX_DIRS:
+        overflow = sorted(stages, key=lambda item: os.path.getmtime(item[1]))
+        for name, path in overflow[:len(stages) - _SANDBOX_MAX_DIRS]:
+            _shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
     # Stray legacy .git mirrors inside agent prototypes.
     agents_dir = os.path.join(THINK_TANK_DIR, 'agents')
     try:
@@ -273,15 +291,43 @@ def _refresh_sandbox_liveness():
         pass
     sandboxes_dir = os.path.join(THINK_TANK_DIR, 'sandboxes')
     try:
-        for name in os.listdir(sandboxes_dir):
-            if not name.startswith('stage-'):
-                continue
-            for suffix in ('.runtime.json', '.repair.json'):
-                fp = os.path.join(sandboxes_dir, name + suffix)
-                if os.path.exists(fp):
-                    live.add(name)
+        names = os.listdir(sandboxes_dir)
     except OSError:
-        pass
+        return
+    now = time.time()
+    for name in names:
+        if not name.startswith('stage-'):
+            continue
+        base = os.path.join(sandboxes_dir, name)
+        for suffix in ('.runtime.json', '.repair.json'):
+            fp = base + suffix
+            if not os.path.exists(fp):
+                continue
+            if not os.path.isdir(base):
+                # Orphaned marker: the workspace is already gone. The marker
+                # file is the only thing left, and nothing ever unlinks it
+                # (staged_work writes it on provision; no completion path
+                # removes it), so it would otherwise pin nothing forever.
+                # Reap the litter after the same grace window.
+                try:
+                    if now - os.path.getmtime(fp) > _SANDBOX_GRACE_S:
+                        os.remove(fp)
+                except OSError:
+                    pass
+                continue
+            try:
+                activity = now - os.path.getmtime(base)
+            except OSError:
+                activity = 0
+            # A marker only vouches for liveness while the workspace shows
+            # activity inside the grace window. Markers are written once at
+            # provision and never removed, so an unbounded marker (as before
+            # this fix) made every provisioned stage immortal: 178 stale
+            # sandboxes, 59 GiB, most of it 2.3 GB git histories. An actively
+            # working agent keeps touching its workspace; a finished or
+            # stalled one ages out exactly like unmarked scratch space.
+            if activity <= _SANDBOX_GRACE_S:
+                live.add(name)
     _SANDBOX_LIVE_IDS.clear()
     _SANDBOX_LIVE_IDS.update(live)
 
@@ -1182,6 +1228,10 @@ _SAVE_COALESCE_S = 3.0
 _SAVE_PENDING: dict = {'snapshot': None, 'at': 0.0}
 _SAVE_EVENT = threading.Event()
 _SAVE_WORKER: list = []
+# Failed-save retry bookkeeping, keyed by snapshot OBJECT IDENTITY and never
+# stored inside the snapshot itself, so retry state can never leak into the
+# saved blob (2026-11-07 zombie-retry fix).
+_SAVE_RETRY_COUNTS: dict = {}
 _STATE_READ_CACHE: dict = {'obj': None}
 _SAVE_FLUSHED = threading.Event()
 
@@ -1239,12 +1289,30 @@ def _save_worker_loop():
         _SAVE_PENDING['snapshot'] = None
         try:
             _save_state_to_db_sync(snap)
+            _SAVE_RETRY_COUNTS.clear()
         except Exception as e:
             print(f'[state-save] coalesced save failed, re-queued: '
                   f'{type(e).__name__}: {e}', flush=True)
             if _SAVE_PENDING.get('snapshot') is None:
-                _SAVE_PENDING['snapshot'] = snap
-                _SAVE_PENDING['at'] = time.time() - _SAVE_COALESCE_S
+                # Only retry a snapshot that is still the newest one, and
+                # never the same object more than three times: a snapshot
+                # that keeps failing (e.g. its nested structures raced the
+                # sim thread into an unserializable shape) must yield to the
+                # next fresh snapshot instead of wedging persistence on a
+                # zombie retry loop -- observed 2026-11-07 when the same
+                # stamped snapshot was re-queued for many minutes. Tracked
+                # by object identity OUTSIDE the snapshot, so no retry
+                # bookkeeping ever leaks into the saved blob.
+                attempts = _SAVE_RETRY_COUNTS.get(id(snap), 0) + 1
+                _SAVE_RETRY_COUNTS[id(snap)] = attempts
+                if attempts <= 3:
+                    _SAVE_PENDING['snapshot'] = snap
+                    _SAVE_PENDING['at'] = time.time() - _SAVE_COALESCE_S
+                else:
+                    _SAVE_RETRY_COUNTS.pop(id(snap), None)
+                    print(f'[state-save] dropping snapshot after {attempts} '
+                          f'failed attempts; the next queued save carries '
+                          f'the newer state', flush=True)
             _SAVE_EVENT.set()
             time.sleep(5.0)
 
@@ -1305,17 +1373,25 @@ def _save_state_to_db_sync(data):
         # done task (upserted only when new/changed), and the blob holds only
         # the live tasks. state['tasks'] itself is left untouched -- this is a
         # view for the write, not a mutation of the caller's state.
+        # The queued snapshot is a TOP-LEVEL copy only: the sim thread keeps
+        # mutating the nested dicts while this worker walks them. Iterate over
+        # LIST snapshots everywhere here and never re-index `tasks` by an id
+        # computed earlier -- both produced intermittent save failures
+        # ("dictionary changed size during iteration", KeyError 'task-19824')
+        # that re-queued the same poisoned snapshot and stalled persistence
+        # for minutes at a time (caught 2026-11-07).
         tasks = data.get('tasks') or {}
-        done = {tid: t for tid, t in tasks.items() if _is_archived_task(t)}
+        task_items = list(tasks.items())
+        done = {tid: t for tid, t in task_items if _is_archived_task(t)}
         # A surviving task may still point at a terminal one -- a repair child
         # mid-flight references its failed parent. Never archive a task a
         # surviving task references, or the child's completion lookup loses
         # its parent and the chain dead-ends. The blob filter below must use
         # this SAME final set, or a guarded task would be dropped from the
         # blob without ever having been archived (silent data loss).
-        live = {tid: t for tid, t in tasks.items() if tid not in done}
+        live = [(tid, t) for tid, t in task_items if tid not in done]
         referenced = set()
-        for t in live.values():
+        for _tid, t in live:
             for field in ('reviewOf', 'rootStoryId', 'investigationOf',
                           'dependsOn', 'adversarialTaskId'):
                 value = t.get(field)
@@ -1328,8 +1404,8 @@ def _save_state_to_db_sync(data):
         _save_phase(data, 'save_archive_reconcile')
         archived_ok = _reconcile_task_archive(done) if done else True
         if done and archived_ok:
-            keep = (set(tasks) - set(done))
-            blob = {**data, 'tasks': {tid: tasks[tid] for tid in keep}}
+            blob = {**data, 'tasks': {tid: t for tid, t in task_items
+                                      if tid not in done}}
         else:
             # Nothing to archive, or the archive table is unavailable -- keep
             # every task in the blob so nothing is ever lost.
@@ -1358,15 +1434,34 @@ def _save_state_to_db_sync(data):
                             blob['sim'] = {k: v for k, v in sim_blob.items()
                                            if k != nkey[4:]}
             _save_phase(data, 'save_insert')
+            # The blob VIEW is detached from the caller's state at the top
+            # level, but its nested values are still shared with the live
+            # state the sim thread mutates. json.dumps walking them can hit
+            # "dictionary changed size during iteration"; a tiny bounded
+            # retry rides out the transient resize (the sim's writes are
+            # short), and a snapshot serialize NEVER fails the whole save
+            # pass -- caught 2026-11-07 after minutes-long save stalls.
+            blob_text = None
+            for attempt in range(4):
+                try:
+                    blob_text = json.dumps(blob)
+                    break
+                except RuntimeError as _ser:
+                    if attempt == 3 or 'changed size during iteration' \
+                            not in str(_ser):
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
             conn.execute(
                 'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?) '
                 'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-                (json.dumps(blob), time.time()),
+                (blob_text, time.time()),
             )
             # Integrity pair (015): the checksum row must commit atomically
-            # with the blob it covers.
+            # with the blob it covers. Reuse the serialized text -- a second
+            # json.dumps walk of the same shared structures would race the
+            # sim thread again and could disagree with the stored blob.
             _save_phase(data, 'save_checksum')
-            _state_checksum_write(conn, json.dumps(blob))
+            _state_checksum_write(conn, blob_text)
         _save_phase(data, 'save_committed')
         # The per-agent mirror (agent.json/AGENTS.md/MEMORY.md/conversations)
         # runs OFF the tick thread (2026-11-02): it was the pass tail, and the

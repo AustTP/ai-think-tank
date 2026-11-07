@@ -793,7 +793,8 @@ async def execute(request: Request):
     await asyncio.to_thread(_snapshot_sandbox, sandbox_id, sandbox_dir)
     try:
         result = await asyncio.to_thread(
-            _run_in_sandbox_sync, sandbox_dir, command, limits=_lease)
+            _run_in_sandbox_sync, sandbox_dir, command, limits=_lease,
+            purpose=purpose, agent_id=agent_id)
     finally:
         resources.GOVERNOR.release(_lease['id'])
     # The post-run tail (DB log write, confirmation update, prototype sync)

@@ -52,7 +52,8 @@ async def escalation_review_execute(request: Request):
         return JSONResponse({'error': 'invalid escalation id'}, status_code=400)
     try:
         sandbox_dir = _sandbox_dir_for(sandbox_id)
-        result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
+        result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command,
+                                         agent_id=actor)
     except Exception as exc:
         return JSONResponse({'error': f'could not run the review command: {exc}'},
                             status_code=500)

@@ -701,7 +701,8 @@ async def _pipeline_execute_locked(request: Request, body: dict):
             log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed_supervisor_override', 'reason': reason, 'supervisorNote': override_note}, authorized=authorized)
 
         await asyncio.to_thread(_snapshot_sandbox, sandbox_id, sandbox_dir)
-        result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command)
+        result = await asyncio.to_thread(_run_in_sandbox_sync, sandbox_dir, command,
+                                         agent_id=agent_id)
         log_action(agent_id, 'execute', {'sandboxId': sandbox_id, 'command': command, 'decision': 'allowed', 'exitCode': result['exitCode']}, authorized=authorized)
         results.append({'name': name, 'allowed': True, **result})
         if job:

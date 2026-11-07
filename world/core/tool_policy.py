@@ -9,7 +9,8 @@ cannot silently become replayable or low-trust.
 
 _READ_ONLY_TOOLS = frozenset({
     'search_library', 'read_library_file', 'search_web', 'browse_page',
-    'github_get_repo', 'github_search_code', 'read_ais_feed', 'read_market_feed',
+    'github_get_repo', 'github_search_code', 'github_list_issues',
+    'github_get_issue', 'read_ais_feed', 'read_market_feed',
     'read_live_feed', 'read_rss_feed', 'read_weather', 'read_google_sheet',
     'read_live_coverage', 'mcp_list_servers', 'mcp_list_tools', 'mcp_read',
     'list_event_streams', 'list_object_stores',
