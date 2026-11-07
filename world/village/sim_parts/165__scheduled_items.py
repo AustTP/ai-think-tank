@@ -41,14 +41,23 @@ _SCHEDULED_SEED_ITEM = {
     'deliverable': 'report',
     'taskType': 'report',
     'instructions': (
-        'Read the daily Telegram alert digest in the Library (the source file '
-        'is named in your task instructions), then triage every alert class: '
+        'Read the Telegram alert digest in the Library (the source file '
+        'is named in your task instructions; one file per scan, scans '
+        'accumulate), then triage every alert class: '
         'which were REAL issues the tank should have handled itself (recurring '
         'failure classes, alerts that fired for conditions already resolved, '
         'alerts that should have routed to a director instead of the operator)? '
         'Write a short triage report, and file ONE issue per genuine problem '
         'for the owning director. Do not re-litigate one-off failures the tank '
-        'already recovered from.'),
+        'already recovered from, and do not re-litigate alert classes already '
+        'covered by an OPEN issue from a previous scan.\n\n'
+        'Scan frequency: you own this decision. When alert volume stays '
+        'quiet for a day, slow the scan (hourly/daily) with an api_call '
+        'PATCH /api/schedules/item/sch-rvp-telegram-digest using your '
+        'agent key (directors are operator-gated); if the gate refuses, '
+        'retry with a clearer purpose, else file the request as an issue '
+        'for the chief of staff. During an integration program or an '
+        'alert fire, keep the scan fast.'),
     'enabled': True,
     'lastRunAtMs': 0,
 }

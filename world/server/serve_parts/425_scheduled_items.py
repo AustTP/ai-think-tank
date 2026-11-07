@@ -45,6 +45,17 @@ def telegram_digest_path(day=None):
     return f'analysis/telegram-alert-digest-{day}.md'
 
 
+def telegram_digest_scan_path(now=None):
+    """Library path for ONE scan's digest. Per-scan files, not a rolling
+    daily file: a 30-minute scan overwriting the day's 24h digest destroyed
+    the record (the RVP's second scan read a 0-alert 0.25h window where the
+    24h triage source used to be). Scans accumulate; nothing is lost."""
+    dt = datetime.datetime.fromtimestamp(
+        now if now is not None else time.time(), datetime.timezone.utc)
+    return (f'analysis/telegram-alert-digest-{dt.strftime("%Y-%m-%d")}'
+            f'-{dt.strftime("%H%M")}.md')
+
+
 def write_telegram_alert_digest(now=None, since_ts=None):
     """Land the last 24h of outbound Telegram alerts into the Library so the
     regional VP's daily scan card can read them with read_library_file.
@@ -105,7 +116,7 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         if len(occurrences) > 6:
             lines.append(f'- ... {len(occurrences) - 6} more')
         lines.append('')
-    rel = telegram_digest_path(day)
+    rel = telegram_digest_scan_path(now)
     target = _safe_library_path(rel)
     if not target:
         return None

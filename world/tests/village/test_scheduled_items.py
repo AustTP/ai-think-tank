@@ -157,7 +157,7 @@ class DigestTests(unittest.TestCase):
             conn.execute.return_value.fetchall.return_value = rows
             db.return_value.__enter__.return_value = conn
             path = serve.write_telegram_alert_digest(now=now)
-        self.assertEqual(path, serve.telegram_digest_path('2026-11-07'))
+        self.assertEqual(path, serve.telegram_digest_scan_path(now))
         text = written['text']
         self.assertIn('Total alerts: 3', text)
         self.assertIn('A content run was abandoned (x2)', text)
@@ -167,6 +167,20 @@ class DigestTests(unittest.TestCase):
     def test_digest_path_is_stable_per_day(self):
         self.assertEqual(serve.telegram_digest_path('2026-11-07'),
                          'analysis/telegram-alert-digest-2026-11-07.md')
+
+    def test_digest_writes_a_unique_file_per_scan(self):
+        # A 30-min scan must NOT overwrite the day's earlier digests (the
+        # RVP's second scan once read a 0-alert rolling window where the
+        # 24h triage source had been).
+        import datetime
+        t1 = datetime.datetime(2026, 11, 7, 21, 47,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        t2 = datetime.datetime(2026, 11, 7, 22, 17,
+                               tzinfo=datetime.timezone.utc).timestamp()
+        p1 = serve.telegram_digest_scan_path(t1)
+        p2 = serve.telegram_digest_scan_path(t2)
+        self.assertEqual(p1, 'analysis/telegram-alert-digest-2026-11-07-2147.md')
+        self.assertNotEqual(p1, p2)
 
 
 class ScheduleApiTests(unittest.TestCase):

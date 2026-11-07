@@ -61,6 +61,14 @@
   every piece is done/validated (create the selfedit push window(s)).
   API: POST /api/intent/programs, GET /api/programs (with derived
   roll-up), DELETE /api/programs/{id}.
+- Digest retention: each scan writes its own file
+  (telegram-alert-digest-<day>-<HHMM>.md) instead of overwriting the
+  day's rolling digest -- a 30-minute scan once destroyed the 24h triage
+  source mid-day (found by the RVP's own second scan, task-22544).
+- The RVP's scan instructions now carry the cadence self-service path
+  (PATCH /api/schedules/item/sch-rvp-telegram-digest with the agent key,
+  operator gate covers directors; retry-with-clearer-purpose on a Jev
+  refusal, else file for the chief of staff).
 - Scheduled items: finer cadences '30min' and 'hourly' (the regional VP
   may set the Telegram-scan frequency itself via the PATCH endpoint,
   operator gate). The digest window is incremental: the scan reads only
