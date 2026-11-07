@@ -55,10 +55,10 @@ def ask(base_url: str, agent_key: str, body: dict) -> str:
     return reply
 
 
-def ask(base_url: str, agent_key: str, body: dict) -> tuple[str, float | None]:
-    """Return (reply, reported_cost_usd). The cost rides the OpenRouter
-    usage payload when the server priced the call; None when unpriced or
-    when the server predates includeUsage."""
+def ask(base_url: str, agent_key: str, body: dict) -> tuple[str, dict]:
+    """Return (reply, usage) where usage carries the server-reported cost
+    and token breakdown (cached_tokens is how provider-side prefix caching
+    is MEASURED). Fields stay absent when unreported; nothing is inferred."""
     request = urllib.request.Request(
         base_url.rstrip('/') + '/api/chat',
         data=json.dumps(body).encode('utf-8'),
@@ -74,8 +74,16 @@ def ask(base_url: str, agent_key: str, body: dict) -> tuple[str, float | None]:
     if not isinstance(reply, str):
         raise RuntimeError(f'response has no reply: {payload!r}')
     usage = payload.get('usage') or {}
-    cost = usage.get('cost') if isinstance(usage, dict) else None
-    return reply, (float(cost) if isinstance(cost, (int, float)) else None)
+    out = {}
+    if isinstance(usage, dict):
+        if isinstance(usage.get('cost'), (int, float)):
+            out['costUsd'] = float(usage['cost'])
+        for key in ('prompt_tokens', 'completion_tokens', 'cached_tokens',
+                    'cache_write_tokens'):
+            value = usage.get(key)
+            if isinstance(value, (int, float)):
+                out[key] = int(value)
+    return reply, out
 
 
 def git_sha() -> str | None:
@@ -119,6 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     case_rows = []
     total_cost = 0.0
     priced_calls = 0
+    token_sums = {}
     started = time.time()
     for case in cases:
         body = {
@@ -126,31 +135,38 @@ def main(argv: list[str] | None = None) -> int:
             'agentId': args.agent_id,
             'max_tokens': 120,
             # The endpoint already accrues and logs this cost; asking for it
-            # back lets the benchmark report real spend per run.
+            # back lets the benchmark report real spend and the provider's
+            # cache behavior per run.
             'includeUsage': True,
             'messages': [{'role': 'user', 'content': case['message']}],
         }
         try:
-            reply, cost = ask(args.base_url, args.agent_key, body)
+            reply, usage = ask(args.base_url, args.agent_key, body)
         except Exception as error:
             failures += 1
             case_rows.append({'name': case['name'], 'ok': False,
                               'error': str(error)[:300]})
             print(f'FAIL {case["name"]}: {error}')
             continue
+        cost = usage.get('costUsd')
         if cost is not None:
             total_cost += cost
             priced_calls += 1
+        for key in ('prompt_tokens', 'cached_tokens', 'cache_write_tokens'):
+            if key in usage:
+                token_sums[key] = token_sums.get(key, 0) + usage[key]
+        row = {'name': case['name']}
+        row.update(usage)
         missing = [pattern for pattern in case['expect']
                    if not re.search(pattern, reply, re.IGNORECASE)]
         if missing:
             failures += 1
-            case_rows.append({'name': case['name'], 'ok': False,
-                              'missing': missing, 'costUsd': cost})
+            row.update({'ok': False, 'missing': missing})
             print(f'FAIL {case["name"]}: missing {missing}; reply={reply[:160]!r}')
         else:
-            case_rows.append({'name': case['name'], 'ok': True, 'costUsd': cost})
+            row['ok'] = True
             print(f'PASS {case["name"]}')
+        case_rows.append(row)
     duration_ms = int((time.time() - started) * 1000)
     # Provenance without leaks: the endpoint host never enters the record
     # (a public benchmark page is rendered from these files), and reply
@@ -168,6 +184,8 @@ def main(argv: list[str] | None = None) -> int:
         'durationMs': duration_ms,
         'costUsd': round(total_cost, 6) if priced_calls else None,
         'pricedCalls': priced_calls,
+        'tokens': ({k: token_sums[k] for k in sorted(token_sums)}
+                   if token_sums else None),
     }
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     slug = re.sub(r'[^A-Za-z0-9._-]', '_', args.model)

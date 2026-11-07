@@ -757,6 +757,7 @@ async def chat(request: Request):
                                          drafts=drafts, service=service,
                                          village_id=_sim_village_for_agent(agent_id))
             usage_cost = total_cost
+            raw_usage = None  # multi-sample: token counts are per-sample; cost is the honest aggregate
         else:
             priced = False
             reply = data['choices'][0]['message']['content']
@@ -776,7 +777,8 @@ async def chat(request: Request):
                         print(f'[chat-debug] empty reply after retry model={model}', flush=True)
                 except Exception as retry_exc:
                     print(f'[chat-debug] empty-reply retry failed model={model} err={retry_exc}', flush=True)
-            raw_cost = (data.get('usage') or {}).get('cost')
+            raw_usage = data.get('usage')
+            raw_cost = (raw_usage or {}).get('cost')
             priced = isinstance(raw_cost, (int, float))
             usage_cost = raw_cost if priced else 0.0
         if task_id and not priced:
@@ -804,11 +806,21 @@ async def chat(request: Request):
         # number it paid leaks nothing. Off by default so existing consumers
         # keep the reply-only contract.
         if body.get('includeUsage'):
-            return JSONResponse({
-                'reply': reply,
-                'usage': {'cost': float(usage_cost)
-                          if isinstance(usage_cost, (int, float)) else None},
-            })
+            # `priced` separates a genuinely free call (0.0) from an
+            # unpriced one (no reliable price -> None, never a fake zero).
+            usage_out = {'cost': float(usage_cost) if priced else None}
+            if isinstance(raw_usage, dict):
+                for key in ('prompt_tokens', 'completion_tokens'):
+                    value = raw_usage.get(key)
+                    if isinstance(value, (int, float)):
+                        usage_out[key] = int(value)
+                details = raw_usage.get('prompt_tokens_details')
+                if isinstance(details, dict):
+                    for key in ('cached_tokens', 'cache_write_tokens'):
+                        value = details.get(key)
+                        if isinstance(value, (int, float)):
+                            usage_out[key] = int(value)
+            return JSONResponse({'reply': reply, 'usage': usage_out})
         return JSONResponse({'reply': reply})
     except OpenRouterCreditsPaused as e:
         return JSONResponse({'error': str(e), 'creditsPaused': True}, status_code=503)

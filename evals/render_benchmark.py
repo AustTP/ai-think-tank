@@ -58,6 +58,24 @@ def latest_per_model(runs: list[dict]) -> dict[str, dict]:
     return latest
 
 
+def fmt_cache(run: dict) -> str:
+    """Provider-reported prefix-cache hit rate for a run, or '' when the
+    run recorded no token breakdown (older records, or the server predates
+    includeUsage). Nothing is inferred from a missing number."""
+    if not isinstance(run, dict):
+        return ''
+    tokens = run.get('tokens')
+    if not isinstance(tokens, dict):
+        return ''
+    cached = tokens.get('cached_tokens')
+    prompt = tokens.get('prompt_tokens')
+    if not isinstance(prompt, (int, float)) or prompt <= 0:
+        return ''
+    if not isinstance(cached, (int, float)):
+        return 'cache n/a'
+    return f'cache hit {cached / prompt:.0%}'
+
+
 def fmt_cost(run: dict) -> str:
     cost = run.get('costUsd')
     if not isinstance(cost, (int, float)):
@@ -86,7 +104,8 @@ def run_table(label: str, run: dict) -> list[str]:
            f'{run.get("passed")}/{run.get("total")} passed · '
            f'cost {escape(fmt_cost(run))} · '
            f'{run.get("durationMs", "?")} ms · '
-           f'source <code>{escape(run["_source"])}</code></p>']
+           + (f'{escape(fmt_cache(run))} · ' if fmt_cache(run) else '')
+           + f'source <code>{escape(run["_source"])}</code></p>']
     out.append('<table><tr><th>case</th><th>result</th></tr>')
     for name, result in case_rows(run):
         cls = 'pass' if result == 'PASS' else 'fail'
@@ -139,12 +158,25 @@ def render(runs: list[dict], generated_at: str) -> str:
             '<tr><td>duration</td>'
             f'<td>{tank.get("durationMs", "?")} ms</td>'
             f'<td>{baseline.get("durationMs", "?")} ms</td></tr>',
-            '</table>',
-            '<p class="meta">Both rows are the latest recorded run per '
-            'model; runs on different code revisions are labeled with their '
-            'git sha above. A fair comparison pairs runs from the same '
-            'revision.</p>',
         ]
+    tank_cache, baseline_cache = fmt_cache(tank), fmt_cache(baseline)
+    if tank_cache or baseline_cache:
+        parts += [
+            '<tr><td>provider cache</td>'
+            f'<td>{escape(tank_cache or "n/a")}</td>'
+            f'<td>{escape(baseline_cache or "n/a")}</td></tr>',
+            '</table>',
+        ]
+    else:
+        parts.append('</table>')
+    parts += [
+        '<p class="meta">Both rows are the latest recorded run per '
+        'model; runs on different code revisions are labeled with their '
+        'git sha above. A fair comparison pairs runs from the same '
+        'revision. The cache line is the provider\'s own reported '
+        'cached-token share of prompt tokens; runs without a token '
+        'breakdown show n/a, never a guess.</p>',
+    ]
     parts.append('</body></html>')
     return '\n'.join(parts)
 

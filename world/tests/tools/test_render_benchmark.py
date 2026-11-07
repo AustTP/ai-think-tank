@@ -8,8 +8,6 @@ import importlib.util
 import json
 from pathlib import Path
 
-import pytest
-
 _ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -74,6 +72,44 @@ def test_comparison_requires_both_sides(tmp_path):
     html = rb.render(rb.load_runs(tmp_path), '2026-01-02T00:00:00+00:00')
     assert 'Comparison' in html
     assert '1/2' in html and '2/2' in html
+
+
+def test_cache_hit_rate_only_when_recorded(tmp_path):
+    rb = _renderer()
+    # No token breakdown -> the line stays silent, nothing inferred.
+    _write_run(tmp_path, 'a.json', 'openrouter/auto',
+               '2026-01-01T00:00:00+00:00', 2, 2, 0.01)
+    latest = rb.latest_per_model(rb.load_runs(tmp_path))
+    assert rb.fmt_cache(latest['openrouter/auto']) == ''
+    # Recorded breakdown -> a real percentage from the provider's numbers.
+    (tmp_path / 'a.json').unlink()
+    record = json.loads(json.dumps({
+        'runAt': '2026-01-01T00:00:00+00:00', 'model': 'openrouter/auto',
+        'endpoint': 'local-tank', 'agentId': 'admin', 'gitSha': 'abc1234',
+        'cases': [{'name': 'c1', 'ok': True}],
+        'passed': 2, 'total': 2, 'durationMs': 100, 'costUsd': 0.01,
+        'tokens': {'prompt_tokens': 1000, 'cached_tokens': 800},
+    }))
+    (tmp_path / 'b.json').write_text(json.dumps(record), encoding='utf-8')
+    latest = rb.latest_per_model(rb.load_runs(tmp_path))
+    assert rb.fmt_cache(latest['openrouter/auto']) == 'cache hit 80%'
+    html = rb.render(rb.load_runs(tmp_path), 'x')
+    assert 'cache hit 80%' in html
+
+
+def test_cache_line_absent_prompt_tokens_but_no_cached(tmp_path):
+    rb = _renderer()
+    record = {
+        'runAt': '2026-01-01T00:00:00+00:00', 'model': 'openrouter/auto',
+        'endpoint': 'local-tank', 'agentId': 'admin', 'gitSha': 'abc1234',
+        'cases': [{'name': 'c1', 'ok': True}],
+        'passed': 2, 'total': 2, 'durationMs': 100, 'costUsd': 0.01,
+        'tokens': {'prompt_tokens': 1000},
+    }
+    (tmp_path / 'a.json').write_text(json.dumps(record), encoding='utf-8')
+    latest = rb.latest_per_model(rb.load_runs(tmp_path))
+    assert rb.fmt_cache(latest['openrouter/auto']) == 'cache n/a'
+    assert rb.fmt_cache(None) == ''
 
 
 def test_corrupt_record_is_skipped_not_fatal(tmp_path):
