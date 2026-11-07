@@ -79,7 +79,10 @@ LANE_DB_PATH = REPO_ROOT / 'fast_lane.db'
 KILL_SWITCH_PATH = REPO_ROOT / 'data' / 'fast-kill'
 LANE_KEY_PATH = REPO_ROOT / '.secret_keys' / 'fast_lane.key'
 
-FAST_PORT = int(os.environ.get('FAST_PORT', '8938'))
+# Default 8939: 8938 is village north's API port. The deployed plist sets
+# FAST_PORT=8939, and a bare `python3 fast_path.py` without that env used to
+# reach for the village's port and collide at bind time.
+FAST_PORT = int(os.environ.get('FAST_PORT', '8939'))
 FAST_HOST = os.environ.get('FAST_HOST', '127.0.0.1')
 FAST_MODEL = os.environ.get('FAST_MODEL', 'meta-llama/llama-3.3-70b-instruct:free')
 MAX_TRADES_PER_DAY = max(1, int(os.environ.get('FAST_MAX_TRADES_PER_DAY', '10')))
