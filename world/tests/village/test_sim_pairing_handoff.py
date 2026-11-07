@@ -176,6 +176,9 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
         # keeps consuming the queue -- the old blanket hold idled the whole
         # village even though free capacity was available. Paid-only cards
         # park at the per-call enforcement and requeue intact.
+        # 2026-11-07 rate-limit gate: the assignment loop holds cards ONLY
+        # while no free-pool route is servable; with a healthy free endpoint
+        # (mocked here) the queue still drains.
         state = self._state()
         grid, doors = sim._load_outdoor_geometry()
         item = {'title': 'Paused work', 'room': 'pressoffice',
@@ -183,12 +186,42 @@ class ServerOwnedPairingHandoff(unittest.TestCase):
                 'priority': sim.WORK_PRIORITY['normal'], 'goal': None,
                 'research': None, 'taskType': 'code', 'skillReview': False}
         state['workQueue'] = [item]
-        with unittest.mock.patch('serve.credits_pause_active', return_value=True):
+        with unittest.mock.patch('serve.credits_pause_active', return_value=True), \
+             unittest.mock.patch('serve._freepool_route_for_band',
+                                 return_value='@freepool:low:groq-qwen3.8-27b'):
             sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
                             task_id_holder=[0])
         self.assertEqual(state['workQueue'], [],
                          'a credit pause must not freeze the queue -- free '
                          'capacity keeps the tank working')
+
+    def test_credit_pause_holds_queue_while_free_pool_rate_limited(self):
+        # 2026-11-07: when the paid account is dry AND every free-pool circuit
+        # is breaker-open (the providers' per-minute windows exhausted), the
+        # assignment loop must HOLD cards instead of assigning them to a
+        # worker whose content run can only raise OpenRouterCreditsPaused --
+        # the walk-to-desk, spawn-thread, park, walk-off churn burned nothing
+        # but worker availability every sim tick. The card stays queued and
+        # dispatches the moment a circuit closes.
+        state = self._state()
+        grid, doors = sim._load_outdoor_geometry()
+        item = {'title': 'Held work', 'room': 'pressoffice',
+                'instructions': 'Go.', 'pair': False, 'notBefore': None,
+                'priority': sim.WORK_PRIORITY['normal'], 'goal': None,
+                'research': None, 'taskType': 'code', 'skillReview': False}
+        state['workQueue'] = [item]
+        with unittest.mock.patch('serve.credits_pause_active', return_value=True), \
+             unittest.mock.patch('serve._freepool_route_for_band',
+                                 return_value=None):
+            sim._task_cycle(state, now=time.time(), grid=grid, doors=doors,
+                            task_id_holder=[0])
+        self.assertEqual(len(state['workQueue']), 1,
+                         'no free route ready -> hold the card, do not '
+                         'assign it to a doomed run')
+        self.assertNotIn('tasks', state) or self.assertEqual(
+            [t for t in (state.get('tasks') or {}).values()
+             if t.get('title') == 'Held work'], [],
+            'no task may be minted for a held card')
 
     def test_pair_card_recruits_a_navigator_server_side(self):
         # A `pair` card assigned server-side must recruit a navigator (walking

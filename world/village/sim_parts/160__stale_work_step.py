@@ -1,5 +1,26 @@
 
 
+def _credits_pause_blocks_assignment():
+    """True while the paid account is paused AND no free-pool endpoint is
+    servable right now (2026-11-07). The free providers publish per-minute and
+    per-day quotas the tank already tracks in its own circuit/quota state, so
+    when every circuit is breaker-open the assignment loop should observe those
+    windows instead of assigning cards that can only fail: an assigned card
+    walks a worker to a desk, spawns a content thread, raises
+    OpenRouterCreditsPaused without ever calling a model, parks the card, and
+    walks the worker off. Holding the assignment costs one cheap in-memory
+    route check per pass and fires the moment a circuit closes -- the effective
+    retry cadence becomes the providers' own minute windows, not the sim tick.
+    Player cards are exempt upstream (they need no model work to deliver)."""
+    try:
+        import serve
+        if not serve.credits_pause_active():
+            return False
+        return serve._freepool_route_for_band('low') is None
+    except Exception:
+        return False
+
+
 def _stale_work_step(state, now, now_ms):
     """SM gap 1: stale in-flight work oversight. Bugs already have a restore
     alarm (RESTORE_TIMEOUT_MS via _escalation_step); a NON-bug task wedged in
@@ -986,6 +1007,19 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
             break
         pick = work_queue[due_index]
         attempted.add(id(pick))
+        # Rate-limit gate (2026-11-07): while the paid account is paused, the
+        # tank runs on the free pool, whose providers publish per-minute/per-day
+        # quotas the tank already tracks. When NO free route is servable right
+        # now (every circuit breaker-open / quota window exhausted), do not
+        # assign at all this pass: an assigned card can only raise
+        # OpenRouterCreditsPaused, which walks a worker to a desk, spawns a
+        # content thread, parks the card, and walks the worker off -- churn
+        # that burns quota-probing nothing. Leave the card queued; the next
+        # pass fires the moment a circuit closes, so the observed cadence is
+        # the providers' own minute windows, not the sim tick.
+        _pick_is_player_card = (pick.get('assignedTo') or '') == 'player'
+        if not _pick_is_player_card and _credits_pause_blocks_assignment():
+            break
         # A peer-approval review/fix subtask is pinned to a specific agent (its
         # reviewer/author) and must reach them even when the generic wake rule
         # (wake only enough agents to keep one awake-idle) would skip the second

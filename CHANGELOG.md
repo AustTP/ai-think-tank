@@ -29,6 +29,13 @@
   serialized text (a second dumps walk would race again and could disagree
   with the stored blob), and a snapshot that fails three times yields to
   the next fresh one.
+- The assignment loop now observes the free providers' minute windows while
+  the paid account is dry. When every free-pool circuit is breaker-open, the
+  loop holds queued cards instead of assigning them to a worker whose content
+  run can only raise OpenRouterCreditsPaused (walk to desk, spawn thread,
+  park, walk off -- every sim tick). The cards dispatch the moment a circuit
+  closes, so the retry cadence is the providers' own rate-limit windows, not
+  the sim tick. Player cards are exempt (they need no model work).
 - Outbound webhooks: the tank can notify external systems. A subscribed URL
   with an optional shared secret receives signed POSTs (`X-Tank-Signature`:
   sha256 HMAC over the exact body) when an action-log kind matches its event
