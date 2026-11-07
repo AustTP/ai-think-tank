@@ -29,6 +29,17 @@
   serialized text (a second dumps walk would race again and could disagree
   with the stored blob), and a snapshot that fails three times yields to
   the next fresh one.
+- Standing rate-limit policy, made explicit: the village ALWAYS observes the
+  free providers' published limits, paid credits or not. The pool already runs
+  free-first -- free endpoints serve within their rpm/rpd/tpm windows, and the
+  paid tiers take the overflow exactly when the free minute/day windows are
+  used up. Fixed the gap where a provider-reported daily-limit 429 marked an
+  endpoint's day as exhausted but the picker only honored that marker for
+  auto-gemini models: plain endpoints (openrouter-free, groq) were re-picked
+  immediately and burned a call on every retry until UTC midnight. The
+  endpoint-level exhausted marker now skips the endpoint for the day; pinned
+  by tests (overflow-to-paid on a used-up pool, next-day recovery without a
+  restart, shipped-config mode guard).
 - The assignment loop now observes the free providers' minute windows while
   the paid account is dry. When every free-pool circuit is breaker-open, the
   loop holds queued cards instead of assigning them to a worker whose content

@@ -629,6 +629,12 @@ def _freepool_ready(ep, band):
             if tpm.get('minute') == minute and tpm.get('tokens', 0) >= ep['tpm']:
                 return False
         rpd = _free_pool_state['rpd'].get(ep['name']) or {}
+        # A provider-reported daily-limit 429 marks the endpoint's day as
+        # exhausted even when no local cap is configured (the marker is how
+        # the tank observes a published daily allowance it does not model).
+        # Retrying until midnight would only burn calls: skip for the day.
+        if rpd.get('date') == _utc_today() and rpd.get('exhausted'):
+            return False
         if ep['rpd'] and rpd.get('date') == _utc_today() and rpd.get('count', 0) >= ep['rpd']:
             return False
     return True

@@ -273,6 +273,51 @@ class FreePoolPickerTests(unittest.TestCase):
         self.assertEqual(serve._freepool_route_for_band('low', force=True),
                          '@freepool:low:gemini-x')
 
+    def test_free_first_overflow_to_paid_when_pool_used_up(self):
+        # Standing policy (2026-11-07): the village ALWAYS observes the free
+        # providers' rate limits, paid credits or not. In free-first mode a
+        # fully quota-exhausted pool (every endpoint's RPD spent) yields no
+        # route, and the caller's normal paid pick takes the overflow -- the
+        # operator's paid credits serve exactly when the free minute/day
+        # windows are used up, never instead of them. Wait for the caller-side
+        # contract: credits_pause_active() False here, so only quota state
+        # decides.
+        _write_pool_config(_POOL_CONFIG)
+        with serve._free_pool_lock:
+            today = serve._utc_today()
+            for name in ('gemini-x', 'groq-x'):
+                serve._free_pool_state['rpd'][name] = {
+                    'date': today, 'count': 99}
+            # openrouter-free ships no local rpd cap; model the provider's own
+            # reported daily exhaustion instead.
+            serve._free_pool_state['rpd']['openrouter-free'] = {
+                'date': today, 'count': 99, 'exhausted': True}
+        self.assertIsNone(serve._freepool_route_for_band('low'),
+                          'a used-up pool must hand the call to paid, not 429')
+
+    def test_free_pool_rpd_counters_reset_next_day(self):
+        # The day boundary is the recovery path when paid is also dry: a pool
+        # exhausted today must be servable again tomorrow without a restart.
+        _write_pool_config(_POOL_CONFIG)
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-x'] = {
+                'date': '2000-01-01', 'count': 99}
+        self.assertEqual(serve._freepool_route_for_band('low'),
+                         '@freepool:low:gemini-x',
+                         'yesterday-s RPD exhaustion must not block today')
+
+    def test_shipped_config_mode_is_free_first(self):
+        # Guard the operator's standing decision in the shipped config: the
+        # village runs free-first (free models first within their published
+        # rate limits, paid credits as the overflow when the windows are
+        # spent). A config drift to 'paid-first' would burn credits on every
+        # call; 'budget-only' would park work while paid credits sit unused.
+        import json as _json
+        with open(os.path.join(os.path.dirname(serve.__file__),
+                               'model_providers.json'), encoding='utf-8') as fh:
+            pool = (_json.load(fh) or {}).get('free_pool') or {}
+        self.assertEqual(pool.get('mode'), 'free-first')
+
     def test_openrouter_free_model_picked_from_catalog(self):
         _seed_db()
         self.assertEqual(serve._freepool_openrouter_free_model('low'),
