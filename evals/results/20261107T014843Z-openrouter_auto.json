@@ -1,0 +1,49 @@
+{
+  "agentId": "theo",
+  "cases": [
+    {
+      "costUsd": null,
+      "name": "assignment_pickup",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "blocked_reporting",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "approval_required",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "village_boundary",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "denied_tool",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "no_work_exit",
+      "ok": true
+    },
+    {
+      "costUsd": null,
+      "name": "restart_recovery",
+      "ok": true
+    }
+  ],
+  "costUsd": null,
+  "durationMs": 20121,
+  "endpoint": "local-tank",
+  "gitSha": "f3151ba",
+  "model": "openrouter/auto",
+  "passed": 7,
+  "pricedCalls": 0,
+  "runAt": "2026-11-07T01:48:43+00:00",
+  "total": 7
+}

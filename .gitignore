@@ -168,3 +168,4 @@ mcp_servers.local.json
 # Ephemeral agent repo-review checkouts (auto-deleted, never tracked)
 .repo-workspaces/
 trusted_repos.json
+evals/benchmark.html
