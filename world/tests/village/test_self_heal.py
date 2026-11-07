@@ -564,13 +564,37 @@ class ContentGraceHelpers(unittest.TestCase):
     def test_fresh_heartbeat_is_live_until_grace_cap(self):
         task = {'_contentHeartbeat': 990.0, '_contentGraceUsed': 0.0}
         self.assertTrue(sim._content_run_is_live(task, 1000.0))
+        # Liveness is now heartbeat-only: the grace budget lives in
+        # _grant_content_grace, so a fresh heartbeat stays live past the cap
+        # and the final-grace branch decides (2026-11-07 shard churn).
         task['_contentGraceUsed'] = sim.TASK_CONTENT_GRACE_MAX_S
-        self.assertFalse(sim._content_run_is_live(task, 1000.0),
-                         'spent grace must stop extending')
+        self.assertTrue(sim._content_run_is_live(task, 1000.0),
+                        'a fresh heartbeat stays live past the cap')
 
     def test_stale_heartbeat_is_not_live(self):
         task = {'_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
         self.assertFalse(sim._content_run_is_live(task, 1000.0))
+
+    def test_final_grace_extends_once_past_the_cap_then_stops(self):
+        # The shard triage killed five live runs at the grace cap with
+        # heartbeats 0-87s old; their reports landed minutes after the kill.
+        # One bounded final extension for a fresh heartbeat, then the cap is
+        # hard again.
+        task = {'workUntil': 500.0, '_contentGraceUsed': sim.TASK_CONTENT_GRACE_MAX_S,
+                '_contentHeartbeat': 1000.0 - 10.0}
+        granted = sim._grant_content_grace(task, 1000.0)
+        self.assertEqual(granted, sim.TASK_CONTENT_GRACE_FINAL_S)
+        self.assertTrue(task['_contentFinalGraceUsed'])
+        self.assertEqual(task['_contentGraceUsed'],
+                         sim.TASK_CONTENT_GRACE_MAX_S + sim.TASK_CONTENT_GRACE_FINAL_S)
+        self.assertEqual(sim._grant_content_grace(task, 1000.0), 0.0,
+                         'the final extension is once per run')
+
+    def test_final_grace_never_granted_without_a_fresh_heartbeat(self):
+        task = {'workUntil': 500.0, '_contentGraceUsed': sim.TASK_CONTENT_GRACE_MAX_S,
+                '_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
+        self.assertEqual(sim._grant_content_grace(task, 1000.0), 0.0,
+                         'a dead thread falls through to the honest fallback')
 
     def test_keepalive_bumps_the_heartbeat_during_a_long_call(self):
         # task-278: a 306s silent synthesis made a live spike look dead and it

@@ -416,6 +416,45 @@ def check_rate_limit(agent_id):
     return True
 
 
+def _link_library_write_to_task(agent_id, write_rel):
+    """Land a report write back on the writer's live task.
+
+    A spike/report card closes on task.reportPath + note. Nothing set
+    reportPath when the report went out through /api/library/file: the write
+    logged and vanished, the completion gate then refused the finished run
+    ('missing_saved_deliverable'), the run was abandoned, and the card
+    re-issued. When the written path carries the agent's live task id, record
+    it as the deliverable and seed the note if the agent left none. Uses the
+    serialized state-writer discipline; best-effort by contract."""
+    state = _state_begin()
+    try:
+        agents = state.get('agents') or {}
+        a = agents.get(agent_id)
+        if not a:
+            return
+        tid = a.get('task')
+        task = (state.get('tasks') or {}).get(tid) if tid else None
+        if not task:
+            return
+        if str(task.get('taskType') or '') not in ('spike', 'report') \
+                and str(task.get('deliverable') or '').strip().lower() not in ('report', 'note'):
+            return
+        tid_str = str(task.get('id') or '')
+        if not tid_str or tid_str not in (write_rel or ''):
+            return
+        changed = False
+        if not task.get('reportPath'):
+            task['reportPath'] = write_rel
+            changed = True
+        if not str(task.get('note') or '').strip():
+            task['note'] = f"Report written to {write_rel} (library_write)."
+            changed = True
+        if changed:
+            save_state_to_db(state)
+    finally:
+        _state_abort()
+
+
 @app.post('/api/library/file')
 async def write_library_file(request: Request):
     # source='external' (anything an agent picked up via /api/browse, not
@@ -488,6 +527,16 @@ async def write_library_file(request: Request):
     with open(target, 'w') as f:
         f.write(content[:200_000])
     log_action(agent_id, 'library_write', {'path': write_rel, 'bytes': len(content), 'source': source}, authorized=authorized)
+    # A report-lane card closes on task.reportPath + note, but the write used
+    # to land here and vanish: the task kept reportPath=None, the completion
+    # gate refused every finished spike/report run ('missing_saved_deliverable'),
+    # the run was abandoned, and the card re-issued (the 2026-11-07 shard-triage
+    # churn). Link the write back to the writer's live task when the path
+    # carries that task's id.
+    try:
+        _link_library_write_to_task(agent_id, write_rel)
+    except Exception:
+        pass  # linkage is best-effort; the write itself already succeeded
     # Injection scan on the untrusted door (386_injection_flags): the
     # pending_review path quarantine is where untrusted content SITS; this
     # is the detector that says WHY a reviewer should look carefully. Flags

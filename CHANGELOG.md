@@ -29,6 +29,21 @@
   serialized text (a second dumps walk would race again and could disagree
   with the stored blob), and a snapshot that fails three times yields to
   the next fresh one.
+- Telegram triage (2026-11-07 11:00+), two root causes fixed:
+  (1) Every finished spike/report run was refused at the completion gate
+  ('missing_saved_deliverable') and its card re-issued: the report was
+  written through /api/library/file, but nothing landed the write back on
+  the task, so reportPath stayed None. The write endpoint now links the
+  saved path (and a seeded note) onto the writer's live spike/report task
+  when the path carries the task id, under the serialized state-writer
+  discipline. Five shard triages each hit this; their reports existed on
+  disk while the gate called the runs empty.
+  (2) Content runs were abandoned at the grace cap while their heartbeats
+  were 0-87s fresh (reports landed minutes after the kill). Liveness is now
+  heartbeat-only; the grace budget lives in _grant_content_grace, which
+  grants ONE bounded final extension (TASK_CONTENT_GRACE_FINAL_S=600s,
+  once per run) to a fresh-heartbeat run before the cap goes hard again.
+  A dead thread still falls through to the honest fallback immediately.
 - Standing rate-limit policy, made explicit: the village ALWAYS observes the
   free providers' published limits, paid credits or not. The pool already runs
   free-first -- free endpoints serve within their rpm/rpd/tpm windows, and the

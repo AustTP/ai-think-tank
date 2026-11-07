@@ -151,6 +151,14 @@ TASK_CONTENT_TIMEOUT_MAX_S = 600.0
 TASK_CONTENT_GRACE_STEP_S = 60.0
 TASK_CONTENT_GRACE_MAX_S = 300.0
 TASK_CONTENT_HB_STALE_S = 240.0
+# One FINAL extension past the grace cap, granted only while the run's
+# heartbeat is still fresh. The 2026-11-07 shard triage showed the cap alone
+# kills honest long reads: five shard runs were abandoned with heartbeats
+# 0-87s old and their reports landed minutes after the kill (task-22339,
+# task-22375, task-22471, task-22475, task-22484), re-minting every card.
+# A dead thread (stale heartbeat) never reaches this branch, so the old
+# timeout semantics still bound genuinely hung runs.
+TASK_CONTENT_GRACE_FINAL_S = 600.0
 
 # In-process heartbeat fallback. The content thread mutates the task dict it
 # was dispatched with; a concurrent whole-blob save from a stale snapshot can
@@ -217,13 +225,14 @@ def _content_heartbeat_at(task):
 
 def _content_run_is_live(task, now):
     """True when a still-in-flight content run has heartbeat evidence it is
-    alive and grace remains. A missing heartbeat (executor never opted in)
-    is NOT live -- that preserves the pre-existing timeout semantics for
-    every other lane."""
+    alive. A missing heartbeat (executor never opted in) is NOT live -- that
+    preserves the pre-existing timeout semantics for every other lane. The
+    grace cap is no longer part of liveness: _grant_content_grace owns the
+    budget, including the one final extension past the cap for a fresh-
+    heartbeat run, so a slow-but-alive synthesis finishes instead of being
+    abandoned mid-write (2026-11-07 shard-triage churn)."""
     hb = _content_heartbeat_at(task)
     if not isinstance(hb, (int, float)):
-        return False
-    if (task.get('_contentGraceUsed') or 0) >= TASK_CONTENT_GRACE_MAX_S:
         return False
     return (now - hb) < TASK_CONTENT_HB_STALE_S
 
@@ -317,14 +326,24 @@ def _reconcile_restarted_content_runs(state):
 def _grant_content_grace(task, now):
     """Extend workUntil by up to TASK_CONTENT_GRACE_STEP_S, bounded by the
     total TASK_CONTENT_GRACE_MAX_S. Returns seconds granted (0.0 when the cap
-    is spent)."""
+    is spent). When the cap is spent but the run's heartbeat is still fresh,
+    grant ONE final bounded extension (TASK_CONTENT_GRACE_FINAL_S) so a
+    slow-but-alive run finishes instead of being abandoned mid-write."""
     remaining = TASK_CONTENT_GRACE_MAX_S - (task.get('_contentGraceUsed') or 0)
-    if remaining <= 0:
+    if remaining > 0:
+        step = min(TASK_CONTENT_GRACE_STEP_S, remaining)
+        task['workUntil'] = (task.get('workUntil') or now) + step
+        task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + step
+        return step
+    if task.get('_contentFinalGraceUsed'):
         return 0.0
-    step = min(TASK_CONTENT_GRACE_STEP_S, remaining)
-    task['workUntil'] = (task.get('workUntil') or now) + step
-    task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + step
-    return step
+    hb = _content_heartbeat_at(task)
+    if not isinstance(hb, (int, float)) or (now - hb) >= TASK_CONTENT_HB_STALE_S:
+        return 0.0
+    task['_contentFinalGraceUsed'] = True
+    task['workUntil'] = (task.get('workUntil') or now) + TASK_CONTENT_GRACE_FINAL_S
+    task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + TASK_CONTENT_GRACE_FINAL_S
+    return TASK_CONTENT_GRACE_FINAL_S
 
 # Server task-loop cadence -- mirrors the browser's runTaskCycle setInterval
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).
