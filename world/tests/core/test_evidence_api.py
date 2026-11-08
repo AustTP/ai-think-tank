@@ -328,6 +328,39 @@ class EnvReload(_ApiTestCase):
             serve._load_env = old_load
             serve.SPEND_CAP_USD = old_cap
 
+    def test_env_reload_syncs_conditional_tools(self):
+        # search_web / generate_image / generate_video ride in AGENT_ASK_TOOLS
+        # only while their credentials are configured. _reload_env_config
+        # rebinds the keys, so it must also sync the advertised membership in
+        # place -- otherwise the tool list goes stale until a restart.
+        old_load = serve._load_env
+        old_id = serve.HIGGSFIELD_API_KEY_ID
+        old_sec = serve.HIGGSFIELD_API_KEY_SECRET
+        try:
+            real = serve._load_env()
+            serve.HIGGSFIELD_API_KEY_ID = 'id-x'
+            serve.HIGGSFIELD_API_KEY_SECRET = 'sec-x'
+            serve._sync_conditional_tools()
+            self.assertIn('generate_image',
+                          {t['function']['name'] for t in serve.AGENT_ASK_TOOLS})
+            serve._load_env = lambda: {**real, 'HIGGSFIELD_API_KEY_ID': '',
+                                       'HIGGSFIELD_API_KEY_SECRET': ''}
+            serve._reload_env_config()
+            names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
+            self.assertNotIn('generate_image', names)
+            self.assertNotIn('generate_video', names)
+            serve._load_env = lambda: {**real, 'HIGGSFIELD_API_KEY_ID': 'id-x',
+                                       'HIGGSFIELD_API_KEY_SECRET': 'sec-x'}
+            serve._reload_env_config()
+            names = {t['function']['name'] for t in serve.AGENT_ASK_TOOLS}
+            self.assertIn('generate_image', names)
+            self.assertIn('generate_video', names)
+        finally:
+            serve._load_env = old_load
+            serve.HIGGSFIELD_API_KEY_ID = old_id
+            serve.HIGGSFIELD_API_KEY_SECRET = old_sec
+            serve._sync_conditional_tools()
+
     def test_reload_never_echoes_values(self):
         old_load = serve._load_env
         old_key = serve.OPENROUTER_API_KEY

@@ -82,7 +82,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             # _read_mailbox_tool_text, server-side, not by prompt).
             return _read_mailbox_tool_text(agent_id, args)
         if name == 'send_mail':
-            # Agent-to-agent mail that does NOT wake the recipient.
+            # Agent-to-agent mail. Default: lands unread without waking the
+            # recipient. wake=true: the server files a mail-triage card
+            # pinned to the recipient so they act on it this cycle.
             # The ENDPOINT binds the sender to this agent's key,
             # validates the recipient, and appends through the pure
             # mailbox writer -- no wake marker, no dispatch. The
@@ -94,10 +96,16 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                 return 'send_mail requires a toAgentId and non-empty text.'
             from core.style import sanitize_text
             text = sanitize_text(text)
+            body = {'toId': to_id, 'text': text.strip()[:2000]}
+            if (args or {}).get('wake'):
+                body['wake'] = 'always'
             result = _http_json('POST', SELF_BASE_URL, '/api/mail/send',
-                                {'toId': to_id, 'text': text.strip()[:2000]},
-                                agent_key)
+                                body, agent_key)
             if isinstance(result, dict) and result.get('ok'):
+                if (args or {}).get('wake'):
+                    return (f'Mail sent to {to_id}: WAKE requested -- a '
+                            'mail-triage card was filed so they act on it '
+                            'now (one open triage card at a time).')
                 return (f'Mail sent to {to_id}: it landed unread '
                         '(it does not wake the recipient).')
             err = (result.get('error') if isinstance(result, dict) else None) or result

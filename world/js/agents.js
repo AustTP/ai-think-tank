@@ -388,13 +388,15 @@ function markContacted(agentId, ts) {
 // the write path must not be an unvalidated client append). On a server
 // failure we fall back to the local append so mail still works degraded, but
 // the normal path is server-authoritative.
-async function sendMail(fromId, toId, text) {
+async function sendMail(fromId, toId, text, opts) {
   const to = AGENTS[toId];
   if (!to || !text) return false;
+  const body = { fromId, toId, text };
+  if (opts && opts.wake) body.wake = 'always';
   try {
     const res = await apiFetch('/api/mail/send', {
       method: 'POST',
-      body: JSON.stringify({ fromId, toId, text }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) return false;
     const data = await res.json();

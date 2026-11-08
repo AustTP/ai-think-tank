@@ -349,7 +349,7 @@ def _deliver_mail(state, agent_id, kind, payload=None, route_if_idle=True):
         'text': (payload or {}).get('text', ''),
     }
     if payload:
-        for k in ('issueKey', 'taskId', 'about'):
+        for k in ('issueKey', 'taskId', 'about', 'wake'):
             if k in payload:
                 entry[k] = payload[k]
     _append_mailbox(a, entry)
@@ -358,9 +358,23 @@ def _deliver_mail(state, agent_id, kind, payload=None, route_if_idle=True):
     # agent (not busy, no task) needs the same routing -- mail to her used to
     # sit unread forever, because only a queued card would ever give her a
     # work cycle, and nothing queued one.
-    needs_wake = bool(a.get('offDuty')) or (route_if_idle and (
-        not a.get('busy') and not a.get('task')
-        and not a.get('handoff') and not a.get('pairWith')))
+    # 2026-11-08: never wake the ADMIN for mail with no routable target.
+    # The admin is excluded from assignment (governance) and from the idle
+    # park pass, so a wake marker that _mail_action_step must clear as
+    # unroutable would leave the admin awake and wandering forever (and
+    # un-park an externally-operated chief of staff on every escalation
+    # copy). The mailbox entry still lands; the admin reads it in their own
+    # process or ceremony context.
+    _is_admin = any(d.get('id') == agent_id and d.get('isAdmin')
+                    for d in (state.get('agentRoster') or [])
+                    if isinstance(d, dict))
+    _routable = bool(payload and (payload.get('issueKey')
+                                  or payload.get('taskId')
+                                  or payload.get('about')))
+    needs_wake = (not (_is_admin and not _routable)) and (
+        bool(a.get('offDuty')) or (route_if_idle and (
+            not a.get('busy') and not a.get('task')
+            and not a.get('handoff') and not a.get('pairWith'))))
     if needs_wake:
         if a.get('offDuty'):
             appear_from_outskirts(state, agent_id)
@@ -448,6 +462,39 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
         m = re.search(r'^(?:\s*[A-Za-z][A-Za-z ]{0,18}: )?\s*HANDOFF:?[ \t]*:?[ \t]*(.+)$',
                       text, re.DOTALL)
         if not m:
+            # Sender-requested wake (2026-11-08): 'always' files a thin
+            # mail-triage card pinned to the recipient so the wake produces a
+            # real action cycle instead of a no-op (the plain-wake marker
+            # cleared without the recipient ever reading the mail). Other
+            # conversation mail returns True WITHOUT a card: the marker
+            # clears (so the park pass can rest her again) and the text
+            # stays in her mailbox for her next natural work cycle.
+            if str((payload or {}).get('wake') or '') != 'always':
+                return True
+            sender = _mail_sender_name(str((payload or {}).get('text') or ''))
+            title = f'Act on mail from {sender}'
+            queue = state.get('workQueue')
+            if not isinstance(queue, list):
+                return False
+            # One open triage card per recipient at a time: a second wake
+            # while the first is unworked would mint a duplicate.
+            if any(i.get('assignedTo') == agent_id and i.get('title') == title
+                   and i.get('status') != 'done'
+                   for i in queue if isinstance(i, dict)):
+                return True
+            queue.append({
+                'title': title,
+                'room': None,
+                'instructions': (
+                    'You were sent wake-flagged mail. Read your mailbox, act '
+                    'on what it asks, and file a short note on what you did. '
+                    'The mail:\n\n' + str((payload or {}).get('text') or '')),
+                'goal': None,
+                'taskType': 'research',
+                'assignedTo': agent_id,  # wake-on-mail pin: THIS agent works it
+                '_mailResume': True,
+                'notBefore': now_ms,
+            })
             return True
         request = m.group(1).strip()
         queue = state.get('workQueue')
@@ -465,6 +512,13 @@ def _queue_mail_work(state, agent_id, kind, payload, now_ms):
         })
         return True
     return False
+
+
+def _mail_sender_name(text):
+    """Best-effort sender name from an API-path mail body ('Name: text').
+    Falls back to 'the sender' -- used only for the wake triage card title."""
+    m = re.match(r'^\s*([A-Za-z][A-Za-z ]{0,18}):\s', str(text or ''))
+    return m.group(1).strip() if m else 'the sender'
 
 
 def _queue_watchdog_alert(state, agent_id, payload, now_ms):
@@ -502,8 +556,12 @@ def _deliver_watchdog_event(state, evt):
     _mail_action_step would never route it; via the marker when off-duty);
     once the streak reaches 2 restarts the admin is ALSO mailed (distinct
     kind -- isAdmin is excluded from assignment, so the admin copy must never
-    queue work) and an audit row is filed. The player is NEVER messaged here:
-    serve's watchdog owns the last-resort Telegram when nothing in the tank
+    queue work) and an audit row is filed. The player gets the same
+    escalation pushed to their channels at that threshold (2026-11-08: the
+    admin now operates from their own process, so an admin-mailbox-only copy
+    could sit unread while an outage churns); the dedup in
+    _queue_player_email keeps a recurring alert from spamming. serve's
+    watchdog still owns the last-resort Telegram when nothing in the tank
     can resolve the outage. Pure state mutation (log_action writes only the
     action_log table, same as help_signal)."""
     now_ms = int(time.time() * 1000)
@@ -537,6 +595,18 @@ def _deliver_watchdog_event(state, evt):
             _deliver_mail(state, admin_id, 'sim_watchdog_escalated',
                           {'text': f'Watchdog escalation (senior director '
                                    f'notified): {text}'})
+        # Mirror the escalation to the player's channels (email + Telegram)
+        # at the same threshold: the admin reads from their own process, so
+        # a mailbox-only copy must not be the only copy in flight during an
+        # outage. Throttled to one push per 30 minutes globally -- a churning
+        # outage fires several alert kinds in quick succession.
+        last_push = float(state.get('_lastWatchdogPlayerPush') or 0)
+        if now_ms - last_push >= 30 * 60 * 1000:
+            _queue_player_email(
+                state, 'watchdog_escalated',
+                '[AI Think Tank] Sim watchdog escalation',
+                text, now_ms=now_ms)
+            state['_lastWatchdogPlayerPush'] = now_ms
         try:
             import serve
             serve.log_action(admin_id or senior_id, 'sim_watchdog_escalated',

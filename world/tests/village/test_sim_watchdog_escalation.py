@@ -154,15 +154,35 @@ class MailActionStepUnroutable(unittest.TestCase):
         self.assertEqual(card['assignedTo'], 'nora')
         self.assertIn('review tweets', card['instructions'])
 
-    def test_unroutable_system_mail_clears_marker_without_queueing(self):
+    def test_unroutable_system_mail_never_wakes_admin(self):
+        # 2026-11-08: the admin is excluded from assignment AND from the idle
+        # park pass, so an unroutable mail (no issueKey/taskId/about) must not
+        # wake or marker them at all -- the old wake-then-clear dance left an
+        # externally operated chief of staff awake and wandering forever.
         st = _state()
         st['agents']['theo']['offDuty'] = True
-        sim._deliver_mail(st, 'theo', 'sim_watchdog_escalated',
-                          {'text': 'watchdog escalation'})
-        self.assertTrue(st['agents']['theo'].get('_mailAwake'))
+        assert sim._deliver_mail(st, 'theo', 'sim_watchdog_escalated',
+                                 {'text': 'watchdog escalation'}) is True
+        self.assertIsNone(st['agents']['theo'].get('_mailAwake'))
+        self.assertTrue(st['agents']['theo']['offDuty'])
         routed = sim._mail_action_step(st, 0, _NOW_MS)
         self.assertEqual(routed, 0)
         self.assertNotIn('_mailAwake', st['agents']['theo'])
+        self.assertEqual(st['workQueue'], [])
+        # The mailbox entry still lands for the admin's own process to read.
+        self.assertEqual(len(st['agents']['theo']['mailbox']), 1)
+
+    def test_unroutable_system_mail_still_wakes_non_admin(self):
+        # Non-admins keep the wake-then-clear behavior: the marker protects
+        # them from the park pass until _mail_action_step routes or clears.
+        st = _state()
+        st['agents']['worker']['offDuty'] = True
+        assert sim._deliver_mail(st, 'worker', 'sim_watchdog_escalated',
+                                 {'text': 'watchdog escalation'}) is True
+        self.assertTrue(st['agents']['worker'].get('_mailAwake'))
+        routed = sim._mail_action_step(st, 0, _NOW_MS)
+        self.assertEqual(routed, 0)
+        self.assertNotIn('_mailAwake', st['agents']['worker'])
         self.assertEqual(st['workQueue'], [])
 
 

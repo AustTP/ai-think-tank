@@ -302,6 +302,13 @@ async def api_mail_send(request: Request):
         names = [d.get('name') or d.get('id') for d in roster
                  if isinstance(d, dict) and d.get('id') == from_id]
         from_name = str(names[0]) if names else str(from_id or '')
+    # Sender-requested wake (2026-11-08): 'always' files a mail-triage card
+    # so the recipient acts on this mail now; anything else keeps the default
+    # (wake an idle/off-duty recipient, conversation mail read on the next
+    # natural cycle). The sender decides; the server never guesses urgency.
+    wake = str((body.get('wake') or '')).strip().lower()
+    if wake not in ('always',):
+        wake = None
     import sim as _sim
     target = (state.get('agents') or {}).get(to_id)
     if not isinstance(target, dict):
@@ -309,6 +316,8 @@ async def api_mail_send(request: Request):
         state.setdefault('agents', {})[to_id] = target
     entry = {'text': f'{from_name}: {text}', 'read': False,
              'ts': int(time.time() * 1000)}
+    if wake:
+        entry['wake'] = wake
     # Wake-on-mail parity (2026-11-04): the sim's _deliver_mail wakes an
     # OFF-DUTY recipient so the mail is acted on instead of sitting unread
     # until an unrelated trigger. The API path previously only appended, so a
@@ -316,7 +325,7 @@ async def api_mail_send(request: Request):
     # (just created above) keep the plain append.
     if to_id in ids:
         _sim._deliver_mail(state, to_id, 'agent_mail',
-                           {'text': f'{from_name}: {text}'})
+                           {'text': f'{from_name}: {text}', 'wake': wake})
     else:
         _sim._append_mailbox(target, entry)
     # BP-62 appeal path: an agent reporter replying about a declined card may

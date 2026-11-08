@@ -123,6 +123,52 @@ def test_agent_mail_conversation_queues_no_card():
     assert state['workQueue'] == []
 
 
+def test_agent_mail_wake_always_files_triage_card():
+    state = {'workQueue': []}
+    assert sim._queue_mail_work(
+        state, 'ruth', 'agent_mail',
+        {'text': 'Theo: please check the gate logs tonight.',
+         'wake': 'always'}, 5000) is True
+    assert len(state['workQueue']) == 1
+    card = state['workQueue'][0]
+    assert card['assignedTo'] == 'ruth'
+    assert card['taskType'] == 'research'
+    assert card['title'] == 'Act on mail from Theo'
+    assert 'gate logs' in card['instructions']
+    assert card['_mailResume'] is True
+
+
+def test_agent_mail_wake_always_dedupes_open_triage_card():
+    state = {'workQueue': [
+        {'title': 'Act on mail from Theo', 'assignedTo': 'ruth',
+         'taskType': 'research', 'status': 'queued'}]}
+    assert sim._queue_mail_work(
+        state, 'ruth', 'agent_mail',
+        {'text': 'Theo: second mail, same recipient.', 'wake': 'always'},
+        6000) is True
+    assert len(state['workQueue']) == 1
+
+
+def test_agent_mail_wake_always_handoff_still_wins():
+    # The HANDOFF: prefix keeps its own card shape; wake must not double-mint.
+    state = {'workQueue': []}
+    assert sim._queue_mail_work(
+        state, 'ruth', 'agent_mail',
+        {'text': 'Theo: HANDOFF: review the shard rows.',
+         'wake': 'always'}, 5000) is True
+    assert len(state['workQueue']) == 1
+    assert state['workQueue'][0]['title'].startswith('HANDOFF: ')
+
+
+def test_deliver_mail_carries_wake_into_entry():
+    state = {'agents': {'ruth': {'mailbox': []}}, 'wakeQueue': []}
+    assert sim._deliver_mail(
+        state, 'ruth', 'agent_mail',
+        {'text': 'Theo: check it.', 'wake': 'always'}) is True
+    entry = state['agents']['ruth']['mailbox'][-1]
+    assert entry['wake'] == 'always'
+
+
 def test_complete_for_agent_without_match_is_false():
     assert sim._wake_complete_for_agent({}, 'ada', 'notice', {}, 'done', 1) is False
 
@@ -134,3 +180,47 @@ def test_restore_skips_completed_and_unknown_agents():
                             'status': 'queued', 'requestedAt': 1}],
              'agents': {}}
     assert sim._wake_restore_markers(state, 2000) == 0
+
+
+def test_deliver_mail_does_not_wake_admin_for_unroutable_mail():
+    # The admin copy of an escalation has no routable target. Waking the
+    # admin is pointless (isAdmin is excluded from assignment) and harmful:
+    # the idle-park pass skips admins, so the wake would leave an externally
+    # operated chief of staff awake and wandering forever.
+    roster = [{'id': 'theo', 'isAdmin': True}]
+    state = {'agentRoster': roster,
+             'agents': {'theo': {'mailbox': [], 'offDuty': True}},
+             'wakeQueue': []}
+    called = []
+    orig = sim.appear_from_outskirts
+    sim.appear_from_outskirts = lambda *a, **k: called.append(a)
+    try:
+        assert sim._deliver_mail(
+            state, 'theo', 'sim_watchdog_escalated',
+            {'text': 'Watchdog escalation: something is wrong.'}) is True
+    finally:
+        sim.appear_from_outskirts = orig
+    a = state['agents']['theo']
+    assert a['offDuty'] is True
+    assert not a.get('_mailAwake')
+    assert called == []
+    assert a['mailbox'][-1]['text'].startswith('Watchdog escalation')
+
+
+def test_deliver_mail_still_wakes_admin_for_routable_mail():
+    roster = [{'id': 'theo', 'isAdmin': True}]
+    state = {'agentRoster': roster,
+             'agents': {'theo': {'mailbox': [], 'offDuty': True}},
+             'wakeQueue': []}
+    called = []
+    orig = sim.appear_from_outskirts
+    sim.appear_from_outskirts = lambda *a, **k: called.append(a)
+    try:
+        assert sim._deliver_mail(
+            state, 'theo', 'system_notice',
+            {'text': 'Card DEV-1 needs your call.', 'issueKey': 'DEV-1'}
+        ) is True
+    finally:
+        sim.appear_from_outskirts = orig
+    assert called, 'routable admin mail still wakes the admin'
+    assert state['agents']['theo'].get('_mailAwake'), 'marker set'

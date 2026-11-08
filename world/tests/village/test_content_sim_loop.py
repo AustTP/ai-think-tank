@@ -149,6 +149,39 @@ class DeepSimTest(_Base):
             sim._deliver_watchdog_event(
                 state, {'kind': 'k', 'detail': 'd', 'restarts': 2})
 
+    def test_watchdog_escalation_mirrors_to_player_throttled(self):
+        state = {'agents': {'d1': {'id': 'd1'}},
+                 'agentRoster': [{'id': 'd1'},
+                                 {'id': 'admin', 'isAdmin': True}],
+                 'emailOutbox': []}
+        base = 1_794_000_000_000.0
+        with unittest.mock.patch.object(sim, '_senior_director',
+                                        return_value={'id': 'd1'}), \
+             unittest.mock.patch.object(sim, '_deliver_mail'), \
+             unittest.mock.patch.object(sim, '_queue_mail_work'), \
+             unittest.mock.patch.object(sim.time, 'time',
+                                        return_value=base / 1000.0), \
+             unittest.mock.patch('serve.log_action'):
+            sim._deliver_watchdog_event(
+                state, {'kind': 'k', 'detail': 'd', 'restarts': 2})
+            kinds = [e.get('kind') for e in state.get('emailOutbox') or []]
+            self.assertEqual(kinds.count('watchdog_escalated'), 1)
+            # a second event minutes later: throttled globally, no new push
+            with unittest.mock.patch.object(sim.time, 'time',
+                                            return_value=base / 1000.0 + 120):
+                sim._deliver_watchdog_event(
+                    state, {'kind': 'k2', 'detail': 'd2', 'restarts': 2})
+            kinds = [e.get('kind') for e in state.get('emailOutbox') or []]
+            self.assertEqual(kinds.count('watchdog_escalated'), 1)
+            # after 30 min: push again
+            with unittest.mock.patch.object(sim.time, 'time',
+                                            return_value=base / 1000.0
+                                            + 31 * 60):
+                sim._deliver_watchdog_event(
+                    state, {'kind': 'k3', 'detail': 'd3', 'restarts': 3})
+            kinds = [e.get('kind') for e in state.get('emailOutbox') or []]
+            self.assertEqual(kinds.count('watchdog_escalated'), 2)
+
     def test_assign_player_task_title_and_depends(self):
         state = {'tasks': {}, 'playerInbox': [], 'emailOutbox': []}
         with unittest.mock.patch('serve.log_action'):

@@ -626,6 +626,52 @@ class ApiMailSend(unittest.TestCase):
                        self._state(), session_ok=False, key_owner=None)
         self.assertEqual(r.status_code, 401)
 
+    def test_wake_always_files_triage_card_for_recipient(self):
+        state = self._state()
+        r = self._post({'fromId': 'ada', 'toId': 'ben',
+                        'text': 'look at the logs now', 'wake': 'always'},
+                       state)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['mail'].get('wake'), 'always')
+        # The API's immediate effect: the mailbox entry carries the wake flag
+        # and a wake is queued. The sim's _mail_action_step mints the pinned
+        # triage card on the next tick (queue_mail_work 'agent_mail'+wake).
+        entry = (state['agents']['ben']['mailbox'] or [])[-1]
+        self.assertEqual(entry.get('wake'), 'always')
+        wakes = [w for w in state.get('wakeQueue') or []
+                 if w.get('agentId') == 'ben']
+        self.assertEqual(wakes[0]['kind'], 'agent_mail')
+        self.assertEqual(wakes[0]['entry'].get('wake'), 'always')
+        state['workQueue'] = []
+        self.assertEqual(
+            sim._queue_mail_work(state, 'ben', 'agent_mail',
+                                 {'text': 'You: look at the logs now',
+                                  'wake': 'always'}, 5000), True)
+        triage = [i for i in state['workQueue']
+                  if i.get('assignedTo') == 'ben']
+        self.assertEqual(len(triage), 1)
+        self.assertEqual(triage[0]['title'], 'Act on mail from You')
+        self.assertEqual(triage[0]['taskType'], 'research')
+
+    def test_wake_other_values_stay_default_no_card(self):
+        for bad in (True, 'urgent', 'none', ''):
+            state = self._state()
+            r = self._post({'fromId': 'ada', 'toId': 'ben',
+                            'text': 'hi', 'wake': bad}, state)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(state.get('workQueue') or [], [],
+                             f'wake={bad!r} must not mint a card')
+
+    def test_wake_always_unknown_recipient_plain_append_no_card(self):
+        # Unknown recipients are 404 before any wake logic; the just-created
+        # plain-append path never mints triage cards.
+        state = {'agentRoster': self._state()['agentRoster'],
+                 'agents': {'ada': {'mailbox': []}}}
+        r = self._post({'fromId': 'ada', 'toId': 'nobody',
+                        'text': 'hi', 'wake': 'always'}, state)
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(state.get('workQueue') or [], [])
+
 
 
 class HardenDbPerms(unittest.TestCase):
