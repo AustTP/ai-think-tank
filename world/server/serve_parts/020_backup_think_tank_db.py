@@ -205,6 +205,8 @@ def _prune_sandboxes():
     now = time.time()
     reaped, gced = 0, 0
     stages = []
+    story_paths = []
+    previous_paths = []
     for name in names:
         path = os.path.join(sandboxes_dir, name)
         if not os.path.isdir(path):
@@ -214,9 +216,27 @@ def _prune_sandboxes():
                                                             'project-',
                                                             'vpn-')):
             continue
-        if not name.startswith('stage-'):
+        if name.startswith('stage-'):
+            stages.append((name, path))
             continue
-        stages.append((name, path))
+        # Story/spike workspaces carry the same per-task git-repo cost as
+        # stage dirs (2026-11-08: 1,063 story/spike dirs, ~13 GB) and the
+        # original sweep never saw them, so every task's workspace outlived
+        # its task forever. Same rule: a workspace whose task is terminal or
+        # unknown is scratch once the grace window passes.
+        task_id = None
+        for prefix in ('story-', 'spike-'):
+            if name.startswith(prefix):
+                task_id = name[len(prefix):]
+                break
+        if task_id:
+            story_paths.append((name, path, task_id))
+            continue
+        if name.startswith('previous-'):
+            # Restart-debris snapshots of the shared workspace: superseded
+            # the moment the server restarts, so plain mtime age reaps them.
+            previous_paths.append(path)
+            continue
     for name, path in stages:
         if name not in _SANDBOX_LIVE_IDS:
             # Not referenced by anything right now. Reap after the grace
@@ -247,6 +267,27 @@ def _prune_sandboxes():
         for name, path in overflow[:len(stages) - _SANDBOX_MAX_DIRS]:
             _shutil.rmtree(path, ignore_errors=True)
             reaped += 1
+    # Story/spike workspaces: reap once their task is terminal/unknown and
+    # the grace window has passed since the last real activity.
+    for name, path, task_id in story_paths:
+        try:
+            if now - os.path.getmtime(path) <= _SANDBOX_GRACE_S:
+                continue
+            if _sandbox_task_status(task_id) is None:
+                continue  # task still live (or unreadable): never delete
+        except OSError:
+            continue
+        _shutil.rmtree(path, ignore_errors=True)
+        reaped += 1
+    # Superseded restart snapshots older than two days.
+    for path in previous_paths:
+        try:
+            if now - os.path.getmtime(path) <= 48 * 3600:
+                continue
+        except OSError:
+            continue
+        _shutil.rmtree(path, ignore_errors=True)
+        reaped += 1
     # Stray legacy .git mirrors inside agent prototypes.
     agents_dir = os.path.join(THINK_TANK_DIR, 'agents')
     try:

@@ -1,4 +1,6 @@
 
+import re
+
 
 # ---------------------------------------------------------------------------
 # Backlog refinement (Cut 1). The scrum master -- a standing,
@@ -469,6 +471,25 @@ def file_issue(state, team_id, issue_type, summary, feature, reporter_id,
         if _norm_issue_title(existing.get('title') or existing.get('summary')) == req_title:
             duplicate_of = existing.get('key')
             break
+    # Cross-team findings dedup: the same root-cause finding filed
+    # independently by every team is ONE finding, not forty (the disk-full
+    # chain, 2026-11-08: 40+ '# Findings:' issues across teams for the same
+    # task). When the title is a findings note naming a task id and an OPEN
+    # findings note in ANY team already names the same task id, stamp the
+    # new card as a duplicate of that canonical one -- filing still
+    # succeeds, the record stays, and the scrum master sees the key.
+    if duplicate_of is None:
+        m = re.search(r'task-\d+', (title or '').lower())
+        if m and re.match(r'#?\s*findings?\b', (title or '').strip().lower()):
+            root = m.group(0)
+            for existing in (state.get('issues') or {}).values():
+                if (existing.get('status') or 'open') not in ('open', 'in_progress'):
+                    continue
+                ex_title = (existing.get('title') or '').lower()
+                if 'findings' not in ex_title or root not in ex_title:
+                    continue
+                duplicate_of = existing.get('key')
+                break
     issue = {
         'key': key,
         'teamId': team_id,

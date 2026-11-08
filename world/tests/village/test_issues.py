@@ -98,6 +98,56 @@ class DeliverableRoundTrip(unittest.TestCase):
         self.assertEqual(state['workQueue'][0]['deliverable'], 'report')
 
 
+class FindingsDedup(unittest.TestCase):
+    def _state(self):
+        return _state(teams=[
+            {'id': 'ben', 'name': "Ben's Crew", 'directorId': 'ben',
+             'purpose': 'X', 'members': ['clara'], 'createdAt': 1},
+            {'id': 'ada', 'name': "Ada's Crew", 'directorId': 'ada',
+             'purpose': 'X', 'members': ['milo'], 'createdAt': 2},
+        ], agents={
+            'ben': {'id': 'ben', 'name': 'Ben'},
+            'ada': {'id': 'ada', 'name': 'Ada'},
+            'clara': {'id': 'clara', 'name': 'Clara'},
+            'milo': {'id': 'milo', 'name': 'Milo'},
+        })
+
+    def test_cross_team_findings_repeat_is_stamped_duplicate(self):
+        # 2026-11-08 disk-full chain: 40+ '# Findings:' issues across teams
+        # for one root cause. A findings note naming a task id that another
+        # team's OPEN findings note already names is stamped duplicateOf.
+        st = self._state()
+        first = sim.file_issue(st, 'ben', 'bug', 'Findings: task-12289 disk-full chain',
+                               'ben-backlog', 'clara',
+                               title='# Findings: task-12289 disk-full chain')
+        self.assertIsNotNone(first)
+        second = sim.file_issue(st, 'ada', 'bug', 'Findings: task-12289 disk-full chain',
+                                'ada-backlog', 'milo',
+                                title='# Findings: task-12289 disk-full chain parked')
+        self.assertIsNotNone(second)
+        self.assertEqual(second['duplicateOf'], first['key'])
+
+    def test_non_findings_issue_is_not_cross_team_stamped(self):
+        st = self._state()
+        first = sim.file_issue(st, 'ben', 'bug', 'Fix disk-full on task-12289',
+                               'ben-backlog', 'clara')
+        second = sim.file_issue(st, 'ada', 'bug', 'Investigate task-12289 latency',
+                                'ada-backlog', 'milo')
+        self.assertIsNotNone(first)
+        self.assertIsNone(second['duplicateOf'])
+
+    def test_findings_on_a_different_task_is_not_stamped(self):
+        st = self._state()
+        first = sim.file_issue(st, 'ben', 'bug', 'Findings: task-12289 disk-full chain',
+                               'ben-backlog', 'clara',
+                               title='# Findings: task-12289 disk-full chain')
+        second = sim.file_issue(st, 'ada', 'bug', 'Findings: task-15000 disk-full chain',
+                                'ada-backlog', 'milo',
+                                title='# Findings: task-15000 disk-full chain')
+        self.assertIsNotNone(first)
+        self.assertIsNone(second['duplicateOf'])
+
+
 class IssueValidation(unittest.TestCase):
     def test_requires_team_id(self):
         state = _state()
