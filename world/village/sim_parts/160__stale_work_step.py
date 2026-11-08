@@ -21,6 +21,9 @@ def _credits_pause_blocks_assignment():
         return False
 
 
+FAILED_RETRY_GRACE_MS = 2 * 3600 * 1000  # a failed card ages 2h before auto re-issue
+
+
 def _stale_work_step(state, now, now_ms):
     """SM gap 1: stale in-flight work oversight. Bugs already have a restore
     alarm (RESTORE_TIMEOUT_MS via _escalation_step); a NON-bug task wedged in
@@ -112,6 +115,41 @@ def _stale_work_step(state, now, now_ms):
                                  'room': task.get('room')})
         del tasks[tid]
         replanned += 1
+    # Failed-aging (2026-11-08): a card sitting in 'failed' had NO auto-resume
+    # at all -- the dankornas X-post verdict cards stranded for a day when
+    # OpenRouter credits ran out mid-run, and nothing ever picked them back
+    # up. A failed card is work the colony STARTED and never finished: once
+    # past a grace window, re-issue it fresh under the same bounded replan
+    # counter as the stale in-flight sweep (complete or fail, never stick).
+    # Bugs, shadows, and review subtasks keep their own machinery.
+    for tid, task in list(tasks.items()):
+        if not isinstance(task, dict) or task.get('status') != 'failed':
+            continue
+        if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow') \
+                or task.get('reviewOf'):
+            continue
+        failed_at = int(task.get('failedAt') or task.get('createdAt') or 0)
+        if not failed_at or now_ms - failed_at < FAILED_RETRY_GRACE_MS:
+            continue
+        key = repr((task.get('title') or '', task.get('room') or ''))
+        replans = replan_map.get(key, 0)
+        if replans < STALE_WORK_MAX_REPLANS:
+            replan_map[key] = replans + 1
+            _requeue_failed_work(state, task)
+            _log_governance(state, 'admin', 'failed_work_requeued',
+                            {'task': tid, 'title': (task.get('title') or '')[:120],
+                             'room': task.get('room'), 'replans': replans + 1})
+        else:
+            if _sm_replan_stale_work(state, task, now_ms):
+                _log_governance(state, 'admin', 'failed_work_sm_replan',
+                                {'task': tid, 'title': (task.get('title') or '')[:120],
+                                 'room': task.get('room'), 'replans': replans + 1})
+            else:
+                _log_governance(state, 'admin', 'failed_work_dropped',
+                                {'task': tid, 'title': (task.get('title') or '')[:120],
+                                 'room': task.get('room')})
+        del tasks[tid]
+        replanned += 1
     return replanned
 
 
@@ -132,6 +170,35 @@ def _requeue_stale_work(state, task):
             'so it is not lost.'
             if task.get('instructions') else
             f"Re-issued stale work: {task.get('title')}"
+        ),
+        'goal': task.get('goal'),
+        'taskType': task.get('taskType') or 'code',
+        'sizeEstimate': task.get('sizeEstimate'),
+        'teamId': task.get('teamId'),
+        'productId': task.get('productId'),
+        'featureId': task.get('featureId'),
+        'backlogItemId': task.get('backlogItemId'),
+        'sprintId': task.get('sprintId'),
+        'priority': WORK_PRIORITY['high'],
+    }])
+
+
+def _requeue_failed_work(state, task):
+    """Re-issue a card that sat in 'failed' past its grace window. Same shape
+    as the stale in-flight re-issue, with the original failure note carried
+    into the instructions so the retry knows why its predecessor died."""
+    room = task.get('room') or _resolve_assignment_room(task)
+    fail_note = (task.get('failNote') or 'unknown cause')[:240]
+    queue_work(state, [{
+        'title': task.get('title'),
+        'reissueOf': task.get('id'),
+        'room': room,
+        'instructions': (
+            (task.get('instructions') or '')
+            + '\n\n[re-planned] This card FAILED earlier and was re-issued so it is '
+            'not lost. Prior failure note: ' + fail_note
+            if task.get('instructions') else
+            f"Re-issued failed work: {task.get('title')} (prior failure: {fail_note})"
         ),
         'goal': task.get('goal'),
         'taskType': task.get('taskType') or 'code',
