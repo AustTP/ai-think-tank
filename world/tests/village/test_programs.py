@@ -35,7 +35,8 @@ def _state(programs=None):
             {'id': 'theo', 'isAdmin': True},
             {'id': 'nora', 'villageChief': True, 'chiefOfVillage': 'main'},
         ],
-        'teams': [{'id': 'ben', 'directorId': 'ben'}],
+        'teams': [{'id': 'ben', 'directorId': 'ben'},
+                  {'id': 'ada', 'directorId': 'ada'}],
         'tasks': {}, 'workQueue': [],
         'programs': programs if programs is not None else [],
     }
@@ -104,7 +105,8 @@ class EnginePassTests(unittest.TestCase):
 
     def test_cr_card_only_when_every_piece_is_done(self):
         st = _state([_program(status='planning-card-minted',
-                              planningCardMinted=True, followupMinted=True)])
+                              planningCardMinted=True,
+                              meetingCardMinted=True, piecesMinted=True)])
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
         self.assertFalse(qw.called, 'one piece still open: no CR yet')
@@ -123,9 +125,11 @@ class EnginePassTests(unittest.TestCase):
         self.assertEqual(st['programs'][0]['status'], 'ready-for-cr')
         self.assertTrue(st['programs'][0]['crRequested'])
 
-    def test_stalled_plan_gets_one_follow_through_card(self):
-        # The plan landed but no piece moved (prog-2 sat complete with zero
-        # sprints): the owner gets ONE follow-through card, not a loop.
+    def test_plan_lands_into_a_kickoff_meeting_the_engine_convenes(self):
+        # The owner cannot file cards (commit-tier refusal, verified in
+        # prog-2's EXECUTE report) -- so when the plan lands with nothing
+        # moving, the ENGINE convenes the senior-director kickoff meeting,
+        # once.
         st = _state([_program(status='planning-card-minted',
                               planningCardMinted=True)])
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
@@ -133,17 +137,44 @@ class EnginePassTests(unittest.TestCase):
             sim._programs_pass(st, now_ms=20_000)
         self.assertEqual(qw.call_count, 1)
         item = qw.call_args[0][1][0]
-        self.assertIn('[EXECUTE]', item['title'])
+        self.assertEqual(item['taskType'], 'meeting')
+        self.assertEqual(item['facilitatorId'], 'theo')
         self.assertEqual(item['assignedTo'], 'theo')
-        self.assertIn('no piece has moved', item['instructions'])
-        self.assertTrue(st['programs'][0]['followupMinted'])
+        self.assertIn('theo', item['attendees'])
+        self.assertIn('nora', item['attendees'])  # village chief invited
+        self.assertIn('RATIFY', item['instructions'])
+        self.assertTrue(st['programs'][0]['meetingCardMinted'])
+        # exactly once
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=30_000)
+        self.assertEqual(qw.call_count, 0)
 
-    def test_engine_never_mints_piece_cards_itself(self):
-        st = _state([_program()])
+    def test_piece_cards_mint_only_after_the_meeting_completes(self):
+        # The engine never mints piece cards while the meeting is live;
+        # once it is done, every piece is minted verbatim and directed to
+        # its owning team's director (unclaimed -> shared backlog).
+        prog = _program(status='planning-card-minted',
+                        planningCardMinted=True, meetingCardMinted=True)
+        st = _state([prog])
+        st['tasks'] = {'task-m': {'id': 'task-m', 'status': 'working',
+                                  'title': '[MEETING] prog-1 kickoff: '
+                                           'ownership and sequencing'}}
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
-        self.assertEqual(len(qw.call_args[0][1]), 1,
-                         'only the planning card; pieces belong to directors')
+        self.assertEqual(qw.call_count, 0, 'meeting still live: no pieces')
+        st['tasks']['task-m']['status'] = 'done'
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=20_000)
+        self.assertTrue(qw.called)
+        items = qw.call_args[0][1]
+        self.assertEqual(len(items), 2)
+        by_title = {i['title']: i for i in items}
+        self.assertIn('Piece A: orchestration lane', by_title)
+        self.assertEqual(by_title['Piece A: orchestration lane']['assignedTo'],
+                         'ben', 'piece directed to the owning director')
+        self.assertEqual(by_title['Piece B: memory service']['assignedTo'],
+                         'ada')
+        self.assertTrue(prog['piecesMinted'])
 
 
 class ProgramApiTests(unittest.TestCase):

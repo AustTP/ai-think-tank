@@ -50,6 +50,13 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- Program lifecycle fix: the owner cannot file cards (commit-tier lane
+  refusal, verified in prog-2's EXECUTE report), so the engine convenes
+  the senior-director kickoff meeting itself once the plan lands, and
+  mints the piece cards -- directed to each owning team's director, or
+  to the shared backlog when unclaimed -- after that meeting completes.
+  Replaces the [EXECUTE] follow-through card, which asked the owner to do
+  the one thing no lane allowed.
 - Program follow-through: when the owner's plan has landed but no piece
   has moved (no teams/sprints/piece cards), the engine mints ONE [EXECUTE]
   card telling the owner to run the delegation steps from their own plan

@@ -78,6 +78,19 @@ def _program_card_item(program, kind, instructions, now_ms):
     }
 
 
+def _program_meeting_done(program, state):
+    """True when this program's kickoff meeting card reached a terminal
+    status (done or failed -- a failed meeting still ratifies nothing, but
+    the piece cards must not be minted twice and the pieces must not be
+    minted while the meeting is still live)."""
+    title = f"[MEETING] {program.get('id')} kickoff: ownership and sequencing"
+    tasks = state.get('tasks') or {}
+    for t in tasks.values():
+        if isinstance(t, dict) and t.get('title') == title:
+            return t.get('status') in ('done', 'failed', 'cancelled')
+    return False
+
+
 def _programs_pass(state, now_ms=None):
     """Roll every program up and mint the owner cards at the two lifecycle
     edges (planning, change request). Returns the number of cards minted."""
@@ -138,31 +151,93 @@ def _programs_pass(state, now_ms=None):
             _log_governance(state, None, 'program_planning_card_minted',
                             {'id': program.get('id'), 'owner': owner})
         elif program.get('status') == 'planning-card-minted' \
-                and not program.get('followupMinted') \
-                and all(s[0] == 'unminted' for s in states.values()) \
-                and states:
-            # The plan landed but nothing moved: mint the owner a
-            # follow-through card once. Execution stalls exactly here
-            # otherwise (prog-2's plan sat complete with zero sprints and
-            # the owner idle).
+                and not program.get('meetingCardMinted'):
+            # The plan landed. The owner CANNOT file the meeting card
+            # herself (worker/director lanes refuse commit-tier api_call;
+            # verified in prog-2's EXECUTE report) and the engine is the
+            # only card-minting lane left -- so the engine convenes the
+            # senior-director meeting on the owner's behalf, exactly as the
+            # plan specifies. Governance stays real: the meeting ratifies
+            # ownership; the engine only performs the mechanical mint.
+            attendees = []
+            for rid in governance.village_chief_ids(state):
+                if rid not in attendees:
+                    attendees.append(rid)
+            for tid in governance.team_director_ids(state):
+                if tid and tid not in attendees:
+                    attendees.append(tid)
+            if owner not in attendees:
+                attendees.append(owner)
             instructions = (
-                "Your program plan has landed but no piece has moved: no "
-                "teams/sprints created, no piece cards minted. Execute the "
-                "plan now, by delegation:\n"
-                "1. File the senior-director MEETING card your plan specified "
-                "(ownership + sequencing ratification).\n"
-                "2. Have each owning senior director author their piece's "
-                "sprint cards and mint the piece card (refinement / director "
-                "governance -- not self_edit).\n"
-                "3. The pieces must carry the titles below verbatim so the "
-                "program roll-up can track them.\n\n"
+                "Program kickoff meeting for " + program.get('id') + " ("
+                + (program.get('title') or '') + "):\n"
+                "1. Review the pieces below against the program goal and its "
+                "context files.\n"
+                "2. RATIFY per-piece ownership: each senior director claims "
+                "the pieces in their lane; where no one claims a piece it "
+                "returns to the shared backlog.\n"
+                "3. Confirm the teams needed under each owning director.\n"
+                "4. Write the minutes into this card's note: the ownership "
+                "table and the sequencing decisions. The engine mints the "
+                "piece cards to the owning directors once this meeting "
+                "completes.\n\n"
                 f"Pieces:\n{piece_lines}\n\n"
-                + (('Plan context: ' + (program.get('goal') or '') + '\n') if program.get('goal') else ''))
-            minted += queue_work(state, [
-                _program_card_item(program, 'EXECUTE', instructions, now_ms)])
-            program['followupMinted'] = True
-            _log_governance(state, None, 'program_followup_minted',
-                            {'id': program.get('id'), 'owner': owner})
+                + (('Goal: ' + (program.get('goal') or '') + '\n') if program.get('goal') else '')
+                + (('Context files: ' + ', '.join('library/' + f for f in program.get('contextFiles') or [])
+                    + '\n') if program.get('contextFiles') else ''))
+            minted += queue_meeting(
+                state,
+                title=f"[MEETING] {program.get('id')} kickoff: ownership "
+                      f"and sequencing",
+                room='pressoffice',
+                instructions=instructions,
+                goal=program.get('goal'),
+                attendees=attendees,
+                facilitator_id=owner,
+                assigned_to=owner)
+            program['meetingCardMinted'] = True
+            _log_governance(state, None, 'program_meeting_card_minted',
+                            {'id': program.get('id'), 'owner': owner,
+                             'attendees': len(attendees)})
+        elif program.get('status') == 'planning-card-minted' \
+                and program.get('meetingCardMinted') \
+                and not program.get('piecesMinted') \
+                and _program_meeting_done(program, state):
+            # The kickoff meeting completed: mint each piece card, directed
+            # to the owning team's director (the meeting's ratified owner;
+            # unclaimed pieces go to the shared backlog unassigned).
+            items = []
+            directors = {t.get('id'): t.get('directorId')
+                         for t in (state.get('teams') or [])
+                         if isinstance(t, dict)}
+            for piece in (program.get('pieces') or []):
+                title = piece.get('title')
+                if not title:
+                    continue
+                assignee = directors.get(piece.get('teamId'))
+                items.append({
+                    'title': title,
+                    'room': None,
+                    'instructions': (
+                        "Program piece for " + program.get('id') + ". Your "
+                        "team owns this piece (ratified at the kickoff "
+                        "meeting). Author your sprint for it, then do the "
+                        "work; peer approvals and a staged, gated change "
+                        "apply to code pieces."),
+                    'goal': program.get('goal'),
+                    'projectLabel': f"program:{program.get('id')}",
+                    'priority': WORK_PRIORITY['high'],
+                    'taskType': piece.get('taskType') or 'code',
+                    'deliverable': piece.get('deliverable') or 'code',
+                    'assignedTo': assignee,
+                    'directedTo': bool(assignee),
+                })
+            if items:
+                minted += queue_work(state, items)
+                program['piecesMinted'] = True
+                _log_governance(state, None, 'program_pieces_minted',
+                                {'id': program.get('id'),
+                                 'pieces': len(items)})
         elif program.get('status') != 'ready-for-cr' and all_done \
                 and (program.get('pieces')):
             instructions = (
