@@ -50,6 +50,9 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- A cancelled/failed kickoff meeting ratifies nothing: the meeting is
+  convened again and the piece cards wait (prog-2's first meeting was
+  walk-cancelled and the pieces minted on that cancel).
 - Program lifecycle fix: the owner cannot file cards (commit-tier lane
   refusal, verified in prog-2's EXECUTE report), so the engine convenes
   the senior-director kickoff meeting itself once the plan lands, and

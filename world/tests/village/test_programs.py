@@ -162,6 +162,14 @@ class EnginePassTests(unittest.TestCase):
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
         self.assertEqual(qw.call_count, 0, 'meeting still live: no pieces')
+        # a CANCELLED meeting ratifies nothing: the meeting is re-convened
+        st['tasks']['task-m']['status'] = 'cancelled'
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=15_000)
+        self.assertEqual(qw.call_count, 0)
+        self.assertFalse(prog['meetingCardMinted'],
+                         'a dead meeting must be convened again')
+        prog['meetingCardMinted'] = True
         st['tasks']['task-m']['status'] = 'done'
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=20_000)

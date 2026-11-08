@@ -78,17 +78,20 @@ def _program_card_item(program, kind, instructions, now_ms):
     }
 
 
-def _program_meeting_done(program, state):
-    """True when this program's kickoff meeting card reached a terminal
-    status (done or failed -- a failed meeting still ratifies nothing, but
-    the piece cards must not be minted twice and the pieces must not be
-    minted while the meeting is still live)."""
+def _program_meeting_state(program, state):
+    """The kickoff meeting card's lifecycle: 'working' (live or queued),
+    'done' (completed -- pieces may mint), or 'dead' (cancelled/failed:
+    nothing was ratified, the meeting must be convened again)."""
     title = f"[MEETING] {program.get('id')} kickoff: ownership and sequencing"
     tasks = state.get('tasks') or {}
     for t in tasks.values():
         if isinstance(t, dict) and t.get('title') == title:
-            return t.get('status') in ('done', 'failed', 'cancelled')
-    return False
+            if t.get('status') == 'done':
+                return 'done'
+            if t.get('status') in ('failed', 'cancelled'):
+                return 'dead'
+            return 'working'
+    return 'working'
 
 
 def _programs_pass(state, now_ms=None):
@@ -201,8 +204,17 @@ def _programs_pass(state, now_ms=None):
                              'attendees': len(attendees)})
         elif program.get('status') == 'planning-card-minted' \
                 and program.get('meetingCardMinted') \
-                and not program.get('piecesMinted') \
-                and _program_meeting_done(program, state):
+                and not program.get('piecesMinted'):
+            meeting = _program_meeting_state(program, state)
+            if meeting == 'dead':
+                # The kickoff died (cancel/failed) without ratifying
+                # anything: convene it again rather than minting pieces
+                # into an unratified org (prog-2's first meeting was
+                # walk-cancelled and the pieces minted on that cancel).
+                program['meetingCardMinted'] = False
+                continue
+            if meeting != 'done':
+                continue
             # The kickoff meeting completed: mint each piece card, directed
             # to the owning team's director (the meeting's ratified owner;
             # unclaimed pieces go to the shared backlog unassigned).
