@@ -1495,6 +1495,7 @@ def _save_state_to_db_sync(data):
             _state_txn.held = False
             _state_txn.saved = True
             _STATE_LOCK.release()
+            _state_lock_owner_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -1520,6 +1521,49 @@ _state_txn = threading.local()
 
 
 _STATE_LOCK_TIMEOUT_S = 120
+# Lock-owner forensics: threading.Lock has no owner, so a thread that dies
+# between acquire and release leaves the lock forever-held with NO suspect in
+# any thread dump (the 2026-11-08 22:20 freeze: every writer queued on
+# _STATE_LOCK, no holder visible, tick stale > 50 min). Record who holds it;
+# on timeout, if the recorded holder no longer exists, the lock is leaked --
+# force-release it instead of freezing the tank behind a ghost.
+_STATE_LOCK_OWNER = {'ident': None, 'name': '', 'at': 0.0}
+
+
+def _state_lock_owner_set():
+    import threading as _t
+    cur = _t.current_thread()
+    _STATE_LOCK_OWNER['ident'] = cur.ident
+    _STATE_LOCK_OWNER['name'] = cur.name
+    _STATE_LOCK_OWNER['at'] = time.time()
+
+
+def _state_lock_owner_clear():
+    _STATE_LOCK_OWNER['ident'] = None
+    _STATE_LOCK_OWNER['name'] = ''
+    _STATE_LOCK_OWNER['at'] = 0.0
+
+
+def _state_lock_recover_leaked():
+    '''If the recorded holder thread no longer exists, the lock is leaked:
+    release it so the tank can proceed. Returns True when a leak was healed.'''
+    import threading as _t
+    owner = _STATE_LOCK_OWNER.get('ident')
+    if owner is None:
+        return False
+    for t in _t.enumerate():
+        if t.ident == owner:
+            return False
+    held_for = time.time() - float(_STATE_LOCK_OWNER.get('at') or 0)
+    print(f'[state-lock] holder thread {_STATE_LOCK_OWNER["name"]!r} '
+          f'is gone but held _STATE_LOCK for {held_for:.0f}s -- leaked lock '
+          f'force-released', flush=True)
+    try:
+        _STATE_LOCK.release()
+    except RuntimeError:
+        pass
+    _state_lock_owner_clear()
+    return True
 
 
 def _state_begin():
@@ -1538,9 +1582,12 @@ def _state_begin():
     # 503 for the waiters; the wedged holder still self-heals when the OS
     # retransmission timer (~15 min) finally kills its socket.
     if not _STATE_LOCK.acquire(timeout=_STATE_LOCK_TIMEOUT_S):
-        raise TimeoutError(
-            f'state lock not acquired within {_STATE_LOCK_TIMEOUT_S}s '
-            '-- a writer is wedged on the DB link; retry shortly')
+        _state_lock_recover_leaked()
+        if not _STATE_LOCK.acquire(timeout=5):
+            raise TimeoutError(
+                f'state lock not acquired within {_STATE_LOCK_TIMEOUT_S}s '
+                '-- a writer is wedged on the DB link; retry shortly')
+    _state_lock_owner_set()
     _state_txn.held = True
     _state_txn.saved = False
     try:
@@ -1548,6 +1595,7 @@ def _state_begin():
     except Exception:
         _state_txn.held = False
         _STATE_LOCK.release()
+        _state_lock_owner_clear()
         raise
 
 
@@ -1557,6 +1605,7 @@ def _state_abort():
     if getattr(_state_txn, 'held', False):
         _state_txn.held = False
         _STATE_LOCK.release()
+        _state_lock_owner_clear()
 
 
 def _state_writer(fn):
