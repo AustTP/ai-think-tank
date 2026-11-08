@@ -31,7 +31,6 @@ def _program_piece_states(program, state):
     queue = state.get('workQueue') or []
     _OPEN = ('working', 'walking', 'queued', 'repairing',
              'needs_review', 'investigating', 'recovery_planned')
-    _TERMINAL = ('blocked', 'failed', 'cancelled', 'abandoned')
     by_title = {}
     for t in tasks.values():
         if not (isinstance(t, dict) and t.get('title')):
