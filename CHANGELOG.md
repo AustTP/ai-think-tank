@@ -55,6 +55,9 @@
   card-pattern suppression: the retry/backoff machinery owns those, and
   the suppression had frozen prog-2's piece titles on restart churn +
   provider timeouts, stranding the whole program.
+- Program piece roll-up matches repair-chain titles (Fix:/Review:
+  prefixes stripped to the root card), so a piece completed inside its
+  fix chain reads done instead of stuck at its first failure.
 - Program piece roll-up prefers open cards over stale ones (newest wins
   otherwise), and a piece whose card died (blocked/failed/cancelled) is
   re-minted once per 30-minute cooldown, directed to its owning director.

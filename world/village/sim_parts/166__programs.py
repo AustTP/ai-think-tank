@@ -35,9 +35,14 @@ def _program_piece_states(program, state):
     for t in tasks.values():
         if not (isinstance(t, dict) and t.get('title')):
             continue
-        prior = by_title.get(t['title'])
+        # Repair chains carry 'Fix: '/'Review: ' prefixes over the root
+        # card's title; a piece completed inside its fix chain must roll up
+        # to that piece (PROG-1D's fix card completed while the piece still
+        # read 'failed').
+        root = _fix_title_root(t['title']) or t['title']
+        prior = by_title.get(root)
         if prior is None:
-            by_title[t['title']] = t
+            by_title[root] = t
             continue
         # An open card outranks anything; among the rest, newest wins --
         # the roll-up must not report a piece from its FIRST stale card
@@ -45,15 +50,15 @@ def _program_piece_states(program, state):
         p_open = prior.get('status') in _OPEN
         t_open = t.get('status') in _OPEN
         if t_open and not p_open:
-            by_title[t['title']] = t
+            by_title[root] = t
         elif t_open == p_open:
             if int(t.get('createdAt') or 0) > int(prior.get('createdAt') or 0):
-                by_title[t['title']] = t
+                by_title[root] = t
     states = {}
     all_done = True
     for piece in (program.get('pieces') or []):
         title = piece.get('title')
-        t = by_title.get(title)
+        t = by_title.get(_fix_title_root(title) or title)
         if t is None:
             if any(q.get('title') == title for q in queue):
                 states[title] = ('queued', None)

@@ -301,3 +301,24 @@ class CadenceWindowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PieceTitleRootTests(unittest.TestCase):
+    def test_piece_done_via_its_fix_chain_rolls_up(self):
+        # Repair chains prefix 'Fix: '/'Review: ' onto the root card's
+        # title; a piece whose fix card completed must roll up as done
+        # (PROG-1D sat 'failed' while its fix card was done).
+        prog = _program(status='planning-card-minted',
+                        planningCardMinted=True, meetingCardMinted=True,
+                        piecesMinted=True)
+        st = _state([prog])
+        st['tasks'] = {
+            't1': {'id': 't1', 'status': 'failed', 'createdAt': 1,
+                   'title': 'Piece A: orchestration lane'},
+            't2': {'id': 't2', 'status': 'done', 'createdAt': 2,
+                   'title': 'Fix: Piece A: orchestration lane'},
+            't3': {'id': 't3', 'status': 'done', 'createdAt': 3,
+                   'title': 'Piece B: memory service'}}
+        states, all_done = sim._program_piece_states(prog, st)
+        self.assertEqual(states['Piece A: orchestration lane'][0], 'done')
+        self.assertTrue(all_done)
