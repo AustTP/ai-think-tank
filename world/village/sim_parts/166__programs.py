@@ -99,6 +99,26 @@ def _program_card_item(program, kind, instructions, now_ms):
     }
 
 
+def _program_cr_card_state(program, state):
+    """The program's CHANGE-REQUEST card lifecycle: 'working' (live or
+    queued), 'done' (completed), or 'dead' (cancelled/failed/abandoned:
+    the CR card died and must be re-minted -- the status guard alone made
+    a dead CR card strand the program in ready-for-cr forever)."""
+    title = (f"[CHANGE-REQUEST] Program {program.get('id')}: "
+             f"{program.get('title')}")
+    tasks = state.get('tasks') or {}
+    seen = False
+    for t in tasks.values():
+        if isinstance(t, dict) and t.get('title') == title:
+            seen = True
+            if t.get('status') == 'done':
+                return 'done'
+            if t.get('status') in ('working', 'queued', 'assigned',
+                                   'walking', 'needs_review'):
+                return 'working'
+    return 'dead' if seen else 'unminted'
+
+
 def _program_meeting_state(program, state):
     """The kickoff meeting card's lifecycle: 'working' (live or queued),
     'done' (completed -- pieces may mint), or 'dead' (cancelled/failed:
@@ -329,4 +349,27 @@ def _programs_pass(state, now_ms=None):
             program['crRequested'] = True
             _log_governance(state, None, 'program_ready_for_cr',
                             {'id': program.get('id'), 'owner': owner})
+        elif program.get('status') == 'ready-for-cr' and all_done \
+                and program.get('crRequested'):
+            # The CR card itself can die (cancel/failed) after ready-for-cr
+            # was set; the one-shot status guard above would then strand the
+            # program forever. Re-mint with the same 30-minute cooldown the
+            # piece re-issue branch uses.
+            cr_state = _program_cr_card_state(program, state)
+            if cr_state in ('dead', 'unminted'):
+                reissues = program.setdefault('pieceReissues', {})
+                last = int(reissues.get('__change_request__') or 0)
+                if not last or now_ms - last >= 30 * 60 * 1000:
+                    reissues['__change_request__'] = now_ms
+                    instructions = (
+                        "Every program piece has landed done/validated. Create the "
+                        "change request(s) now: stage the validated work and run the "
+                        "selfedit push window(s) with an independent validator -- one "
+                        "CR, or several given the scale. CI must be green after the "
+                        "push. When the push lands, close this program.")
+                    minted += queue_work(state, [
+                        _program_card_item(program, 'CHANGE-REQUEST', instructions, now_ms)])
+                    _log_governance(state, None, 'program_cr_card_reminted',
+                                    {'id': program.get('id'), 'owner': owner,
+                                     'state': cr_state})
     return minted

@@ -214,6 +214,56 @@ class EnginePassTests(unittest.TestCase):
         self.assertEqual(qw.call_count, 1, 'a new window re-arms')
 
 
+    def test_dead_cr_card_is_reminted_despite_ready_for_cr(self):
+        # The CR card can die (cancel/failed) after ready-for-cr was set; the
+        # one-shot status guard must not strand the program forever. The
+        # engine re-mints the CR card on the same cooldown the pieces use.
+        prog = _program(status='ready-for-cr', planningCardMinted=True,
+                        meetingCardMinted=True, piecesMinted=True,
+                        crRequested=True)
+        st = _state([prog])
+        st['tasks'] = {
+            'task-a': {'id': 'task-a', 'status': 'done', 'createdAt': 5,
+                       'title': 'Piece A: orchestration lane'},
+            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+                       'title': 'Piece B: memory service'},
+            'task-cr': {'id': 'task-cr', 'status': 'cancelled',
+                        'createdAt': 7,
+                        'title': '[CHANGE-REQUEST] Program prog-1: '
+                                 'Integrate the dankornas recommendations'}}
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000)
+        self.assertTrue(qw.called, 'a dead CR card is re-minted')
+        item = qw.call_args[0][1][0]
+        self.assertEqual(item['title'],
+                         '[CHANGE-REQUEST] Program prog-1: '
+                         'Integrate the dankornas recommendations')
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=20_000)
+        self.assertEqual(qw.call_count, 0, 'cooldown holds')
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000 + 31 * 60 * 1000)
+        self.assertEqual(qw.call_count, 1, 'a new window re-arms')
+
+    def test_live_cr_card_is_not_reminted(self):
+        prog = _program(status='ready-for-cr', planningCardMinted=True,
+                        meetingCardMinted=True, piecesMinted=True,
+                        crRequested=True)
+        st = _state([prog])
+        st['tasks'] = {
+            'task-a': {'id': 'task-a', 'status': 'done', 'createdAt': 5,
+                       'title': 'Piece A: orchestration lane'},
+            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+                       'title': 'Piece B: memory service'},
+            'task-cr': {'id': 'task-cr', 'status': 'working',
+                        'createdAt': 7,
+                        'title': '[CHANGE-REQUEST] Program prog-1: '
+                                 'Integrate the dankornas recommendations'}}
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000)
+        self.assertEqual(qw.call_count, 0)
+
+
 class ProgramApiTests(unittest.TestCase):
     def _client(self):
         from fastapi.testclient import TestClient
