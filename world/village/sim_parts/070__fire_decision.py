@@ -403,6 +403,23 @@ def _card_pattern_key(task):
     return ('title:' + root) if root else None
 
 
+def _failure_is_transient(task):
+    """A failure the transport-recovery machinery owns (provider timeouts,
+    connection resets, model calls that returned nothing) is NOT a card
+    contract defect. Counting it toward the 3-strike pattern suppression
+    froze prog-2's piece titles after a restart churned live runs and the
+    provider timed out -- suppression then blocked the whole program for
+    24h on infrastructure noise. Genuine contract failures (missing
+    deliverable, refused completion) still count, as toby's card showed."""
+    note = str(task.get('failNote') or '') + ' ' + str(task.get('blockedReason') or '')
+    lower = note.lower()
+    return any(marker in lower for marker in (
+        'model connection failed', 'connection reset', 'connection refused',
+        'timed out', 'timeout', 'service unavailable',
+        'temporarily unavailable', 'model call failed or returned nothing',
+        'request failed:', 'returned nothing usable'))
+
+
 def _card_pattern_failures(state, key, now_ms):
     if not key:
         return []
@@ -411,6 +428,8 @@ def _card_pattern_failures(state, key, now_ms):
         if t.get('status') not in ('failed', 'blocked', 'abandoned'):
             continue
         if _card_pattern_key(t) != key:
+            continue
+        if _failure_is_transient(t):
             continue
         ts = t.get('failedAt') or t.get('blockedAt') or t.get('createdAt') or 0
         if now_ms - int(ts) <= CARD_PATTERN_WINDOW_MS:

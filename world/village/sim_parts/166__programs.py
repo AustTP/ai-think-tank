@@ -29,10 +29,27 @@ def _program_piece_states(program, state):
     (states, all_done) where states maps title -> (state, taskId)."""
     tasks = state.get('tasks') or {}
     queue = state.get('workQueue') or []
+    _OPEN = ('working', 'walking', 'queued', 'repairing',
+             'needs_review', 'investigating', 'recovery_planned')
+    _TERMINAL = ('blocked', 'failed', 'cancelled', 'abandoned')
     by_title = {}
     for t in tasks.values():
-        if isinstance(t, dict) and t.get('title'):
-            by_title.setdefault(t['title'], t)
+        if not (isinstance(t, dict) and t.get('title')):
+            continue
+        prior = by_title.get(t['title'])
+        if prior is None:
+            by_title[t['title']] = t
+            continue
+        # An open card outranks anything; among the rest, newest wins --
+        # the roll-up must not report a piece from its FIRST stale card
+        # while a live retry runs under the same title.
+        p_open = prior.get('status') in _OPEN
+        t_open = t.get('status') in _OPEN
+        if t_open and not p_open:
+            by_title[t['title']] = t
+        elif t_open == p_open:
+            if int(t.get('createdAt') or 0) > int(prior.get('createdAt') or 0):
+                by_title[t['title']] = t
     states = {}
     all_done = True
     for piece in (program.get('pieces') or []):
@@ -111,6 +128,9 @@ def _programs_pass(state, now_ms=None):
         owner = program.get('ownerAgentId')
         if not owner:
             continue
+        directors = {t.get('id'): t.get('directorId')
+                     for t in (state.get('teams') or [])
+                     if isinstance(t, dict)}
         by_title = {p.get('title'): p for p in (program.get('pieces') or [])}
         piece_lines = '\n'.join(
             '- ' + t + ' (team: '
@@ -219,9 +239,6 @@ def _programs_pass(state, now_ms=None):
             # to the owning team's director (the meeting's ratified owner;
             # unclaimed pieces go to the shared backlog unassigned).
             items = []
-            directors = {t.get('id'): t.get('directorId')
-                         for t in (state.get('teams') or [])
-                         if isinstance(t, dict)}
             for piece in (program.get('pieces') or []):
                 title = piece.get('title')
                 if not title:
@@ -250,6 +267,50 @@ def _programs_pass(state, now_ms=None):
                 _log_governance(state, None, 'program_pieces_minted',
                                 {'id': program.get('id'),
                                  'pieces': len(items)})
+        elif program.get('piecesMinted') and program.get('meetingCardMinted') \
+                and not all_done:
+            # A piece whose card died (blocked/failed/cancelled) gets ONE
+            # re-mint per cooldown window. The pattern-suppression gate
+            # (070__fire_decision) still stops genuine contract-failure
+            # loops; this covers infrastructure deaths (restart churn,
+            # provider timeouts) that left the program stranded.
+            reissues = program.setdefault('pieceReissues', {})
+            cooldown_ms = 30 * 60 * 1000
+            items = []
+            for piece in (program.get('pieces') or []):
+                title = piece.get('title')
+                if not title:
+                    continue
+                st_, _tid = states.get(title, ('unminted', None))
+                if st_ not in ('blocked', 'failed', 'cancelled', 'abandoned'):
+                    continue
+                last = int(reissues.get(title) or 0)
+                if last and now_ms - last < cooldown_ms:
+                    continue
+                reissues[title] = now_ms
+                items.append({
+                    'title': title,
+                    'room': None,
+                    'instructions': (
+                        "Re-issue of a program piece for "
+                        + program.get('id') + "; the previous card died "
+                        "without completing (blocked/failed). Pick the "
+                        "work up: author your sprint, do the piece, peer "
+                        "approvals and a staged, gated change apply to "
+                        "code pieces."),
+                    'goal': program.get('goal'),
+                    'projectLabel': f"program:{program.get('id')}",
+                    'priority': WORK_PRIORITY['high'],
+                    'taskType': piece.get('taskType') or 'code',
+                    'deliverable': piece.get('deliverable') or 'code',
+                    'assignedTo': directors.get(piece.get('teamId')),
+                    'directedTo': True,
+                })
+            if items:
+                minted += queue_work(state, items)
+                _log_governance(state, None, 'program_pieces_reissued',
+                                {'id': program.get('id'),
+                                 'pieces': [i['title'][:40] for i in items]})
         elif program.get('status') != 'ready-for-cr' and all_done \
                 and (program.get('pieces')):
             instructions = (

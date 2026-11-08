@@ -185,6 +185,35 @@ class EnginePassTests(unittest.TestCase):
         self.assertTrue(prog['piecesMinted'])
 
 
+    def test_piece_cards_reissue_after_a_terminal_death_with_cooldown(self):
+        # Infrastructure deaths (restart churn, provider timeouts) must not
+        # strand the program: a blocked piece card is re-minted once per
+        # cooldown window, directed to the owning director.
+        prog = _program(status='planning-card-minted',
+                        planningCardMinted=True, meetingCardMinted=True,
+                        piecesMinted=True)
+        st = _state([prog])
+        st['tasks'] = {
+            'task-a': {'id': 'task-a', 'status': 'blocked', 'blockedAt': 5,
+                       'createdAt': 5,
+                       'title': 'Piece A: orchestration lane'},
+            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+                       'title': 'Piece B: memory service'}}
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000)
+        self.assertTrue(qw.called)
+        items = qw.call_args[0][1]
+        self.assertEqual([i['title'] for i in items],
+                         ['Piece A: orchestration lane'])
+        self.assertEqual(items[0]['assignedTo'], 'ben')
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=20_000)
+        self.assertEqual(qw.call_count, 0, 'cooldown holds')
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000 + 31 * 60 * 1000)
+        self.assertEqual(qw.call_count, 1, 'a new window re-arms')
+
+
 class ProgramApiTests(unittest.TestCase):
     def _client(self):
         from fastapi.testclient import TestClient

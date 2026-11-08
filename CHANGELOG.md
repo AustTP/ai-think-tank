@@ -50,6 +50,14 @@
   first Telegram-scan triage landed a solid report and graded 0 because the
   grader judged the work order alone -- same evidence gap class as the
   completion gate's reportPath refusal.
+- Transient transport failures (provider timeouts, connection resets,
+  model calls that returned nothing) no longer count toward the 3-strike
+  card-pattern suppression: the retry/backoff machinery owns those, and
+  the suppression had frozen prog-2's piece titles on restart churn +
+  provider timeouts, stranding the whole program.
+- Program piece roll-up prefers open cards over stale ones (newest wins
+  otherwise), and a piece whose card died (blocked/failed/cancelled) is
+  re-minted once per 30-minute cooldown, directed to its owning director.
 - A cancelled/failed kickoff meeting ratifies nothing: the meeting is
   convened again and the piece cards wait (prog-2's first meeting was
   walk-cancelled and the pieces minted on that cancel).

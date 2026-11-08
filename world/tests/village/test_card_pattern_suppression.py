@@ -82,3 +82,24 @@ def test_stop_card_pattern_alerts_once_per_window(monkeypatch):
                 'title': 'Reset cards again'}, info, 'ada')
     assert len(calls) == 1
     assert 'Card pattern suppressed' in calls[0][0]
+
+
+def test_transient_transport_failures_do_not_count():
+    # Provider timeouts and model-call dropouts are the transport-recovery
+    # machinery's job, not card-contract defects: they must not freeze a
+    # card pattern (prog-2's piece titles froze on restart churn + provider
+    # timeouts, stranding the whole program).
+    now = int(time.time() * 1000)
+    state = {'tasks': {
+        'task-1': _failed('task-1', now, issue='IRIS-1'),
+        'task-2': _failed('task-2', now - 1000, issue='IRIS-1'),
+        'task-3': {**_failed('task-3', now - 2000, issue='IRIS-1'),
+                   'failNote': 'Model connection failed; retry scheduled.'},
+    }}
+    assert sim._card_pattern_suppressed(
+        state, {'issueKey': 'IRIS-1', 'title': 'x'}, now) is None
+    # a genuine contract failure beside transients still counts
+    state['tasks']['task-3']['failNote'] = 'no reportPath or task note'
+    info = sim._card_pattern_suppressed(
+        state, {'issueKey': 'IRIS-1', 'title': 'x'}, now)
+    assert info is not None and info['failures'] == 3
