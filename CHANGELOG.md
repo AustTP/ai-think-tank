@@ -274,3 +274,13 @@
 - Listener thread pushes through call_soon_threadsafe (a bare ensure_future
   from a worker thread dies silently), and the debounce drain runs on
   select timeouts, not only on notify arrival.
+
+## Mission Control fixes + mobile (2026-11-08)
+- Boot crash fixed: buildVillageSwitcher/renderHealth definitions were missing
+  while already called, so the client never rendered (stuck "sealing…");
+  mc.js rewritten as one coherent file with the village switcher, health
+  screen, attention actions, task drawer (spend + trail) and the map.
+- Responsive layout: single-column panels, scrollable screen nav and map,
+  larger touch targets, full-width drawer under 720 px; verified at 390x844.
+- Live update push verified end-to-end in a real browser (CDP): panels
+  refresh without reload when mc_changed fires.
