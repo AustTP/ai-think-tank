@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tank Mission Control</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/mc/mc.css?v=1">
+</head>
+<body>
+<header id="topbar">
+  <span id="livedot" class="dot off" title="realtime connection"></span>
+  <h1>Tank Mission Control</h1>
+  <span id="clock" class="muted"></span>
+  <span id="subcount" class="muted"></span>
+</header>
+<nav id="screens">
+  <button data-screen="overview" class="on">Overview</button>
+  <button data-screen="work">Work</button>
+  <button data-screen="queue">Queue</button>
+  <button data-screen="issues">Issues</button>
+  <button data-screen="attention">Attention</button>
+  <button data-screen="decisions">Decisions</button>
+  <button data-screen="activity">Activity</button>
+  <button data-screen="health">Health</button>
+  <button data-screen="map">Map</button>
+  <select id="villageswitch" title="village switcher"></select>
+</nav>
+<main id="panels"></main>
+<footer id="statusbar" class="muted"></footer>
+<script src="/mc/mc.js?v=3"></script>
+</body>
+</html>

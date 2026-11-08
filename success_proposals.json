@@ -1,0 +1,30 @@
+[
+  {
+    "id": "succ-rule-82fbec80",
+    "ts": 1793798458.8596349,
+    "room": "pressoffice",
+    "count": 11,
+    "avgGrade": 9.6,
+    "lesson": "Keep doing what makes the pressoffice room ship well: 11 recent deliverables graded 9.6/10 or better. Apply that standard and its practices to future work here.",
+    "examples": [
+      {
+        "title": "[TASK] Recover task-5600 after the model transport timeout",
+        "section": ""
+      },
+      {
+        "title": "[TASK] Stop the task-5488 skills-inventory loop: run one real ls and save the note, or cancel it",
+        "section": ""
+      },
+      {
+        "title": "[TASK] Stop re-carding task-5675 and point it at the dev flake8 fix",
+        "section": ""
+      }
+    ],
+    "fixture": {
+      "title": "[TASK] Recover task-5600 after the model transport timeout",
+      "room": "pressoffice"
+    },
+    "status": "pending",
+    "dedupeKey": "success:pressoffice"
+  }
+]

@@ -1,0 +1,108 @@
+{
+  "version": 1,
+  "title": "Think Tank Mission Map",
+  "pipelineIncludes": [
+    "world/village/sim_parts/010__reclaim_orphaned_walking_tasks.py",
+    "world/village/sim_parts/020_work_request_room_thin.py",
+    "world/village/sim_parts/030__dispatch_content_work.py",
+    "world/village/sim_parts/070__fire_decision.py",
+    "world/village/sim_parts/120__file_free_spike.py",
+    "world/village/sim_parts/140__supervisor_brief.py",
+    "world/village/sim_parts/165__scheduled_items.py",
+    "world/village/sim_parts/166__programs.py",
+    "world/server/serve_parts/015_integrity.py",
+    "world/server/serve_parts/020_backup_think_tank_db.py",
+    "world/server/serve_parts/220_create_issue.py",
+    "world/core/selfedit_parts/30_part.py",
+    "world/core/selfedit_parts/40_part.py"
+  ],
+  "nodes": [
+    {
+      "id": "inputs",
+      "title": "Three ways in",
+      "x": 40, "y": 180, "w": 150, "h": 84,
+      "kind": "source",
+      "covers": ["world/server/serve_parts/220_create_issue.py"],
+      "detail": "Player files an issue, the RVP digest files one, or the factory finds a problem in review."
+    },
+    {
+      "id": "intake",
+      "title": "Intake",
+      "x": 250, "y": 180, "w": 130, "h": 64,
+      "kind": "stage",
+      "covers": ["world/village/sim_parts/020_work_request_room_thin.py"],
+      "detail": "Work requests are groomed into cards: triaged, sized, and pointed at a lane."
+    },
+    {
+      "id": "dispatch",
+      "title": "Dispatch",
+      "x": 440, "y": 180, "w": 130, "h": 64,
+      "kind": "stage",
+      "covers": ["world/village/sim_parts/030__dispatch_content_work.py",
+                 "world/village/sim_parts/010__reclaim_orphaned_walking_tasks.py"],
+      "detail": "Cards go to rooms and agents; walkers that give up are requeued to the next idle agent."
+    },
+    {
+      "id": "work",
+      "title": "Work",
+      "x": 630, "y": 180, "w": 130, "h": 64,
+      "kind": "stage",
+      "covers": ["world/village/sim_parts/120__file_free_spike.py",
+                 "world/core/selfedit_parts/30_part.py"],
+      "detail": "Sandboxed builds and reports: staged coding, write_report deliverables, budget-bounded."
+    },
+    {
+      "id": "review",
+      "title": "Review + gates",
+      "x": 820, "y": 180, "w": 130, "h": 64,
+      "kind": "stage",
+      "covers": ["world/village/sim_parts/070__fire_decision.py",
+                 "world/core/selfedit_parts/40_part.py",
+                 "world/server/serve_parts/015_integrity.py"],
+      "detail": "Peer review, pattern suppression, and the CI gate: a change request only lands green."
+    },
+    {
+      "id": "supervision",
+      "title": "Supervision",
+      "x": 630, "y": 60, "w": 130, "h": 64,
+      "kind": "oversight",
+      "covers": ["world/village/sim_parts/140__supervisor_brief.py"],
+      "detail": "Directors watch their teams, act on blocked work, and answer recovery asks."
+    },
+    {
+      "id": "programs",
+      "title": "Programs",
+      "x": 820, "y": 60, "w": 130, "h": 64,
+      "kind": "oversight",
+      "covers": ["world/village/sim_parts/166__programs.py"],
+      "detail": "Program roll-up: planning card, engine-convened kickoff, piece cards, change request."
+    },
+    {
+      "id": "cadence",
+      "title": "Cadence",
+      "x": 440, "y": 60, "w": 130, "h": 64,
+      "kind": "oversight",
+      "covers": ["world/village/sim_parts/165__scheduled_items.py"],
+      "detail": "Scheduled recurring cards: RVP scans, digests, watchdog alerts."
+    },
+    {
+      "id": "persist",
+      "title": "Persist",
+      "x": 1010, "y": 180, "w": 130, "h": 64,
+      "kind": "stage",
+      "covers": ["world/server/serve_parts/020_backup_think_tank_db.py"],
+      "detail": "Coalesced whole-state saves; the projection mirrors state for the live panels."
+    }
+  ],
+  "edges": [
+    {"from": "inputs", "to": "intake", "label": "work"},
+    {"from": "intake", "to": "dispatch", "label": ""},
+    {"from": "dispatch", "to": "work", "label": ""},
+    {"from": "work", "to": "review", "label": "deliverable"},
+    {"from": "review", "to": "persist", "label": "merged / archived"},
+    {"from": "supervision", "to": "work", "label": "unblock", "dashed": true},
+    {"from": "cadence", "to": "dispatch", "label": "recurring cards", "dashed": true},
+    {"from": "programs", "to": "dispatch", "label": "piece cards", "dashed": true},
+    {"from": "review", "to": "inputs", "label": "problems found become new work", "dashed": true, "backward": true}
+  ]
+}

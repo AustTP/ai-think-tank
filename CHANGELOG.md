@@ -250,3 +250,27 @@
   use. No manual migration is required. Webhook and direct API callers can keep
   using `/api/intent/assign-big-task`; the player UI uses
   `/api/intent/plan-big-task` and `/api/plans/*`.
+
+## Tank Mission Control (2026-11-07)
+- Live-query realtime dashboard, reverse-engineered from @neon/realtime
+  (Apache-2.0) and rebuilt self-hosted: the server seals allowlisted SQL
+  queries into short-lived AES-GCM capabilities (`server/mc_realtime.py`), the
+  browser subscribes over one WebSocket (`/api/mc/ws`), and pg_notify-driven
+  re-runs push fresh rows -- no panel polls, no secrets reach the browser.
+- Projection mirrors the live state into mc_* tables after every committed
+  save (`server/mc_projection.py`); sync is mutation-tolerant (sim threads
+  mutate nested dicts mid-iteration), fails silently and is counted.
+- Read-only toward the tank: the only writes to primary tables are
+  INSERT-only pg_notify triggers on action_log, decision_archive and
+  confirmation_proposals.
+- UI at /mc: Overview, Work, Queue, Issues, Attention (player asks +
+  confirmations with respond/confirm actions), Decisions, Activity, Health
+  (CI runs via gh, realtime failure counters), and the hand-authored tank
+  map (world/mc/map.json) with a drift check test. Task drawer shows the
+  card's action_log trail plus budget/ownSpend. Village switcher covers
+  main + village-north.
+- Lifespan hook: on_event is ignored when a custom lifespan is set, so the
+  listener startup wraps app.router.lifespan_context like 105_village_mode.
+- Listener thread pushes through call_soon_threadsafe (a bare ensure_future
+  from a worker thread dies silently), and the debounce drain runs on
+  select timeouts, not only on notify arrival.
