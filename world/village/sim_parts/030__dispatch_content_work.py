@@ -58,6 +58,19 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
         except Exception:
             pass
         try:
+            # A run that STARTED is alive: stamp the heartbeat at thread
+            # entry, before the router's hybrid pre-pass -- that pre-pass is
+            # a real model call that can sit in free-pool retry for minutes
+            # under a worker ramp, and the executors' own first _hb() only
+            # fires after their preamble. The dead zone read as
+            # heartbeat-less and the completion loop abandoned live runs
+            # (2026-11-08: 35 HIGH-severity abandonments in one hour, every
+            # one heartbeat-less, all during the 57-worker burst).
+            task['_contentHeartbeat'] = time.time()
+            _bump_content_heartbeat(task_id)
+        except Exception:
+            pass
+        try:
             executor(snapshot, agent_id, task, base_ctx=perception)
         except Exception as e:  # never let a content failure strand the agent
             if getattr(e, 'credits_paused', False):

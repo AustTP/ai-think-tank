@@ -676,7 +676,13 @@ class ContentGraceHelpers(unittest.TestCase):
                 '_contentHeartbeat': 999999.0, '_contentGraceUsed': 250.0}
         with unittest.mock.patch('sim.threading.Thread', _InlineThread):
             sim._dispatch_content_work(noop, _state(), 'ada', task, 1000.0)
-        self.assertIsNone(task['_contentHeartbeat'])
+        # The prior occupant's residue must be GONE, and the fresh run's own
+        # heartbeat stamped in its place (2026-11-08: a run that started is
+        # alive -- the thread-entry stamp covers the router's hybrid pre-pass,
+        # which is a real model call that can sit in free-pool retry for
+        # minutes before the executor's own first heartbeat).
+        self.assertNotEqual(task['_contentHeartbeat'], 999999.0)
+        self.assertIsInstance(task['_contentHeartbeat'], float)
         self.assertEqual(task['_contentGraceUsed'], 0.0)
 
 
