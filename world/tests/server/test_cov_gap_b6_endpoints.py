@@ -437,7 +437,19 @@ class BoundedProbeResultTest(unittest.TestCase):
                 return '<weird>'
 
         value = Weird()
-        self.assertIs(serve._bounded_probe_result(value), value)
+        # A non-serializable value must degrade to its repr string, never
+        # flow raw into the JSONResponse (prod saw ValueError: Circular
+        # reference detected -> 500 on exactly that path).
+        out = serve._bounded_probe_result(value)
+        self.assertIsInstance(out, str)
+        self.assertEqual(out, '<weird>')
+
+    def test_circular_value_is_degraded_to_repr(self):
+        value = {}
+        value['self'] = value
+        out = serve._bounded_probe_result(value)
+        self.assertIsInstance(out, str)
+        self.assertIn('self', out)
 
     def test_oversized_value_is_truncated(self):
         out = serve._bounded_probe_result('x' * 50, max_chars=10)

@@ -80,7 +80,12 @@ def _bounded_probe_result(value, max_chars=PAGE_PROBE_MAX_RESULT_CHARS):
     try:
         text = json.dumps(value, default=str)
     except Exception:
-        text = repr(value)
+        # A non-serializable value (cyclic object, odd custom type) must
+        # never reach the JSONResponse raw: that is the ValueError:
+        # Circular reference detected 500 seen in prod on this endpoint.
+        # Degrade to the repr string -- bounded, transportable, honest.
+        value = repr(value)
+        text = value
     if len(text) <= max_chars:
         return value
     return {'truncated': True, 'chars': len(text), 'preview': text[:max_chars]}
