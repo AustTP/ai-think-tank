@@ -60,8 +60,8 @@ class PieceStateTests(unittest.TestCase):
             'task-1': {'id': 'task-1', 'title': p['pieces'][0]['title'], 'status': 'working'}})
         self.assertEqual(states[p['pieces'][0]['title']], ('working', 'task-1'))
         states, _ = self._run(p, tasks={
-            'task-1': {'title': p['pieces'][0]['title'], 'status': 'done'},
-            'task-2': {'title': p['pieces'][1]['title'], 'status': 'done'}})
+            'task-1': {'title': p['pieces'][0]['title'], 'status': 'done', 'reportPath': 'library/reports/x.md', 'reportPath': 'library/reports/x.md'},
+            'task-2': {'title': p['pieces'][1]['title'], 'status': 'done', 'reportPath': 'library/reports/x.md', 'reportPath': 'library/reports/x.md'}})
         self.assertTrue(all(s == 'done' for s, _ in states.values()))
         states, all_done = self._run(p, tasks={
             'task-1': {'id': 'task-1', 'title': p['pieces'][0]['title'], 'status': 'cancelled'}})
@@ -112,9 +112,9 @@ class EnginePassTests(unittest.TestCase):
         self.assertFalse(qw.called, 'one piece still open: no CR yet')
         st['tasks'] = {
             'task-1': {'id': 'task-1', 'title': 'Piece A: orchestration lane',
-                       'status': 'done'},
+                       'status': 'done', 'reportPath': 'library/reports/x.md', 'reportPath': 'library/reports/x.md'},
             'task-2': {'id': 'task-2', 'title': 'Piece B: memory service',
-                       'status': 'done'}}
+                       'status': 'done', 'reportPath': 'library/reports/x.md', 'reportPath': 'library/reports/x.md'}}
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=20_000)
         self.assertTrue(qw.called)
@@ -197,7 +197,7 @@ class EnginePassTests(unittest.TestCase):
             'task-a': {'id': 'task-a', 'status': 'blocked', 'blockedAt': 5,
                        'createdAt': 5,
                        'title': 'Piece A: orchestration lane'},
-            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+            'task-b': {'id': 'task-b', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 6,
                        'title': 'Piece B: memory service'}}
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._programs_pass(st, now_ms=10_000)
@@ -214,6 +214,29 @@ class EnginePassTests(unittest.TestCase):
         self.assertEqual(qw.call_count, 1, 'a new window re-arms')
 
 
+    def test_hollow_done_card_never_stamps_a_piece_done(self):
+        # prog-2, 2026-11-08: cards closed with an empty reportPath and no
+        # artifact; the roll-up read them as landed and the CR premise was
+        # false. A done card must carry delivery evidence to stamp done, and
+        # a program of hollow cards must never reach the CR branch.
+        prog = _program(status='planning-card-minted',
+                        planningCardMinted=True, meetingCardMinted=True,
+                        piecesMinted=True, crRequested=False)
+        st = _state([prog])
+        st['tasks'] = {
+            'task-a': {'id': 'task-a', 'status': 'done', 'createdAt': 5,
+                       'title': 'Piece A: orchestration lane'},
+            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+                       'title': 'Piece B: memory service'}}
+        with mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._programs_pass(st, now_ms=10_000)
+        self.assertEqual(qw.call_count, 0, 'no CR on hollow pieces')
+        piece_status = prog['pieceStatus']
+        self.assertEqual(piece_status['Piece A: orchestration lane'],
+                         'unverified')
+        self.assertEqual(piece_status['Piece B: memory service'],
+                         'unverified')
+
     def test_dead_cr_card_is_reminted_despite_ready_for_cr(self):
         # The CR card can die (cancel/failed) after ready-for-cr was set; the
         # one-shot status guard must not strand the program forever. The
@@ -223,9 +246,9 @@ class EnginePassTests(unittest.TestCase):
                         crRequested=True)
         st = _state([prog])
         st['tasks'] = {
-            'task-a': {'id': 'task-a', 'status': 'done', 'createdAt': 5,
+            'task-a': {'id': 'task-a', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 5,
                        'title': 'Piece A: orchestration lane'},
-            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+            'task-b': {'id': 'task-b', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 6,
                        'title': 'Piece B: memory service'},
             'task-cr': {'id': 'task-cr', 'status': 'cancelled',
                         'createdAt': 7,
@@ -251,9 +274,9 @@ class EnginePassTests(unittest.TestCase):
                         crRequested=True)
         st = _state([prog])
         st['tasks'] = {
-            'task-a': {'id': 'task-a', 'status': 'done', 'createdAt': 5,
+            'task-a': {'id': 'task-a', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 5,
                        'title': 'Piece A: orchestration lane'},
-            'task-b': {'id': 'task-b', 'status': 'done', 'createdAt': 6,
+            'task-b': {'id': 'task-b', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 6,
                        'title': 'Piece B: memory service'},
             'task-cr': {'id': 'task-cr', 'status': 'working',
                         'createdAt': 7,
@@ -365,9 +388,9 @@ class PieceTitleRootTests(unittest.TestCase):
         st['tasks'] = {
             't1': {'id': 't1', 'status': 'failed', 'createdAt': 1,
                    'title': 'Piece A: orchestration lane'},
-            't2': {'id': 't2', 'status': 'done', 'createdAt': 2,
+            't2': {'id': 't2', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 2,
                    'title': 'Fix: Piece A: orchestration lane'},
-            't3': {'id': 't3', 'status': 'done', 'createdAt': 3,
+            't3': {'id': 't3', 'status': 'done', 'reportPath': 'library/reports/x.md', 'createdAt': 3,
                    'title': 'Piece B: memory service'}}
         states, all_done = sim._program_piece_states(prog, st)
         self.assertEqual(states['Piece A: orchestration lane'][0], 'done')

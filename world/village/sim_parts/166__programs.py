@@ -68,7 +68,20 @@ def _program_piece_states(program, state):
             continue
         st = t.get('status')
         if st in _PROGRAM_DONE_STATUSES:
-            states[title] = ('done', t.get('id'))
+            # A done card stamps its piece done only when it actually
+            # delivered something (prog-2, 2026-11-08: cards closed with an
+            # empty reportPath and no artifact, the piece roll-up read them
+            # as landed, and an honest agent then refused to file the change
+            # request on a false premise). reportPath / writtenPy /
+            # artifactExists are the completion gate's own evidence fields.
+            delivered = (bool(t.get('reportPath'))
+                         or bool(t.get('writtenPy'))
+                         or t.get('artifactExists') is True)
+            if delivered:
+                states[title] = ('done', t.get('id'))
+            else:
+                states[title] = ('unverified', t.get('id'))
+                all_done = False
         elif st in _PROGRAM_OPEN_STATUSES:
             states[title] = (st, t.get('id'))
             all_done = False
