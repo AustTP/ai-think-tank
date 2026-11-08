@@ -169,3 +169,11 @@ mcp_servers.local.json
 .repo-workspaces/
 trusted_repos.json
 evals/benchmark.html
+
+# Tank-authored project outputs and reports stay untracked; the tank keeps
+# using them on disk. Skills and operator-seeded design references stay tracked.
+library/projects/
+library/reports/
+library/rejected/
+library/templates/
+library/hybrid-design-note.md
