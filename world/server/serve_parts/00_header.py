@@ -712,6 +712,16 @@ def _reload_env_config():
             ensure_sandbox_networking()
         except Exception:
             pass
+    # Gated tool surfaces follow their credentials: search_web + read_ais_feed
+    # ride on TAVILY_API_KEY; generate_image/generate_video on the two-part
+    # Higgsfield key. The sync helper is defined later in the merged serve
+    # namespace, so it is only present once the full server is imported.
+    try:
+        _sync = g.get('_sync_conditional_tools')
+        if callable(_sync):
+            _sync()
+    except Exception:
+        pass
     # An env reload is the operator touching keys/config -- wipe the API-key
     # auth-health tracker so a swapped key starts from a clean slate (the
     # next real 401 will re-alert; a working key never re-alerts).
