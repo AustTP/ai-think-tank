@@ -448,6 +448,20 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     if verdict == 'actionable':
         queue_fix = {'title': f'Fix issues found in {kind} testing of "{backlog}"',
                      'room': 'pressoffice',
+                     # The fix card MUST carry the project label: without it
+                     # _run_workroom_content's dispatcher falls through to the
+                     # bare-ambient stub (the shared-tooling health check),
+                     # which completes with a note and no artifact -- the
+                     # completion gate then refuses it and the repair loop
+                     # churns (2026-11-09: 81 cards blocked with 'the lane
+                     # output and the completion gate disagree', 14 refused
+                     # completions per 37 minutes). The review knew the
+                     # project; the fix must route to the same coding lane.
+                     # Prose fixes keep their note-deliverable path (the
+                     # gate accepts a note for them); code fixes need the
+                     # label to reach the coding lane.
+                     **({'projectLabel': project_label}
+                        if not is_prose_review else {}),
                      'instructions': (f'A {kind} pass of "{project_label}" found real problems -- see the Library entry just filed for '
                                       f'"{backlog}" -- fix them. Build on the existing files.'
                                       + (f'\n\nQuality pipeline is red: {qp["note"]}' if not qp['ok'] else '')),
