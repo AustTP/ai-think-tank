@@ -713,12 +713,14 @@ function southMenuCallMeeting() {
 // reachable east. Winter itself keeps its direct band connection; it appears
 // here too while enabled so both doors to it are visible.
 function eastDestinations() {
+  // Winter first: it shares the east road and, when enabled, is the
+  // adversarial destination. Generated art-backed villages follow.
   const out = [];
+  if (WINTER_ENABLED && state.scene !== 'winter') out.push('winter');
   for (const id in SCENES) {
-    if (id === 'main') continue;
+    if (id === 'main' || id === 'winter') continue;
     const s = SCENES[id];
     if (!s || !s.bgSprite) continue;          // schematic villages stay south
-    if (id === 'winter' && !WINTER_ENABLED) continue;
     if (id === state.scene) continue;
     out.push(id);
   }

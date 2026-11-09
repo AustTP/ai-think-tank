@@ -104,24 +104,39 @@ function updateOutside(dt) {
   // is ENABLED -- otherwise the boundary is simply a wall. If winter was
   // disabled while the player was inside it, pull them back to the main
   // village rather than leaving them in a now-unwalkable map.
+  // ONE east exit: the whole carved right edge (winter band rows 26-32 plus
+  // the gate corridor rows 13-24) opens the east-exit menu, which offers the
+  // adversarial (winter) village and every art-backed generated village.
+  // Winter used to switch directly off the band; the band and the corridor
+  // are the same road now (2026-11-08, owner direction).
   if (state.scene === 'main') {
-    if (WINTER_ENABLED) {
-      const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
-      if (inBand && state.player.x + state.player.w >= GROUND_W - 2) { switchScene('winter'); return; }
-    }
-    // The east gate (rows 13-24, below the winter band): walking into the
-    // carved corridor opens the east-exit menu for every art-backed village.
-    if (typeof EAST_GATE !== 'undefined' && typeof openEastMenu === 'function'
-        && state.player.x + state.player.w >= EAST_GATE.x
-        && state.player.y + state.player.h >= EAST_GATE.y
-        && state.player.y <= EAST_GATE.y + EAST_GATE.h) {
-      openEastMenu();
-      return;
+    const atEastEdge = state.player.x + state.player.w >= GROUND_W - 2;
+    const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
+    const inGate = typeof EAST_GATE !== 'undefined'
+      && state.player.y + state.player.h >= EAST_GATE.y
+      && state.player.y <= EAST_GATE.y + EAST_GATE.h;
+    if (atEastEdge && (inBand || inGate)) {
+      if (WINTER_ENABLED && typeof openEastMenu === 'function') {
+        openEastMenu();
+        return;
+      }
+      // Winter disabled: the band is walled (fail closed, as before), but the
+      // carved gate corridor still leads east to generated villages.
+      if (inGate && typeof openEastMenu === 'function') { openEastMenu(); return; }
+      if (inBand) return;  // walled band: no exit, no menu
     }
   } else if (state.scene === 'winter') {
     if (WINTER_ENABLED) {
       const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
-      if (inBand && state.player.x <= 2) { switchScene('main'); return; }
+      if (inBand && state.player.x <= 2) {
+        switchScene('main');
+        // Land just west of the east gate, on the shared road.
+        if (typeof EAST_GATE !== 'undefined') {
+          state.player.x = EAST_GATE.x - state.player.w - 6;
+          state.player.y = EAST_GATE.y + EAST_GATE.h / 2 - state.player.h / 2;
+        }
+        return;
+      }
     } else {
       switchScene('main'); return;
     }

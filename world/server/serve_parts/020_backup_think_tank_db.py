@@ -1313,6 +1313,60 @@ def _flush_pending_save(timeout=20.0):
         print(f'[state-save] shutdown flush failed: {e}', flush=True)
 
 
+def _save_snapshot_with_retry(snap):
+    """Persist one snapshot with fast in-worker retries for transient
+    serialize races, falling back to the re-queue cycle on repeated failure.
+
+    The snapshot's nested structures are shared with the live state, so a sim
+    thread mid-mutation can break a json walk (RuntimeError: dictionary
+    changed size during iteration) or a task lookup (KeyError). Each retry
+    re-reads the live structures a beat later, which is usually settled --
+    far faster convergence than throwing the whole snapshot back into the 5s
+    coalesce cycle (2026-11-08: 458 re-queues in a day). Returns True when the
+    snapshot persisted; on failure it runs the re-queue/drop logic itself
+    (newest-snapshot-wins, max three attempts per object) and returns False.
+    """
+    saved = False
+    race_error = None
+    for _attempt in range(3):
+        try:
+            _save_state_to_db_sync(snap)
+            _SAVE_RETRY_COUNTS.clear()
+            saved = True
+            break
+        except (RuntimeError, KeyError) as _race:
+            race_error = _race
+            time.sleep(0.1 * (_attempt + 1))
+        except Exception as _fatal:
+            race_error = _fatal
+            break  # not a transient race: re-queue immediately
+    if saved:
+        return True
+    e = race_error
+    print(f'[state-save] coalesced save failed, re-queued: '
+          f'{type(e).__name__}: {e}', flush=True)
+    if _SAVE_PENDING.get('snapshot') is None:
+        # Only retry a snapshot that is still the newest one, and never the
+        # same object more than three times: a snapshot that keeps failing
+        # (e.g. its nested structures raced the sim thread into an
+        # unserializable shape) must yield to the next fresh snapshot instead
+        # of wedging persistence on a zombie retry loop -- observed
+        # 2026-11-07 when the same stamped snapshot was re-queued for many
+        # minutes. Tracked by object identity OUTSIDE the snapshot, so no
+        # retry bookkeeping ever leaks into the saved blob.
+        attempts = _SAVE_RETRY_COUNTS.get(id(snap), 0) + 1
+        _SAVE_RETRY_COUNTS[id(snap)] = attempts
+        if attempts <= 3:
+            _SAVE_PENDING['snapshot'] = snap
+            _SAVE_PENDING['at'] = time.time() - _SAVE_COALESCE_S
+        else:
+            _SAVE_RETRY_COUNTS.pop(id(snap), None)
+            print(f'[state-save] dropping snapshot after {attempts} '
+                  f'failed attempts; the next queued save carries '
+                  f'the newer state', flush=True)
+    return False
+
+
 def _save_worker_loop():
     # Coalescing saver: sleep through the quiet tail of a burst, then persist
     # the newest snapshot once. A failed serialize/save keeps its payload and
@@ -1328,10 +1382,9 @@ def _save_worker_loop():
         if age < _SAVE_COALESCE_S and not _SAVE_FLUSHED.is_set():
             continue
         _SAVE_PENDING['snapshot'] = None
-        try:
-            _save_state_to_db_sync(snap)
-            _SAVE_RETRY_COUNTS.clear()
-        except Exception as e:
+        saved = _save_snapshot_with_retry(snap)
+        if not saved:
+            e = race_error
             print(f'[state-save] coalesced save failed, re-queued: '
                   f'{type(e).__name__}: {e}', flush=True)
             if _SAVE_PENDING.get('snapshot') is None:
