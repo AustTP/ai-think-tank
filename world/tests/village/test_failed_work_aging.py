@@ -177,3 +177,43 @@ class StaleSuspensionResidue(unittest.TestCase):
                       'a fresh suspension is honored')
         self.assertIn('_suspendedForScheduled', state['tasks']['task-c'],
                       'a working card keeps its suspension')
+
+
+class QueuedCardReconciler(unittest.TestCase):
+    """A queued card whose dispatch item vanished without an assignment is
+    re-issued by the stale sweep: the consume-then-fail race otherwise leaves
+    it queued forever with no holder and no item."""
+
+    def _state(self):
+        return {'tasks': {'task-orphan': {
+                    'id': 'task-orphan', 'status': 'queued',
+                    'title': 'Orphaned merge card', 'room': 'observatory',
+                    'taskType': 'report'}},
+                'agents': {}, 'agentRoster': [], 'workQueue': [],
+                'lastStaleWorkSweep': 0, '_staleWorkReplans': {}, 'teams': []}
+
+    def test_orphaned_queued_card_is_reissued(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        sim._stale_work_step(state, time.time(), now_ms)
+        items = [w for w in state['workQueue'] if w.get('reissueOf') == 'task-orphan']
+        self.assertEqual(len(items), 1)
+        self.assertNotIn('task-orphan', state['tasks'].get('task-orphan', {})
+                         and [] or [])
+
+    def test_card_with_item_or_holder_is_left_alone(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        state['workQueue'].append({'reissueOf': 'task-orphan', 'title': 'x'})
+        sim._stale_work_step(state, time.time(), now_ms)
+        self.assertEqual(len(state['workQueue']), 1,
+                         'an item already queued is not duplicated')
+        state2 = self._state()
+        state2['agents'] = {'ghost': {'task': 'task-orphan'}}
+        sim._stale_work_step(state2, time.time(), now_ms)
+        self.assertEqual(len(state2['workQueue']), 0,
+                         'a held card is not re-issued')

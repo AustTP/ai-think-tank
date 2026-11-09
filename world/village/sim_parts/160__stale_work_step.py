@@ -56,6 +56,58 @@ def _clear_content_residue(state):
     return cleaned
 
 
+def _reconcile_queued_cards(state, now_ms):
+    """Re-issue queued cards whose dispatch item vanished without an
+    assignment. A dispatch consumes its workQueue item, then the assignment
+    can still fail (worker picked another card, wake skipped, governor cap
+    hit at the wrong moment) -- the item is gone and nothing re-queues it, so
+    the card sits 'queued' forever with no holder and no item (2026-11-09:
+    242 such cards, including the MAYA-31 merge card, invisible to every
+    dispatch pass). Runs inside the coarse stale sweep: bounded by the same
+    per-card replan counter, so a card that keeps failing to stick cannot
+    loop unbounded. Returns the number re-issued."""
+    tasks = state.get('tasks')
+    if not isinstance(tasks, dict) or not tasks:
+        return 0
+    queue = state.get('workQueue')
+    if not isinstance(queue, list):
+        return 0
+    issued_for = {w.get('reissueOf') for w in queue if isinstance(w, dict)}
+    held = set()
+    for a in (state.get('agents') or {}).values():
+        if isinstance(a, dict) and a.get('task'):
+            held.add(a['task'])
+    replan_map = state.setdefault('_staleWorkReplans', {})
+    reissued = 0
+    for tid, task in list(tasks.items()):
+        if not isinstance(task, dict) or task.get('status') != 'queued':
+            continue
+        if tid in issued_for or tid in held:
+            continue
+        key = repr((task.get('title') or '', task.get('room') or ''))
+        replans = replan_map.get(key, 0)
+        if replans >= STALE_WORK_MAX_REPLANS:
+            continue  # the loop stopper owns this card already
+        replan_map[key] = replans + 1
+        queue.append({
+            'reissueOf': tid,
+            'title': task.get('title'),
+            'room': task.get('room') or 'observatory',
+            'instructions': task.get('instructions') or '',
+            'taskType': task.get('taskType') or 'code',
+            'deliverable': task.get('deliverable'),
+            'teamId': task.get('teamId'),
+            'goal': task.get('goal'),
+            'projectLabel': task.get('projectLabel'),
+            'productId': task.get('productId'),
+            'reviewOf': task.get('reviewOf'),
+            'priority': task.get('priority') or 2,
+            'notBefore': now_ms + 5000,
+        })
+        reissued += 1
+    return reissued
+
+
 def _stale_work_step(state, now, now_ms):
     """SM gap 1: stale in-flight work oversight. Bugs already have a restore
     alarm (RESTORE_TIMEOUT_MS via _escalation_step); a NON-bug task wedged in
@@ -84,6 +136,7 @@ def _stale_work_step(state, now, now_ms):
     if now_ms - (state.get('lastStaleWorkSweep') or 0) < STALE_WORK_CADENCE_MS:
         return 0
     state['lastStaleWorkSweep'] = now_ms
+    _reconcile_queued_cards(state, now_ms)
     tasks = state.get('tasks')
     if not isinstance(tasks, dict) or not tasks:
         return 0
