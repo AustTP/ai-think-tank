@@ -196,6 +196,10 @@ class _ContentHeartbeatKeepalive:
 
     def __enter__(self):
         if self.task_id:
+            # Bump immediately on entry (2026-11-08): the whole point is
+            # covering the window BEFORE the wrapped call returns, and a
+            # first-interval wait left that window heartbeat-less.
+            _bump_content_heartbeat(self.task_id)
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
         return self

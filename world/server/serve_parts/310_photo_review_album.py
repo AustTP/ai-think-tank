@@ -725,6 +725,23 @@ async def chat(request: Request):
     # against the spend ledger like any other.
     deliberate = _ttc_should_deliberate(model, body.get('deliberate'), body.get('best_of'))
     best_n = _ttc_best_of(body.get('best_of')) if deliberate else 1
+    # In-flight heartbeat bridge (2026-11-08): a chat call carrying a taskId
+    # IS live work on that task. The upstream call can legitimately queue
+    # behind the free pool for minutes under a worker ramp -- longer than the
+    # content heartbeat's stale threshold -- and the executor-level keepalive
+    # does not cover every call path (the hybrid pre-pass, tool-side calls).
+    # Keep the task's content heartbeat fresh from HERE, at the one choke
+    # point every model call flows through, for exactly the request's
+    # duration. Harmless when the task is not content-in-flight: the
+    # heartbeat registry is only consulted for in-flight runs.
+    _content_keepalive = None
+    if task_id:
+        try:
+            import sim as _sim_mod
+            _content_keepalive = _sim_mod.content_heartbeat_keepalive(task_id, 30.0)
+            _content_keepalive.__enter__()
+        except Exception:
+            _content_keepalive = None
     try:
         # urllib is blocking -- run it off the event loop rather than
         # stalling every other request for the duration of the API call.
@@ -833,6 +850,12 @@ async def chat(request: Request):
         return JSONResponse({'error': e.read().decode()}, status_code=e.code)
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if _content_keepalive is not None:
+            try:
+                _content_keepalive.__exit__(None, None, None)
+            except Exception:
+                pass
 
 
 @app.get('/api/vpn-exits')
