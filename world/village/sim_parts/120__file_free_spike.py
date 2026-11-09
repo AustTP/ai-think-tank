@@ -576,6 +576,8 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
         if req.get('status') != 'pending':
             continue
         filed_by = req.get('filedBy')
+        if isinstance(filed_by, dict):
+            filed_by = filed_by.get('id')
         author = (agents.get(filed_by) or {})
         pc = req.get('playerConstraints') or {}
         # Player pins are CONTEXT for the scrum master's judgment, not

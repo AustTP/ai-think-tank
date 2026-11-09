@@ -261,7 +261,10 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
         if req.get('status') != 'pending':
             continue
         goal = req.get('goal') or req.get('title') or 'untitled large request'
-        author = agents.get(req.get('filedBy')) or {}
+        filed_by = req.get('filedBy')
+        if isinstance(filed_by, dict):
+            filed_by = filed_by.get('id')
+        author = agents.get(filed_by) or {}
         pc = req.get('playerConstraints') or {}
         # Player pins are CONTEXT for the scrum master's judgment, not
         # mechanical overrides. They're woven into the instructions the same

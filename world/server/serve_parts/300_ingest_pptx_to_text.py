@@ -312,9 +312,14 @@ def _launch_adversarial_village(state, admin_id, task, now_ms=None):
     st['status'] = 'active'
     # File the same goal to the MAIN village's free authority team.
     authority = _free_authority(state) or admin_id
-    team = _staffing_team_for_authority(state, authority)
-    main_team_id = (team.get('id') or team.get('directorId')) if team else authority
-    main_req = _sim.file_large_request(state, authority, task, main_team_id, now_ms=now_ms)
+    # _free_authority returns the ROSTER ROW; file_large_request expects the
+    # id. Passing the row stored a dict as filedBy and crashed the whole sim
+    # loop on every tick (2026-11-08: TypeError unhashable type dict in
+    # _breakdown_step, tank frozen for hours).
+    authority_id = authority.get('id') if isinstance(authority, dict) else authority
+    team = _staffing_team_for_authority(state, authority_id)
+    main_team_id = (team.get('id') or team.get('directorId')) if team else authority_id
+    main_req = _sim.file_large_request(state, authority_id, task, main_team_id, now_ms=now_ms)
     if main_req:
         main_req['adversarialTaskId'] = task_id
         main_req['villageId'] = 'main'

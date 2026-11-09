@@ -107,7 +107,8 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
     req = {
         'id': next_request_id(state),
-        'filedBy': authority_id, 'title': goal[:120], 'room': 'pressoffice',
+        'filedBy': (authority_id.get('id') if isinstance(authority_id, dict)
+                    else authority_id), 'title': goal[:120], 'room': 'pressoffice',
         'reason': f"Large request: {goal[:200]}", 'goal': goal,
         'filedAt': now_ms, 'status': 'pending',
         'origin': 'large_request', 'breakdown': True,
