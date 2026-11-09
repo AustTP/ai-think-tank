@@ -367,6 +367,21 @@ def _restore_refinement_agent(state, aid, snap, now_ms, duration_ms):
         return
     if snap.get('task'):
         t = (state.get('tasks') or {}).get(snap['task'])
+        # Guard (2026-11-09): the agent may have taken NEW work while
+        # the ceremony ran -- a wedged pass can also leave the restore
+        # half-applied. Replaying the stale pointer stomps a live
+        # assignment (seen: leo restored onto archived task-27930 an
+        # hour after finishing it, orphaning his fresh card and
+        # benching him on an ineligible ghost .task). Only replay the
+        # snapshot when the agent has NOT moved on; otherwise keep the
+        # live assignment and extend ITS budget if it is the same card.
+        cur = a.get('task')
+        live_cur = (state.get('tasks') or {}).get(cur or '') or {}
+        if cur and cur != snap['task'] \
+                and live_cur.get('status') in ('walking', 'working'):
+            if t and t.get('status') in ('walking', 'working'):
+                t['workUntil'] = (t.get('workUntil') or 0) + (duration_ms // 1000)
+            return
         a['task'] = snap['task']; a['busy'] = True; a['inRoom'] = snap.get('inRoom')
         a['visible'] = snap.get('visible')
         if t and t.get('status') in ('walking', 'working'):

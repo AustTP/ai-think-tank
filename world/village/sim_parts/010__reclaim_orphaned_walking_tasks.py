@@ -1079,3 +1079,33 @@ PAIR_WALK_OFFSETS = [10, -10, 6, -6, 0]
 # absorbing identical coaching -- either the coaching works or it surfaces.
 COACHING_MAX_ROUNDS = 3
 COACHING_LOOP_CADENCE_MS = 24 * 3600 * 1000  # daily catch-up sweep (like stale work)
+
+
+def _clear_ghost_agent_tasks(state):
+    """An agent whose .task points at a task that no longer exists (archived
+    or torn mid-flight by a wedged pass) is permanently ineligible: the
+    candidate filter requires an empty .task, so a ghost pointer benches her
+    forever and nothing clears it (seen live: leo held task-27930 an hour
+    after it completed, while every later assignment to him orphaned the
+    previous card). Clear the pointer when nobody holds a live task under
+    that id and the agent is not busy. Cheap, pure, runs beside the orphan
+    reclaim on every tick. Returns the count cleared."""
+    agents = state.get('agents') or {}
+    if not agents:
+        return 0
+    tasks = state.get('tasks') or {}
+    cleared = 0
+    for aid, a in agents.items():
+        if not isinstance(a, dict) or a.get('busy'):
+            continue
+        tid = a.get('task')
+        if not tid:
+            continue
+        t = tasks.get(tid)
+        if isinstance(t, dict) and t.get('status') in ('walking', 'working',
+                                                       'repairing',
+                                                       'needs_review'):
+            continue
+        a['task'] = None
+        cleared += 1
+    return cleared

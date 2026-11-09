@@ -721,6 +721,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # think tank that simply has a stale in-flight task re-issues it rather than
     # treating the think tank as done. Cheap: no-op unless such a task exists.
     _reclaim_orphaned_walking_tasks(state)
+    _clear_ghost_agent_tasks(state)
 
     # SM gap 1: age-based stale in-flight work sweep. A held non-bug card
     # wedged past any legitimate budget (walking forever, or still working long
