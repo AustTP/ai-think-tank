@@ -754,10 +754,13 @@ class ContentRunGraceTimeout(unittest.TestCase):
         self.assertEqual(task['workUntil'], (now - 1.0) + sim.TASK_CONTENT_GRACE_FINAL_S)
         self.assertTrue(task.get('_contentFinalGraceUsed'))
 
-    def test_after_the_final_extension_the_budget_fails_closed(self):
-        # Even a permanently-fresh heartbeat cannot extend past the final
-        # extension: once it is spent the run falls back -- fail closed, not
-        # fabricate done.
+    def test_after_the_final_extension_an_alive_run_earns_steps_to_the_wall(self):
+        # 2026-11-08 policy: past the final extension an ALIVE run keeps
+        # earning 60s steps up to the hard wall -- the transport bridge makes
+        # a fresh heartbeat strong life evidence, and the run's COST is
+        # already bounded by the per-task spend gate. A DEAD run (stale
+        # heartbeat) still fails closed below; the fail-closed contract is
+        # about not fabricating done, which the abandon path preserves.
         task = self._spike(_contentGraceUsed=sim.TASK_CONTENT_GRACE_MAX_S
                            + sim.TASK_CONTENT_GRACE_FINAL_S,
                            _contentFinalGraceUsed=True)
@@ -766,8 +769,23 @@ class ContentRunGraceTimeout(unittest.TestCase):
         task['workUntil'] = now - 1.0
         task['_contentHeartbeat'] = now - 1.0
         self._cycle(state, now)
+        self.assertEqual(task['status'], 'working',
+                         'an alive run earns its next step instead of being cut')
+        self.assertEqual(task['workUntil'], (now - 1.0) + sim.TASK_CONTENT_GRACE_STEP_S)
+
+    def test_past_the_alive_wall_the_budget_fails_closed(self):
+        # Once the wall is spent even a fresh heartbeat cannot extend: the
+        # run falls back -- fail closed, not fabricate done.
+        task = self._spike(_contentGraceUsed=sim.TASK_CONTENT_GRACE_MAX_S
+                           + sim.TASK_CONTENT_GRACE_WALL_S,
+                           _contentFinalGraceUsed=True)
+        state, now_ms = self._quiet_base(task)
+        now = now_ms / 1000.0
+        task['workUntil'] = now - 1.0
+        task['_contentHeartbeat'] = now - 1.0
+        self._cycle(state, now)
         self.assertEqual(task['status'], 'failed',
-                         'grace exhaustion must fail closed, not fabricate done')
+                         'wall exhaustion must fail closed, not fabricate done')
 
     def test_no_heartbeat_keeps_preexisting_timeout(self):
         # An executor that never opts into heartbeats (every other content

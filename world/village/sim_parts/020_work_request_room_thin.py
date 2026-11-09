@@ -159,6 +159,14 @@ TASK_CONTENT_HB_STALE_S = 240.0
 # A dead thread (stale heartbeat) never reaches this branch, so the old
 # timeout semantics still bound genuinely hung runs.
 TASK_CONTENT_GRACE_FINAL_S = 600.0
+# Hard wall for a PROVABLY-alive run (fresh heartbeat): after the standard
+# cap and the one final extension are spent, a run keeps earning 60s steps
+# up to this wall. A hang dies at the heartbeat stale threshold regardless;
+# a live run's runaway COST is already bounded by the per-task spend gate,
+# so wall-clock is the only dimension left to bound (2026-11-08: budget cuts
+# were abandoning runs whose heartbeat was 10s old -- alive, just slow under
+# a 57-worker load).
+TASK_CONTENT_GRACE_WALL_S = 3600.0
 
 # In-process heartbeat fallback. The content thread mutates the task dict it
 # was dispatched with; a concurrent whole-blob save from a stale snapshot can
@@ -331,23 +339,35 @@ def _grant_content_grace(task, now):
     """Extend workUntil by up to TASK_CONTENT_GRACE_STEP_S, bounded by the
     total TASK_CONTENT_GRACE_MAX_S. Returns seconds granted (0.0 when the cap
     is spent). When the cap is spent but the run's heartbeat is still fresh,
-    grant ONE final bounded extension (TASK_CONTENT_GRACE_FINAL_S) so a
-    slow-but-alive run finishes instead of being abandoned mid-write."""
+    grant ONE final bounded extension (TASK_CONTENT_GRACE_FINAL_S) and then
+    rolling step extensions up to TASK_CONTENT_GRACE_WALL_S, so a
+    slow-but-alive run finishes instead of being abandoned mid-write while
+    its heartbeat keeps proving it lives."""
     remaining = TASK_CONTENT_GRACE_MAX_S - (task.get('_contentGraceUsed') or 0)
     if remaining > 0:
         step = min(TASK_CONTENT_GRACE_STEP_S, remaining)
         task['workUntil'] = (task.get('workUntil') or now) + step
         task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + step
         return step
-    if task.get('_contentFinalGraceUsed'):
-        return 0.0
     hb = _content_heartbeat_at(task)
     if not isinstance(hb, (int, float)) or (now - hb) >= TASK_CONTENT_HB_STALE_S:
         return 0.0
-    task['_contentFinalGraceUsed'] = True
-    task['workUntil'] = (task.get('workUntil') or now) + TASK_CONTENT_GRACE_FINAL_S
-    task['_contentGraceUsed'] = (task.get('_contentGraceUsed') or 0) + TASK_CONTENT_GRACE_FINAL_S
-    return TASK_CONTENT_GRACE_FINAL_S
+    # Cap spent but the heartbeat is fresh: one bounded final extension, then
+    # rolling 60s steps up to the alive wall. A dead thread never gets here
+    # (stale heartbeat falls through), so the wall bounds only ALIVE runs --
+    # and their spend is already bounded by the per-task model-spend gate.
+    used = (task.get('_contentGraceUsed') or 0)
+    if used >= TASK_CONTENT_GRACE_MAX_S + TASK_CONTENT_GRACE_WALL_S:
+        return 0.0
+    ceiling = TASK_CONTENT_GRACE_MAX_S + TASK_CONTENT_GRACE_WALL_S
+    if not task.get('_contentFinalGraceUsed'):
+        task['_contentFinalGraceUsed'] = True
+        step = min(TASK_CONTENT_GRACE_FINAL_S, ceiling - used)
+    else:
+        step = min(TASK_CONTENT_GRACE_STEP_S, ceiling - used)
+    task['workUntil'] = (task.get('workUntil') or now) + step
+    task['_contentGraceUsed'] = used + step
+    return step
 
 # Server task-loop cadence -- mirrors the browser's runTaskCycle setInterval
 # (index.html, 6s). Distinct from the movement tick (SIM_TICK_S=2).

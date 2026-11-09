@@ -575,20 +575,25 @@ class ContentGraceHelpers(unittest.TestCase):
         task = {'_contentHeartbeat': 1000.0 - sim.TASK_CONTENT_HB_STALE_S - 1.0}
         self.assertFalse(sim._content_run_is_live(task, 1000.0))
 
-    def test_final_grace_extends_once_past_the_cap_then_stops(self):
+    def test_alive_run_earns_rolling_grace_up_to_the_wall(self):
         # The shard triage killed five live runs at the grace cap with
         # heartbeats 0-87s old; their reports landed minutes after the kill.
-        # One bounded final extension for a fresh heartbeat, then the cap is
-        # hard again.
+        # One final extension, then rolling steps -- but ONLY while the
+        # heartbeat proves life, up to the hard wall (2026-11-08: budget cuts
+        # were abandoning runs whose heartbeat was 10s old).
         task = {'workUntil': 500.0, '_contentGraceUsed': sim.TASK_CONTENT_GRACE_MAX_S,
                 '_contentHeartbeat': 1000.0 - 10.0}
         granted = sim._grant_content_grace(task, 1000.0)
         self.assertEqual(granted, sim.TASK_CONTENT_GRACE_FINAL_S)
         self.assertTrue(task['_contentFinalGraceUsed'])
-        self.assertEqual(task['_contentGraceUsed'],
-                         sim.TASK_CONTENT_GRACE_MAX_S + sim.TASK_CONTENT_GRACE_FINAL_S)
+        # Past the final extension, an ALIVE run keeps earning 60s steps...
+        granted = sim._grant_content_grace(task, 1000.0)
+        self.assertEqual(granted, sim.TASK_CONTENT_GRACE_STEP_S)
+        # ...up to the hard wall...
+        task['_contentGraceUsed'] = (sim.TASK_CONTENT_GRACE_MAX_S
+                                     + sim.TASK_CONTENT_GRACE_WALL_S)
         self.assertEqual(sim._grant_content_grace(task, 1000.0), 0.0,
-                         'the final extension is once per run')
+                         'the wall is hard even for an alive run')
 
     def test_final_grace_never_granted_without_a_fresh_heartbeat(self):
         task = {'workUntil': 500.0, '_contentGraceUsed': sim.TASK_CONTENT_GRACE_MAX_S,
