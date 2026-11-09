@@ -717,6 +717,20 @@ def _run_workroom_content(snapshot, agent_id, task, base_ctx=None):
     if project_label and (task.get('taskType') == 'review' or task.get('taskType') == 'qa'):
         _run_review_content(snapshot, agent_id, task, base_ctx)
         return
+    # A repair/fix card (reviewOf + code lane) belongs to its parent story's
+    # workspace even when an ancestor mint lost the project label: without
+    # this it fell to the bare-ambient stub below, completed with a note and
+    # no artifact, and the fail-closed gate refused it every cycle
+    # (2026-11-09: 81 cards stuck in 'the lane output and the completion
+    # gate disagree'). The coding executor walks reviewOf for the workspace.
+    if not project_label and task.get('reviewOf') and str(task.get('taskType') or '') == 'code':
+        _run_coding_content(snapshot, agent_id,
+                            {**task,
+                             'projectLabel': (project_label
+                                              or task.get('title', '')),
+                             'title': task.get('title', ''),
+                             'instructions': None}, base_ctx=base_ctx)
+        return
     if project_label:
         backlog = f"{task.get('title') or ''} -- {task.get('instructions')}" if task.get('instructions') else (task.get('title') or '')
         context_summary = ''

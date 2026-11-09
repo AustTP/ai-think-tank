@@ -18,10 +18,25 @@ class FixCardRouting(unittest.TestCase):
         self._mint_source_has_project_label()
         self._dispatch_order_has_stub_last()
 
+    def test_unlabeled_code_fix_routes_to_coding_lane(self):
+        # The dispatcher must send a reviewOf+code card to the coding lane
+        # even with no project label: the stub path completes note-only and
+        # the fail-closed gate refuses it forever.
+        import agents as _agents_mod
+        root = os.path.dirname(os.path.dirname(os.path.abspath(_agents_mod.__file__)))
+        path = os.path.join(root, 'agents', 'content_parts', '80_body_09.py')
+        src = open(path, encoding='utf-8').read()
+        fn = src[src.index('def _run_workroom_content'):]
+        fn = fn[:fn.index('\ndef ', 10)]
+        self.assertIn("task.get('reviewOf') and str(task.get('taskType') or '') == 'code'",
+                      fn, 'unlabeled code fix cards route to the coding lane')
+        self.assertLess(fn.index("task.get('reviewOf') and str"),
+                        fn.index('if project_label:'),
+                        'the fix-card route comes before the labeled route')
+
     def _mint_source_has_project_label(self):
         # Contract test on the mint site: the queue_fix dict literal must
         # carry projectLabel for code fixes (is_prose_review-guarded).
-        import re
         import agents as _agents_mod
         root = os.path.dirname(os.path.dirname(os.path.abspath(_agents_mod.__file__)))
         path = os.path.join(root, 'agents', 'content_parts', '30_body_04.py')
