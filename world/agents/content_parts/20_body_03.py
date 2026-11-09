@@ -574,6 +574,32 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     import agents.story_tracking as story_tracking
     import agents.staged_work as staged_work
     import agents.work_reuse as work_reuse
+    # An unworkable fix card short-circuits BEFORE any model spend: when the
+    # root story's workspace is gone AND its task row is terminal or unknown
+    # (disk hygiene reaps workspaces of closed stories by design), the fix has
+    # nothing to amend -- every staged run on it was destined to flail on an
+    # empty tree, complete without a deliverable, get refused by the gate, and
+    # re-mint (2026-11-09: 100 of 184 fix cards pointed at reaped workspaces;
+    # the refusal storm burned dispatch slots and Telegram alerts for hours).
+    if task.get('reviewOf'):
+        root_id = story_tracking.root(snapshot, task)
+        root = (snapshot.get('tasks') or {}).get(root_id or '') or {}
+        if (str(root.get('status') or '') in ('done', 'cancelled', 'failed',
+                                              'blocked', 'abandoned', '')
+                and not os.path.isdir(os.path.join(
+                    _serve.SANDBOXES_DIR,
+                    'story-' + (root_id or task.get('reviewOf'))))):
+            sim._store_content_result(task.get('id'), {
+                'ok': False,
+                'note': 'the parent story is closed and its workspace was '
+                        'reaped; there is no deliverable left to amend',
+                'terminalGap': True,
+                'feedback': {'text': 'Fix target gone: the parent story is '
+                                    'closed and its workspace was reaped. '
+                                    'Do not re-card; re-open the parent or '
+                                    'start fresh work.',
+                             'source': 'executor'}})
+            return
     workspace = _review_sandbox_id(snapshot, task, agent_id)
     parent = story_tracking.root(snapshot, task)
     staged_work.cleanup(_serve.SANDBOXES_DIR)

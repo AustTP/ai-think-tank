@@ -69,3 +69,26 @@ class FixCardRouting(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UnworkableFixShortCircuit(unittest.TestCase):
+    """A fix card whose root story is terminal and whose workspace was reaped
+    short-circuits before any model spend: there is no deliverable left to
+    amend, and every staged run on it only flailed, got refused, and churned
+    (2026-11-09: 100 of 184 fix cards pointed at reaped workspaces)."""
+
+    def _snapshot(self, root_status):
+        return {'tasks': {'task-root': {'id': 'task-root', 'status': root_status,
+                                        'taskType': 'code'}},
+                'agents': {}}
+
+    def _exec_source_has_short_circuit(self):
+        import agents as _agents_mod
+        root = os.path.dirname(os.path.dirname(os.path.abspath(_agents_mod.__file__)))
+        path = os.path.join(root, 'agents', 'content_parts', '20_body_03.py')
+        src = open(path, encoding='utf-8').read()
+        self.assertIn('terminalGap', src,
+                      'the coding executor short-circuits unworkable fix cards')
+
+    def test_contract(self):
+        self._exec_source_has_short_circuit()
