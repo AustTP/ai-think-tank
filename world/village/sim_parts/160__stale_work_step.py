@@ -29,20 +29,30 @@ _CONTENT_RESIDUE_KEYS = ('_contentInFlight', '_contentHeartbeat',
 
 
 def _clear_content_residue(state):
-    """Drop content-run residue from tasks that are not working. A restart
-    kills the run threads but the flags persist in the saved state; residue on
-    a non-working card is definitionally dead (no thread can own it) and it
+    """Drop dead markers from tasks that cannot own them. A restart kills the
+    run threads but the flags persist in the saved state; residue on a
+    non-working card is definitionally dead (no thread can own it) and it
     poisoned the dispatch governor's count (2026-11-08: 422 zombie flags).
-    Returns the number of cleaned tasks."""
+    Also clears a scheduled-suspension stamp more than two hours old on a
+    non-working card: the interrupting item is long gone and the resume
+    callback never fired while the loop was down (2026-11-08: 46 stale
+    suspensions, including the MAYA-31 merge card, suppressed dispatch for
+    half a day). Returns the number of cleaned tasks."""
     cleaned = 0
+    now_ms = int(time.time() * 1000)
     for t in (state.get('tasks') or {}).values():
         if not isinstance(t, dict) or t.get('status') == 'working':
             continue
-        if not any(k in t for k in _CONTENT_RESIDUE_KEYS):
-            continue
+        touched = False
         for k in _CONTENT_RESIDUE_KEYS:
-            t.pop(k, None)
-        cleaned += 1
+            if t.pop(k, None) is not None:
+                touched = True
+        flag = t.get('_suspendedForScheduled')
+        if isinstance(flag, (int, float)) and now_ms - flag > 7200000:
+            t.pop('_suspendedForScheduled', None)
+            touched = True
+        if touched:
+            cleaned += 1
     return cleaned
 
 

@@ -153,3 +153,27 @@ class HolderlessBugZombie(unittest.TestCase):
         self.assertEqual(n, 0,
                          'a HELD bug card keeps the bug-alarm path')
         self.assertIn('task-zombie-bug', state['tasks'])
+
+
+class StaleSuspensionResidue(unittest.TestCase):
+    """A scheduled-suspension stamp hours old on a non-working card is dead:
+    the interrupting item is gone and the resume callback never fired."""
+
+    def test_stale_suspension_cleared_on_queued_card(self):
+        from sim import _clear_content_residue
+        import time
+        now_ms = int(time.time() * 1000)
+        state = {'tasks': {
+            'task-a': {'status': 'queued',
+                       '_suspendedForScheduled': now_ms - 3 * 3600000},
+            'task-b': {'status': 'queued',
+                       '_suspendedForScheduled': now_ms - 60000},
+            'task-c': {'status': 'working',
+                       '_suspendedForScheduled': now_ms - 7200000},
+        }}
+        _clear_content_residue(state)
+        self.assertNotIn('_suspendedForScheduled', state['tasks']['task-a'])
+        self.assertIn('_suspendedForScheduled', state['tasks']['task-b'],
+                      'a fresh suspension is honored')
+        self.assertIn('_suspendedForScheduled', state['tasks']['task-c'],
+                      'a working card keeps its suspension')
