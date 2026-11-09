@@ -72,7 +72,8 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         with _db() as conn:
             rows = conn.execute(
                 'SELECT ts, details FROM action_log '
-                "WHERE action = 'telegram_sent' AND ts >= ? ORDER BY ts ASC",
+                "WHERE action IN ('telegram_sent', 'telegram_digest_only') "
+                'AND ts >= ? ORDER BY ts ASC',
                 (cutoff,)).fetchall()
     except Exception:
         pass

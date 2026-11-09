@@ -482,15 +482,17 @@ def _stop_card_pattern(state, task, info, author):
         _log_governance(state, author, 'card_pattern_suppressed',
                         {'taskId': task.get('id'), 'pattern': info['key'],
                          'failures': info['failures'], 'taskIds': info['taskIds']})
+        # Digest-only (operator direction 2026-11-09): a suppression is the
+        # loop stopper WORKING, not a live failure. The daily 30-min digest
+        # picks it up from the log row; an immediate ping only added noise.
         try:
-            from serve import send_player_telegram_sync
-            send_player_telegram_sync(
-                '[AI Think Tank] Card pattern suppressed',
-                (f'Stopped minting cards for {info["key"]} after '
-                 f'{info["failures"]} failures in 24h.\n'
-                 f'Task: {task.get("title") or task.get("id")}\n'
-                 f'Tasks: {", ".join(info["taskIds"])}\n'
-                 'The card contract is wrong. Fix it before another card is filed.'))
+            from serve import log_action
+            log_action('system', 'telegram_digest_only', {
+                'preview': '[AI Think Tank] Card pattern suppressed\n\n'
+                           f'Stopped minting cards for {info["key"]} after '
+                           f'{info["failures"]} failures in 24h. '
+                           f'Task: {task.get("title") or task.get("id")}'},
+                authorized=True)
         except Exception:
             pass
 

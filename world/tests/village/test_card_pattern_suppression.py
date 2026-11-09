@@ -63,12 +63,19 @@ def test_title_fallback_strips_fix_prefixes():
 
 
 def test_stop_card_pattern_alerts_once_per_window(monkeypatch):
+    # Digest-only (operator direction 2026-11-09): the suppression is the
+    # loop stopper working, so it must NOT ping Telegram immediately. It
+    # logs one telegram_digest_only row per pattern per window, which the
+    # 30-min digest scan reads (action in telegram_sent/digest_only).
     import serve
     calls = []
+    logs = []
     monkeypatch.setattr(serve, 'send_player_telegram_sync',
                         lambda subject, body: calls.append((subject, body)) or True)
     monkeypatch.setattr(sim, '_log_governance', lambda *a, **k: None)
     monkeypatch.setattr(sim, '_append_mailbox', lambda *a, **k: None)
+    monkeypatch.setattr(serve, 'log_action',
+                        lambda *a, **k: logs.append(a))
     now = int(time.time() * 1000)
     state = {'tasks': {
         'task-1': {'id': 'task-1', 'status': 'failed', 'failedAt': now,
@@ -80,8 +87,10 @@ def test_stop_card_pattern_alerts_once_per_window(monkeypatch):
     sim._stop_card_pattern(
         state, {'id': 'task-2', 'assignedTo': 'ada', 'issueKey': 'IRIS-1',
                 'title': 'Reset cards again'}, info, 'ada')
-    assert len(calls) == 1
-    assert 'Card pattern suppressed' in calls[0][0]
+    assert calls == [], 'suppression must not ping Telegram directly'
+    rows = [c for c in logs
+            if c[1] == 'telegram_digest_only' and 'issue:IRIS-1' in str(c[2])]
+    assert len(rows) == 1, 'one digest-only log row per pattern per window'
 
 
 def test_transient_transport_failures_do_not_count():

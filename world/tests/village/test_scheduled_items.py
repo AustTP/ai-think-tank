@@ -4,6 +4,7 @@ directed card each cadence; the digest lands the last 24h of Telegram
 alerts in the Library first."""
 import datetime
 import json
+import os
 import unittest
 from unittest import mock
 
@@ -66,7 +67,7 @@ class EnginePassTests(unittest.TestCase):
     def test_seed_created_once_on_first_pass(self):
         st = _state()
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw, \
-                mock.patch.object(sim, 'serve', create=True) as srv:
+                mock.patch.object(sim, 'serve', create=True):
             sim._scheduled_items_pass(st, now_ms=10_000_000_000)
         self.assertEqual([i['id'] for i in st['scheduledItems']],
                          ['sch-rvp-telegram-digest'])
@@ -226,3 +227,33 @@ class ScheduleApiTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DigestOnlyAlerts(unittest.TestCase):
+    """Digest-only alerts land in the digest scan but never ping Telegram
+    immediately (operator direction 2026-11-09): a card-pattern suppression
+    is the loop stopper working, not a live failure."""
+
+    def test_digest_scan_includes_digest_only_rows(self):
+        # serve.py execs server/serve_parts/*.py at import; assert against
+        # the parts source, not the shim.
+        parts = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))),
+            'server', 'serve_parts')
+        src = open(os.path.join(parts, '425_scheduled_items.py'),
+                   encoding='utf-8').read()
+        self.assertIn("'telegram_sent', 'telegram_digest_only'", src,
+                      'the digest scan reads telegram_digest_only rows')
+
+    def test_stopper_uses_digest_only_channel(self):
+        parts = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))),
+            'village', 'sim_parts')
+        src = open(os.path.join(parts, '070__fire_decision.py'),
+                   encoding='utf-8').read()
+        block = src[src.index('def _stop_card_pattern'):]
+        block = block[:block.index('\ndef ', 10)]
+        self.assertNotIn('send_player_telegram_sync', block,
+                         'suppression must not ping Telegram directly')
+        self.assertIn('telegram_digest_only', block,
+                      'suppression logs a digest-only row instead')
