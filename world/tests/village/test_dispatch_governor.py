@@ -41,11 +41,16 @@ class DispatchGovernor(unittest.TestCase):
         finally:
             sim._TASK_CONTENT_MAX_CONCURRENT = old_cap
 
-    def test_active_content_runs_counts_exactly_in_flight(self):
+    def test_active_content_runs_counts_only_working_in_flight(self):
         state = self._state(running=2)
         state['tasks']['task-light'] = {'status': 'working'}
         state['tasks']['task-review'] = {'status': 'needs_review',
                                          '_contentInFlight': False}
+        self.assertEqual(sim._active_content_runs(state), 2)
+        # Zombie flags on non-working cards are residue, not live runs
+        # (2026-11-08: 422 of them throttled the tank to zero).
+        state['tasks']['task-zombie'] = {'status': 'queued',
+                                         '_contentInFlight': True}
         self.assertEqual(sim._active_content_runs(state), 2)
 
     def test_non_content_tasks_do_not_count(self):

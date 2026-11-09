@@ -551,8 +551,13 @@ _TASK_CONTENT_MAX_CONCURRENT = max(
 
 
 def _active_content_runs(state):
+    # Only a WORKING task's in-flight flag means a live thread. Flags on
+    # queued/blocked/reviewing cards are residue from restarts and requeues
+    # (2026-11-08: 422 zombie flags after a day of restart churn made the
+    # cap look permanently exhausted and throttled the tank to zero).
     return sum(1 for t in (state.get('tasks') or {}).values()
-               if isinstance(t, dict) and t.get('_contentInFlight'))
+               if isinstance(t, dict) and t.get('_contentInFlight')
+               and t.get('status') == 'working')
 
 
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):

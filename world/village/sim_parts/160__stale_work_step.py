@@ -24,6 +24,28 @@ def _credits_pause_blocks_assignment():
 FAILED_RETRY_GRACE_MS = 2 * 3600 * 1000  # a failed card ages 2h before auto re-issue
 
 
+_CONTENT_RESIDUE_KEYS = ('_contentInFlight', '_contentHeartbeat',
+                         '_contentGraceUsed', '_contentFinalGraceUsed')
+
+
+def _clear_content_residue(state):
+    """Drop content-run residue from tasks that are not working. A restart
+    kills the run threads but the flags persist in the saved state; residue on
+    a non-working card is definitionally dead (no thread can own it) and it
+    poisoned the dispatch governor's count (2026-11-08: 422 zombie flags).
+    Returns the number of cleaned tasks."""
+    cleaned = 0
+    for t in (state.get('tasks') or {}).values():
+        if not isinstance(t, dict) or t.get('status') == 'working':
+            continue
+        if not any(k in t for k in _CONTENT_RESIDUE_KEYS):
+            continue
+        for k in _CONTENT_RESIDUE_KEYS:
+            t.pop(k, None)
+        cleaned += 1
+    return cleaned
+
+
 def _stale_work_step(state, now, now_ms):
     """SM gap 1: stale in-flight work oversight. Bugs already have a restore
     alarm (RESTORE_TIMEOUT_MS via _escalation_step); a NON-bug task wedged in
@@ -48,6 +70,7 @@ def _stale_work_step(state, now, now_ms):
     (their deadlock lives in the stuck-gate watchdog). Pure state mutation;
     runs before the idle gate so a quiet tank still re-plans a wedged card.
     Returns the number of cards re-planned (requeued + SM-routed)."""
+    _clear_content_residue(state)
     if now_ms - (state.get('lastStaleWorkSweep') or 0) < STALE_WORK_CADENCE_MS:
         return 0
     state['lastStaleWorkSweep'] = now_ms

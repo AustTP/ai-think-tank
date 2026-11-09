@@ -89,3 +89,28 @@ class FailedWorkAging(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ContentResidueSweep(unittest.TestCase):
+    """Restart-orphaned content flags on non-working cards are dead and must
+    be swept, or the dispatch governor's count stays poisoned."""
+
+    def test_residue_cleared_off_non_working_tasks(self):
+        from sim import _clear_content_residue
+        state = {'tasks': {
+            'task-a': {'status': 'queued', '_contentInFlight': True,
+                       '_contentGraceUsed': 60.0},
+            'task-b': {'status': 'blocked', '_contentInFlight': True},
+            'task-c': {'status': 'working', '_contentInFlight': True},
+            'task-d': {'status': 'done'},
+        }}
+        cleaned = _clear_content_residue(state)
+        self.assertEqual(cleaned, 2)
+        self.assertNotIn('_contentInFlight', state['tasks']['task-a'])
+        self.assertNotIn('_contentGraceUsed', state['tasks']['task-a'])
+        self.assertNotIn('_contentInFlight', state['tasks']['task-b'])
+        self.assertTrue(state['tasks']['task-c']['_contentInFlight'],
+                        'a working task keeps its live-run flags')
+        self.assertEqual(cleaned, 0) if False else None
+        self.assertEqual(_clear_content_residue(state), 0,
+                         'a second pass finds nothing left to clean')
