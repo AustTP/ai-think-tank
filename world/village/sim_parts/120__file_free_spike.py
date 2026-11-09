@@ -802,6 +802,10 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                     'deliverable': deliverable,
                     'approvedTools': list(req.get('approvedTools') or []),
                     'teamId': req.get('teamId'),
+                    # Adversarial pairing: the groomed card must keep its side
+                    # tag or the tick cannot detect this side's delivery.
+                    'adversarialTaskId': req.get('adversarialTaskId'),
+                    'villageId': req.get('villageId'),
                     'userStory': story,
                     'acceptanceCriteria': criteria,
                     'never': never,
