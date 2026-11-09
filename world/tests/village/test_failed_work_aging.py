@@ -114,3 +114,42 @@ class ContentResidueSweep(unittest.TestCase):
         self.assertEqual(cleaned, 0) if False else None
         self.assertEqual(_clear_content_residue(state), 0,
                          'a second pass finds nothing left to clean')
+
+
+class HolderlessBugZombie(unittest.TestCase):
+    """A holderless working card hours past its deadline is reclaimed by the
+    stale sweep even when it is bug-typed: no thread owns it, no agent holds
+    it, so neither the completion loop nor the bug alarm will act."""
+
+    def _state(self):
+        import time
+        now_ms = int(time.time() * 1000)
+        task = {'id': 'task-zombie-bug', 'status': 'working',
+                'title': '[BUG] Leonard (Fix: orphaned)', 'room': 'observatory',
+                'taskType': 'bug', 'createdAt': now_ms - 7200000,
+                'workUntil': time.time() - 7200,
+                'assignedTo': 'ghost', 'teamId': None}
+        return {'tasks': {'task-zombie-bug': task}, 'agents': {},
+                'agentRoster': [], 'workQueue': [], 'lastStaleWorkSweep': 0,
+                '_staleWorkReplans': {}, 'teams': []}
+
+    def test_holderless_bug_zombie_is_reclaimed(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        n = sim._stale_work_step(state, time.time(), now_ms)
+        self.assertEqual(n, 1)
+        self.assertNotIn('task-zombie-bug', state['tasks'])
+        self.assertTrue(state['workQueue'])
+
+    def test_held_bug_card_stays_with_the_alarm(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        state['agents'] = {'ghost': {'task': 'task-zombie-bug'}}
+        n = sim._stale_work_step(state, time.time(), now_ms)
+        self.assertEqual(n, 0,
+                         'a HELD bug card keeps the bug-alarm path')
+        self.assertIn('task-zombie-bug', state['tasks'])

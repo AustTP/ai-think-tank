@@ -92,8 +92,21 @@ def _stale_work_step(state, now, now_ms):
             continue
         if task.get('status') not in ('walking', 'working'):
             continue
-        if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow'):
+        holderless_zombie = (
+            task.get('status') == 'working'
+            and now_ms - int((_effective_work_deadline_ms(state, task, now_ms)
+                              or now_ms)) > 3600_000
+            and not any(isinstance(a, dict) and a.get('task') == tid
+                        for a in agents.values()))
+        if ((task.get('taskType') == 'bug' or task.get('incident')
+             or task.get('shadow')) and not holderless_zombie):
             continue  # bugs own an alarm; shadows never ship; reviews -> stuck-gate
+        # EXCEPT a holderless working card hours past its deadline: no thread
+        # can own it and no agent holds it, so neither the completion loop nor
+        # the bug alarm will ever reclaim it (2026-11-08: 22 [BUG] zombies sat
+        # 12h past deadline after a loop freeze; only an operator pass cleared
+        # them). The alarm keeps authority over HELD bug cards; an orphaned
+        # one is requeued here under the same bounded replan counter.
         if task.get('reviewOf'):
             continue  # review/fix subtasks are the stuck-gate watchdog's domain
         if task.get('_suspendedForScheduled'):
