@@ -684,7 +684,14 @@ function closeGateMenu() {
 function travelFromGate(id) {
   closeGateMenu();
   if (id === 'main') {
-    returnToMainFromSouth();
+    // A village entered from the east road returns to the east road; every
+    // other arrival keeps the long-standing south-outlet landing.
+    if (state.enteredViaEast) {
+      state.enteredViaEast = null;
+      returnToMainFromEast();
+    } else {
+      returnToMainFromSouth();
+    }
     return;
   }
   const scene = SCENES[id];
@@ -699,6 +706,76 @@ function travelFromGate(id) {
 function southMenuCallMeeting() {
   closeSouthMenu();
   openMeetingUI('south_outlet');
+}
+
+// The east path menu: every ART-BACKED village (generated from the
+// winter-template pipeline, registered in scenes.json with a bgSprite) is
+// reachable east. Winter itself keeps its direct band connection; it appears
+// here too while enabled so both doors to it are visible.
+function eastDestinations() {
+  const out = [];
+  for (const id in SCENES) {
+    if (id === 'main') continue;
+    const s = SCENES[id];
+    if (!s || !s.bgSprite) continue;          // schematic villages stay south
+    if (id === 'winter' && !WINTER_ENABLED) continue;
+    if (id === state.scene) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+function renderEastDestinations() {
+  const box = document.getElementById('eastExitDestinations');
+  if (!box) return;
+  box.innerHTML = '';
+  const ids = eastDestinations();
+  if (!ids.length) {
+    const note = document.createElement('p');
+    note.style.cssText = 'margin:0; font-size:12px;';
+    note.textContent = 'No villages lie east yet.';
+    box.appendChild(note);
+    return;
+  }
+  for (const id of ids) {
+    const btn = document.createElement('button');
+    btn.textContent = 'Walk to the ' + id.replace(/-/g, ' ') + ' village';
+    btn.addEventListener('click', () => travelFromEast(id));
+    box.appendChild(btn);
+  }
+}
+
+function travelFromEast(id) {
+  const scene = SCENES[id];
+  if (!scene || !scene.grid || (scene.bgSprite && !scene.bg)) {
+    showToast('That village is not ready yet.');
+    return;
+  }
+  closeEastMenu();
+  state.enteredViaEast = id;   // the village's gate returns to the east road
+  switchScene(id);
+  showToast('Arrived in the ' + id.replace(/-/g, ' ') + ' village.');
+}
+
+function openEastMenu() {
+  if (state.ui) return;
+  state.ui = 'eastExit';
+  renderEastDestinations();
+  document.getElementById('eastExitModal').classList.remove('hidden');
+}
+
+function closeEastMenu() {
+  state.ui = null;
+  document.getElementById('eastExitModal').classList.add('hidden');
+  // Nudge west off the gate tile so closing the menu does not immediately
+  // re-open it (same pattern as closeSouthMenu).
+  state.player.x = Math.min(state.player.x, EAST_GATE.x - state.player.w - 6);
+}
+
+function wireEastExitMenu() {
+  const cancel = document.getElementById('eastExitCancelBtn');
+  if (!cancel) return;
+  cancel.addEventListener('click', closeEastMenu);
 }
 
 function wireSouthOutletMenu() {

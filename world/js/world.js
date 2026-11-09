@@ -611,6 +611,17 @@ const CONNECTION_BAND = { y0: 26 * 8 * SCALE, y1: 33 * 8 * SCALE };
 // It is NOT the adversarial (winter) village and is always walkable. The
 // arrival gate is the road cut into the north edge of its background; walking
 // into it returns to the main map, just above the south outlet.
+// The east path: a carved corridor on the main map's right edge (rows
+// 12-25, collision_grid.json) below the winter connection band. New
+// villages generated from the winter-template art connect HERE -- the east
+// edge is the image-world road, the south outlet stays the schematic road.
+const EAST_GATE = {
+  x: GROUND_W - 14 * SCALE,
+  y: 13 * 8 * SCALE,
+  w: 14 * SCALE,
+  h: 12 * 8 * SCALE,
+};
+
 const SOUTH_GATE = { x: 292 * SCALE, y: 0, w: 56 * SCALE, h: 10 * SCALE };
 const SOUTH_OUTLET = { x: 448 * SCALE, y: 370 * SCALE, w: 88 * SCALE, h: 14 * SCALE };
 
@@ -735,6 +746,16 @@ function switchScene(to) {
   state.player.x = s.spawn.x;
   state.player.y = s.spawn.y;
   state.zoom = ZOOM_SHOW_ALL;
+}
+
+// Return to the main map from an east-connected village, landing just west
+// of the east gate (facing back into the village).
+function returnToMainFromEast() {
+  switchScene('main');
+  state.player.x = EAST_GATE.x - state.player.w - 6;
+  state.player.y = EAST_GATE.y + EAST_GATE.h / 2 - state.player.h / 2;
+  state.player.dir = 'west';
+  if (typeof showToast === 'function') showToast('Back in the main village.');
 }
 
 // Return from the south village to the main map, just above the south outlet.

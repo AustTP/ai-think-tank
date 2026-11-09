@@ -109,6 +109,15 @@ function updateOutside(dt) {
       const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
       if (inBand && state.player.x + state.player.w >= GROUND_W - 2) { switchScene('winter'); return; }
     }
+    // The east gate (rows 13-24, below the winter band): walking into the
+    // carved corridor opens the east-exit menu for every art-backed village.
+    if (typeof EAST_GATE !== 'undefined' && typeof openEastMenu === 'function'
+        && state.player.x + state.player.w >= EAST_GATE.x
+        && state.player.y + state.player.h >= EAST_GATE.y
+        && state.player.y <= EAST_GATE.y + EAST_GATE.h) {
+      openEastMenu();
+      return;
+    }
   } else if (state.scene === 'winter') {
     if (WINTER_ENABLED) {
       const inBand = state.player.y >= CONNECTION_BAND.y0 && state.player.y <= CONNECTION_BAND.y1;
@@ -412,6 +421,7 @@ async function main() {
   renderPresetButtons();
   wireDoorMenu();
   wireSouthOutletMenu();
+  wireEastExitMenu();
   document.getElementById('startCallBtn').addEventListener('click', handleStartCall);
   document.getElementById('suggestAttendeesBtn').addEventListener('click', handleSuggestAttendees);
   document.getElementById('cancelCallBtn').addEventListener('click', handleCancelCall);

@@ -538,11 +538,31 @@ def _assign_player_task(state, pick, now_ms, task_id_holder=None):
 _ASSIGN_WAIT = object()
 
 
+# Concurrency governor: each content run holds a full state snapshot on its
+# own thread; past ~24 concurrent runs the box (32GB) saturates and the
+# server can no longer serve the UI at all (2026-11-08 incident: 57 concurrent
+# runs pegged the CPU at 132%, pushed memory to a quarter of the machine, and
+# every endpoint -- including static map assets -- timed out). The queue
+# dispatcher is the right throttle point: a due item that would exceed the
+# cap simply waits for the next tick (_ASSIGN_WAIT), so nothing is lost,
+# nothing fails, and the UI stays alive. Env-overridable for bigger boxes.
+_TASK_CONTENT_MAX_CONCURRENT = max(
+    1, int((os.environ.get('TANK_MAX_CONTENT_RUNS') or '24').strip() or '24'))
+
+
+def _active_content_runs(state):
+    return sum(1 for t in (state.get('tasks') or {}).values()
+               if isinstance(t, dict) and t.get('_contentInFlight'))
+
+
 def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder=None):
     """Deterministic assignment of one due queue item: pick the most-idle
     eligible candidate (round-robin, zero JEV spend), wake her if off-duty,
     assign. Returns the task dict or None. Mirrors assignTaskViaJev's
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
+    # Governor: never dispatch a content run past the concurrency cap.
+    if _active_content_runs(state) >= _TASK_CONTENT_MAX_CONCURRENT:
+        return _ASSIGN_WAIT
     request_id = pick.get('requestId')
     sequence = pick.get('sequence')
     if request_id and sequence is not None:
