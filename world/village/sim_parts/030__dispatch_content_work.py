@@ -300,11 +300,6 @@ def queue_work(state, items):
             # villages; agents inherit their director's villageId). Provenance
             # for the multi-village org -- rooms are shared geometry today.
             'villageId': item.get('villageId') or None,
-            # The adversarial pairing tag: without it a groomed card loses its
-            # side (the 2026-11-08 live verification -- the winter ceremony
-            # accepted wrq-591 and the card queued UNTAGGED, so the tick could
-            # never see the side deliver and winter would never auto-disable).
-            'adversarialTaskId': item.get('adversarialTaskId') or None,
             # Product ownership pin: the card belongs to the team that OWNS
             # the product the parent ask was about. The assignment pass uses
             # it as a HARD pool (the owning team's members + explicit loans
