@@ -652,6 +652,21 @@ def _restore_social_agent(state, aid, snapshot, now_ms, duration_ms):
         a['inRoom'] = None
         a['task'] = None
     elif tid:
+        # Guard (2026-11-09): the agent may have taken NEW work while the
+        # social ran -- replaying the stale pointer stomps a live assignment
+        # (same class as the refinement/escalation restore guards; seen live
+        # as orphaned cards and permanent ghost .task pointers). Only replay
+        # the snapshot when the agent has NOT moved on; otherwise keep the
+        # live assignment and extend ITS budget if it is the same card.
+        cur = a.get('task')
+        live_cur = (state.get('tasks') or {}).get(cur or '') or {}
+        if cur and cur != tid \
+                and live_cur.get('status') in ('walking', 'working'):
+            tasks_probe = state.get('tasks') or {}
+            t_old = tasks_probe.get(tid)
+            if isinstance(t_old, dict) and t_old.get('status') in ('walking', 'working'):
+                t_old['workUntil'] = (t_old.get('workUntil') or 0) + (duration_ms // 1000)
+            return
         # Was working -- reclaim the task, restore position + busy + inRoom, and
         # give back the budget the meet consumed.
         a['task'] = tid

@@ -72,3 +72,20 @@ class GhostAgentSweeper(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class SocialRestoreGuard(unittest.TestCase):
+    """_restore_social_agent replays a pre-ceremony task pointer; when the
+    agent took new work during the social it must keep the live assignment
+    instead (same guard class as the refinement/escalation restores)."""
+
+    def test_does_not_stomp_a_live_assignment(self):
+        src = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__)))),
+            'village', 'sim_parts', '090__spawn_team_agent.py'),
+            encoding='utf-8').read()
+        self.assertIn('Only replay\n        # the snapshot when the agent has NOT moved on',
+                      src,
+                      'the social restore replays a stale pointer only when '
+                      'the agent has not taken new work during the social')
