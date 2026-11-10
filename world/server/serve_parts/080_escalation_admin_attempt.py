@@ -1180,9 +1180,17 @@ async def _sim_watchdog_loop(sim_holder, interval_s=None, stale_s=None):
                 if (_sim_module._PASS_LOCK.locked() and held_since
                         and time.time() - held_since > stale_s):
                     held_wedge = True
+                    holder = ''
+                    try:
+                        owner = getattr(_sim_module, '_STATE_LOCK_OWNER', None)
+                        if isinstance(owner, dict) and owner.get('name'):
+                            holder = (f'; _STATE_LOCK held by {owner["name"]!r} '
+                                      f'for {time.time() - float(owner.get("at") or 0):.0f}s')
+                    except Exception:
+                        holder = ''
                     print(f'[sim-watchdog] pass lock held {time.time() - held_since:.0f}s '
                           f'(> {stale_s:.0f}s); wedged pass -- recycling sim loop '
-                          f'(dormancy does not mask a held pass)', flush=True)
+                          f'(dormancy does not mask a held pass){holder}', flush=True)
             except AttributeError:
                 pass
             if held_wedge or (last and not _dormant()):
