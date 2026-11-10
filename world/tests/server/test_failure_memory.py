@@ -157,8 +157,9 @@ class LibraryPathTolerance(unittest.TestCase):
         base = os.path.abspath(serve.LIBRARY_DIR)
         self.assertTrue(got and got.startswith(base + os.sep),
                         'resolves inside the Library')
-        self.assertFalse(os.path.join('library', 'library') in got,
-                         'no double prefix')
+        rel = os.path.relpath(got, base)
+        self.assertFalse(rel.startswith('library' + os.sep + 'library'),
+                         'no double prefix (base itself may end in /library)')
 
     def test_plain_relative_paths_still_work(self):
         import serve
