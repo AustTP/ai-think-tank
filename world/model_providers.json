@@ -21,8 +21,7 @@
   "enabled": true,
   "bands": [
    "low",
-   "sublow",
-   "mid"
+   "sublow"
   ],
   "mode": "free-first",
   "endpoints": [
