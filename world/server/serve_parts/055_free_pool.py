@@ -175,7 +175,10 @@ def _load_free_pool_config():
         min_score = None if min_score is None else float(min_score)
     except (TypeError, ValueError):
         min_score = None
+    budget_bands = [b for b in (pool.get('budget_bands') or [])
+                    if isinstance(b, str) and b.strip()]
     return {'enabled': True, 'bands': [b.strip() for b in bands],
+            'budget_bands': [b.strip() for b in budget_bands],
             'mode': mode, 'endpoints': endpoints,
             'or_free_min_score': min_score}
 
@@ -687,6 +690,19 @@ def _freepool_route_for_band(band, force=False):
             return None
         kind = _free_pool_active_kind()
         paid_blocked = _low_paid_blocked()
+        budget_bands = set(cfg.get('budget_bands') or [])
+        if not force and band in budget_bands:
+            # A budget band never rides the pool on its own merits: the pool
+            # engages for it only when the paid leg is actually unavailable
+            # (credits paused, spend cap hit, or the paid leg blocked). The
+            # paid-failure fallback below still reaches the pool via
+            # force=True. 2026-11-10: putting 'mid' in plain `bands` made
+            # every mid call free-first even with credits healthy -- the
+            # operator wants paid mid when credits exist, free mid when they
+            # don't.
+            if not (credits_pause_active() or _think_tank_spend_cap_exceeded()
+                    or paid_blocked):
+                return None
         if not force:
             if cfg['mode'] == 'paid-first' and not paid_blocked:
                 # The operator wants paid first: the picker never routes to
@@ -929,6 +945,7 @@ def _freepool_status():
         if not cfg:
             return out
         out.update({'enabled': True, 'mode': cfg['mode'], 'bands': list(cfg['bands']),
+                    'budget_bands': list(cfg.get('budget_bands') or []),
                     'paidBlocked': _low_paid_blocked()})
         now = time.time()
         for ep in cfg['endpoints']:

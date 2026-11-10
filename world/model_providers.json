@@ -92,6 +92,10 @@
     "tpm": 12000
    }
   ],
-  "or_free_min_score": 20
+  "or_free_min_score": 20,
+  "budget_bands": [
+   "mid"
+  ],
+  "comment": " budget_bands (2026-11-10): bands listed here engage the pool ONLY when credits are paused/exhausted or the spend cap is hit -- they stay on the paid pick otherwise. mid is a budget band: paid mid when credits exist, free mid when they do not."
  }
 }

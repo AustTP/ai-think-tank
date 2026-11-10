@@ -1203,3 +1203,65 @@ class GeminiAutoModelTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BudgetBandTests(unittest.TestCase):
+    """A budget band engages the pool only when the paid leg is unavailable
+    (credits paused, spend cap hit, or the low paid leg blocked). With
+    credits healthy it returns None so the paid pick serves; a paid FAILURE
+    still reaches the pool through force=True."""
+
+    def _cfg(self):
+        import copy
+        cfg = copy.deepcopy(_POOL_CONFIG)
+        cfg['bands'] = ['low', 'mid']
+        cfg['budget_bands'] = ['mid']
+        return cfg
+
+    def test_budget_band_skips_pool_with_healthy_credits(self):
+        patcher = _write_pool_config(self._cfg())
+        try:
+            _reset_pool_state()
+            # The module defaults to a paused-credits posture; force healthy.
+            with unittest.mock.patch.object(serve, 'credits_pause_active',
+                                            return_value=False):
+                self.assertIsNone(serve._freepool_route_for_band('mid'))
+                # The plain band keeps its free-first behavior.
+                self.assertIsNotNone(serve._freepool_route_for_band('low'))
+        finally:
+            patcher.stop()
+            _reset_pool_state()
+
+    def test_budget_band_serves_when_credits_paused(self):
+        patcher = _write_pool_config(self._cfg())
+        try:
+            _reset_pool_state()
+            with unittest.mock.patch.object(serve, 'credits_pause_active',
+                                            return_value=True):
+                self.assertIsNotNone(serve._freepool_route_for_band('mid'))
+        finally:
+            patcher.stop()
+            _reset_pool_state()
+
+    def test_budget_band_serves_on_forced_fallback(self):
+        patcher = _write_pool_config(self._cfg())
+        try:
+            _reset_pool_state()
+            slug = serve._freepool_route_for_band('mid', force=True)
+            self.assertIsNotNone(slug)
+            self.assertTrue(slug.startswith('@freepool:mid:'))
+        finally:
+            patcher.stop()
+            _reset_pool_state()
+
+    def test_budget_band_serves_when_spend_cap_exceeded(self):
+        patcher = _write_pool_config(self._cfg())
+        try:
+            _reset_pool_state()
+            with unittest.mock.patch.object(
+                    serve, '_think_tank_spend_cap_exceeded',
+                    return_value=True):
+                self.assertIsNotNone(serve._freepool_route_for_band('mid'))
+        finally:
+            patcher.stop()
+            _reset_pool_state()
