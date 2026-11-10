@@ -1214,9 +1214,27 @@ class BudgetBandTests(unittest.TestCase):
     def _cfg(self):
         import copy
         cfg = copy.deepcopy(_POOL_CONFIG)
+        # 'mid' must be in bands for the pool to reach it at all;
+        # budget_bands is the brake that holds it for the paid pick while
+        # credits are healthy.
         cfg['bands'] = ['low', 'mid']
         cfg['budget_bands'] = ['mid']
         return cfg
+
+    def test_budget_band_without_bands_membership_never_serves(self):
+        import copy
+        cfg = copy.deepcopy(_POOL_CONFIG)
+        cfg['bands'] = ['low']
+        cfg['budget_bands'] = ['mid']
+        patcher = _write_pool_config(cfg)
+        try:
+            _reset_pool_state()
+            with unittest.mock.patch.object(serve, 'credits_pause_active',
+                                            return_value=True):
+                self.assertIsNone(serve._freepool_route_for_band('mid'))
+        finally:
+            patcher.stop()
+            _reset_pool_state()
 
     def test_budget_band_skips_pool_with_healthy_credits(self):
         patcher = _write_pool_config(self._cfg())

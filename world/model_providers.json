@@ -21,7 +21,8 @@
   "enabled": true,
   "bands": [
    "low",
-   "sublow"
+   "sublow",
+   "mid"
   ],
   "mode": "free-first",
   "endpoints": [
@@ -96,6 +97,6 @@
   "budget_bands": [
    "mid"
   ],
-  "comment": " budget_bands (2026-11-10): bands listed here engage the pool ONLY when credits are paused/exhausted or the spend cap is hit -- they stay on the paid pick otherwise. mid is a budget band: paid mid when credits exist, free mid when they do not."
+  "comment": " budget_bands (2026-11-10): bands listed here engage the pool ONLY when credits are paused/exhausted or the spend cap is hit -- they stay on the paid pick otherwise. mid is a budget band: paid mid when credits exist, free mid when they do not. budget_bands semantics (2026-11-10): a listed band must ALSO be in bands for the pool to reach it at all; budget_bands then suppresses it whenever credits are healthy (paid pick serves) and releases it only on credits pause/exhaustion or spend cap."
  }
 }
