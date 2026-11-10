@@ -217,3 +217,46 @@ class QueuedCardReconciler(unittest.TestCase):
         sim._stale_work_step(state2, time.time(), now_ms)
         self.assertEqual(len(state2['workQueue']), 0,
                          'a held card is not re-issued')
+
+
+class ReplanCappedLogThrottle(unittest.TestCase):
+    """A capped card's log row fires once per 30 minutes per card -- 197
+    stuck cards logged 26,398 rows/hour when it fired every tick."""
+
+    def _state(self):
+        tasks = {'task-cap': {'id': 'task-cap', 'status': 'queued',
+                              'title': 'Stuck card', 'room': 'dev'}}
+        return {'tasks': tasks, 'workQueue': [],
+                'agents': {'dev1': {'task': None}},
+                '_staleWorkReplans':
+                    {repr(('Stuck card', 'dev')): sim.STALE_WORK_MAX_REPLANS}}
+
+    def _run(self, state, now_ms):
+        with mock.patch('serve.log_action') as la:
+            sim._reconcile_queued_cards(state, now_ms)
+        return la
+
+    def test_logs_once_then_stays_silent_within_window(self):
+        state = self._state()
+        base = 1_700_000_000_000
+        first = self._run(state, base)
+        self.assertEqual(first.call_count, 1)
+        second = self._run(state, base + 60_000)
+        self.assertEqual(second.call_count, 0)
+
+    def test_logs_again_after_window(self):
+        state = self._state()
+        base = 1_700_000_000_000
+        self._run(state, base)
+        again = self._run(state, base + 31 * 60 * 1000)
+        self.assertEqual(again.call_count, 1)
+
+    def test_tracker_stays_bounded(self):
+        state = self._state()
+        for i in range(410):
+            state['tasks'][f'task-c{i}'] = {
+                'id': f'task-c{i}', 'status': 'queued', 'title': f'c{i}',
+                'room': 'dev'}
+            state['_staleWorkReplans'][repr((f'c{i}', 'dev'))] = 99
+        self._run(state, 1_700_000_000_000)
+        self.assertLessEqual(len(state.get('_replanCappedLoggedAt') or {}), 400)

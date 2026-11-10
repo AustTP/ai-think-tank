@@ -89,18 +89,23 @@ def _reconcile_queued_cards(state, now_ms):
         if replans >= STALE_WORK_MAX_REPLANS:
             # Visible, not silent (2026-11-09): a capped card stranded between
             # this bound and the SM re-plan otherwise sits queued forever with
-            # no trace. One log per cap hit, deduped by the replan counter
-            # itself not advancing.
-            from serve import log_action
-            try:
-                log_action('system', 'queued_card_replan_capped',
-                           {'taskId': tid, 'title': task.get('title'),
-                            'room': task.get('room'), 'replans': replans,
-                            'note': 'SM re-plan owns this card; operator '
-                                    'reset resets the counter'},
-                           authorized=True)
-            except Exception:
-                pass
+            # no trace. Time-windowed per card (30 min): the "counter won't
+            # advance" dedup assumption was wrong -- 197 stuck cards logged
+            # 26,398 rows in one hour (every tick), drowning the action log
+            # and pushing real events out of every query window.
+            logged = state.setdefault('_replanCappedLoggedAt', {})
+            if now_ms - (logged.get(tid) or 0) >= 30 * 60 * 1000:
+                logged[tid] = now_ms
+                from serve import log_action
+                try:
+                    log_action('system', 'queued_card_replan_capped',
+                               {'taskId': tid, 'title': task.get('title'),
+                                'room': task.get('room'), 'replans': replans,
+                                'note': 'SM re-plan owns this card; operator '
+                                        'reset resets the counter'},
+                               authorized=True)
+                except Exception:
+                    pass
             continue
         replan_map[key] = replans + 1
         queue.append({
@@ -119,6 +124,12 @@ def _reconcile_queued_cards(state, now_ms):
             'notBefore': now_ms + 5000,
         })
         reissued += 1
+    _logged_map = state.get('_replanCappedLoggedAt')
+    if isinstance(_logged_map, dict) and len(_logged_map) > 400:
+        # Keep the newest 400 entries; dead card ids must not accumulate
+        # forever (a mass-capped board can exceed the freshness prune).
+        keep = sorted(_logged_map.items(), key=lambda kv: kv[1])[-400:]
+        state['_replanCappedLoggedAt'] = dict(keep)
     return reissued
 
 
