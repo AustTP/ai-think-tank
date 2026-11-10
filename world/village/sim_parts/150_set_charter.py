@@ -456,6 +456,13 @@ def _restore_escalation_agent(state, aid, snap, now_ms):
             if t and t.get('status') in ('walking', 'working'):
                 t['workUntil'] = (t.get('workUntil') or 0) + (ESCALATION_MEET_MS // 1000)
             return
+        if not (t and t.get('status') in ('walking', 'working')):
+            # The snapshotted task completed or was archived while the
+            # ceremony ran; replay would stamp a ghost. Idle instead.
+            a['task'] = None
+            a['busy'] = False
+            a['inRoom'] = None
+            return
         a['task'] = snap['task']; a['busy'] = True; a['inRoom'] = snap.get('inRoom')
         a['visible'] = snap.get('visible')
         if t and t.get('status') in ('walking', 'working'):

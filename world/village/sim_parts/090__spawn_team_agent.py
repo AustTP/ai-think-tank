@@ -658,14 +658,25 @@ def _restore_social_agent(state, aid, snapshot, now_ms, duration_ms):
         # as orphaned cards and permanent ghost .task pointers). Only replay
         # the snapshot when the agent has NOT moved on; otherwise keep the
         # live assignment and extend ITS budget if it is the same card.
+        t_snap = (state.get('tasks') or {}).get(tid)
+        snap_live = isinstance(t_snap, dict) and t_snap.get('status') in (
+            'walking', 'working')
         cur = a.get('task')
         live_cur = (state.get('tasks') or {}).get(cur or '') or {}
         if cur and cur != tid \
                 and live_cur.get('status') in ('walking', 'working'):
-            tasks_probe = state.get('tasks') or {}
-            t_old = tasks_probe.get(tid)
-            if isinstance(t_old, dict) and t_old.get('status') in ('walking', 'working'):
-                t_old['workUntil'] = (t_old.get('workUntil') or 0) + (duration_ms // 1000)
+            if snap_live:
+                t_snap['workUntil'] = (t_snap.get('workUntil') or 0) + (duration_ms // 1000)
+            return
+        if not snap_live:
+            # The snapshotted task completed or was archived while the social
+            # ran (seen live: garret re-stamped onto task-29367 eleven
+            # minutes after it completed, because his pointer had been
+            # cleared by the completion between snapshot and restore).
+            # Replay would stamp a ghost; idle instead.
+            a['task'] = None
+            a['busy'] = False
+            a['inRoom'] = None
             return
         # Was working -- reclaim the task, restore position + busy + inRoom, and
         # give back the budget the meet consumed.
