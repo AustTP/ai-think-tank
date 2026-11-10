@@ -1008,6 +1008,9 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
                     # they were asked to write.
                     or pick.get('deliverable') in ('note', 'report')
                     or pick.get('wordLimit')))
+    lesson_note = _team_lesson_note_for(state, pick)
+    if lesson_note:
+        instructions = (instructions + '\n' + lesson_note) if instructions else lesson_note
     task = assign_task(state, chosen_id, pick.get('title'), pick.get('room'),
                        instructions, pick.get('projectLabel') or pick.get('goal'), extra,
                        grid, doors, now_ms, task_id_holder or _TASK_ID_HOLDER)

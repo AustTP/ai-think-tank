@@ -118,7 +118,9 @@ def _reclaim_orphaned_walking_tasks(state):
         # Fault-aware routing memory: this agent's work attempt just failed
         # to complete -- steer the next round-robin pick away from it for a
         # bit (see _agent_failure_score / _assign_due_item).
-        record_agent_failure(state, task.get('assignedTo'))
+        # An orphaned card is a lifecycle/transport failure, not a craft
+        # failure -- weight it lightly (2026-11-10 failure-kind split).
+        record_agent_failure(state, task.get('assignedTo'), kind='infra')
         del tasks[task_id]
         reclaimed += 1
     return reclaimed
@@ -233,10 +235,6 @@ class SimEngine:
                 # documented -- self-correcting, only cheaper.
                 tick_index = _spatial_index(agents_map)
                 _tick_phase_stamp(state, 'movement_substeps')
-                _n_paths = sum(1 for v in agents_map.values()
-                               if isinstance(v, dict) and v.get('path'))
-                if _n_paths:
-                    print(f'[move-diag] stepping {_n_paths} pathed agents', flush=True)
                 for _ in range(max(1, int(SIM_TICK_S / SIM_SUBSTEP_S))):
                     events += step_agent_movement(SIM_SUBSTEP_S, agents_map,
                                                   self._grid, doors=self._doors,

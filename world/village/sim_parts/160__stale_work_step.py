@@ -636,6 +636,109 @@ def _coaching_loop_step(state, now_ms):
     return checked
 
 
+_REJECT_PATTERN_WINDOW_MS = 7 * 24 * 3600 * 1000
+_REJECT_PATTERN_THRESHOLD = 3
+_REJECT_PATTERN_SWEEP_MS = 15 * 60 * 1000
+_PATTERN_FIX_COOLDOWN_MS = 14 * 24 * 3600 * 1000
+
+
+def _reject_pattern_step(state, now_ms):
+    """Supervisor pattern loop over the reject ledger (2026-11-10). The same
+    (team, workType, kind) rejection recurring past the threshold mints ONE
+    'fix the pattern' card for the owning team -- examine the rejections,
+    either write the rule that prevents the mode (the note becomes a
+    teamLesson injected into future same-family instructions by
+    _team_lesson_note_for) or close it as known-and-accepted. Either
+    terminal outcome arms a cooldown so an accepted pattern stops churning.
+    Bounded, cadence-gated, pure state mutation."""
+    if now_ms - (state.get('lastRejectPatternSweep') or 0) < _REJECT_PATTERN_SWEEP_MS:
+        return
+    state['lastRejectPatternSweep'] = now_ms
+    ledger = [e for e in (state.get('rejectLedger') or [])
+              if isinstance(e, dict)
+              and now_ms - (e.get('atMs') or 0) <= _REJECT_PATTERN_WINDOW_MS]
+    state['rejectLedger'] = ledger
+    pstate = state.setdefault('_patternFixState', {})
+    # Harvest finished pattern cards: done with a note -> team lesson;
+    # either terminal outcome -> cooldown for the key.
+    for key, st in list(pstate.items()):
+        if not isinstance(st, dict) or st.get('cooldownUntil'):
+            continue
+        t = next((x for x in (state.get('tasks') or {}).values()
+                  if isinstance(x, dict) and x.get('title') == st.get('title')
+                  and x.get('status') in ('done', 'cancelled')), None)
+        if not t:
+            continue
+        if t.get('status') == 'done':
+            lesson = str(t.get('note') or '').strip()
+            if lesson:
+                lkey = repr((st.get('team'), st.get('workType')))
+                lessons = state.setdefault('teamLessons', {})
+                lessons[lkey] = {'lesson': lesson[:400], 'atMs': int(now_ms),
+                                 'fromPattern': key}
+        st['cooldownUntil'] = now_ms + _PATTERN_FIX_COOLDOWN_MS
+        st['taskId'] = None
+    groups = {}
+    for e in ledger:
+        gk = repr((e.get('teamId'), e.get('workType') or 'task', e.get('kind')))
+        g = groups.setdefault(gk, {'team': e.get('teamId'),
+                                   'workType': e.get('workType') or 'task',
+                                   'kind': e.get('kind'), 'hits': []})
+        g['hits'].append(e)
+    for gk, g in groups.items():
+        if len(g['hits']) < _REJECT_PATTERN_THRESHOLD:
+            continue
+        st = pstate.get(gk)
+        if isinstance(st, dict):
+            if (st.get('cooldownUntil') or 0) > now_ms:
+                continue
+            live = any(isinstance(x, dict) and x.get('title') == st.get('title')
+                       and x.get('status') in ('queued', 'walking', 'working',
+                                               'repairing', 'needs_review', 'blocked')
+                       for x in (state.get('tasks') or {}).values())
+            if live:
+                continue  # a fix-the-pattern card is already active
+        room = g['hits'][-1].get('room') or 'observatory'
+        evidence = '\n'.join(
+            f"- task {h.get('taskId')}: {h.get('note') or 'no note'}"
+            for h in g['hits'][-5:])
+        card = {
+            'title': (f"[PATTERN] {g['kind']} rejections x{len(g['hits'])}: "
+                      f"{g['team'] or 'unassigned'}/{g['workType']} -- write the rule"),
+            'room': room,
+            'taskType': 'task',
+            'deliverable': 'note',
+            'teamId': g['team'],
+            'priority': 2,
+            'sizeEstimate': 'S',
+            'instructions': (
+                f"This failure mode recurred {len(g['hits'])} times in 7 days: "
+                f"kind '{g['kind']}' on {g['workType']} cards for team "
+                f"{g['team'] or 'unassigned'}. Recent rejections:\n{evidence}\n"
+                "1) Read the cited cards' review notes and decide the root cause. "
+                "2) EITHER write the rule that prevents this mode -- a short, "
+                "concrete 'do this, not that' note -- and finish the card with "
+                "that rule as your note (it becomes a standing team lesson "
+                "injected into future " + g['workType'] + " instructions), "
+                "OR finish the card explaining why the behavior is intended "
+                "and should stop being flagged. "
+                "Never re-do the rejected cards themselves; the pattern is "
+                "the deliverable."),
+        }
+        from serve import log_action
+        try:
+            queue_work(state, [card])
+            pstate[gk] = {'team': g['team'], 'workType': g['workType'],
+                          'kind': g['kind'], 'title': card['title'],
+                          'mintedAt': int(now_ms)}
+            log_action(None, 'reject_pattern_minted',
+                       {'team': g['team'], 'workType': g['workType'],
+                        'kind': g['kind'], 'hits': len(g['hits']),
+                        'title': card['title']}, authorized=True)
+        except Exception as e:
+            print(f'[reject-pattern] mint failed: {e}', flush=True)
+
+
 def _repair_stale_holds(state):
     """Clear stale busy/task holds before the idle gate short-circuits.
 
@@ -754,6 +857,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # to re-plan. Runs before the idle gate on a coarse cadence (no-op unless a
     # card is genuinely wedged).
     _stale_work_step(state, now, now_ms)
+    _reject_pattern_step(state, now_ms)
 
     # W5: daily coaching catch-up sweep. Re-checks agents with an applied
     # coaching plan whose real trailing grade is still below the floor, and
@@ -1202,18 +1306,11 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # cards -> assign again. Ten per pass keeps the pass well inside the
     # budget; the 6s cycle spreads the rest over the next passes.
     assigned_this_pass = 0
-    _pick_calls = 0
-    if not work_queue:
-        print('[assign-diag] pass: EMPTY work_queue', flush=True)
     for _ in range(max(1, roster_size)):
         if assigned_this_pass >= MAX_ASSIGN_PER_PASS:
             break
         due_index = pick_next_due_index(work_queue, now_ms, attempted, state, tier_ratios=_tier_ratios)
-        _pick_calls += 1
         if due_index == -1:
-            if _pick_calls == 1:
-                print('[assign-diag] pass: first pick exhausted the queue '
-                      f'(queue={len(work_queue)} awake_supply gates follow)', flush=True)
             break
         pick = work_queue[due_index]
         attempted.add(id(pick))
@@ -1272,10 +1369,6 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
         if isinstance(assigned, dict):
             assigned_this_pass += 1
-        elif _pick_calls <= 2:
-            print('[assign-diag] pick', _pick_calls,
-                  '->', 'WAIT' if assigned is _ASSIGN_WAIT else repr(assigned),
-                  '| title:', (pick.get('title') or '')[:50], flush=True)
         if assigned is _ASSIGN_WAIT:
             # A card that must wait for its named agent is not a failed
             # assignment: put it back without incrementing attempts, or the

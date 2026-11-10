@@ -529,6 +529,72 @@ def _store_content_result(task_id, result):
 MAX_REVIEW_CYCLES = 8
 
 
+_REJECT_LEDGER_MAX = 200
+_REJECT_NOTE_CHARS = 400
+
+
+def _record_reject_event(state, parent, task, reviewer, kind, note, now_ms):
+    """One structured peer-review rejection into the durable reject ledger
+    (2026-11-10): the raw material for the pattern aggregator
+    (_reject_pattern_step). A rejection the colony paid for should be
+    countable by (team, workType, kind) so a recurring failure mode mints
+    its own fix-the-pattern work instead of re-rolling the same card.
+    Kinds: 'rejected' (explicit actionable verdict), 'red_pipeline'
+    (clean vote downgraded: quality pipeline red), 'no_evidence' (clean
+    vote downgraded: no pipeline evidence on a coding-class card).
+    Bounded (oldest dropped), JSON-safe. Pure state mutation."""
+    if not isinstance(parent, dict):
+        return
+    ledger = state.setdefault('rejectLedger', [])
+    ledger.append({
+        'atMs': int(now_ms),
+        'taskId': parent.get('id'),
+        'title': str(parent.get('title') or '')[:80],
+        'teamId': parent.get('teamId'),
+        'room': parent.get('room'),
+        'workType': parent.get('taskType') or 'task',
+        'kind': kind,
+        'reviewer': reviewer,
+        'note': str(note or '')[:_REJECT_NOTE_CHARS],
+    })
+    over = len(ledger) - _REJECT_LEDGER_MAX
+    if over > 0:
+        del ledger[:over]
+
+
+def _maybe_queue_reject_memory(state, parent, reviewer, note, now_ms):
+    """Queue an LTM extraction for the AUTHOR of a rejected card: the
+    rejection rationale distilled into 'what to do differently next time'
+    memories (agents.memory.agent_ltm_extract), recalled into the author's
+    next comparable task by _agent_memory_note_for. Same pending queue and
+    worker the completion path uses; a per-agent cadence guard keeps a
+    rejection storm from becoming an extraction storm."""
+    author = parent.get('assignedTo')
+    if not author or author not in (state.get('agents') or {}):
+        return
+    body = str(note or '').strip()
+    if len(body) < 40:
+        return
+    last = _reject_last_extract.get(author, 0.0)
+    if now_ms - last < _AGENT_MEMORY_CADENCE_S * 1000:
+        return
+    _reject_last_extract[author] = now_ms
+    with _pending_agent_memory_lock:
+        _pending_agent_memory['reject-' + str(parent.get('id')) + '-' + str(now_ms)] = {
+            'agentId': author,
+            'title': 'REJECTED by peer review (' + str(reviewer or 'reviewer') + '): '
+                     + str(parent.get('title') or '')[:120],
+            'note': ('Your work on this card was rejected. Reviewer findings: '
+                     + body[:1200]
+                     + ' Distill the rule that would have made this pass the '
+                       'reviewer the first time -- what to do differently on '
+                       'the next comparable task.'),
+            'room': parent.get('room')}
+
+
+_reject_last_extract = {}
+
+
 def _maybe_escalate_stuck_gate(state, parent, gate, reason):
     """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
     auto-close the story (ship what exists) instead of looping or paging the
@@ -894,6 +960,10 @@ def _apply_content_result(state, task, result, now_ms=None):
                     'atMs': now_ms,
                 })
             if verdict == 'actionable':
+                _record_reject_event(state, parent, task, reviewer, 'rejected',
+                                     task.get('note'), now_ms)
+                _maybe_queue_reject_memory(state, parent, reviewer,
+                                           task.get('note'), now_ms)
                 if not _maybe_escalate_stuck_gate(state, parent, gate, 'repeated rejections'):
                     gate['approvals'] = 0
                     gate['approvers'] = []
@@ -906,8 +976,10 @@ def _apply_content_result(state, task, result, now_ms=None):
                 # a clean verdict with a red or missing pipeline is downgraded to
                 # the actionable path (reset the gate + send it back to the
                 # author) exactly as if the reviewer had rejected it.
+                reject_kind = None
                 if not result.get('pipelineOk'):
                     verdict = 'actionable'
+                    reject_kind = 'red_pipeline'
                 # Item 7 evidence-based done gate: for a CODING-CLASS parent (a
                 # pressoffice story or any product-backed card), a clean vote also
                 # needs OBJECTIVE evidence that the quality pipeline actually ran
@@ -922,7 +994,13 @@ def _apply_content_result(state, task, result, now_ms=None):
                 # library/design-references/stop-condition.md).
                 elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
                     verdict = 'actionable'
+                    reject_kind = 'no_evidence'
                 if verdict == 'actionable':
+                    _record_reject_event(state, parent, task, reviewer,
+                                         reject_kind or 'rejected',
+                                         task.get('note'), now_ms)
+                    _maybe_queue_reject_memory(state, parent, reviewer,
+                                               task.get('note'), now_ms)
                     if not _maybe_escalate_stuck_gate(state, parent, gate, 'repeated red-pipeline rejections'):
                         gate['approvals'] = 0
                         gate['approvers'] = []

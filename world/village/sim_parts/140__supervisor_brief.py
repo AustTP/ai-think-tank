@@ -1582,6 +1582,22 @@ def _refocus_note_for(state, product_id):
             f'serves that -- not just what looks like a natural next addition from here.')
 
 
+def _team_lesson_note_for(state, pick):
+    """The standing team lesson for this card's (teamId, taskType), written
+    by a completed [PATTERN] fix-the-pattern card (see _reject_pattern_step).
+    One line appended to the task's instructions so the rule the team wrote
+    after repeated rejections reaches every future card of that family.
+    Returns None when no lesson is on file."""
+    if not isinstance(pick, dict):
+        return None
+    lessons = state.get('teamLessons') or {}
+    entry = lessons.get(repr((pick.get('teamId'), pick.get('taskType') or 'task')))
+    if not entry or not entry.get('lesson'):
+        return None
+    return ('Team lesson from past rejected ' + str(pick.get('taskType') or 'task')
+            + ' work: ' + str(entry['lesson'])[:400])
+
+
 def _augment_task_instructions(state, agent_id, product_id, instructions, refocus=False, scoped=False):
     """Append coaching + runbook knowledge to a task's instructions BEFORE
     assignment. Pure: returns the augmented instructions (or the original).

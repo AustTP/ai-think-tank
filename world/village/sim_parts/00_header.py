@@ -1097,11 +1097,22 @@ FAILURE_COOLDOWN_HALF_LIFE_S = 1800  # 30 minutes
 FAILURE_COOLDOWN_THRESHOLD = 0.5
 
 
-def record_agent_failure(state, agent_id, now_ms=None):
+# Failure kinds weight the routing-avoidance score differently (2026-11-10):
+# an OpenRouter outage or a restart orphan is nobody's craft failure -- it
+# should barely steer work away from the agent. A completion-gate refusal is
+# a quality signal. Without the split, one storm of infra failures routed
+# work away from healthy workers for an hour.
+FAILURE_KIND_WEIGHTS = {'infra': 0.2, 'refusal': 0.7, 'quality': 1.0}
+
+
+def record_agent_failure(state, agent_id, now_ms=None, kind='quality'):
     """Bump agent_id's fault-memory the moment its work attempt genuinely
     failed to complete (currently: its task was orphaned/reclaimed -- see
-    _reclaim_orphaned_walking_tasks). Pure on state; safe to call with a
-    falsy agent_id (e.g. an orphan with no assignedTo) -- no-ops."""
+    _reclaim_orphaned_walking_tasks). `kind` splits infra noise from real
+    quality signals so the routing score can weight them apart. The
+    default is 'quality' (full weight) so legacy callers keep the old
+    behavior. Pure on state; safe to call with a falsy agent_id (e.g. an
+    orphan with no assignedTo) -- no-ops."""
     if not agent_id:
         return
     now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
@@ -1109,6 +1120,8 @@ def record_agent_failure(state, agent_id, now_ms=None):
     entry = mem.get(agent_id) or {'count': 0, 'lastFailedAt': 0}
     entry['count'] = entry.get('count', 0) + 1
     entry['lastFailedAt'] = now_ms
+    kinds = entry.setdefault('kinds', {})
+    kinds[kind] = kinds.get(kind, 0) + 1
     mem[agent_id] = entry
 
 
@@ -1122,4 +1135,10 @@ def _agent_failure_score(state, agent_id, now_ms):
         return 0.0
     age_s = max(0.0, (now_ms - mem['lastFailedAt']) / 1000.0)
     decay = 0.5 ** (age_s / FAILURE_COOLDOWN_HALF_LIFE_S)
-    return mem.get('count', 0) * decay
+    kinds = mem.get('kinds') or {}
+    if not kinds:
+        # Pre-kind entries keep the old flat weighting.
+        return mem.get('count', 0) * decay
+    weighted = sum(count * FAILURE_KIND_WEIGHTS.get(kind, 1.0)
+                   for kind, count in kinds.items())
+    return weighted * decay
