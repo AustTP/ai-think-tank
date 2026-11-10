@@ -35,6 +35,9 @@ def choose_route(purpose, task_type=None, allow_high=False, best_effort=False):
     if ttype in ('code', 'review', 'qa'):
         return {'band': 'coding', 'best_of': 1,
                 'reason': 'code/review/qa lane', 'confidence': 'high'}
+    if ttype in ('bounty', 'bug-bounty'):
+        return {'band': 'bounty', 'best_of': 1,
+                'reason': 'bug-bounty lane', 'confidence': 'high'}
     if any(word in text for word in ('pulse', 'triage', 'latency', 'monitor', 'ping', 'status')):
         return {'band': 'low', 'best_of': 1,
                 'reason': 'latency-sensitive call', 'confidence': 'high'}

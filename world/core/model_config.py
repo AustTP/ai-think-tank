@@ -5,7 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-BANDS = ('low', 'sublow', 'mid', 'coding', 'high', 'vision', '3d')
+BANDS = ('low', 'sublow', 'mid', 'coding', 'high', 'vision', '3d',
+        'bounty')
 
 
 def load_bands(path: Path) -> dict:

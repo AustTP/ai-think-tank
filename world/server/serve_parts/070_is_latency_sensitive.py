@@ -14,6 +14,9 @@ def _is_latency_sensitive(purpose, task_type=None):
 def _slug_for_band(band):
     if band in ('3d', '3d-modeling'):
         return _3d_tier_slug() or _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if band == 'bounty':
+        return _model_tier_slug('bounty') or _coding_tier_slug() \
+            or _mid_tier_slug() or _low_tier_slug()
     if band == 'coding':
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if band == 'high':
@@ -72,7 +75,8 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
     # correctness is the whole job there) or latency work (already cheap);
     # everything else goes straight to the sublow band with no JEV call.
     # Fail-open: no sublow slug configured and the normal path takes over.
-    if task_type not in ('code', 'review', 'qa', '3d', '3d-modeling') \
+    if task_type not in ('code', 'review', 'qa', '3d', '3d-modeling',
+                         'bounty', 'bug-bounty') \
             and not _is_latency_sensitive(purpose, task_type) \
             and _scale_tier_actor():
         slug = _slug_for_band('sublow')
@@ -100,6 +104,11 @@ def _resolve_model_tier(purpose, task_type=None, allow_high=False, decider=None,
         return _3d_tier_slug() or _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if task_type in ('code', 'review', 'qa'):
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
+    if task_type in ('bounty', 'bug-bounty'):
+        # Deterministic like the coding lane: bounty triage never rides the
+        # JEV gate (a low-confidence answer must not demote a scoped finding
+        # to the cheap tier), and it always degrades through coding first.
+        return _slug_for_band('bounty')
     if _is_latency_sensitive(purpose, task_type):
         # Pulse triage and live monitoring are latency work: use the cheap,
         # fast tier and never wait on a JEV escalation call.

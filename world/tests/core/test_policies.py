@@ -18,6 +18,13 @@ class RouteTests(unittest.TestCase):
         self.assertEqual(route['band'], 'coding')
         self.assertEqual(route['best_of'], 1)
 
+    def test_bounty_routes_bounty_band(self):
+        for tt in ('bounty', 'bug-bounty'):
+            route = policies.choose_route('triage the target report', task_type=tt)
+            self.assertEqual(route['band'], 'bounty')
+            self.assertEqual(route['best_of'], 1)
+            self.assertEqual(route['confidence'], 'high')
+
     def test_latency_routes_low(self):
         route = policies.choose_route('pulse triage on the live monitor')
         self.assertEqual(route['band'], 'low')
@@ -300,3 +307,31 @@ class IntegrationTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class BountyTierTests(unittest.TestCase):
+    """task_type 'bounty' resolves like the coding lane: deterministic, no
+    JEV, no scale-tier demotion, degrading through coding then mid then low."""
+
+    def test_resolves_provider_pin(self):
+        slug = serve._resolve_model_tier('triage a bounty target', 'bounty')
+        # The operator pin resolves to the @provider handle; the concrete
+        # model slug is chosen at call time from model_providers.json.
+        self.assertEqual(slug, '@provider:bounty')
+
+    def test_bug_bounty_alias(self):
+        self.assertEqual(serve._resolve_model_tier('triage', 'bug-bounty'),
+                         serve._resolve_model_tier('triage', 'bounty'))
+        self.assertEqual(serve._resolve_model_tier('triage', 'bug-bounty'),
+                         '@provider:bounty')
+
+    def test_never_demoted_by_scale_tier(self):
+        with mock.patch.object(serve, '_scale_tier_actor', return_value=True):
+            slug = serve._resolve_model_tier('recon report', 'bounty')
+            self.assertEqual(slug, '@provider:bounty')
+
+    def test_slug_for_band_degrades_through_coding(self):
+        with mock.patch.object(serve, '_model_tier_slug',
+                               side_effect=lambda b: None if b == 'bounty' else '@x'):
+            slug = serve._slug_for_band('bounty')
+            self.assertEqual(slug, '@x')

@@ -866,9 +866,14 @@ class ModelTierEndpoints(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json(), cached)
 
+    def _no_pins(self):
+        return unittest.mock.patch.object(serve, '_provider_override_tier_view',
+                                          return_value={})
+
     def test_model_tiers_refreshes_when_cold(self):
         fresh = {'low': {'id': 's', 'name': 'S', 'price': 0.1}}
-        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+        with self._no_pins(), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
              unittest.mock.patch.object(serve, 'get_cached_model_tiers', return_value=None), \
              unittest.mock.patch.object(serve, 'refresh_model_tiers',
                                         new=unittest.mock.AsyncMock(return_value=fresh)):
@@ -880,13 +885,29 @@ class ModelTierEndpoints(unittest.TestCase):
     def test_model_tiers_refresh_failure_is_502(self):
         async def _boom():
             raise RuntimeError('no catalog')
-        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+        with self._no_pins(), \
+             unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
              unittest.mock.patch.object(serve, 'get_cached_model_tiers', return_value=None), \
              unittest.mock.patch.object(serve, 'refresh_model_tiers', side_effect=_boom):
             c = TestClient(serve.app)
             r = c.get('/api/model-tiers')
         self.assertEqual(r.status_code, 502)
         self.assertIn('no catalog', r.json()['error'])
+
+    def test_pinned_band_serves_without_catalog(self):
+        # The bounty band is an operator pin: with only pins present the
+        # endpoint serves them even when the catalog refresh is broken --
+        # a deliberate pin must not 502 because HF is down.
+        async def _boom():
+            raise RuntimeError('no catalog')
+
+        with unittest.mock.patch.object(serve, 'verify_session', return_value=True), \
+             unittest.mock.patch.object(serve, 'get_cached_model_tiers', return_value=None), \
+             unittest.mock.patch.object(serve, 'refresh_model_tiers', side_effect=_boom):
+            c = TestClient(serve.app)
+            r = c.get('/api/model-tiers')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('bounty', r.json())
 
     def test_model_tiers_refresh_post(self):
         fresh = {'low': {'id': 's', 'name': 'S', 'price': 0.1}}

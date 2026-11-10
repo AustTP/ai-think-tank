@@ -8,6 +8,13 @@
    "api_key_env": "GEMINI_API_KEY_4",
    "price_per_m": 10.0,
    "send_reasoning": false
+  },
+  "bounty": {
+   "comment": "Bug-bounty band: DeepSeek V4.1 Flash 1017 via OpenRouter. Empty base_url keeps the OpenRouter transport; price_per_m is the operator's blended estimate ($0.006/M prompt, $0.50/M completion, cache-read $0.005/M -- re-tune as OpenRouter reprices). send_reasoning stays false: the tier pin rides the default OpenRouter body.",
+   "model": "deepseek/deepseek-v4.1-flash-1017",
+   "api_key_env": "OPENROUTER_API_KEY",
+   "price_per_m": 0.25,
+   "send_reasoning": false
   }
  },
  "free_pool": {

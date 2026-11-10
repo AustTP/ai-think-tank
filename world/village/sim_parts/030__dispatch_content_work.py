@@ -941,6 +941,8 @@ def _band_for_work_item(item):
     tt = item.get('taskType') or 'code'
     if tt in ('3d', '3d-modeling'):
         return '3d'
+    if tt in ('bounty', 'bug-bounty'):
+        return 'bounty'
     if tt in ('code', 'review', 'qa'):
         return 'coding'
     return 'mid'
