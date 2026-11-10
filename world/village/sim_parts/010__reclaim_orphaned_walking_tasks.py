@@ -951,6 +951,11 @@ ESCALATION_MAX_OPEN = 3                 # cap concurrent escalations per owning 
 # re-queue once for a fast re-issue, then route the repeat offender to the owning
 # team's scrum master (SM gap 1's "SM re-plan") instead of letting it wedge forever.
 STALE_WORK_CADENCE_MS = 20_000          # coarse sweep cadence (like STUCK_GATE)
+
+# Assignments per task_cycle pass: a pass must finish inside the watchdog's
+# 180s budget, so a mass requeue spreads over the 6s cycles instead of
+# minting 70-140 tasks in one pass that then gets killed with its state lost.
+MAX_ASSIGN_PER_PASS = 10
 STALE_WORK_TIMEOUT_MS = 3 * 3600 * 1000  # 'walking' older than this -> never arrived
 STALE_WORK_BUDGET_GRACE_S = 900         # 'working' still working this far past workUntil -> wedged
 STALE_WORK_MAX_REPLANS = 2              # re-queues per (title,room) before the SM re-plan

@@ -1193,7 +1193,18 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     roster = state.get('agentRoster') or []
     roster_size = sum(1 for d in roster if not d.get('isAdmin'))
     attempted = set()
+    # Per-pass assignment cap (2026-11-10): a mass requeue (82 zombie cards,
+    # a failed-card sweep) let ONE pass mint ~70-140 tasks -- walks, wakes,
+    # and pointers for every one -- and the pass blew past the watchdog's
+    # 180s budget. The watchdog then recycled the loop and every in-memory
+    # assignment was lost (the task_assigned log rows survived, the state
+    # did not): a doom loop of assign -> kill -> sweep requeues the same
+    # cards -> assign again. Ten per pass keeps the pass well inside the
+    # budget; the 6s cycle spreads the rest over the next passes.
+    assigned_this_pass = 0
     for _ in range(max(1, roster_size)):
+        if assigned_this_pass >= MAX_ASSIGN_PER_PASS:
+            break
         due_index = pick_next_due_index(work_queue, now_ms, attempted, state, tier_ratios=_tier_ratios)
         if due_index == -1:
             break
@@ -1252,6 +1263,8 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
                 break  # nobody who could take this right now, of any kind
         work_queue.pop(due_index)
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
+        if isinstance(assigned, dict):
+            assigned_this_pass += 1
         if assigned is _ASSIGN_WAIT:
             # A card that must wait for its named agent is not a failed
             # assignment: put it back without incrementing attempts, or the

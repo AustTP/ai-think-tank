@@ -260,3 +260,18 @@ class ReplanCappedLogThrottle(unittest.TestCase):
             state['_staleWorkReplans'][repr((f'c{i}', 'dev'))] = 99
         self._run(state, 1_700_000_000_000)
         self.assertLessEqual(len(state.get('_replanCappedLoggedAt') or {}), 400)
+
+
+class AssignPerPassCap(unittest.TestCase):
+    """One task_cycle pass must not mint 70-140 tasks: a mass requeue made a
+    single pass blow the watchdog's 180s budget, the recycle killed it, and
+    every in-memory assignment was lost (task_assigned rows survived, state
+    did not). The cap spreads the burst over the 6s cycles."""
+
+    def test_cap_constant_and_loop_bound(self):
+        import sim
+        self.assertEqual(sim.MAX_ASSIGN_PER_PASS, 10)
+        import inspect
+        src = inspect.getsource(sim._task_cycle)
+        self.assertIn('assigned_this_pass >= MAX_ASSIGN_PER_PASS', src)
+        self.assertIn('assigned_this_pass += 1', src)
