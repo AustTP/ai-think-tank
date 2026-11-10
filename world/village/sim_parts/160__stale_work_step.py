@@ -1202,11 +1202,18 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # cards -> assign again. Ten per pass keeps the pass well inside the
     # budget; the 6s cycle spreads the rest over the next passes.
     assigned_this_pass = 0
+    _pick_calls = 0
+    if not work_queue:
+        print('[assign-diag] pass: EMPTY work_queue', flush=True)
     for _ in range(max(1, roster_size)):
         if assigned_this_pass >= MAX_ASSIGN_PER_PASS:
             break
         due_index = pick_next_due_index(work_queue, now_ms, attempted, state, tier_ratios=_tier_ratios)
+        _pick_calls += 1
         if due_index == -1:
+            if _pick_calls == 1:
+                print('[assign-diag] pass: first pick exhausted the queue '
+                      f'(queue={len(work_queue)} awake_supply gates follow)', flush=True)
             break
         pick = work_queue[due_index]
         attempted.add(id(pick))
@@ -1265,6 +1272,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
         assigned = _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_id_holder)
         if isinstance(assigned, dict):
             assigned_this_pass += 1
+        elif _pick_calls <= 2:
+            print('[assign-diag] pick', _pick_calls,
+                  '->', 'WAIT' if assigned is _ASSIGN_WAIT else repr(assigned),
+                  '| title:', (pick.get('title') or '')[:50], flush=True)
         if assigned is _ASSIGN_WAIT:
             # A card that must wait for its named agent is not a failed
             # assignment: put it back without incrementing attempts, or the
