@@ -87,7 +87,21 @@ def _reconcile_queued_cards(state, now_ms):
         key = repr((task.get('title') or '', task.get('room') or ''))
         replans = replan_map.get(key, 0)
         if replans >= STALE_WORK_MAX_REPLANS:
-            continue  # the loop stopper owns this card already
+            # Visible, not silent (2026-11-09): a capped card stranded between
+            # this bound and the SM re-plan otherwise sits queued forever with
+            # no trace. One log per cap hit, deduped by the replan counter
+            # itself not advancing.
+            from serve import log_action
+            try:
+                log_action('system', 'queued_card_replan_capped',
+                           {'taskId': tid, 'title': task.get('title'),
+                            'room': task.get('room'), 'replans': replans,
+                            'note': 'SM re-plan owns this card; operator '
+                                    'reset resets the counter'},
+                           authorized=True)
+            except Exception:
+                pass
+            continue
         replan_map[key] = replans + 1
         queue.append({
             'reissueOf': tid,
