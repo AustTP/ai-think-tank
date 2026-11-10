@@ -662,7 +662,20 @@ def _safe_library_path(rel_path):
     # A shared, agent-writable directory is exactly the kind of thing a
     # "../../.env" style path needs to be defended against explicitly.
     base = os.path.abspath(LIBRARY_DIR)
-    target = os.path.normpath(os.path.join(base, rel_path))
+    rel = (rel_path or '').strip()
+    # Tolerate the repo-convention prefix (2026-11-09): cards, instructions,
+    # and the Library's own search results name artifacts as
+    # 'library/reports/...', but the read surface wants Library-relative
+    # paths -- an agent reading the literal instruction path resolved to
+    # library/library/... and got 'Not found' for files that exist (seen
+    # live: the dankornas submission card halted on exactly that). Strip a
+    # single leading 'library/' component when the remainder resolves
+    # inside the Library; the traversal guard below still applies to the
+    # final target either way.
+    if rel.startswith('library/') and os.path.isfile(
+            os.path.join(base, rel[len('library/'):])):
+        rel = rel[len('library/'):]
+    target = os.path.normpath(os.path.join(base, rel))
     if target != base and not target.startswith(base + os.sep):
         return None
     return target
