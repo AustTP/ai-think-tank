@@ -90,6 +90,47 @@ def write_telegram_alert_digest(now=None, since_ts=None):
             if preview.startswith('[AI Think Tank]') else (preview[:60] or '(no preview)')
         by_class.setdefault(headline, []).append(
             (int(ts), preview.split('\n', 3)[-1][:220]))
+    # Internal tank signals (owner direction 2026-11-11): governance events
+    # that never ping the operator's Telegram are invisible to this scan, so
+    # the VP cannot triage them. Surface the curated set from action_log
+    # directly -- these are exactly the anomalies a live operator session
+    # monitors (pattern suppressions, repeat-failure freezes, cap closures,
+    # walk-churn storms, hollow grades, content-thread failures, sweeps that
+    # could not run).
+    _INTERNAL_SIGNAL_ACTIONS = (
+        'card_pattern_suppressed', 'repair_loop_stopped',
+        'operator_veto_window_expired', 'task_auto_closed',
+        'task_requeued_unreachable', 'task_parked_unreachable',
+        'grade_artifact_mismatch', 'scheduled_item_skipped',
+        'operator_quality_blocks_cancelled')
+    internal_rows = []
+    try:
+        with _db() as conn:
+            marks = ','.join('?' * len(_INTERNAL_SIGNAL_ACTIONS))
+            internal_rows = conn.execute(
+                'SELECT ts, action, details FROM action_log '
+                f'WHERE action IN ({marks}) AND ts >= ? ORDER BY ts ASC',
+                (*_INTERNAL_SIGNAL_ACTIONS, cutoff)).fetchall()
+    except Exception:
+        internal_rows = []
+    internal_by_class = {}
+    for row in internal_rows:
+        if len(row) < 3:
+            continue  # a legacy or mocked cursor: skip, never crash the scan
+        ts, action, details_raw = row[0], row[1], row[2]
+        try:
+            d = json.loads(details_raw) if isinstance(details_raw, str) else details_raw
+        except Exception:
+            d = {}
+        tail = ''
+        if action == 'task_requeued_unreachable':
+            tail = f"{d.get('agent')} could not reach {d.get('room')}"
+        elif action in ('card_pattern_suppressed', 'repair_loop_stopped'):
+            tail = str(d.get('taskId') or '')
+        else:
+            tail = str(d.get('title') or d.get('taskId') or d.get('path') or '')
+        internal_by_class.setdefault(action, []).append(
+            (int(ts), tail[:160]))
     day = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
     window_h = max(0.25, round((now - cutoff) / 3600.0, 2))
     lines = [
@@ -117,6 +158,20 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         if len(occurrences) > 6:
             lines.append(f'- ... {len(occurrences) - 6} more')
         lines.append('')
+    lines.append('## Internal tank signals (these never pinged the operator;')
+    lines.append('triage them the same way -- which were REAL issues the tank')
+    lines.append('should have handled itself?)')
+    lines.append('')
+    for action in sorted(internal_by_class, key=lambda a: -len(internal_by_class[a])):
+        occurrences = internal_by_class[action]
+        lines.append(f'### {action} (x{len(occurrences)})')
+        for ts, tail in occurrences[:6]:
+            stamp = datetime.datetime.fromtimestamp(
+                ts, datetime.timezone.utc).strftime('%H:%M')
+            lines.append(f'- {stamp} UTC: {tail}'.rstrip())
+        if len(occurrences) > 6:
+            lines.append(f'- ... {len(occurrences) - 6} more')
+        lines.append('')
     rel = telegram_digest_scan_path(now)
     target = _safe_library_path(rel)
     if not target:
@@ -125,7 +180,9 @@ def write_telegram_alert_digest(now=None, since_ts=None):
     with open(target, 'w') as f:
         f.write('\n'.join(lines))
     log_action('system', 'telegram_digest_written',
-               {'path': rel, 'alerts': len(rows), 'classes': len(by_class)},
+               {'path': rel, 'alerts': len(rows), 'classes': len(by_class),
+                'internalSignals': len(internal_rows),
+                'internalClasses': len(internal_by_class)},
                authorized=True)
     return rel
 

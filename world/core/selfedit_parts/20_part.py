@@ -69,9 +69,18 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 # logged as emergency_change_requested and telegram-notified immediately, and
 # the supervisor review + owner veto still apply unchanged. Labeling routine
 # work as emergency to skip the notice period is a Rule 12 violation.
+#
+# Tank-down lane (owner direction, 2026-11-11): a bug that PREVENTS THE TANK
+# FROM RUNNING may file an emergency change request with tankDown=True and
+# NO minimum lead -- the request schedules immediately, with the same
+# pretense of activity as every other change request (supervisor review,
+# validator, the veto link before it fires, and rollback after it fires
+# before the push). Labeling routine work as tank-down is a Rule 12
+# violation of the same kind as labeling it emergency.
 WINDOW_MIN_LEAD_S = 12 * 60 * 60
 WINDOW_MAX_LEAD_S = 7 * 24 * 60 * 60
 WINDOW_EMERGENCY_MIN_LEAD_S = 60 * 60
+WINDOW_TANK_DOWN_MIN_LEAD_S = 0
 
 # Validator turn (operator decision, 2026-10-19). The tank is dormant while a
 # change window holds for validation, so the sim tick cannot run and the
@@ -585,7 +594,7 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                    post_apply_checks=None, safe_state_plan=None,
                    restore_plan=None, on_call=None,
                    acknowledgements=None, blackout_windows=None,
-                   notify_created=False):
+                   notify_created=False, tank_down=False):
     """Run the change-request chain for one dormancy slot.
 
     Returns (ok, payload); ok=False carries the refusal (with 'conflicts'
@@ -651,16 +660,25 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     if err:
         return False, {'error': err}
     emergency = change_type == 'emergency'
-    min_lead = WINDOW_EMERGENCY_MIN_LEAD_S if emergency else WINDOW_MIN_LEAD_S
+    if tank_down and not emergency:
+        return False, {'error': 'tank_down only applies to emergency change '
+                                'requests -- it marks a bug that prevents '
+                                'the think tank from running'}
+    min_lead = (WINDOW_TANK_DOWN_MIN_LEAD_S if tank_down else
+                (WINDOW_EMERGENCY_MIN_LEAD_S if emergency
+                 else WINDOW_MIN_LEAD_S))
     if start_ts < now + min_lead:
-        if emergency:
+        if tank_down:
+            pass  # the tank is down: the window may start now
+        elif emergency:
             return False, {'error': 'emergency change requests must start at '
                                     'least 1 hour from now -- the owner '
                                     'still needs a chance to veto'}
-        return False, {'error': 'the window must start at least 12 hours '
-                                'from now -- change requests need half a '
-                                'day of notice so the owner can review '
-                                'and veto'}
+        else:
+            return False, {'error': 'the window must start at least 12 hours '
+                                    'from now -- change requests need half a '
+                                    'day of notice so the owner can review '
+                                    'and veto'}
     if start_ts > now + WINDOW_MAX_LEAD_S:
         return False, {'error': 'the window may not be more than 7 days out '
                                 '-- file the request closer to the window'}
@@ -889,7 +907,8 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     if emergency:
         serve.log_action(agent_id, 'emergency_change_requested',
                          {'windowId': window_id, 'reason': reason[:200],
-                          'start': f'{date} {start}'}, authorized=True)
+                          'start': f'{date} {start}',
+                          'tankDown': bool(tank_down)}, authorized=True)
     if notify_created or emergency:
         try:
             _telegram_change_request_created(window_id)
