@@ -44,10 +44,12 @@ async def selfedit_schedule(request: Request):
             on_call=body.get('onCall'),
             acknowledgements=body.get('acknowledgements'),
             blackout_windows=body.get('blackoutWindows'),
-            # No creation-time Telegram. The director -> senior director ->
-            # chief of staff chain decides first; the player is only paged by
-            # notify_human_of_escalation when every rung fails.
-            notify_created=False)
+            # Creation-time Telegram for every change request (owner
+            # direction 2026-11-11): the message carries the window's exact
+            # date/time and the token-gated veto link, and the approval
+            # chain still decides first -- the operator is informed, never a
+            # blocker; no veto means the window processes as planned.
+            notify_created=True)
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
