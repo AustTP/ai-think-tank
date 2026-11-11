@@ -2,9 +2,11 @@
 (trading, bug bounty, on-call) declare their OWN levels -- the tank stores
 them and routes notifications but imposes no severity vocabulary. Reusable
 templates live in doctrine_templates.json; a team ADOPTS one (the levels
-are copied onto the team's record), then edits its own copy freely.
-Only the team's own people (director/scrum master/members) or the operator
-may define or change levels."""
+are copied onto the team's record), then edits its own copy freely. A team
+can run SEVERAL process doctrines at once (bounty + trading books), each
+with independent levels and history. Only the team's own people
+(director/scrum master/members) or the operator may define or change
+levels."""
 import json
 import os
 import sys
@@ -78,6 +80,9 @@ class DoctrineBase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
+    def doctrine_for(self, team_index, process):
+        return serve._team_doctrine_for(self.st['teams'][team_index], process)
+
 
 class TeamDoctrine(DoctrineBase):
     MEMBER = {'X-Agent-Key': 'key-w1'}
@@ -87,10 +92,12 @@ class TeamDoctrine(DoctrineBase):
         r = client().put('/api/team-doctrine/bounty', json={'levels': LEVELS},
                          headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
+        self.assertEqual('default', r.json()['process'])
         self.assertEqual('d1', r.json()['doctrine']['currentLevel'])
         r = client().get('/api/team-doctrine/bounty', headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
-        levels = r.json()['doctrine']['levels']
+        doctrine = r.json()['processes']['default']
+        levels = doctrine['levels']
         self.assertEqual(['d1', 'd3'], [l['id'] for l in levels])
         self.assertEqual('live exploit window', levels[0]['trigger'])
 
@@ -150,7 +157,7 @@ class TeamDoctrine(DoctrineBase):
         self.assertEqual(200, r.status_code)
         self.assertEqual('d1', r.json()['currentLevel'])
         self.assertEqual(1, tg.call_count)
-        doctrine = self.st['teams'][0]['doctrine']
+        doctrine = self.doctrine_for(0, 'default')
         self.assertEqual(2, len(doctrine['history']))
         self.assertEqual('DEFCON 1', doctrine['history'][-1]['name'])
         self.assertEqual('live exploit window', doctrine['history'][-1]['reason'])
@@ -173,11 +180,12 @@ class TeamDoctrine(DoctrineBase):
                           json={'level': 'd1'}, headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
         self.assertTrue(r.json()['unchanged'])
-        self.assertEqual([], self.st['teams'][0]['doctrine']['history'])
+        self.assertEqual([], self.doctrine_for(0, 'default')['history'])
 
     def test_team_status_text_shows_activation(self):
-        self.st['teams'][0]['doctrine'] = {
-            'levels': LEVELS, 'currentLevel': 'd1', 'history': []}
+        self.st['teams'][0]['doctrines'] = {
+            'default': {'levels': LEVELS, 'currentLevel': 'd1',
+                        'history': []}}
         text = serve._team_status_text()
         self.assertIn('ACTIVATION LEVELS', text)
         self.assertIn('Bounty Desk: DEFCON 1', text)
@@ -195,7 +203,9 @@ class DoctrineTemplates(DoctrineBase):
         r = client().post('/api/team-doctrine/bounty/adopt',
                           json={'template': 'bug-bounty'}, headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
-        doctrine = self.st['teams'][0]['doctrine']
+        # The adopted process is named after the template by default.
+        self.assertEqual('bug-bounty', r.json()['process'])
+        doctrine = self.doctrine_for(0, 'bug-bounty')
         self.assertEqual('template:bug-bounty', doctrine['origin'])
         self.assertEqual('d5', doctrine['currentLevel'])  # template's first level
         self.assertEqual(5, len(doctrine['levels']))
@@ -205,27 +215,106 @@ class DoctrineTemplates(DoctrineBase):
                       json={'template': 'trading-desk'}, headers=self.MEMBER)
         # Team edits its copy: does not touch the template file.
         r = client().put('/api/team-doctrine/bounty',
-                         json={'levels': [{'id': 'x1', 'name': 'OWN RULE',
+                         json={'process': 'trading-desk',
+                               'levels': [{'id': 'x1', 'name': 'OWN RULE',
                                            'notify': True}]},
                          headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
-        doctrine = self.st['teams'][0]['doctrine']
+        doctrine = self.doctrine_for(0, 'trading-desk')
         self.assertEqual(['x1'], [l['id'] for l in doctrine['levels']])
         with open(serve.DOCTRINE_TEMPLATES_PATH, encoding='utf-8') as fh:
             templates = json.load(fh)
         self.assertIn('s5', [l['id'] for l in
                              templates['templates']['trading-desk']['levels']])
 
+    def test_same_template_twice_under_two_processes(self):
+        r1 = client().post('/api/team-doctrine/bounty/adopt',
+                           json={'template': 'trading-desk',
+                                 'process': 'personal-book'},
+                           headers=self.MEMBER)
+        r2 = client().post('/api/team-doctrine/bounty/adopt',
+                           json={'template': 'trading-desk',
+                                 'process': 'fund-book'},
+                           headers=self.MEMBER)
+        self.assertEqual(200, r1.status_code)
+        self.assertEqual(200, r2.status_code)
+        r = client().post('/api/team-doctrine/bounty/level',
+                          json={'process': 'fund-book', 'level': 's3',
+                                'reason': 'drawdown 6%'},
+                          headers=self.MEMBER)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual('s5',
+                         self.doctrine_for(0, 'personal-book')['currentLevel'])
+        self.assertEqual('s3',
+                         self.doctrine_for(0, 'fund-book')['currentLevel'])
+
+    def test_get_without_process_returns_every_process(self):
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'bug-bounty'}, headers=self.MEMBER)
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'on-call'}, headers=self.MEMBER)
+        r = client().get('/api/team-doctrine/bounty', headers=self.MEMBER)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual({'bug-bounty', 'on-call'},
+                         set(r.json()['processes'].keys()))
+        r = client().get('/api/team-doctrine/bounty?process=on-call',
+                         headers=self.MEMBER)
+        self.assertEqual('template:on-call', r.json()['doctrine']['origin'])
+
+    def test_level_processes_are_independent(self):
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'bug-bounty'}, headers=self.MEMBER)
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'on-call'}, headers=self.MEMBER)
+        r = client().post('/api/team-doctrine/bounty/level',
+                          json={'process': 'bug-bounty', 'level': 'd3',
+                                'reason': 'finding confirmed'},
+                          headers=self.MEMBER)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual('c5',
+                         self.doctrine_for(0, 'on-call')['currentLevel'])
+        self.assertEqual('d3',
+                         self.doctrine_for(0, 'bug-bounty')['currentLevel'])
+
+    def test_delete_retires_one_process_or_all(self):
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'bug-bounty'}, headers=self.MEMBER)
+        client().post('/api/team-doctrine/bounty/adopt',
+                      json={'template': 'on-call'}, headers=self.MEMBER)
+        r = client().delete('/api/team-doctrine/bounty?process=on-call',
+                            headers=self.MEMBER)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual({'bug-bounty'},
+                         set(serve._team_doctrine_all(
+                             self.st['teams'][0]).keys()))
+        r = client().delete('/api/team-doctrine/bounty', headers=self.MEMBER)
+        self.assertEqual(200, r.status_code)
+        self.assertEqual({}, serve._team_doctrine_all(self.st['teams'][0]))
+
+    def test_process_cap(self):
+        for i in range(serve._DOCTRINE_MAX_PROCESSES):
+            r = client().put('/api/team-doctrine/bounty',
+                             json={'process': f'p{i}',
+                                   'levels': [{'id': 'a', 'name': 'A'}]},
+                             headers=self.MEMBER)
+            self.assertEqual(200, r.status_code)
+        r = client().put('/api/team-doctrine/bounty',
+                         json={'process': 'overflow',
+                               'levels': [{'id': 'a', 'name': 'A'}]},
+                         headers=self.MEMBER)
+        self.assertEqual(409, r.status_code)
+
     def test_readopt_resets_to_template(self):
         client().post('/api/team-doctrine/bounty/adopt',
                       json={'template': 'on-call'}, headers=self.MEMBER)
         client().put('/api/team-doctrine/bounty',
-                     json={'levels': [{'id': 'mine', 'name': 'Mine'}]},
+                     json={'process': 'on-call',
+                           'levels': [{'id': 'mine', 'name': 'Mine'}]},
                      headers=self.MEMBER)
         r = client().post('/api/team-doctrine/bounty/adopt',
                           json={'template': 'on-call'}, headers=self.MEMBER)
         self.assertEqual(200, r.status_code)
-        doctrine = self.st['teams'][0]['doctrine']
+        doctrine = self.doctrine_for(0, 'on-call')
         self.assertEqual('c5', doctrine['currentLevel'])
         self.assertEqual([], doctrine['history'])
 

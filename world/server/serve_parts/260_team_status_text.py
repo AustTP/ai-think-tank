@@ -89,20 +89,25 @@ def _team_status_text(max_chars=1600):
     # Team-defined activation levels (see 199_team_doctrine): permanent
     # standing work (trading, bounty, on-call) declares its OWN doctrine --
     # the tank only displays the CURRENT level and the team's own autonomy
-    # wording, it never imposes a severity vocabulary.
+    # wording, it never imposes a severity vocabulary. One team can run
+    # several process doctrines at once; each shows on its own line.
     try:
         activation = []
         for _t in (state.get('teams') or []):
             if not isinstance(_t, dict):
                 continue
-            _d = _t.get('doctrine')
-            if not isinstance(_d, dict):
-                continue
-            _cur = _d.get('currentLevel')
-            _entry = next((l for l in (_d.get('levels') or [])
-                           if isinstance(l, dict) and l.get('id') == _cur), None)
-            if _entry:
-                _line = f'- {_t.get("name") or _t.get("id")}: {_entry.get("name") or _cur}'
+            for _proc, _d in sorted(_team_doctrine_all(_t).items()):
+                if not isinstance(_d, dict):
+                    continue
+                _cur = _d.get('currentLevel')
+                _entry = next((l for l in (_d.get('levels') or [])
+                               if isinstance(l, dict) and l.get('id') == _cur), None)
+                if not _entry:
+                    continue
+                _label = _t.get('name') or _t.get('id')
+                if _proc != 'default':
+                    _label += f' [{_proc}]'
+                _line = f'- {_label}: {_entry.get("name") or _cur}'
                 if _entry.get('autonomy'):
                     _line += f' -- {_entry["autonomy"][:120]}'
                 activation.append(_line)
