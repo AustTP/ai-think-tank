@@ -7,6 +7,8 @@ used to go back through the 5s coalesce cycle (458 re-queues in a day on
 """
 import os
 import sys
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -82,6 +84,61 @@ class SaverRaceRetry(unittest.TestCase):
         self.assertFalse(saved)
         self.assertEqual(len(calls), 1,
                          'a non-transient error goes straight to re-queue')
+
+
+class _FakeClock:
+    """Deterministic clock for the saver worker: time() is driven by the
+    test, sleep() advances the clock instead of blocking."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+class SaverStarvationByRefresh(unittest.TestCase):
+    """A producer that queues faster than the coalesce window resets 'at' on
+    every queue, so 'age' never reaches _SAVE_COALESCE_S and the pre-2026-11-10
+    saver skipped forever. The north village hit exactly this once its idle
+    tick dropped to ~1s per pass: kv_state froze while the sim kept running.
+    The worker must persist once the queue has been continuously non-empty
+    for _SAVE_MAX_PENDING_S, no matter how often the snapshot is refreshed."""
+
+    def setUp(self):
+        serve._SAVE_PENDING['snapshot'] = None
+        serve._SAVE_PENDING['at'] = 0.0
+        serve._SAVE_EVENT.clear()
+        serve._SAVE_RETRY_COUNTS.clear()
+
+    def tearDown(self):
+        serve._SAVE_PENDING['snapshot'] = None
+        serve._SAVE_RETRY_COUNTS.clear()
+
+    def test_continuously_refreshed_queue_still_persists(self):
+        clock = _FakeClock()
+        saved = []
+        with mock.patch.object(serve, 'time', clock), \
+                mock.patch.object(serve, '_save_state_to_db_sync',
+                                  lambda data: saved.append(dict(data))):
+            worker = threading.Thread(target=serve._save_worker_loop,
+                                      daemon=True)
+            worker.start()
+            for tick in range(14):
+                clock.t += 1.0  # one idle sim pass per second, forever
+                serve._queue_state_save({'tick': tick})
+                time.sleep(0.01)  # let the worker wake, skip, or save
+        self.assertTrue(
+            saved,
+            'a queue refreshed faster than the coalesce window must still '
+            'persist within _SAVE_MAX_PENDING_S')
+        self.assertGreaterEqual(
+            saved[0].get('tick'), 10,
+            'the first save lands only after the max-pending cap, not on '
+            'every refreshed snapshot')
 
 
 if __name__ == '__main__':

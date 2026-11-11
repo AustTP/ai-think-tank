@@ -1266,6 +1266,16 @@ def _save_phase(data, name):
 # window grows to the coalescing window (default 3s), which the sim's own
 # cadence and the client's 5s autosave make immaterial in practice.
 _SAVE_COALESCE_S = 3.0
+# Max time a continuously-refreshed pending queue may wait before the worker
+# must persist anyway. The coalesce window above only closes when the queue
+# goes quiet: every _queue_state_save resets 'at', so a caller that queues
+# faster than _SAVE_COALESCE_S starves the saver forever. The north village's
+# idle sim tick queues a fresh snapshot every ~1s, so once its engine stopped
+# making model calls (budget critical, 2026-11-08 04:01) every pass queued
+# inside the window, kv_state never updated again, and the whole village ran
+# on stale state until the restart (2026-11-10 diagnosis). This cap bounds
+# the durability window regardless of queue cadence.
+_SAVE_MAX_PENDING_S = 10.0
 _SAVE_PENDING: dict = {'snapshot': None, 'at': 0.0}
 _SAVE_EVENT = threading.Event()
 _SAVE_WORKER: list = []
@@ -1371,42 +1381,40 @@ def _save_worker_loop():
     # Coalescing saver: sleep through the quiet tail of a burst, then persist
     # the newest snapshot once. A failed serialize/save keeps its payload and
     # retries after a short backoff -- the tank never loses a queued mutation
-    # to a transient race.
+    # to a transient race. pending_since tracks how long the queue has been
+    # continuously non-empty (every queue resets 'at', so 'age' alone can
+    # stay under the coalesce window forever); past _SAVE_MAX_PENDING_S the
+    # worker persists anyway (2026-11-10 north starvation fix).
+    pending_since = None
     while True:
         _SAVE_EVENT.wait(timeout=0.5)
         _SAVE_EVENT.clear()
         snap = _SAVE_PENDING.get('snapshot')
         if snap is None:
+            pending_since = None
             continue
-        age = time.time() - float(_SAVE_PENDING.get('at') or 0)
-        if age < _SAVE_COALESCE_S and not _SAVE_FLUSHED.is_set():
+        now = time.time()
+        if pending_since is None:
+            pending_since = now
+        age = now - float(_SAVE_PENDING.get('at') or 0)
+        if (age < _SAVE_COALESCE_S
+                and now - pending_since < _SAVE_MAX_PENDING_S
+                and not _SAVE_FLUSHED.is_set()):
             continue
+        pending_since = None
         _SAVE_PENDING['snapshot'] = None
         saved = _save_snapshot_with_retry(snap)
         if not saved:
-            e = race_error
-            print(f'[state-save] coalesced save failed, re-queued: '
-                  f'{type(e).__name__}: {e}', flush=True)
-            if _SAVE_PENDING.get('snapshot') is None:
-                # Only retry a snapshot that is still the newest one, and
-                # never the same object more than three times: a snapshot
-                # that keeps failing (e.g. its nested structures raced the
-                # sim thread into an unserializable shape) must yield to the
-                # next fresh snapshot instead of wedging persistence on a
-                # zombie retry loop -- observed 2026-11-07 when the same
-                # stamped snapshot was re-queued for many minutes. Tracked
-                # by object identity OUTSIDE the snapshot, so no retry
-                # bookkeeping ever leaks into the saved blob.
-                attempts = _SAVE_RETRY_COUNTS.get(id(snap), 0) + 1
-                _SAVE_RETRY_COUNTS[id(snap)] = attempts
-                if attempts <= 3:
-                    _SAVE_PENDING['snapshot'] = snap
-                    _SAVE_PENDING['at'] = time.time() - _SAVE_COALESCE_S
-                else:
-                    _SAVE_RETRY_COUNTS.pop(id(snap), None)
-                    print(f'[state-save] dropping snapshot after {attempts} '
-                          f'failed attempts; the next queued save carries '
-                          f'the newer state', flush=True)
+            # _save_snapshot_with_retry already printed the failure and
+            # re-queued (or dropped) the snapshot, keyed by object identity
+            # OUTSIDE the snapshot so no retry bookkeeping leaks into the
+            # saved blob (zombie-retry fix 2026-11-07). This worker only
+            # wakes the event and backs off: a retry loop HERE would die on
+            # the next failed save -- the pre-fix copy of this block
+            # referenced a name that only exists inside the helper
+            # (NameError -> silent saver death, the 2026-11-08 north
+            # freeze) -- and a hot retry would spin instead of yielding to
+            # the next fresh snapshot.
             _SAVE_EVENT.set()
             time.sleep(5.0)
 

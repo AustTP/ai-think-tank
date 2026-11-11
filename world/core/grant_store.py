@@ -4,6 +4,7 @@ sublow and JEV grants differ only in the model they serve, the ledger bucket,
 and the policy checks around the grant. The table shape and CRUD are identical,
 so they live here once. Callers keep their own policy checks and public names.
 """
+import threading
 import time
 
 # table -> agent index name. Fixed names only: never interpolate caller text.
@@ -16,25 +17,54 @@ COLUMNS = ('id', 'token_hash', 'agent_id', 'task_id', 'purpose', 'estimate_usd',
            'accrued_usd', 'calls', 'max_tokens_per_call', 'granted_by',
            'created_at', 'expires_at')
 
+# The DDL below is idempotent (CREATE ... IF NOT EXISTS), but the sim's
+# per-tick expiry sweeps (serve.expire_sublow_grants / expire_jev_grants,
+# called every ~1s) made these two statements a per-second DDL cost, and each
+# DDL takes an AccessExclusiveLock plus a catalog refresh -- a slow or
+# zombified pooled connection under that DDL wedged the whole sim pass for
+# ~17 minutes (2026-11-10 north village diagnosis). A grant table is created
+# at most once per process: production talks to exactly one database
+# (db_backend._dsn is cached per process), and test/sandbox runs bypass the
+# cache because conftest swaps databases per test.
+_ensured_tables: set = set()
+_ensure_lock = threading.Lock()
+
+
+def _ddl_cacheable():
+    """False for pytest / THINK_TANK_FORCE_SQLITE runs: they point the
+    connection at a fresh database per test, so the DDL must really run."""
+    try:
+        import db_backend as _dbm
+        return not _dbm._test_sandboxed()
+    except Exception:
+        return False
+
 
 def ensure_table(conn, table):
-    """Create the grant table and its agent index if absent."""
-    index = TABLES[table]
-    conn.execute(f'''CREATE TABLE IF NOT EXISTS {table} (
-        id TEXT PRIMARY KEY,
-        token_hash TEXT NOT NULL UNIQUE,
-        agent_id TEXT NOT NULL,
-        task_id TEXT NOT NULL DEFAULT '',
-        purpose TEXT NOT NULL,
-        estimate_usd REAL NOT NULL,
-        accrued_usd REAL NOT NULL DEFAULT 0,
-        calls INTEGER NOT NULL DEFAULT 0,
-        max_tokens_per_call INTEGER NOT NULL,
-        granted_by TEXT NOT NULL,
-        created_at REAL NOT NULL,
-        expires_at REAL NOT NULL
-    )''')
-    conn.execute('CREATE INDEX IF NOT EXISTS %s ON %s(agent_id)' % (index, table))
+    """Create the grant table and its agent index if absent. No-op after the
+    first success in this process (see _ensured_tables)."""
+    if table in _ensured_tables and _ddl_cacheable():
+        return
+    with _ensure_lock:
+        if table in _ensured_tables and _ddl_cacheable():
+            return
+        index = TABLES[table]
+        conn.execute(f'''CREATE TABLE IF NOT EXISTS {table} (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            agent_id TEXT NOT NULL,
+            task_id TEXT NOT NULL DEFAULT '',
+            purpose TEXT NOT NULL,
+            estimate_usd REAL NOT NULL,
+            accrued_usd REAL NOT NULL DEFAULT 0,
+            calls INTEGER NOT NULL DEFAULT 0,
+            max_tokens_per_call INTEGER NOT NULL,
+            granted_by TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            expires_at REAL NOT NULL
+        )''')
+        conn.execute('CREATE INDEX IF NOT EXISTS %s ON %s(agent_id)' % (index, table))
+        _ensured_tables.add(table)
 
 
 def insert(conn, table, row):
