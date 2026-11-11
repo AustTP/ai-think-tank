@@ -219,9 +219,27 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
             'ok': False,
             'note': f'Report text was generated but the Library write did not land: {resp}'})
         return
-    _sim_module._store_content_result(task.get('id'), {
+    result = {
         'ok': True, 'reportPath': report_path,
-        'note': f'Wrote the source-grounded report to {report_path} in the Library.'})
+        'note': f'Wrote the source-grounded report to {report_path} in the Library.'}
+    import re
+    # Operator-bound submissions notify the operator on BOTH channels
+    # (owner report 2026-11-11: the dankornas change request was submitted
+    # and approved without a single Telegram reaching the operator -- only
+    # the spike lane ever set notifyPlayer, and card closes are silent by
+    # owner policy). Detection is deliberately plain text: a card whose
+    # title or instructions say "operator" is a submission TO the operator.
+    if re.search(r'\boperator\b', f'{task.get("title") or ""} '
+                 f'{task.get("instructions") or ""}', re.IGNORECASE):
+        result['notifyPlayer'] = {
+            'kind': 'operator_submission',
+            'subject': f'[AI Think Tank] Submitted for your review: '
+                       f'{task.get("title") or "report"}',
+            'body': (f'{name} submitted the report to the Library.\n'
+                     f'Path: library/{report_path}\n'
+                     'Nothing is required from you unless you veto; it is '
+                     'also on your operator backlog.')}
+    _sim_module._store_content_result(task.get('id'), result)
 
 
 def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):

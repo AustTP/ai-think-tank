@@ -424,6 +424,39 @@ class ReportLaneContracts(_ExecutorTestCase):
             len(prose.split()), 600 + 10,
             'the final report stays inside the card\'s word cap')
 
+    def test_operator_bound_report_notifies_the_operator(self):
+        # Owner report (2026-11-11): the dankornas change request was
+        # submitted and approved with zero Telegram reaching the operator.
+        # A card addressed to the operator must queue a BOTH-channel notify
+        # through the safe W2 result indirection.
+        long_body = ' '.join(['word'] * 100)
+        gap = '\n\n## Gap check\n\nNone found.'
+        task = {
+            'id': 'r2', 'title': 'Submit the change request to the operator',
+            'room': 'pressoffice', 'taskType': 'bug', 'deliverable': 'report',
+            'sourcePaths': ['analysis/x.md'],
+            'instructions': 'Write the change-request report for the operator.'}
+        seen = self._run_report([long_body + gap], task=task)
+        notify = seen['r2'].get('notifyPlayer')
+        self.assertIsNotNone(notify)
+        self.assertEqual(notify['kind'], 'operator_submission')
+        self.assertIn('library/', notify['body'])
+        self.assertIn(seen['r2']['reportPath'], notify['body'])
+
+    def test_non_operator_report_stays_silent(self):
+        # Card closes are silent by owner policy -- only an operator-bound
+        # submission pings.
+        long_body = ' '.join(['word'] * 100)
+        gap = '\n\n## Gap check\n\nNone found.'
+        task = {
+            'id': 'r3', 'title': 'Write the weekly recap',
+            'room': 'pressoffice', 'taskType': 'bug', 'deliverable': 'report',
+            'sourcePaths': ['analysis/x.md'],
+            'instructions': 'Write the recap report.'}
+        seen = self._run_report([long_body + gap], task=task)
+        self.assertTrue(seen['r3']['ok'])
+        self.assertNotIn('notifyPlayer', seen['r3'])
+
     def test_note_content_hard_trims_to_the_card_word_limit(self):
         seen = _store()
         _base_mocks()
