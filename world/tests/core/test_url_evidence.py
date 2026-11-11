@@ -50,3 +50,31 @@ def test_search_then_browse_uses_exact_discovered_url():
         assert 'valid syntax' in rejected and 'No page fetch was attempted' in rejected
         assert 'https://example.org/overview' in rejected
         fetch.assert_not_called()
+
+
+def test_first_party_urls_browse_without_discovery():
+    # Owner direction (2026-11-11): the tank must always be able to reach
+    # its own repo and its own control plane. ada could not read the CI
+    # failure she was assigned to investigate because the Actions run URL
+    # was never in her discovery ledger. The gate keeps guarding invented
+    # THIRD-PARTY citations; first-party origins are trusted outright.
+    from unittest.mock import patch
+    import serve
+    from core.url_evidence import first_party_url, TANK_GITHUB_REPO
+    page = {'allowed': True, 'textForModel': 'CI log', 'modelInstruction': 'page data'}
+    with patch.object(serve, 'log_action'), \
+            patch.object(serve, '_http_json', return_value=page) as fetch:
+        tool = serve._make_web_tools_executor('ada', 'test')
+        assert 'CI log' in tool('browse_page', {
+            'url': 'https://github.com/AustTP/ai-think-tank/actions/runs/43026323376'})
+        fetch.assert_called_once()
+    # The predicate itself: the tank's repo in any subpath, any case.
+    assert first_party_url('https://github.com/AustTP/ai-think-tank/')
+    assert first_party_url('https://github.com/austtp/ai-think-tank/pull/12')
+    own = (serve.ESCALATION_BASE_URL, serve.SELF_BASE_URL)
+    assert first_party_url(serve.ESCALATION_BASE_URL + '/api/mc/ci', own)
+    # But not other repos, other hosts, or malformed URLs.
+    assert not first_party_url('https://github.com/other/repo/actions')
+    assert not first_party_url('https://github.com/AustTP/ai-think-tank.evil.com/x')
+    assert not first_party_url('https://example.org/anything')
+    assert not first_party_url('not a url')

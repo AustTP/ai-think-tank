@@ -36,8 +36,14 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
     # Track every URL the tools actually returned. browse_page may only
     # follow a path that search_web or a previous page really exposed, so a
     # model cannot invent a plausible news/post URL and cite it as evidence.
-    from core.url_evidence import DiscoveredURLs
+    from core.url_evidence import DiscoveredURLs, first_party_url
     discovered = DiscoveredURLs((default_query or '') + '\n' + (work_context or ''))
+    # First-party URLs (the tank's own repo + its own control plane) are
+    # always browsable -- see first_party_url. The gate's job is to stop
+    # invented THIRD-PARTY citations, not to blind the tank about its own
+    # CI runs and change requests (2026-11-11: ada could not read the CI
+    # failure she was assigned to investigate).
+    own_origins = (SELF_BASE_URL, ESCALATION_BASE_URL)
     # Server-minted, single-use proof that the work-context host bypass is
     # backed by a stored player-authored task. Minted HERE (server code, at
     # factory time, once per tool set) -- never from an agent's request body.
@@ -385,7 +391,7 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             exit_name = ((args or {}).get('exit') or '').strip()
             from urllib.parse import urlsplit
             url = (args or {}).get('url') or ''
-            if not discovered.allows(url):
+            if not discovered.allows(url) and not first_party_url(url, own_origins):
                 valid_url = discovered.valid(url)
                 log_action(agent_id, 'browse_url_rejected', {
                     'url': url,

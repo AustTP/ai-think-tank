@@ -48,6 +48,40 @@ def extract_urls(text):
     """Every syntactically valid http(s) URL in a report, normalized."""
     return sorted(DiscoveredURLs(text).urls)
 
+
+# First-party origins whose subpages an agent may browse without prior
+# discovery (owner direction 2026-11-11: the tank must always be able to
+# reach its own repo and its own control plane). The discovery ledger exists
+# to stop a model from inventing THIRD-PARTY citation URLs; a URL inside the
+# tank's own GitHub repo or the tank's own server is first-party evidence of
+# the tank's own work -- worst case a 404 on itself, never a fabricated
+# external source. The GitHub slug matches the repo the change-request
+# pipeline manages (AustTP/ai-think-tank).
+TANK_GITHUB_REPO = 'AustTP/ai-think-tank'
+TANK_GITHUB_ORIGIN = 'https://github.com'
+TANK_GITHUB_PATH = '/' + TANK_GITHUB_REPO
+
+
+def first_party_url(url, own_origins=()):
+    """True when `url` points into the tank's own control plane or its own
+    GitHub repository (any subpath -- Actions runs, PRs, CI logs). Syntax
+    rules still apply: a malformed URL is never first-party. `own_origins`
+    are the tank's server roots (scheme://host[:port]) supplied by the
+    caller -- url_evidence is core and never imports serve."""
+    if not DiscoveredURLs.valid(url):
+        return False
+    p = urlsplit(url)
+    # The tank's own GitHub repo: github.com/<owner>/<repo>[/<anything>].
+    if (p.hostname or '').lower() == 'github.com':
+        first_two = (p.path or '').split('/', 3)
+        return len(first_two) >= 3 and \
+            '/'.join(first_two[1:3]).lower() == TANK_GITHUB_REPO.lower()
+    # The tank's own server origins: any page the tank itself serves. The
+    # control plane hosts the change-request links, the mission-control CI
+    # view, and the player inbox -- all first-party.
+    origin = f'{p.scheme}://{p.netloc.lower()}'
+    return origin in {str(o).rstrip('/').lower() for o in (own_origins or [])}
+
 def citation_errors(text, allowed):
     """Flag report citations that were never discovered by the tools.
 
