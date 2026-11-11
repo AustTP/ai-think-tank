@@ -58,6 +58,56 @@ class ResolveOwnerTests(unittest.TestCase):
             st, {'ownerRole': 'worker', 'agentId': 'ghost'}), [])
 
 
+class OnceCadenceTests(unittest.TestCase):
+    """One-shot scheduled items (owner direction 2026-11-11): fire once at
+    notBeforeMs. ownerRole 'player' surfaces to the operator's inbox and the
+    email/telegram outbox instead of minting an agent card."""
+
+    def _item(self, not_before, owner_role='player'):
+        return {'id': 'sch-once-1', 'title': 'Review the Eidetic Engine plan',
+                'ownerRole': owner_role, 'cadence': 'once',
+                'notBeforeMs': not_before,
+                'instructions': 'Schedule the work order.',
+                'enabled': True}
+
+    def test_player_item_fires_once_into_the_operator_inbox(self):
+        st = _state()
+        st['playerInbox'] = []
+        st['emailOutbox'] = []
+        st['scheduledItems'] = [self._item(1_700_000_000_000)]
+        with mock.patch.object(serve, 'log_action'), \
+             mock.patch.object(sim, '_queue_player_email') as mail:
+            sim._scheduled_items_pass(st, 1_700_000_000_001)
+        self.assertEqual(len(st['playerInbox']), 1)
+        self.assertIn('Eidetic', st['playerInbox'][0]['question'])
+        mail.assert_called_once()
+        item = st['scheduledItems'][0]
+        self.assertFalse(item['enabled'], 'a once item must not re-fire')
+
+    def test_player_item_waits_until_not_before(self):
+        st = _state()
+        st['playerInbox'] = []
+        st['emailOutbox'] = []
+        st['scheduledItems'] = [self._item(1_700_000_000_000)]
+        with mock.patch.object(serve, 'log_action'), \
+             mock.patch.object(sim, '_queue_player_email') as mail:
+            sim._scheduled_items_pass(st, 1_700_000_000_000 - 1)
+        self.assertEqual(st['playerInbox'], [])
+        mail.assert_not_called()
+        self.assertTrue(st['scheduledItems'][0]['enabled'])
+
+    def test_agent_once_item_mints_one_directed_card_then_disables(self):
+        st = _state()
+        st['scheduledItems'] = [self._item(1_700_000_000_000,
+                                           owner_role='chief-of-staff')]
+        with mock.patch.object(serve, 'log_action'), \
+             mock.patch.object(sim, 'queue_work', return_value=1) as qw:
+            sim._scheduled_items_pass(st, 1_700_000_000_001)
+        self.assertEqual(qw.call_count, 1)
+        self.assertEqual(qw.call_args[0][1][0]['assignedTo'], 'theo')
+        self.assertFalse(st['scheduledItems'][0]['enabled'])
+
+
 class EnginePassTests(unittest.TestCase):
     def _item(self, **over):
         item = dict(sim._SCHEDULED_SEED_ITEM)

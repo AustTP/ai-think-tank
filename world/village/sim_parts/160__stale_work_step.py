@@ -864,6 +864,10 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     if now_ms - (state.get('lastStuckGateSweep') or 0) >= STUCK_GATE_CADENCE_MS:
         state['lastStuckGateSweep'] = now_ms
         _sweep_stuck_gates(state, now_ms)
+        # Owner direction (2026-11-11): operator veto windows on repeat-failure
+        # freezes expire into process-as-planned (one clean retry, then ship
+        # what exists). Same coarse cadence as the stuck-gate sweep.
+        _operator_veto_pass(state, now_ms)
 
     # Bound the append-only tails of the kv_state blob (completedDeliverables,
     # resolved backlogRequests, answered playerInbox, closed issues, applied

@@ -116,6 +116,56 @@ def _scheduled_items_pass(state, now_ms=None):
     for item in items:
         if not isinstance(item, dict) or item.get('enabled') is False:
             continue
+        # One-shot item (owner direction 2026-11-11): fires once at
+        # notBeforeMs. ownerRole 'player' routes to the operator's inbox and
+        # the email/telegram outbox instead of minting an agent card -- that
+        # is what a "scheduled operator backlog item" is: the operator sees
+        # it at the scheduled time, no agent work is implied.
+        if item.get('cadence') == 'once':
+            if now_ms < (item.get('notBeforeMs') or 0):
+                continue
+            if item.get('ownerRole') == 'player':
+                messages = state.setdefault('playerInbox', [])
+                messages.append({
+                    'id': f"ask-{item.get('id')}", 'taskId': None,
+                    'question': item.get('title') or 'Scheduled item',
+                    'context': item.get('instructions') or '',
+                    'status': 'awaiting_input',
+                    'createdAt': now_ms})
+                try:
+                    _queue_player_email(
+                        state, 'scheduled_operator_backlog',
+                        f"[AI Think Tank] Scheduled: {item.get('title')}",
+                        (item.get('instructions')
+                         or item.get('title') or ''), channels=None)
+                except Exception:
+                    pass
+                item['enabled'] = False
+                item['lastRunAtMs'] = now_ms
+                _log_governance(state, None, 'scheduled_item_fired',
+                                {'id': item.get('id'), 'ownerRole': 'player',
+                                 'cadence': 'once'})
+            else:
+                owners = _resolve_scheduled_owners(state, item)
+                if not owners:
+                    continue
+                for aid in owners:
+                    minted += queue_work(state, [{
+                        'title': item.get('title') or 'Scheduled item',
+                        'room': None,
+                        'instructions': (item.get('instructions')
+                                         or f"Scheduled work: {item.get('title')}"),
+                        'taskType': item.get('taskType') or 'report',
+                        'deliverable': item.get('deliverable') or 'report',
+                        'assignedTo': aid, 'directedTo': True,
+                        'priority': item.get('priority') or 'low',
+                        'feature': f"scheduled:{item.get('id')}"}])
+                item['enabled'] = False
+                item['lastRunAtMs'] = now_ms
+                _log_governance(state, None, 'scheduled_item_fired',
+                                {'id': item.get('id'), 'owners': owners,
+                                 'cadence': 'once'})
+            continue
         cadence_ms = SCHEDULED_CADENCE_MS.get(item.get('cadence'))
         if not cadence_ms:
             continue

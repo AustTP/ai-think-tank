@@ -595,6 +595,74 @@ def _maybe_queue_reject_memory(state, parent, reviewer, note, now_ms):
 _reject_last_extract = {}
 
 
+def _operator_veto_pass(state, now_ms):
+    """Owner direction (2026-11-11): the operator must never be a hard
+    blocker. A repeat-failure freeze (agents/repeat_work.py) stamps
+    _operatorVetoBy and notifies the operator with a veto option; with no
+    veto inside the window the story processes as planned:
+      first expiry  -> one clean retry (freeze cleared, fresh gate cycle)
+      second expiry -> ship-what-exists auto-close (the 020 escalation rule)
+    Veto = the operator channel stamps _operatorVetoed on the task. Returns
+    the number of stories processed."""
+    processed = 0
+    for task in (state.get('tasks') or {}).values():
+        if not isinstance(task, dict):
+            continue
+        deadline = task.get('_operatorVetoBy')
+        if not deadline or task.get('_operatorVetoed'):
+            continue
+        if now_ms < deadline or task.get('status') != 'blocked':
+            continue
+        processed += 1
+        tid = task.get('id')
+        title = (task.get('title') or '')[:120]
+        expiries = int(task.get('_operatorVetoExpiries') or 0) + 1
+        task['_operatorVetoExpiries'] = expiries
+        task.pop('_operatorVetoBy', None)
+        try:
+            from serve import log_action
+            log_action(None, 'operator_veto_window_expired',
+                       {'taskId': tid, 'title': title,
+                        'expiry': expiries}, authorized=True)
+        except Exception:
+            pass
+        if expiries >= 2:
+            # The clean retry failed the same way: ship what exists instead of
+            # looping forever or paging the operator again.
+            gate = dict(task.get('_peerGate') or {})
+            gate['escalated'] = True
+            task['_peerGate'] = gate
+            task.pop('manualAttention', None)
+            task.pop('blockedReason', None)
+            task.pop('failNote', None)
+            try:
+                from serve import log_action
+                log_action(None, 'task_auto_closed',
+                           {'taskId': tid, 'title': title,
+                            'reason': 'operator veto window expired '
+                                      '(ship what exists)'},
+                           authorized=True)
+            except Exception:
+                pass
+            _close_gated_story(state, task)
+            continue
+        # One clean retry as planned: clear the freeze and re-enter the gate
+        # for a fresh cycle. repeatWorkFailures/repeatWorkStop are cleared so
+        # the retry counts as a NEW attempt, not an instant re-freeze.
+        task['status'] = 'needs_review'
+        task['deliveryState'] = 'awaiting_review'
+        task.pop('manualAttention', None)
+        task.pop('blockedReason', None)
+        task.pop('failNote', None)
+        task.pop('repeatWorkFailures', None)
+        task.pop('repeatWorkStop', None)
+        gate = dict(task.get('_peerGate') or {})
+        gate.update({'approvals': 0, 'approvers': [], 'enteredMs': now_ms,
+                     'escalated': False})
+        task['_peerGate'] = gate
+    return processed
+
+
 def _maybe_escalate_stuck_gate(state, parent, gate, reason):
     """Bump the gate's cycle counter; once it crosses MAX_REVIEW_CYCLES,
     auto-close the story (ship what exists) instead of looping or paging the

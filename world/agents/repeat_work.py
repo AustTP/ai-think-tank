@@ -4,6 +4,12 @@ import json
 import os
 import re
 
+# Owner direction (2026-11-11): a repeat-failure freeze must never hard-block
+# on the operator. It stands for this window (12h, matching the new
+# change-request notice lead); no veto inside the window processes the story
+# as planned. See _operator_veto_pass in sim_parts/020.
+_OPERATOR_VETO_WINDOW_MS = 12 * 3600 * 1000
+
 
 def evidence_digest(state, parent):
     """Hash the evidence a retry would actually see.
@@ -81,4 +87,42 @@ def record(state, task, result, now):
     parent['_peerGate'] = dict(parent.get('_peerGate') or {})
     parent['_peerGate']['escalated'] = True
     parent['repeatWorkStop'] = {'signature': signature, 'at': now, 'attempts': matches}
+    # Operator veto window (owner direction 2026-11-11): the operator must
+    # never be a hard blocker. The freeze stands for a bounded window during
+    # which the operator may veto it; with no operator action the story
+    # processes as planned -- one clean retry, then ship-what-exists (see
+    # _operator_veto_pass). Previously this froze forever pending a manual
+    # look, which is what wedged the dankornas X-post change request.
+    parent['_operatorVetoBy'] = now + _OPERATOR_VETO_WINDOW_MS
+    parent['_operatorVetoExpiries'] = 0
+    try:
+        _notify_operator_veto_window(state, parent, now)
+    except Exception as e:
+        print(f'[repeat-work] operator veto notify failed: {e}', flush=True)
     return True
+
+
+def _notify_operator_veto_window(state, parent, now):
+    """Tell the operator a repeat-failure freeze is standing and when it
+    self-resolves. Player-inbox for the record + the email/telegram outbox so
+    the option is actually visible; text states the default explicitly."""
+    tid = parent.get('id')
+    title = parent.get('title') or tid
+    hours = _OPERATOR_VETO_WINDOW_MS / 3600000.0
+    text = (f'"{title}" froze: the same failure recurred with unchanged '
+            f'evidence (task {tid}). You may veto this freeze through the '
+            f'operator channel; if you take no action within {hours:g}h the '
+            'story processes as planned (one clean retry, then ship what '
+            'exists). No operator decision is required.')
+    messages = state.setdefault('playerInbox', [])
+    messages.append({'id': f'ask-veto-{tid}-{int(now)}', 'taskId': tid,
+                     'question': f'Veto the freeze on "{title}"?',
+                     'context': text[:2000], 'status': 'awaiting_input',
+                     'createdAt': int(now)})
+    try:
+        import sim
+        sim._queue_player_email(state, 'operator_veto_window',
+                                f'[AI Think Tank] Operator veto window: {title}',
+                                text, channels=None)
+    except Exception as e:
+        print(f'[repeat-work] veto email queue failed: {e}', flush=True)

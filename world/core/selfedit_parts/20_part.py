@@ -56,11 +56,12 @@ def status_snapshot(limit=25):
 WINDOW_MIN_DURATION_MIN = 5
 WINDOW_MAX_DURATION_MIN = 240
 WINDOW_DEFAULT_DURATION_MIN = 15
-# Change-request lead time (owner rule, 2026-10-27): a change window must be
-# requested at least 24 hours ahead so the owner has a real chance to review
-# the request and use the veto link, and no more than 7 days out -- requests
-# filed further ahead go stale before the window arrives; re-request closer
-# to the work.
+# Change-request lead time (owner rule, 2026-10-27; owner revision
+# 2026-11-11): a change window must be requested at least 12 hours ahead --
+# the owner gets the veto link and a real chance to review, but a full day
+# of notice proved slower than the work needs -- and no more than 7 days out
+# -- requests filed further ahead go stale before the window arrives;
+# re-request closer to the work.
 #
 # The emergency lane (owner decision, 2026-10-27): changeType 'emergency' may
 # use a shorter runway, but never under one hour -- the owner's veto link
@@ -68,7 +69,7 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 # logged as emergency_change_requested and telegram-notified immediately, and
 # the supervisor review + owner veto still apply unchanged. Labeling routine
 # work as emergency to skip the notice period is a Rule 12 violation.
-WINDOW_MIN_LEAD_S = 24 * 60 * 60
+WINDOW_MIN_LEAD_S = 12 * 60 * 60
 WINDOW_MAX_LEAD_S = 7 * 24 * 60 * 60
 WINDOW_EMERGENCY_MIN_LEAD_S = 60 * 60
 
@@ -656,9 +657,10 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
             return False, {'error': 'emergency change requests must start at '
                                     'least 1 hour from now -- the owner '
                                     'still needs a chance to veto'}
-        return False, {'error': 'the window must start at least 24 hours '
-                                'from now -- change requests need a day of '
-                                'notice so the owner can review and veto'}
+        return False, {'error': 'the window must start at least 12 hours '
+                                'from now -- change requests need half a '
+                                'day of notice so the owner can review '
+                                'and veto'}
     if start_ts > now + WINDOW_MAX_LEAD_S:
         return False, {'error': 'the window may not be more than 7 days out '
                                 '-- file the request closer to the window'}
@@ -696,12 +698,15 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
         return False, {'error': f'{validator} is not a known agent -- name a '
                                 'real validator from the tank roster'}
     admin_mode = governance.admin_change_request_enabled(state)
-    if admin_mode and names and not serve._is_director(state, validator):
-        return False, {'error': 'the validator must be a director -- change '
-                                'requests need a director approval, not a '
-                                'peer worker'}
+    if admin_mode and names and not governance.is_change_request_validator(
+            state, validator):
+        return False, {'error': 'the validator must be a supervisor, the '
+                                'chief of staff, or a regional VP -- change '
+                                'requests need an authority-layer approval, '
+                                'not a peer worker'}
     if admin_mode and validator == serve._admin_agent_id(state):
-        return False, {'error': 'name a director other than the admin; the '
+        return False, {'error': 'name a supervisor, the chief of staff, or a '
+                                'regional VP other than the admin; the '
                                 'admin approves the push as the second, '
                                 'independent approver'}
     reserved_rows = _reserved_edit_rows(agent_id)
