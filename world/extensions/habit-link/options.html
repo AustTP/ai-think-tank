@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px -apple-system, sans-serif; max-width: 560px; margin: 20px auto; }
+    label { display: block; margin-top: 12px; font-weight: 600; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 6px; box-sizing: border-box; }
+    .row { margin: 6px 0; display: flex; gap: 6px; }
+    .row input { flex: 1; }
+    .row button { padding: 4px 10px; }
+    ul { padding-left: 18px; }
+    button.primary { margin-top: 14px; padding: 8px 16px; }
+    #saved { color: #1b5e20; margin-left: 10px; }
+    p.hint { color: #555; }
+  </style>
+</head>
+<body>
+  <h1>Habit Link options</h1>
+  <p class="hint">
+    Metadata only: host, path, title, time on page, scroll depth, clicks.
+    Page content, forms, and cookies are never read or sent. Query strings
+    are stripped server-side before storage.
+  </p>
+  <label for="tankUrl">Tank URL</label>
+  <input type="text" id="tankUrl" placeholder="http://127.0.0.1:8936" />
+  <label for="token">Pairing token (HABIT_LINK_TOKEN from the tank's .env)</label>
+  <input type="password" id="token" placeholder="paste token" />
+  <label>Never collect from these hosts</label>
+  <div class="row">
+    <input type="text" id="blockedInput" placeholder="bank.example.com" />
+    <button id="addBlocked">Block</button>
+  </div>
+  <ul id="blocked"></ul>
+  <button class="primary" id="save">Save</button>
+  <span id="saved"></span>
+  <script src="options.js"></script>
+</body>
+</html>

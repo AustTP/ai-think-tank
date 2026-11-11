@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Habit Link",
+  "version": "1.0.0",
+  "description": "Sends the tank metadata about the pages you actually use (host, title, dwell, scroll, clicks) so agents can learn your real habits. Metadata only, never page content. Pause anytime from the toolbar.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Habit Link"
+  },
+  "options_page": "options.html"
+}

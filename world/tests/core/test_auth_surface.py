@@ -39,6 +39,12 @@ EXPECTED_PUBLIC = (
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',
     '/api/sms',
+    # Habit Link (199_habit_link.py). Public HERE because the paired browser
+    # extension authenticates with the HABIT_LINK_TOKEN env secret, not a
+    # session cookie; the endpoints self-guard in-handler (token compared
+    # per-request, fail-closed 501 when unset). toggle/summary/status are
+    # operator- or token-gated in their own handlers.
+    '/api/habit-link',
     '/api/experiments',
     '/api/rule-proposals', '/api/success-proposals',
     # A2A Agent Card: public metadata only (name, skills, auth scheme). The

@@ -793,6 +793,7 @@ AUTH_PUBLIC_PATHS = (
     '/api/ais', '/api/market', '/api/rss', '/api/ws',
     '/api/data-sources', '/api/credentials',
     '/api/sms',                                         # incl. inbound (X-SMS-Forward-Secret)
+    '/api/habit-link',                                  # browser extension: X-Habit-Link-Token, in-handler (199); toggle/summary stay operator-gated in-handler
     '/api/experiments',                                 # incl. inference (grant token)
     '/api/rule-proposals', '/api/success-proposals',
     # A2A Agent Card is public metadata (no secrets); the /a2a endpoint itself

@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px -apple-system, sans-serif; width: 260px; margin: 10px; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    #status { margin: 8px 0; padding: 6px 8px; border-radius: 6px; }
+    .on  { background: #e6f6e9; color: #1b5e20; }
+    .off { background: #fdecea; color: #b71c1c; }
+    button { width: 100%; margin-top: 6px; padding: 8px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Habit Link</h1>
+  <div id="status" class="off">checking…</div>
+  <button id="pause">Pause for 1 hour</button>
+  <button id="resume">Resume</button>
+  <button id="options">Options</button>
+  <script src="popup.js"></script>
+</body>
+</html>
