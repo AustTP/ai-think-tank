@@ -105,8 +105,26 @@ jobs:
           python -c "from cryptography.fernet import Fernet; open('.secret_keys/edek.key', 'w').write(Fernet.generate_key().decode())"
           chmod 600 .secret_keys/edek.key
 
+      - name: Cache Playwright chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      # Two 2026-11-11 runs died here on a transient runner DNS failure
+      # (azure.archive.ubuntu.com unresolvable for ~10 min). Retry with
+      # backoff; the browser cache above usually skips the download entirely.
       - name: Playwright chromium (browser tests)
-        run: python -m playwright install --with-deps chromium
+        run: |
+          for attempt in 1 2 3; do
+            if python -m playwright install --with-deps chromium; then
+              exit 0
+            fi
+            echo "playwright install attempt $attempt failed; retrying in 45s"
+            sleep 45
+          done
+          echo "playwright install failed after 3 attempts"
+          exit 1
 
       # The suite runs as per-directory steps (and integrations as parts) so
       # any future runner-level event is bounded to one step and the rest of
