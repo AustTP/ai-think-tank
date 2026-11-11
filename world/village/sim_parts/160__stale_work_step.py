@@ -1,4 +1,8 @@
 
+import time
+
+_LOITER_ERR_LAST = 0.0
+
 
 def _credits_pause_blocks_assignment():
     """True while the paid account is paused AND no free-pool endpoint is
@@ -983,8 +987,15 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     try:
         _grid_probe, _doors_probe = _load_outdoor_geometry()
         _disperse_door_mouth_loiterers(state, _doors_probe, now_ms)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A silent pass here hid a dispersal failure for hours (the sweep
+        # looked healthy while the mouth stayed clogged). Surface it, but
+        # throttle: a persistent failure would otherwise print every tick.
+        global _LOITER_ERR_LAST
+        now_s = time.time()
+        if now_s - _LOITER_ERR_LAST > 300:
+            _LOITER_ERR_LAST = now_s
+            print(f'[sim] door-mouth dispersal sweep failed: {exc!r}')
 
     # Load geometry once per call for this pass (cheap; the movement tick has
     # its own cached copy via self in SimEngine.tick).

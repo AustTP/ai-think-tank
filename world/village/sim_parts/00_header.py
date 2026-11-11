@@ -881,6 +881,83 @@ _WALKER_REPAIR_RETRY_MS = 2000
 # of giving up (first success wins; mirrors PAIR_WALK_OFFSETS).
 _DOOR_APPROACH_OFFSETS = (-56, 56, -112, 112, -168, 168)
 
+# Approach-band relief (2026-11-11 pressoffice clot): 27 visible agents --
+# most fully idle by every mirrored flag -- stood packed in the approach
+# column below the pressoffice door for hours while every walking task
+# stalled behind them, stuck-cancelled, and re-carded (~20 reissues of the
+# dankornas submit card in an hour). The idle sweeps could not touch them
+# (_is_fully_idle also demands no path/_suspendedTask/inRoom -- fields no
+# snapshot mirrors, so a statue with any hidden flag is unparkable forever),
+# and each stuck cancel left one more visible body at the mouth. This healer
+# keys ONLY on mirrored, verifiable state -- visible + in the band + no
+# task/pair/handoff/busy/pathActive -- so it clears the clot no matter which
+# hidden flag froze the idle sweeps.
+_DOOR_BAND_DEPTH = 120      # px of approach column below a door rect
+_DOOR_BAND_CLEAR_PER_PASS = 4   # bounded relocations per sweep
+
+
+def _door_band_boxes(doors):
+    """One approach band per door: the door's rect extended _DOOR_BAND_DEPTH
+    px below its bottom edge -- the walk-up column an assignee traverses."""
+    boxes = []
+    for room, door in (doors or {}).items():
+        if not isinstance(door, dict):
+            continue
+        boxes.append({'room': room, 'x': door['x'], 'y': door['y'],
+                      'w': door['w'], 'h': door['h'] + _DOOR_BAND_DEPTH})
+    return boxes
+
+
+def _in_door_band(x, y, bands):
+    """The agent's 20x16 box at (x, y) overlaps a door approach band?"""
+    for b in bands:
+        if (x < b['x'] + b['w'] and x + AGENT_W > b['x']
+                and y < b['y'] + b['h'] and y + AGENT_H > b['y']):
+            return b
+    return None
+
+
+def _reconcile_door_band_idles(state, doors, grid):
+    """Relocate visible, taskless bodies out of door approach bands. A door
+    approach is a walkway, not a resting spot: movement blocks on visible
+    bodies (the co-located exemption only frees OVERLAPPING pairs, not a
+    queue), so one statue at the mouth deadlocks every assignee behind her.
+    Task/pair/handoff holders and mid-walk agents are left alone -- they are
+    the walkers the band exists to serve. Mirrors _reconcile_stranded_agents'
+    healing shape (pick_free_spot's reachability guarantee, stuck counters
+    cleared, idempotent). Bounded per pass; returns the number moved."""
+    agents = state.get('agents')
+    if not isinstance(agents, dict) or not agents:
+        return 0
+    bands = _door_band_boxes(doors)
+    if not bands:
+        return 0
+    avoid = [{'x': d['x'] + d['w'] / 2, 'y': d['y'] + d['h'] + 4}
+             for d in (doors or {}).values() if isinstance(d, dict)]
+    moved = 0
+    for aid, a in list(agents.items()):
+        if moved >= _DOOR_BAND_CLEAR_PER_PASS:
+            break
+        if not isinstance(a, dict) or not a.get('visible'):
+            continue
+        if (a.get('task') or a.get('pairWith') or a.get('handoff')
+                or a.get('busy') or a.get('pathActive')):
+            continue
+        x, y = a.get('x'), a.get('y')
+        if x is None or y is None or not _in_door_band(x, y, bands):
+            continue
+        spot = pick_free_spot(grid, avoid_points=avoid)
+        a['x'], a['y'] = spot['x'], spot['y']
+        a['path'] = None
+        a['pathIndex'] = 0
+        a['pathTarget'] = None
+        a['pathActive'] = False
+        a['stuckTimer'] = 0
+        a['replanCount'] = 0
+        a.pop('_loiterSinceMs', None)
+        moved += 1
+    return moved
+
 
 def _repair_stalled_walkers(state, grid, doors, now_ms=None, index=None):
     """An agent can be left HOLDING a 'walking' task with an EMPTY

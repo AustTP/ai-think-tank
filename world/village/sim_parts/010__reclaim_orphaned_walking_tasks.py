@@ -318,6 +318,12 @@ class SimEngine:
                 # everyone is reachable.
                 _tick_phase_stamp(state, 'stranded_reconcile')
                 _reconcile_stranded_agents(state, self._grid)
+                # Door approaches are walkways: relocate idle bodies standing
+                # in a door's approach band so they cannot cork the assignees
+                # behind them (2026-11-11 pressoffice clot). Runs BEFORE the
+                # walker repair so a re-path this pass sees a cleared mouth.
+                _tick_phase_stamp(state, 'door_band_reconcile')
+                _reconcile_door_band_idles(state, self._doors, self._grid)
                 # Covers the inverse stranding: an agent HOLDING a 'walking' task
                 # with no path (path cleared, arrival never fired). Movement skips
                 # pathless agents, so without this they freeze mid-task forever.
