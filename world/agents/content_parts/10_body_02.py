@@ -233,8 +233,8 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
                  f'{task.get("instructions") or ""}', re.IGNORECASE):
         result['notifyPlayer'] = {
             'kind': 'operator_submission',
-            'subject': f'[AI Think Tank] Submitted for your review: '
-                       f'{task.get("title") or "report"}',
+            'subject': ('[AI Think Tank] Submitted for your review: '
+                        f'{task.get("title") or "report"}'),
             'body': (f'{name} submitted the report to the Library.\n'
                      f'Path: library/{report_path}\n'
                      'Nothing is required from you unless you veto; it is '
