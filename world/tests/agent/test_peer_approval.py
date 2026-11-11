@@ -150,7 +150,8 @@ class ReviewerSelection(unittest.TestCase):
         # still awaiting approval, so it is not shipped work. The room lands
         # when the gate actually closes.
         state2 = _state()
-        t2 = _task(room='observatory', status='working', entryX=None, entryY=None)
+        t2 = _task(room='observatory', status='working', entryX=None, entryY=None,
+                   codePublished=True)  # evidence-first gate (2026-11-11)
         state2['agents']['ben']['task'] = t2['id']
         state2['tasks'][t2['id']] = t2
         sim._release_agent_gated(state2, 'ben', None)
@@ -200,6 +201,7 @@ class VerdictFolding(unittest.TestCase):
     def _gated_state(self):
         state = _state()
         task = _task()  # author ben
+        task['codePublished'] = True  # evidence-first gate (2026-11-11)
         state['tasks'][task['id']] = task
         sim._enter_peer_review(state, task, now_ms=1000)
         return state, task
@@ -432,7 +434,8 @@ class Integration(unittest.TestCase):
 
         def fake_executor(snapshot, agent_id, task, base_ctx):
             # Only the primary code task dispatches real work in this harness.
-            real_store(task['id'], {'note': 'wrote the code'})
+            real_store(task['id'], {'note': 'wrote the code',
+                                    'codePublished': True})  # evidence-first gate (2026-11-11)
 
         sim._content_executor = fake_executor
 

@@ -11,15 +11,16 @@ import selfedit  # noqa: E402
 import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402
-    fake_repo, _window_slot, _patch_player_approval
+    fake_repo, _window_slot, _patch_player_approval, _approve
 )
 
 NORMAL_STATE = {'agents': {'worker': {}, 'reviewer': {}}}
 ADMIN_STATE = {
-    'agents': {'worker': {}, 'peer': {}, 'boss': {}},
+    'agents': {'worker': {}, 'peer': {}, 'boss': {}, 'chief': {}},
     'agentRoster': [{'id': 'boss', 'isAdmin': True},
                     {'id': 'worker', 'director': 'boss'},
-                    {'id': 'peer'}],
+                    {'id': 'peer'},
+                    {'id': 'chief', 'villageChief': True}],
     'governance': {'changeRequestAdminApproval': True},
 }
 
@@ -207,14 +208,20 @@ def test_cov_request_window_event_duration_cap(fake_repo, monkeypatch):
 
 def test_cov_request_window_admin_validator_guards(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
+    _approve(monkeypatch)
     _arm_row()
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: ADMIN_STATE)
     ok, payload = selfedit.request_window(
         'worker', _window_slot(), '03:10', 15, 'why', 'peer')
-    assert ok is False and 'must be a director' in payload['error']
+    assert ok is False and 'must be a supervisor' in payload['error']
     ok, payload = selfedit.request_window(
         'worker', _window_slot(), '03:10', 15, 'why', 'boss')
     assert ok is False and 'other than the admin' in payload['error']
+    # A regional VP (villageChief, no direct reports needed) is a valid
+    # validator tier -- the appointed authority layer, not a peer worker.
+    ok, payload = selfedit.request_window(
+        'worker', _window_slot(), '03:10', 15, 'why', 'chief')
+    assert ok is True
 
 
 def test_cov_request_window_high_risk_detail_guards(fake_repo, monkeypatch):
@@ -279,18 +286,32 @@ def test_cov_fire_blocker_roster_and_manifest(fake_repo, monkeypatch):
         selfedit._window_row('win-ghost'))
     assert any('no longer on the roster' in b for b in blockers)
 
-    # Admin mode: validator must be a director other than the admin.
+    # Admin mode: validator must be a supervisor (director), the chief of
+    # staff, or a regional VP -- other than the admin (who is the second,
+    # independent push approver).
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: ADMIN_STATE)
     _mk_window('win-peer', validator='peer', file_manifest='[]',
                risk_level='low')
     blockers = selfedit._window_fire_blockers(
         selfedit._window_row('win-peer'))
-    assert any('no longer a director' in b for b in blockers)
+    assert any('no longer a supervisor' in b for b in blockers)
     _mk_window('win-boss', validator='boss', file_manifest='[]',
                risk_level='low')
     blockers = selfedit._window_fire_blockers(
         selfedit._window_row('win-boss'))
     assert any('validator is the admin' in b for b in blockers)
+
+    # A regional VP (villageChief) is a valid validator tier even when she
+    # has no direct reports yet -- the appointed authority layer, not a
+    # peer worker.
+    monkeypatch.setattr(serve, 'get_state_from_db', lambda: ADMIN_STATE)
+    _mk_window('win-chief', validator='chief', file_manifest='[]',
+               risk_level='low')
+    blockers = selfedit._window_fire_blockers(
+        selfedit._window_row('win-chief'))
+    assert 'no validator on record' not in blockers
+    assert not any('no longer a supervisor' in b for b in blockers)
+    assert not any('validator is the admin' in b for b in blockers)
 
     # Reserved rows drive the manifest recheck.
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: NORMAL_STATE)

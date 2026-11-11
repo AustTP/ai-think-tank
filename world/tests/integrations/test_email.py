@@ -209,6 +209,7 @@ class CardReport(unittest.TestCase):
                   'room': 'pressoffice', 'projectLabel': 'PR-1',
                   'userStory': 'As an analyst, I want a brief, so that I can decide',
                   'never': '- never cite a repost as a second source',
+                  'codePublished': True,  # evidence-first gate (2026-11-11)
                   '_peerGate': {'approvals': 2, 'approvers': ['nadia', 'priya'], 'closed': False}}
         with unittest.mock.patch.object(sim, '_revoke_task_access'):
             ok = sim._close_gated_story(st, parent)

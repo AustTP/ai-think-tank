@@ -596,10 +596,11 @@ _reject_last_extract = {}
 
 
 def _operator_veto_pass(state, now_ms):
-    """Owner direction (2026-11-11): the operator must never be a hard
-    blocker. A repeat-failure freeze (agents/repeat_work.py) stamps
-    _operatorVetoBy and notifies the operator with a veto option; with no
-    veto inside the window the story processes as planned:
+    """Owner direction (2026-11-11, revised): the 12-hour minimum is for
+    CHANGE REQUESTS only. A repeat-failure freeze is urgent governance: the
+    freeze (agents/repeat_work.py) stamps _operatorVetoBy and notifies the
+    operator with a veto option; with no veto inside the 2h window the story
+    processes as planned:
       first expiry  -> one clean retry (freeze cleared, fresh gate cycle)
       second expiry -> ship-what-exists auto-close (the 020 escalation rule)
     Veto = the operator channel stamps _operatorVetoed on the task. Returns

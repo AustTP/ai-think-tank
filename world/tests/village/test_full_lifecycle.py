@@ -136,6 +136,7 @@ class FullLifecycle(unittest.TestCase):
             calls['room'] = task.get('room')
             calls['author'] = agent_id
             self._real_store(task['id'], {'note': 'implemented checkout flow',
+                                          'codePublished': True,  # evidence-first gate (2026-11-11)
                                           'seenUrls': []})
 
         sim._content_executor = fake_executor

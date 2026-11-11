@@ -352,6 +352,78 @@ class ObservatoriesAndDispatcher(_ExecutorTestCase):
         self.assertEqual(seen['n1']['note'], 'Verified X. Next: Y.')
         self.assertEqual(seen['n1']['deliverableText'], 'Verified X. Next: Y.')
 
+
+class ReportLaneContracts(_ExecutorTestCase):
+    """Owner-approved items (2026-11-11 video review): the source-grounded
+    report lane must (a) end with a Gap check section -- the author's own
+    devil's-advocate pass, which the dankornas submission never ran -- and
+    (b) honor the card's word cap deterministically. The dankornas card filed
+    a 4.6k-word report against a 600-word limit."""
+
+    def _run_report(self, completions, task=None):
+        seen = _store()
+        posted = {}
+        _base_mocks()
+        task = task or {
+            'id': 'r1', 'title': 'Submit the change request',
+            'room': 'pressoffice', 'taskType': 'bug',
+            'deliverable': 'report',
+            'sourcePaths': ['analysis/dankornas.md'],
+            'wordLimit': 600,
+            'instructions': 'Write the change-request report. At most 600 words.'}
+        long_body = ' '.join(['word'] * 900)
+        gap_section = ('\n\n## Gap check\n\nNone found: every claim is '
+                       'cited from the source shard and the timestamps '
+                       'cross-check.')
+        with mock.patch.object(content, '_read_library_document',
+                               return_value='=== merged shard ==='), \
+                mock.patch.object(content, '_plain_completion',
+                                  side_effect=completions), \
+                mock.patch.object(serve, '_safe_library_path',
+                                  return_value='/tmp/report.md'), \
+                mock.patch.object(serve, '_resolve_model_tier',
+                                  return_value='test-model'), \
+                mock.patch.object(serve, '_http_json',
+                                  side_effect=lambda *a, **k: posted.__setitem__(
+                                      'body', a[3]['content']) or {'ok': True}), \
+                mock.patch('os.path.isfile', return_value=True), \
+                mock.patch('sim.content_heartbeat_keepalive',
+                           return_value=mock.MagicMock()):
+            content._run_report_content(_snapshot(), 'cora', task)
+        seen['_posted'] = posted
+        return seen
+
+    def test_gap_check_is_requested_again_when_missing(self):
+        # First draft lacks the section; the lane re-asks once and ships the
+        # retry that has it.
+        long_body = ' '.join(['word'] * 300)
+        gap = '\n\n## Gap check\n\nNone found.'
+        seen = self._run_report([long_body, long_body + gap])
+        self.assertTrue(seen['r1']['ok'])
+        self.assertIn('## Gap check', seen['_posted']['body'])
+
+    def test_missing_gap_check_after_retry_is_flagged_for_the_reviewer(self):
+        long_body = ' '.join(['word'] * 300)
+        seen = self._run_report([long_body, long_body])
+        self.assertTrue(seen['r1']['ok'])
+        self.assertIn('Not provided by the author', seen['_posted']['body'])
+
+    def test_word_limit_trims_the_body_and_keeps_the_gap_check(self):
+        long_body = ' '.join(['word'] * 900)
+        gap = ('\n\n## Gap check\n\nNone found: every claim is cited from '
+               'the source shard and the timestamps cross-check.')
+        seen = self._run_report([long_body + gap, long_body + gap])
+        self.assertTrue(seen['r1']['ok'])
+        body = seen['_posted']['body']
+        self.assertIn('## Gap check', body,
+                      'the devil\'s-advocate section survives the trim')
+        # The saved FILE is the contract surface: heading + byline + body.
+        # The prose itself must stay inside the card's word cap.
+        prose = body.split('# ', 1)[1].split('\n', 1)[1]
+        self.assertLessEqual(
+            len(prose.split()), 600 + 10,
+            'the final report stays inside the card\'s word cap')
+
     def test_note_content_hard_trims_to_the_card_word_limit(self):
         seen = _store()
         _base_mocks()

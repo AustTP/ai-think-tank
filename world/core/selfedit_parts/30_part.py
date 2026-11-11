@@ -46,10 +46,11 @@ def _window_fire_blockers(window):
     elif names and validator not in names:
         blockers.append(f'validator {validator} is no longer on the roster')
     elif governance.admin_change_request_enabled(state):
-        if not _s()._is_director(state, validator):
-            blockers.append(f'validator {validator} is no longer a director')
+        if not governance.is_change_request_validator(state, validator):
+            blockers.append(f'validator {validator} is no longer a supervisor, '
+                            'the chief of staff, or a regional VP')
         if validator == _s()._admin_agent_id(state):
-            blockers.append('validator is the admin, not an independent director')
+            blockers.append('validator is the admin, not an independent approver')
     with _s()._db() as conn:
         _ensure_table(conn)
         conn.row_factory = sqlite3.Row

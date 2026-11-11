@@ -4,11 +4,12 @@ import json
 import os
 import re
 
-# Owner direction (2026-11-11): a repeat-failure freeze must never hard-block
-# on the operator. It stands for this window (12h, matching the new
-# change-request notice lead); no veto inside the window processes the story
-# as planned. See _operator_veto_pass in sim_parts/020.
-_OPERATOR_VETO_WINDOW_MS = 12 * 3600 * 1000
+# Owner direction (2026-11-11, revised): the 12-hour minimum is for CHANGE
+# REQUESTS only (selfedit windows). A repeat-failure freeze is urgent
+# governance, not a scheduled change: the veto window is 2h (four VP digest
+# cycles), after which the story processes as planned -- one clean retry,
+# then ship-what-exists. See _operator_veto_pass in sim_parts/020.
+_OPERATOR_VETO_WINDOW_MS = 2 * 3600 * 1000
 
 
 def evidence_digest(state, parent):

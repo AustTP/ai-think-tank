@@ -331,6 +331,7 @@ class CloseGatedStoryMerges(unittest.TestCase):
     def _coding_parent(self, **over):
         p = {'id': 'task-p1', 'title': 'Ship the brief', 'taskType': 'code',
              'room': 'pressoffice', 'projectLabel': 'PR-1', 'assignedTo': 'cora',
+             'codePublished': True,  # evidence-first gate (2026-11-11): a hollow story cannot close
              '_peerGate': {'approvals': 2, 'approvers': ['ben', 'priya'],
                            'closed': False}}
         p.update(over)

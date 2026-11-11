@@ -143,6 +143,14 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
         f'the supplied source text. Follow this playbook:\n\n{report_guide}\n\n'
         f'Card: {task.get("title") or ""}\n'
         f'Instructions: {task.get("instructions") or ""}\n\n'
+        'Before you finish, play devil\'s advocate against your own draft '
+        '(owner direction 2026-11-11, from live churn: authors closed cards '
+        'with no artifact and never self-checked, burning three review '
+        'cycles). End the report with a `## Gap check` section that answers '
+        'concretely: what would make this NOT satisfy the card\'s contract -- '
+        'missing evidence, unverified claims, format violations? List the '
+        'gaps or state "None found." An honest gap list is required; a '
+        'reviewer reads it first.\n\n'
         'SOURCES:\n\n' + '\n\n'.join(chunks)
     )
     text = _plain_completion(model, [{'role': 'user', 'content': prompt}],
@@ -152,6 +160,40 @@ def _run_report_content(snapshot, agent_id, task, base_ctx=None):
         _sim_module._store_content_result(task.get('id'), {
             'ok': False, 'note': 'Report synthesis returned nothing.'})
         return
+    if 'Gap check' not in text:
+        # One bounded re-ask, then ship: the reviewer sees an explicit
+        # "missing gap check" line instead of silently absent evidence.
+        retry = _plain_completion(
+            model,
+            [{'role': 'user', 'content': prompt
+              + '\n\nYour previous draft was missing the required `## Gap '
+                'check` section. Return the full report again with that '
+                'section at the end.'}],
+            max_tokens=8000, service='report', task_id=task.get('id'))
+        if retry and 'Gap check' in retry:
+            text = retry
+        else:
+            text += ('\n\n## Gap check\n\nNot provided by the author -- '
+                     'the reviewer should treat this as a contract miss.')
+    # The word cap is a hard card constraint (the dankornas submission filed
+    # a 4.6k-word report against a 600-word limit). Deterministic
+    # word-boundary trim, same contract as the note lane -- but the Gap check
+    # section is the devil's-advocate evidence, so it is KEPT: the body trims
+    # to (limit - gap-check length) instead of cutting the section off.
+    limit = _note_word_limit(task)
+    if limit:
+        marker = '## Gap check'
+        head, sep, gap = text.partition(marker)
+        budget = max(1, limit - _word_count(sep + gap))
+        words = head.split()
+        while words and _word_count(' '.join(words)) > budget:
+            words.pop()
+        head = ' '.join(words).rstrip(' ,;:-')
+        if head and sep:
+            head += '\n\n'
+        text = head + sep + gap
+        if text and text[-1] not in '.!?':
+            text += '.'
     report_path = task.get('reportPath') or f"archive/{int(time.time() * 1000)}-report-{task.get('id') or 'adhoc'}.md"
     body = (f'# {task.get("title") or "Report"}\n\n'
             f'By: {name}\n\n{text}\n\n'

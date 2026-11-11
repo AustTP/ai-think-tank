@@ -79,7 +79,6 @@ def _open_twin_task(state, task):
             return tid
     return None
 
-
 def _reconcile_queued_cards(state, now_ms):
     """Re-issue queued cards whose dispatch item vanished without an
     assignment. A dispatch consumes its workQueue item, then the assignment
@@ -90,6 +89,11 @@ def _reconcile_queued_cards(state, now_ms):
     dispatch pass). Runs inside the coarse stale sweep: bounded by the same
     per-card replan counter, so a card that keeps failing to stick cannot
     loop unbounded. Returns the number re-issued."""
+    # Aged retirement bounds (owner-approved item, 2026-11-11 video review):
+    # a queued card unused past 14 days is a parked tangent, not live work.
+    # Bounded per pass so a backlog cleanup never flips mass state in one tick.
+    _AGED_CARD_RETIRE_MS = 14 * 24 * 3600 * 1000
+    _AGED_CARD_RETIRE_PER_PASS = 10
     tasks = state.get('tasks')
     if not isinstance(tasks, dict) or not tasks:
         return 0
@@ -103,8 +107,33 @@ def _reconcile_queued_cards(state, now_ms):
             held.add(a['task'])
     replan_map = state.setdefault('_staleWorkReplans', {})
     reissued = 0
+    retired_this_pass = 0
     for tid, task in list(tasks.items()):
         if not isinstance(task, dict) or task.get('status') != 'queued':
+            continue
+        # Aged retirement (owner-approved item, 2026-11-11 video review): a
+        # queued card older than 14 days is a parked tangent, not live work.
+        # The dankornas family accumulated ~30 such records from October that
+        # every sweep kept trying to re-plan. Park them for operator promotion
+        # (the DEV-109 idiom) instead of feeding the dispatch loop forever.
+        if task.get('lane') == 'parking-lot':
+            continue  # already retired
+        created = task.get('createdAt') or 0
+        if created and now_ms - created >= _AGED_CARD_RETIRE_MS \
+                and retired_this_pass < _AGED_CARD_RETIRE_PER_PASS:
+            task['lane'] = 'parking-lot'
+            task['parkedAt'] = now_ms
+            task['parkedReason'] = 'aged: queued unused past the 14-day line'
+            retired_this_pass += 1
+            try:
+                from serve import log_action
+                log_action('system', 'aged_card_retired',
+                           {'taskId': tid, 'title': (task.get('title') or '')[:120],
+                            'ageDays': round((now_ms - created) / 86400000.0, 1),
+                            'note': 'parked for operator promotion'},
+                           authorized=True)
+            except Exception:
+                pass
             continue
         if tid in issued_for or tid in held:
             continue

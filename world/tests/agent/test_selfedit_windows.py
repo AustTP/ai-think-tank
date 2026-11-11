@@ -125,7 +125,7 @@ def test_emergency_lane_shorter_lead_time(fake_repo, monkeypatch):
     start = target.strftime('%H:%M')
     # normal change at the same near-term slot: refused
     ok, payload = selfedit.request_window('worker', date, start, 15, 'why')
-    assert ok is False and 'at least 24 hours' in payload['error']
+    assert ok is False and 'at least 12 hours' in payload['error']
     # emergency at the same slot: accepted, announced, recorded
     ok, payload = selfedit.request_window('worker', date, start, 15, 'why',
                                           validator='reviewer',
@@ -154,7 +154,7 @@ def test_schedule_window_time_and_range_validation(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     ok, payload = selfedit.request_window('worker', '2020-01-01', '03:00',
                                           15, 'why')
-    assert ok is False and 'at least 24 hours' in payload['error']
+    assert ok is False and 'at least 12 hours' in payload['error']
     ok, payload = selfedit.request_window('worker', 'bad-day', '03:00',
                                           15, 'why')
     assert ok is False and 'YYYY-MM-DD' in payload['error']

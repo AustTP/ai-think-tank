@@ -236,6 +236,55 @@ class QueuedCardReconciler(unittest.TestCase):
             [],
             'an open twin owns the work; the stranded record is not re-issued')
 
+    def test_aged_queued_card_is_parked_not_reissued(self):
+        # Owner-approved item (2026-11-11 video review): a queued card unused
+        # past 14 days is a parked tangent. The dankornas family accumulated
+        # ~30 October records that every sweep kept re-planning. They park for
+        # operator promotion instead of feeding the dispatch loop.
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        state['tasks']['task-orphan']['createdAt'] = now_ms - 15 * 24 * 3600 * 1000
+        with mock.patch('serve.log_action') as la:
+            sim._stale_work_step(state, time.time(), now_ms)
+        task = state['tasks']['task-orphan']
+        self.assertEqual(task.get('lane'), 'parking-lot')
+        self.assertEqual(task.get('parkedReason'), 'aged: queued unused past the 14-day line')
+        self.assertEqual(
+            [w for w in state['workQueue'] if w.get('reissueOf') == 'task-orphan'],
+            [], 'an aged card is not re-issued into the queue')
+        self.assertIn('aged_card_retired', [c[0][1] for c in la.call_args_list])
+        # Already-retired cards are skipped on later sweeps: no duplicate logs.
+        with mock.patch('serve.log_action') as la2:
+            sim._stale_work_step(state, time.time(), now_ms + 60_000)
+        self.assertEqual(la2.call_count, 0)
+
+    def test_fresh_queued_card_is_not_parked(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        state['tasks']['task-orphan']['createdAt'] = now_ms - 2 * 24 * 3600 * 1000
+        sim._stale_work_step(state, time.time(), now_ms)
+        self.assertNotIn('lane', state['tasks']['task-orphan'])
+
+    def test_retirement_is_bounded_per_pass(self):
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        for i in range(15):
+            state['tasks'][f'aged-{i}'] = dict(
+                state['tasks']['task-orphan'], id=f'aged-{i}',
+                createdAt=now_ms - 20 * 24 * 3600 * 1000)
+        with mock.patch('serve.log_action'):
+            sim._stale_work_step(state, time.time(), now_ms)
+        parked = [t for t in state['tasks'].values()
+                  if isinstance(t, dict) and t.get('lane') == 'parking-lot']
+        self.assertEqual(len(parked), 10,
+                         'retirement parks at most 10 cards per sweep')
+
 
 class ReplanCappedLogThrottle(unittest.TestCase):
     """A capped card's log row fires once per 30 minutes per card -- 197

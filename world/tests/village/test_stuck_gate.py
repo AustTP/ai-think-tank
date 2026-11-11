@@ -223,6 +223,40 @@ class StuckGateSweep(unittest.TestCase):
         gate = state['tasks']['task-1']['_peerGate']
         self.assertEqual(gate['enteredMs'], 40 * 60 * 1000)
 
+    def test_gate_close_without_evidence_is_refused(self):
+        # Owner-approved item (2026-11-11 video review, evidence-first): the
+        # dankornas submission closed DONE through a peer vote with no saved
+        # deliverable at all -- the gate close bypassed finish_task's evidence
+        # contract. The close must refuse, send the story back to its gate,
+        # and leave an explicit log row.
+        state = _state()
+        _gated_task(state)  # no reportPath, no note: no evidence
+        with unittest.mock.patch.object(serve, 'log_action') as la, \
+                unittest.mock.patch.object(sim, '_deliver_card_report') as rep:
+            ok = sim._close_gated_story(state, state['tasks']['task-1'])
+        self.assertFalse(ok)
+        task = state['tasks']['task-1']
+        self.assertEqual(task['status'], 'needs_review',
+                         'a refused close sends the story back to its gate')
+        self.assertIn('no saved deliverable', task.get('failNote') or '')
+        self.assertIn('gate_close_refused', [c[0][1] for c in la.call_args_list])
+        rep.assert_not_called()
+        self.assertFalse(task['_peerGate'].get('approvals'))
+
+    def test_gate_close_with_evidence_still_closes(self):
+        # Positive control: a story carrying a real report artifact + note
+        # closes as before (the refusal only fires on the hollow case). Same
+        # contract shape as the dankornas card: deliverable='report'.
+        state = _state()
+        _gated_task(state, taskType='task', deliverable='report',
+                    reportPath='archive/report.md',
+                    note='Submitted the change request report.')
+        with unittest.mock.patch.object(serve, 'log_action'), \
+                unittest.mock.patch.object(sim, '_deliver_card_report'):
+            ok = sim._close_gated_story(state, state['tasks']['task-1'])
+        self.assertTrue(ok)
+        self.assertEqual(state['tasks']['task-1']['status'], 'done')
+
     def test_repeated_no_verdict_rescues_freeze_after_the_bound(self):
         # Bounded review-cycle escalation: this exact rescue path (a review consumed with no verdict, reachable
         # pair, re-enqueue a fresh one) used to be able to fire once per

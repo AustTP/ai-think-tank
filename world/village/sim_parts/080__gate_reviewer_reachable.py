@@ -269,7 +269,36 @@ def _close_gated_story(state, parent):
     """Close a peer-gated story once its gate is satisfied. The parent is not on
     any agent (its author was released when primary work finished), so this is a
     direct status flip + log rather than finish_task, which needs a working
-    agent. Returns True on close."""
+    agent. Returns True on close. False means the close was REFUSED: the story
+    carries no saved deliverable, so shipping it would repeat the 2026-11-11
+    dankornas hollow auto-close (a card closed done via a peer vote with no
+    artifact at all). A refused close sends the story back to its gate."""
+    from sim import _completion_has_evidence as _evidence_ok
+    if not _evidence_ok(state, parent):
+        tid = parent.get('id')
+        title = (parent.get('title') or '')[:120]
+        gap = None
+        try:
+            from sim import _completion_evidence_gap as _gap
+            gap = _gap(parent)
+        except Exception:
+            gap = 'no saved deliverable'
+        parent['status'] = 'needs_review'
+        parent['deliveryState'] = 'awaiting_review'
+        parent['failNote'] = ('Peer gate close refused: the story carries no '
+                              f'saved deliverable ({gap}).')
+        gate = dict(parent.get('_peerGate') or {})
+        gate['approvals'] = 0
+        gate['approvers'] = []
+        parent['_peerGate'] = gate
+        try:
+            from serve import log_action
+            log_action(None, 'gate_close_refused',
+                       {'taskId': tid, 'title': title, 'gap': gap},
+                       authorized=True)
+        except Exception:
+            pass
+        return False
     review_counts = parent.get('_peerGate') or {}
     # The author's approval and the deliverable grade belong to the gate
     # closing, not the earlier release. Count them once per close.

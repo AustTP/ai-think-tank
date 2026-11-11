@@ -349,6 +349,7 @@ class TaskCycle(SimIsolation):
             {
                 'task-1': {'id': 'task-1', 'title': 'parent', 'room': 'observatory',
                            'status': 'needs_review', 'assignedTo': 'ben',
+                           'codePublished': True,  # evidence-first gate (2026-11-11)
                            '_peerGate': {'approvals': 1, 'approvers': ['ben'],
                                          'reviewerIds': ['ada', 'ben'], 'enteredMs': 0}},
                 'task-2': {'id': 'task-2', 'title': 'review', 'room': 'observatory',
@@ -593,7 +594,7 @@ class StuckGate(SimIsolation):
 
     def test_close_gated_story_log_raises(self):
         state = {'agents': {}}
-        parent = {'id': 'task-1', 'title': 't',
+        parent = {'id': 'task-1', 'title': 't', 'codePublished': True,
                   '_peerGate': {'approvals': 1, 'approvers': ['ben']}}
         with unittest.mock.patch('serve.log_action', side_effect=RuntimeError('boom')), \
              unittest.mock.patch.object(sim, '_revoke_task_access'), \

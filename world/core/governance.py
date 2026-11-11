@@ -42,6 +42,20 @@ def is_director(state, agent_id):
     return is_admin(state, agent_id) or bool(direct_reports(state, agent_id))
 
 
+def is_change_request_validator(state, agent_id):
+    """A change request's validator must be a supervisor (director), the
+    chief of staff, or a regional VP. THE chief of staff (the admin) is
+    the second, independent push approver and so is excluded from the
+    validator slot by the request-time check -- the regional VP is the
+    explicit authority tier even when she has no direct reports yet
+    (a brand-new village with no senior directors). Operators direction
+    (2026-11-12): the determination that approval-chain modifications are
+    necessary may come from any of the three authority layers."""
+    if not agent_id:
+        return False
+    return is_director(state, agent_id) or is_village_chief(state, agent_id)
+
+
 def is_scrum_master(state, agent_id):
     if not agent_id:
         return False
