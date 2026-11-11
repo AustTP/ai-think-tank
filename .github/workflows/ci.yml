@@ -111,20 +111,25 @@ jobs:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
 
-      # Two 2026-11-11 runs died here on a transient runner DNS failure
-      # (azure.archive.ubuntu.com unresolvable for ~10 min). Retry with
-      # backoff; the browser cache above usually skips the download entirely.
-      - name: Playwright chromium (browser tests)
+      # No required step in this workflow launches a real browser: every
+      # sync_playwright consumer in the required suites is a mock or an
+      # import-availability check, and tests/web (the one real-browser
+      # suite) needs a live tank + password and runs off-CI only. The
+      # download comes from the Playwright CDN; only the --with-deps apt
+      # step touches the Ubuntu mirrors, whose DNS failed for over an hour
+      # on 2026-11-11 (three 30-minute jobs burned on it). Both parts are
+      # therefore best-effort: warn loudly, never fail the gate on them.
+      # The cache keeps the CDN download a no-op once warm.
+      - name: Playwright chromium (best-effort)
         run: |
+          python -m playwright install chromium || echo "::warning::chromium download failed; tests/web is off-CI so the gate proceeds"
           for attempt in 1 2 3; do
-            if python -m playwright install --with-deps chromium; then
-              exit 0
+            if python -m playwright install-deps chromium 2>&1 | tail -5; then
+              break
             fi
-            echo "playwright install attempt $attempt failed; retrying in 45s"
+            echo "::warning::chromium system deps attempt $attempt failed (Ubuntu mirror DNS?); retrying in 45s"
             sleep 45
           done
-          echo "playwright install failed after 3 attempts"
-          exit 1
 
       # The suite runs as per-directory steps (and integrations as parts) so
       # any future runner-level event is bounded to one step and the rest of
