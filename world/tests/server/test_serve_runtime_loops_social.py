@@ -179,10 +179,17 @@ class RefinementEscalationDigests(unittest.TestCase):
         state = {'agents': {}, 'agentRoster': [{'id': 'nora', 'name': 'Nora'}]}
         groom = {'scrumMasterId': 'nora',
                  'accepted': [{'room': 'bank', 'title': 'Reconcile ledger', 'filedBy': 'ada'}]}
-        serve.log_refinement_digest(state, state['agents'], groom)
-        files = os.listdir(os.path.join(_MODULE_TMP_DIR, 'library', 'refinement'))
-        self.assertEqual(len(files), 1)
-        with open(os.path.join(_MODULE_TMP_DIR, 'library', 'refinement', files[0])) as f:
+        # The digest filename is second-resolution (refinement-<epoch>.md) and
+        # the none-accepted sibling test writes into the same shared tmp dir:
+        # a second boundary between the two calls used to leave two files and
+        # fail the exact-count assert (CI flake, 2026-11-11). Pin the clock.
+        ts = 1_760_000_000.0
+        with unittest.mock.patch.object(serve.time, 'time', return_value=ts):
+            serve.log_refinement_digest(state, state['agents'], groom)
+        path = os.path.join(_MODULE_TMP_DIR, 'library', 'refinement',
+                            f'refinement-{int(ts)}.md')
+        self.assertTrue(os.path.isfile(path), 'the accepted digest file exists')
+        with open(path) as f:
             self.assertIn('Reconcile ledger', f.read())
 
     def test_log_refinement_digest_none_accepted_branch(self):
