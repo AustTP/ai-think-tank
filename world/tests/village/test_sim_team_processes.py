@@ -364,6 +364,22 @@ class Refocus(unittest.TestCase):
         self.assertNotIn('Focus next work', instructions)
         self.assertIn('Write the note the card asks for.', instructions)
 
+    def test_augment_does_not_compound_relay_across_reissue_generations(self):
+        # 2026-11-11 dankornas churn: a reissue carries the PREVIOUS
+        # generation's augmented instructions, and the relay insert prepended
+        # another copy each generation -- the submit card's instructions were
+        # the same "Focus next work on" line repeated dozens of times,
+        # drowning the work text. The insert must be idempotent.
+        state = _seed()
+        relay_line = 'Focus next work on weatherstation (no recent delivery).'
+        state['consensusRelay'] = {'consensus': relay_line}
+        first = sim._augment_task_instructions(state, 'ben', None, 'Submit the change request.')
+        self.assertEqual(first.count(relay_line), 1)
+        # Generation 2: the chain carries generation 1's augmented text.
+        second = sim._augment_task_instructions(state, 'ben', None, first)
+        self.assertEqual(second.count(relay_line), 1,
+                         'the relay line must never compound')
+
     def test_assign_due_item_sets_refocus_for_review_and_incident_only(self):
         # The real call site: refocus=True iff the queued item is a review
         # (reviewOf set) or an incident, never a plain fresh task.

@@ -1615,11 +1615,16 @@ def _augment_task_instructions(state, agent_id, product_id, instructions, refocu
     pieces = [instructions] if instructions else []
     # The spine FIRST: the charter goal opens every task's instructions so the
     # work a room does points at the player's direction (see _charter_note).
+    # Idempotent guards (2026-11-11): a reissue chain carries the PREVIOUS
+    # generation's augmented instructions, so an unguarded insert compounded
+    # the relay/charter line once per generation -- the dankornas submit card
+    # reached instructions that were the same "Focus next work on" line
+    # repeated dozens of times, drowning the actual work text.
     charter_line = _charter_note(state)
-    if charter_line:
+    if charter_line and charter_line not in (instructions or ''):
         pieces.insert(0, charter_line)
     relay = _consensus_relay_note(state)
-    if relay and not scoped:
+    if relay and not scoped and relay not in (instructions or ''):
         pieces.insert(0, relay)
     note = _coaching_note_for(state, agent_id)
     if note:
