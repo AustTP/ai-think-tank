@@ -1,0 +1,159 @@
+{
+  "version": 1,
+  "comment": "Doctrine TEMPLATES for permanent/standing work that lives outside the sprint structure (trading desks, bug-bounty lanes, on-call watches). A team ADOPTS one of these (POST /api/team-doctrine/<teamId>/adopt), which copies the levels onto the team's own record as their live doctrine; the team then OWNS its copy and modifies it freely (PUT /api/team-doctrine/<teamId>) without touching this file or any other team. Adopting again resets the copy back to the template. Level ids are strings; names are whatever the team calls them (DEFCON, green/amber/red, anything). The tank stores levels and routes notify pings; it never interprets trigger/staffing/autonomy/demote -- those are the team's own words, surfaced in team status and Telegram.",
+  "templates": {
+    "bug-bounty": {
+      "name": "Bug bounty desk",
+      "description": "Vulnerability research with hard safety rails. Escalation is driven by the blast radius of what was found and how close work is to touching a live target.",
+      "levels": [
+        {
+          "id": "d5",
+          "name": "DEFCON 5 - routine recon",
+          "trigger": "normal hunting day; nothing found or trivial low-severity findings",
+          "staffing": "1 researcher, no observers",
+          "autonomy": "read-only recon on in-scope targets; draft reports internally",
+          "demote": "never (baseline)",
+          "notify": false
+        },
+        {
+          "id": "d4",
+          "name": "DEFCON 4 - active lead",
+          "trigger": "a plausible finding needs reproduction work",
+          "staffing": "researcher + one reviewer",
+          "autonomy": "reproduction against OWN lab replicas only; no third-party systems",
+          "demote": "lead disproven or resolved",
+          "notify": false
+        },
+        {
+          "id": "d3",
+          "name": "DEFCON 3 - confirmed finding",
+          "trigger": "reproducible finding of medium severity confirmed in the lab",
+          "staffing": "full desk",
+          "autonomy": "write the report, prepare disclosure, NO contact with the vendor yet",
+          "demote": "report filed and acknowledged",
+          "notify": true
+        },
+        {
+          "id": "d2",
+          "name": "DEFCON 2 - disclosure window",
+          "trigger": "report submitted; embargo clock running",
+          "staffing": "full desk + operator informed",
+          "autonomy": "correspond with the vendor per the disclosure policy; nothing else external",
+          "demote": "patch released and verified",
+          "notify": true
+        },
+        {
+          "id": "d1",
+          "name": "DEFCON 1 - actively exploited",
+          "trigger": "evidence the finding is being exploited in the wild",
+          "staffing": "all hands, operator woken",
+          "autonomy": "nothing autonomous beyond reading; every external action needs the operator",
+          "demote": "exploitation ended",
+          "notify": true
+        }
+      ]
+    },
+    "trading-desk": {
+      "name": "Trading desk",
+      "description": "Capital risk states. Escalation is driven by drawdown and volatility, never by profit (a good day is still DEFCON 5).",
+      "levels": [
+        {
+          "id": "s5",
+          "name": "STEADY - normal ops",
+          "trigger": "drawdown under 2% and volatility within the model's expected band",
+          "staffing": "1 analyst",
+          "autonomy": "paper trades and analysis freely; live orders only inside the pre-approved playbook",
+          "demote": "never (baseline)",
+          "notify": false
+        },
+        {
+          "id": "s4",
+          "name": "ELEVATED - watch",
+          "trigger": "drawdown 2-5% or volatility above the 80th percentile",
+          "staffing": "analyst + reviewer",
+          "autonomy": "reduce position sizes; no new strategies; log every order with a reason",
+          "demote": "two calm sessions in a row",
+          "notify": false
+        },
+        {
+          "id": "s3",
+          "name": "CAUTION - defensive",
+          "trigger": "drawdown 5-10%",
+          "staffing": "full desk",
+          "autonomy": "close or hedge into the defensive book; no new entries",
+          "demote": "drawdown recovered under 5%",
+          "notify": true
+        },
+        {
+          "id": "s2",
+          "name": "HIGH - capital freeze",
+          "trigger": "drawdown 10-15% or an exchange/outage incident",
+          "staffing": "full desk + operator informed",
+          "autonomy": "flatten risk only; every action reported, none initiated without the operator",
+          "demote": "operator reviews and re-authorizes",
+          "notify": true
+        },
+        {
+          "id": "s1",
+          "name": "CRITICAL - full stop",
+          "trigger": "drawdown over 15%, or funds moved unexpectedly",
+          "staffing": "all hands, operator woken",
+          "autonomy": "read-only. Report. Nothing moves without the operator.",
+          "demote": "operator-led incident review closes it",
+          "notify": true
+        }
+      ]
+    },
+    "on-call": {
+      "name": "On-call watch",
+      "description": "Keeping services and monitors healthy. Escalation follows alert severity and how much of the tank's own work is impacted.",
+      "levels": [
+        {
+          "id": "c5",
+          "name": "GREEN - all clear",
+          "trigger": "no open alerts",
+          "staffing": "the assigned watcher",
+          "autonomy": "routine checks, dashboards, minor fixes",
+          "demote": "never (baseline)",
+          "notify": false
+        },
+        {
+          "id": "c4",
+          "name": "AMBER - degraded",
+          "trigger": "a non-blocking monitor is failing",
+          "staffing": "watcher + whoever owns the surface",
+          "autonomy": "diagnose and fix inside the affected service",
+          "demote": "monitor green for an hour",
+          "notify": false
+        },
+        {
+          "id": "c3",
+          "name": "ORANGE - user impact",
+          "trigger": "agents or the player are visibly blocked",
+          "staffing": "watcher + senior on the affected surface",
+          "autonomy": "restarts, rollbacks, and mitigations allowed; log each one",
+          "demote": "impact gone and cause identified",
+          "notify": true
+        },
+        {
+          "id": "c2",
+          "name": "RED - tank down",
+          "trigger": "the tank itself is unreachable or a data-loss risk exists",
+          "staffing": "all hands, operator woken",
+          "autonomy": "restore service; no schema or destructive changes",
+          "demote": "service restored, incident review opened",
+          "notify": true
+        },
+        {
+          "id": "c1",
+          "name": "BLACK - data loss",
+          "trigger": "evidence of actual data loss or breach",
+          "staffing": "all hands, operator woken",
+          "autonomy": "preserve evidence, restore from backup, change nothing else",
+          "demote": "operator-led review closes it",
+          "notify": true
+        }
+      ]
+    }
+  }
+}

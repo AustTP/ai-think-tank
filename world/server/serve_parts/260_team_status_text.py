@@ -86,6 +86,30 @@ def _team_status_text(max_chars=1600):
     lines.append('TASK STATUS COUNTS: ' + ', '.join(f'{k}={v}' for k, v in sorted(counts.items())))
     if attention:
         lines.append('NEEDS ATTENTION (stuck/failed):\n' + '\n'.join(attention[:8]))
+    # Team-defined activation levels (see 199_team_doctrine): permanent
+    # standing work (trading, bounty, on-call) declares its OWN doctrine --
+    # the tank only displays the CURRENT level and the team's own autonomy
+    # wording, it never imposes a severity vocabulary.
+    try:
+        activation = []
+        for _t in (state.get('teams') or []):
+            if not isinstance(_t, dict):
+                continue
+            _d = _t.get('doctrine')
+            if not isinstance(_d, dict):
+                continue
+            _cur = _d.get('currentLevel')
+            _entry = next((l for l in (_d.get('levels') or [])
+                           if isinstance(l, dict) and l.get('id') == _cur), None)
+            if _entry:
+                _line = f'- {_t.get("name") or _t.get("id")}: {_entry.get("name") or _cur}'
+                if _entry.get('autonomy'):
+                    _line += f' -- {_entry["autonomy"][:120]}'
+                activation.append(_line)
+        if activation:
+            lines.append('ACTIVATION LEVELS (team-defined doctrines):\n' + '\n'.join(activation))
+    except Exception:
+        pass
     try:
         pending_esc = [(eid, e) for eid, e in (_load_escalations() or {}).items()
                        if isinstance(e, dict) and e.get('status') == 'pending']
