@@ -832,10 +832,19 @@ def _apply_content_result(state, task, result, now_ms=None):
     # adds get linted by the next review; same-name overwrites are a no-op).
     written_py = result.get('writtenPy')
     if written_py:
-        task['writtenPy'] = sorted(set(task.get('writtenPy') or []) | set(written_py))
+        # Filter to strings: a dict entry in the result channel would make
+        # set() raise TypeError: unhashable type, killing every pass that
+        # folds the result (and wedging the sim loop -- 2026-11-11).
+        written_py = [w for w in written_py if isinstance(w, str)]
+    if written_py:
+        task['writtenPy'] = sorted(
+            {w for w in (task.get('writtenPy') or []) if isinstance(w, str)}
+            | set(written_py))
         parent = (state.get('tasks') or {}).get(task.get('reviewOf') or '')
         if parent is not None:
-            parent['writtenPy'] = sorted(set(parent.get('writtenPy') or []) | set(written_py))
+            parent['writtenPy'] = sorted(
+                {w for w in (parent.get('writtenPy') or []) if isinstance(w, str)}
+                | set(written_py))
     # Infrastructure-failure tag: a model-call/API failure (not the agent's
     # quality) rides the content result channel so _send_back_after_failure
     # can distinguish it -- no coaching note, no "failed the quality

@@ -30,7 +30,14 @@ def evidence_digest(state, parent):
                 h.update(stream.read(200000))
     sandbox_ids = [parent.get('sandboxId'), f"spike-{parent.get('id')}",
                    f"sb-{parent.get('id')}", f"story-{parent.get('id')}"]
-    names = sorted(set(parent.get('writtenPy') or []))
+    # writtenPy normally holds filename strings; a contaminated result can
+    # smuggle dict entries in, and set()/sorted() on those raises
+    # TypeError: unhashable type -- which killed every sim pass that
+    # recorded the failure (2026-11-11: the dankornas retry family wedged
+    # the loop this way). Keep only strings; a non-string name can't be
+    # opened on disk anyway.
+    names = sorted({n for n in (parent.get('writtenPy') or [])
+                    if isinstance(n, str)})
     for sandbox_id in sandbox_ids:
         if not sandbox_id:
             continue
