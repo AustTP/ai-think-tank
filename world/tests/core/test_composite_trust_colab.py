@@ -221,17 +221,31 @@ class ColabStandbyTests(unittest.TestCase):
             self.assertEqual(popen.call_count, 1, 'a dead forward is recognised and respawned')
         serve._colab_standby_stop_forward()
 
-    def test_standby_reachable_checks_the_loopback_health(self):
+    def test_standby_reachable_probes_the_decision_route(self):
+        # 2026-11-11: fast_path answered /health 200 on the standby port
+        # while 404ing every /v1/systemone call -- a health-only check
+        # declared a standby that could not serve a single decision. The
+        # check now probes the decision route itself.
         with unittest.mock.patch.object(serve.urllib.request, 'urlopen') as u:
             u.return_value.__enter__.return_value.status = 200
             self.assertTrue(serve._colab_standby_reachable())
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen') as u:
+            u.return_value.__enter__.return_value.status = 404
+            self.assertFalse(serve._colab_standby_reachable(),
+                             'a 404 on the decision route is not a standing Laya')
+        with unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        side_effect=serve.urllib.error.HTTPError(
+                                            'u', 405, 'method not allowed',
+                                            hdrs=None, fp=None)):
+            self.assertTrue(serve._colab_standby_reachable(),
+                            '405/422 on GET proves the POST route exists')
         with unittest.mock.patch.object(serve.urllib.request, 'urlopen',
                                         side_effect=OSError('nothing on the port')):
             self.assertFalse(serve._colab_standby_reachable())
         with unittest.mock.patch.object(serve.urllib.request, 'urlopen') as u:
             u.return_value.__enter__.return_value.status = 503
             self.assertFalse(serve._colab_standby_reachable(),
-                             'a non-200 /health is not a standing Laya')
+                             'a 503 route probe is not a standing Laya')
 
     def test_standby_enabled_gates_on_cli_switch_and_opt_in(self):
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \

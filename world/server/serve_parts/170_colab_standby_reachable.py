@@ -1,13 +1,24 @@
 
 
 def _colab_standby_reachable(port=None):
-    """True when laya answers /health through the loopback forward -- the
-    loop trusts this (not the boot exec) before declaring the standby up."""
+    """True when LAYA answers through the loopback forward -- the loop trusts
+    this (not the boot exec) before declaring the standby up.
+
+    Checks the DECISION route, not just /health: the tank's own fast_path
+    server answered /health 200 on the old standby port while 404ing every
+    /v1/systemone call, so a health-only check declared a standby that could
+    not serve (2026-11-11, 32/32 Jev decision failures). /v1/systemone is a
+    POST route; a GET against the real laya comes back 405/422 -- anything
+    but 404 proves the route exists behind this port."""
     port = port or COLAB_STANDBY_PORT
     try:
         with urllib.request.urlopen(  # nosec B310 -- loopback-only by construction
-                f'http://127.0.0.1:{port}/health', timeout=5) as r:
-            return r.status == 200
+                f'http://127.0.0.1:{port}/v1/systemone', timeout=5) as r:
+            return r.status in (200, 405, 422)
+    except urllib.error.HTTPError as e:
+        # A 405/422 from a real laya surfaces as HTTPError on GET; only those
+        # (or a 200) prove the POST route exists behind this port.
+        return e.code in (200, 405, 422)
     except Exception:
         return False
 

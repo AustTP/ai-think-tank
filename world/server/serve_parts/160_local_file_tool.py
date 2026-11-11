@@ -841,7 +841,13 @@ COLAB_FAILOVER_INTERVAL_S = 15 * 60   # 15 min, matching the health cadence
 COLAB_STANDBY_HEALTHY_CYCLES = 2      # consecutive healthy cycles -> teardown
 COLAB_STANDBY_DECISION_PATH = '/v1/systemone'
 COLAB_STANDBY_SESSION = 'think-tank-standby'
-COLAB_STANDBY_PORT = 8939             # loopback; the dev server uses 8936
+# 8941, NOT 8939: the tank's own fast_path server (server/fast_path.py, the
+# deployed plist sets FAST_PORT=8939) owns loopback 8939. Its /health answers
+# 200, so the standby's old /health-only reachability check declared the
+# standby "up" while every decision call hit fast_path's 404 on
+# /v1/systemone -- 32/32 Jev decisions failed for a full hour (2026-11-11).
+# The port moved AND the reachability check now probes the decision route.
+COLAB_STANDBY_PORT = 8941             # loopback; 8937 tank, 8938 village, 8939 fast_path
 COLAB_STANDBY_URL = f'http://127.0.0.1:{COLAB_STANDBY_PORT}'
 COLAB_STANDBY_SSH_KEY = os.path.expanduser('~/.ssh/id_ed25519_colab')
 COLAB_STANDBY_ENABLED = str(_load_env().get('COLAB_STANDBY_ENABLED', '') or '').lower() in ('1', 'true', 'yes')
