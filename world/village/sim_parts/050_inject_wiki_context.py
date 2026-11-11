@@ -355,6 +355,13 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
         'acceptanceCriteria': (extra or {}).get('acceptanceCriteria'),
         'never': (extra or {}).get('never') or None,
         'pipelineStep': (extra or {}).get('pipelineStep'),
+        # DEV-109 continuity: the walk-failure list accumulated by the
+        # reissue chain (queue_work whitelists it onto the item) MUST ride
+        # onto the minted task. Without it every new card started a fresh
+        # list, so the park-after-3-distinct-agents bound never engaged
+        # across generations and a congested door churned ~20 reissues in
+        # an hour (2026-11-11 dankornas submit chain).
+        '_unreachableBy': list((extra or {}).get('_unreachableBy') or []),
         # Bot Ops / shadow mode: a dry-run task (see queue_work). Stamped so the
         # completion path (_task_cycle) captures to the shadow ledger instead of
         # shipping.

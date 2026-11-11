@@ -992,6 +992,10 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # with an empty attendee list even though queue_work preserved them.
         'attendees': pick.get('attendees'),
         'facilitatorId': pick.get('facilitatorId'),
+        # DEV-109 continuity: the reissue chain's accumulated walk-failure
+        # list rides onto the minted task so the park-after-3 bound counts
+        # across generations (see assign_task / _requeue_unreachable_work).
+        '_unreachableBy': pick.get('_unreachableBy'),
     }
     # Cut 2 coaching + runbook injection: append the chosen agent's pending
     # growth-plan note (applied once) and any product runbook knowledge to the

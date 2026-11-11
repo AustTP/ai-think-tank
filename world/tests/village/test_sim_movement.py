@@ -246,6 +246,61 @@ class SimServerOwnedMovement(unittest.TestCase):
         sim._cancel_at_task(state, 'ada')
         self.assertEqual(state.get('workQueue') or [], [])
 
+    def test_minted_task_carries_the_reissue_chains_unreachable_list(self):
+        # 2026-11-11 dankornas churn: the reissue ITEM carried _unreachableBy
+        # but the MINTED task dropped it, so every new generation started a
+        # fresh failure list and the park-after-3 bound never engaged across
+        # the chain. The mint must inherit the accumulated list.
+        grid, doors = sim._load_outdoor_geometry()
+        state = {'sim': {'owner': 'server'},
+                 'agents': {'ada': {'id': 'ada', 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                                    'dir': 'south', 'visible': True, 'busy': False,
+                                    'task': None, 'inRoom': None, 'offDuty': False,
+                                    'path': None, 'pathIndex': 0, 'pathTarget': None,
+                                    'stuckTimer': 0, 'replanCount': 0}},
+                 'tasks': {}, 'agentRoster': [], 'workQueue': []}
+        extra = {'_unreachableBy': ['ben'], 'taskType': 'report'}
+        task = sim.assign_task(state, 'ada', 't', 'pressoffice', 'do it',
+                               None, extra, grid, doors, 1_000, sim._TASK_ID_HOLDER)
+        self.assertIsNotNone(task)
+        self.assertEqual(task['_unreachableBy'], ['ben'],
+                         'the minted task inherits the chain failure list')
+
+    def test_reissue_chain_parks_after_three_failures_across_generations(self):
+        # The full churn bound, END TO END across reissue generations: each
+        # cancel accumulates the failed agent, the reissue item carries the
+        # list, the NEXT generation's minted task inherits it -- so the third
+        # distinct failure parks the chain instead of feeding a fourth walker.
+        grid, doors = sim._load_outdoor_geometry()
+        state = {'sim': {'owner': 'server'}, 'agentRoster': [], 'workQueue': [],
+                 'agents': {}, 'tasks': {}}
+        for name in ('ada', 'ben', 'cal'):
+            state['agents'][name] = {
+                'id': name, 'x': sim.SPAWN['x'], 'y': sim.SPAWN['y'],
+                'dir': 'south', 'visible': True, 'busy': False, 'task': None,
+                'inRoom': None, 'offDuty': False, 'path': None, 'pathIndex': 0,
+                'pathTarget': None, 'stuckTimer': 0, 'replanCount': 0}
+        pick = {'title': 't', 'room': 'pressoffice', 'taskType': 'report',
+                'reissueOf': None, '_unreachableBy': []}
+        failed = []
+        for walker in ('ada', 'ben', 'cal'):
+            pick['_unreachableBy'] = list(failed)
+            holder = sim._TASK_ID_HOLDER
+            task = sim.assign_task(state, walker, pick['title'], pick['room'],
+                                   'do it', None,
+                                   {'_unreachableBy': pick['_unreachableBy'],
+                                    'taskType': 'report'},
+                                   grid, doors, 1_000, holder)
+            self.assertIsNotNone(task)
+            self.assertEqual(task['_unreachableBy'], failed)
+            cancelled = sim._cancel_at_task(state, walker)
+            failed = list(cancelled['_unreachableBy'])
+            pick = state['workQueue'][-1]
+            self.assertEqual(pick['_unreachableBy'], failed)
+        self.assertEqual(failed, ['ada', 'ben', 'cal'])
+        self.assertTrue(pick.get('lane') == 'parking-lot',
+                        'three distinct failed walkers park the chain')
+
     def test_tick_dispatches_task_cancel_release(self):
         # REGRESSION (vela, replanCount 55,350): a walking-task agent whose walk
         # can't progress emits a 'cancel' every tick, and the tick previously

@@ -60,6 +60,26 @@ def _clear_content_residue(state):
     return cleaned
 
 
+def _open_twin_task(state, task):
+    """Another OPEN card (not `task` itself) with the same dedup key, or None.
+    The re-issue guards consult this: re-issuing while a twin is open forks
+    the work into parallel live cards that each run their own reissue chain
+    (the 2026-11-11 dankornas submit chain reached several live twins at
+    once). `card_dedup_key` and the open-status set are 030's; the sim parts
+    share one exec namespace, so both resolve at runtime."""
+    key = card_dedup_key((task or {}).get('title'))
+    if not key:
+        return None
+    own_id = task.get('id')
+    for tid, t in (state.get('tasks') or {}).items():
+        if not isinstance(t, dict) or tid == own_id:
+            continue
+        if t.get('status') in _OPEN_TWIN_STATUSES \
+                and card_dedup_key(t.get('title')) == key:
+            return tid
+    return None
+
+
 def _reconcile_queued_cards(state, now_ms):
     """Re-issue queued cards whose dispatch item vanished without an
     assignment. A dispatch consumes its workQueue item, then the assignment
@@ -87,6 +107,11 @@ def _reconcile_queued_cards(state, now_ms):
         if not isinstance(task, dict) or task.get('status') != 'queued':
             continue
         if tid in issued_for or tid in held:
+            continue
+        # An open twin means the work is already live under another card:
+        # re-issuing this stranded record forks the chain into parallel live
+        # cards. Leave the record for the stale-work sweep to clean up.
+        if _open_twin_task(state, task):
             continue
         key = repr((task.get('title') or '', task.get('room') or ''))
         replans = replan_map.get(key, 0)

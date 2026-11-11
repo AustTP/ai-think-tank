@@ -218,6 +218,24 @@ class QueuedCardReconciler(unittest.TestCase):
         self.assertEqual(len(state2['workQueue']), 0,
                          'a held card is not re-issued')
 
+    def test_orphan_with_an_open_twin_is_not_reissued(self):
+        # 2026-11-11 dankornas churn: re-issuing a stranded 'queued' record
+        # while an OPEN twin (same dedup key) is already walking/working forks
+        # the work into parallel live cards. The rescue must stand down and
+        # leave cleanup to the stale-work sweep.
+        import sim
+        import time
+        now_ms = int(time.time() * 1000)
+        state = self._state()
+        state['tasks']['task-twin'] = {
+            'id': 'task-twin', 'status': 'walking',
+            'title': 'Orphaned merge card', 'room': 'observatory'}
+        sim._stale_work_step(state, time.time(), now_ms)
+        self.assertEqual(
+            [w for w in state['workQueue'] if w.get('reissueOf') == 'task-orphan'],
+            [],
+            'an open twin owns the work; the stranded record is not re-issued')
+
 
 class ReplanCappedLogThrottle(unittest.TestCase):
     """A capped card's log row fires once per 30 minutes per card -- 197
