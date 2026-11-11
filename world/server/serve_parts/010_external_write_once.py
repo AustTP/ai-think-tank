@@ -847,6 +847,46 @@ def init_db():
             created_at  REAL NOT NULL,
             expires_at  REAL NOT NULL
         )''')
+        # Credential health (2026-11-11): consecutive auth-failure streaks per
+        # credential, so an expired/revoked/unusable API key pings the player
+        # instead of silently failing every task that touches it. label is
+        # 'vault:<name>' or 'env:<KEY>' -- env keys are tracked with the same
+        # machinery even though they live outside the vault. notified_at
+        # guards re-ping spam: one alert per failure streak, re-alerted only
+        # after CREDENTIAL_HEALTH_RENOTIFY_S of continued failure.
+        conn.execute('''CREATE TABLE IF NOT EXISTS credential_health (
+            label                   TEXT PRIMARY KEY,
+            kind                    TEXT NOT NULL DEFAULT 'vault',
+            service                 TEXT NOT NULL DEFAULT '',
+            consecutive_failures    INTEGER NOT NULL DEFAULT 0,
+            first_failed_at         REAL,
+            last_failed_at          REAL,
+            last_detail             TEXT NOT NULL DEFAULT '',
+            notified_at             REAL,
+            total_failures          INTEGER NOT NULL DEFAULT 0
+        )''')
+        # Habit Link (2026-11-11): the owner's own browsing habits, collected
+        # by the paired browser extension, aggregated PER HOST PER DAY only.
+        # Metadata, never page content: host, path (query strings are always
+        # stripped before storage), title, dwell, scroll depth, clicks.
+        # Feeds digest ranking and allowlist candidates -- the owner's real
+        # usage is the strongest standing signal a host deserves agent reach.
+        conn.execute('''CREATE TABLE IF NOT EXISTS habit_link_days (
+            host        TEXT NOT NULL,
+            day         TEXT NOT NULL,
+            hits        INTEGER NOT NULL DEFAULT 0,
+            dwell_ms    INTEGER NOT NULL DEFAULT 0,
+            scroll_sum  REAL NOT NULL DEFAULT 0,
+            scroll_n    INTEGER NOT NULL DEFAULT 0,
+            clicks      INTEGER NOT NULL DEFAULT 0,
+            last_ts     REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (host, day)
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS habit_link_seen_hosts (
+            host            TEXT PRIMARY KEY,
+            first_seen_at   REAL NOT NULL,
+            candidate_notified_at REAL
+        )''')
         # Real, persistent record of health anomalies (see
         # compute_health_snapshot) -- a table, not just a print, so an
         # alert survives even if nobody's watching stdout when it fires.

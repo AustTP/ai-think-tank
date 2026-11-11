@@ -176,6 +176,19 @@ def _api_execute(agent_id, agent_key, url, method='GET', req_body=None, req_head
                 f'API CALL FAILED - NO DATA RETURNED. The request did not complete '
                 f'({e}). Report the failure itself; you have NO numbers from this '
                 f'service and must not state any count, price, or event for it.'}
+    # Credential health (see 199): a 401/403 from the service while carrying
+    # its key is the signature of an expired/revoked/unusable credential --
+    # track the streak so the player gets pinged instead of finding out
+    # through a pile of failed tasks. Env-type keys are tracked under their
+    # env name; vault rows under their credential name.
+    _cred_spec = (service or {}).get('credential') or {}
+    if registered and token is not None:
+        _cred_kind = 'env' if _cred_spec.get('type') == 'env' else 'vault'
+        _cred_name = (_cred_spec.get('name') if _cred_kind == 'vault'
+                      else _cred_spec.get('key')) or _api_service_id(service)
+        _credential_note_auth_result(
+            _cred_kind, _cred_name, result.get('status'),
+            f'{result.get("status")} from {parsed.hostname}')
 
     parsed_json, ctype, wrapped, instruction = _api_build_text(result, service, registered, parsed.hostname)
     price_line = _api_price_line(price_quote)

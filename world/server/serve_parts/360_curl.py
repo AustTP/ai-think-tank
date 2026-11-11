@@ -144,6 +144,14 @@ async def curl(request: Request):
         result['body'] = result['body'].replace(secret, '[REDACTED]')
         result['headers'] = {k: (v.replace(secret, '[REDACTED]') if secret in v else v)
                              for k, v in result['headers'].items()}
+        # Credential health: a 401/403 FROM THE SERVICE while carrying this
+        # handle's key is the signature of an expired/revoked/unusable
+        # credential. Track the streak; at the threshold the player is
+        # alerted on the standing health-alert channels (see 199).
+        _credential_note_auth_result(
+            'vault', grant['credential_name'], result.get('status'),
+            f'{result.get("status")} from {urllib.parse.urlparse(url).hostname}')
+
 
     log_action(agent_id, 'curl', {'url': url, 'method': method, 'finalUrl': result['finalUrl'], 'purpose': purpose, 'decision': 'allowed', 'status': result['status'], 'bytes': len(result['body'])}, authorized=authorized, trace_id=trace_id)
     return JSONResponse({'allowed': True, **result})
