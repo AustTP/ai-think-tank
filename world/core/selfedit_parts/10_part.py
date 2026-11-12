@@ -452,9 +452,20 @@ def run_remediation_checks(agent_id):
 
 
 def _target_from_display(display):
-    """display is repo-root-relative ('world/sim.py'); self-edits only ever
-    target world modules, so the real file is basename under world/."""
-    return os.path.join(_world(), os.path.basename(display))
+    """display is repo-root-relative ('world/sim.py',
+    'world/village/sim_parts/030__dispatch_content_work.py'); the real file
+    is that path relative to world/. The old basename-only join flattened
+    every nested target onto world/ and the window's apply pass deferred
+    with 'target missing at apply time' -- no change request had ever
+    targeted a nested module before 2026-11-12."""
+    rel = str(display or '').replace('\\', '/').strip('/')
+    if rel.startswith('world/'):
+        rel = rel[len('world/'):]
+    if not rel or '..' in rel.split('/'):
+        # A traversal display would escape world/ -- refuse by pointing at
+        # nothing (the caller marks the edit conflict).
+        return os.path.join(_world(), '__refused_path__')
+    return os.path.join(_world(), *rel.split('/'))
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import hashlib
+import os
 import types
 
 import selfedit
@@ -60,3 +61,19 @@ def test_apply_kernel(monkeypatch, tmp_path):
     assert selfedit._apply_kernel('r', 'x', sha) == 0
     monkeypatch.setattr(selfedit, '_kernel_argv', lambda: ['x'])
     assert selfedit._apply_kernel('r', 'x', sha) == 1
+
+def test_target_from_display_keeps_nested_paths(monkeypatch):
+    """The 2026-11-12 window deferral: _target_from_display flattened every
+    nested target onto world/ (basename join), so the first change request
+    targeting a nested module (030__dispatch_content_work.py) deferred with
+    'target missing at apply time'. Nested repo-root displays must resolve
+    to their real subpath; a traversal display must never escape world/."""
+    world = selfedit._world()
+    flat = selfedit._target_from_display('world/sim.py')
+    assert flat == os.path.join(world, 'sim.py')
+    nested = selfedit._target_from_display(
+        'world/village/sim_parts/030__dispatch_content_work.py')
+    assert nested == os.path.join(world, 'village', 'sim_parts',
+                                  '030__dispatch_content_work.py')
+    traversal = selfedit._target_from_display('world/../secrets.txt')
+    assert traversal.endswith('__refused_path__')
