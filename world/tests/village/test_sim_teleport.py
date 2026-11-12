@@ -140,5 +140,140 @@ class TeleportAssignment(unittest.TestCase):
         self.assertIsNone(task)
 
 
+def _village_state(ada, villages):
+    state = _state(ada)
+    state['villages'] = list(villages)
+    return state
+
+
+class TeleportVillages(unittest.TestCase):
+    """Cross-village teleport legs: a task filed for another village first
+    teleports the agent to THAT village's access point (access-before-entry),
+    then into the room. Room names repeat across villages, so the door is
+    looked up in the task village's own geometry."""
+
+    def setUp(self):
+        self.grid, self.doors = sim._load_outdoor_geometry()
+
+    def _assign(self, state, extra, teleport=True):
+        with mock.patch.object(serve, '_load_env', return_value=_env(teleport)):
+            return sim.assign_task(state, 'ada', 't', 'pressoffice', 'do it',
+                                   None, extra, self.grid, self.doors, 1_000,
+                                   sim._TASK_ID_HOLDER)
+
+    def test_cross_village_assignment_lands_access_then_room(self):
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'main'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'},
+                                     {'id': 'south', 'name': 'South Village'}])
+        task = self._assign(state, {'villageId': 'south', 'taskType': 'report'})
+        self.assertIsNotNone(task)
+        self.assertEqual(task['status'], 'working')
+        self.assertEqual(task['villageId'], 'south')
+        ada = state['agents']['ada']
+        # identity followed the task: she now BELONGS to the south village
+        self.assertEqual(ada['villageId'], 'south')
+        # and she is inside the room, not stranded at the village gate
+        self.assertEqual(ada['inRoom'], 'pressoffice')
+        self.assertTrue(ada['busy'])
+        # the door front she was placed at is SOUTH's pressoffice door, not
+        # main's -- room names repeat, geometry does not.
+        sdoor = sim._load_outdoor_geometry('south')[1]['pressoffice']
+        self.assertAlmostEqual(ada['x'], sdoor['x'] + sdoor['w'] / 2, places=4)
+        self.assertAlmostEqual(ada['y'], sdoor['y'] + sdoor['h'] + 4, places=4)
+
+    def test_same_village_assignment_skips_the_village_leg(self):
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'south'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'},
+                                     {'id': 'south', 'name': 'South Village'}])
+        task = self._assign(state, {'villageId': 'south', 'taskType': 'report'})
+        self.assertIsNotNone(task)
+        self.assertEqual(task['status'], 'working')
+        ada = state['agents']['ada']
+        self.assertEqual(ada['villageId'], 'south')
+        self.assertEqual(ada['inRoom'], 'pressoffice')
+        sdoor = sim._load_outdoor_geometry('south')[1]['pressoffice']
+        self.assertAlmostEqual(ada['x'], sdoor['x'] + sdoor['w'] / 2, places=4)
+
+    def test_unregistered_village_falls_back_home(self):
+        # 'narnia' is not in state['villages']: the access leg is refused, and
+        # the assignment still happens in the agent's CURRENT village rather
+        # than being lost. Identity never desyncs.
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'main'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'}])
+        task = self._assign(state, {'villageId': 'narnia', 'taskType': 'report'})
+        self.assertIsNotNone(task)
+        self.assertEqual(task['status'], 'working')
+        ada = state['agents']['ada']
+        self.assertEqual(ada['villageId'], 'main')
+        self.assertEqual(ada['inRoom'], 'pressoffice')
+        self.assertAlmostEqual(ada['x'], self.doors['pressoffice']['x']
+                               + self.doors['pressoffice']['w'] / 2, places=4)
+
+    def test_task_village_defaults_to_the_agents_village(self):
+        # A task with no villageId filed for an agent standing in a satellite
+        # village must NOT drag her to main: the room resolves at home.
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'south'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'},
+                                     {'id': 'south', 'name': 'South Village'}])
+        task = self._assign(state, {'taskType': 'report'})
+        self.assertIsNotNone(task)
+        ada = state['agents']['ada']
+        self.assertEqual(ada['villageId'], 'south')
+        self.assertEqual(ada['inRoom'], 'pressoffice')
+
+    def test_teleport_to_village_primitive(self):
+        # The leg-1 primitive is reusable on its own: village -> village and
+        # room -> village land at the target's access point.
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'main'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'},
+                                     {'id': 'south', 'name': 'South Village'},
+                                     {'id': 'winter', 'name': 'Winter Village'}])
+        self.assertTrue(sim._teleport_to_village(state, 'ada', 'south'))
+        ada = state['agents']['ada']
+        self.assertEqual(ada['villageId'], 'south')
+        self.assertIsNone(ada['inRoom'])
+        spot = sim._village_arrival_point('south')
+        self.assertAlmostEqual(ada['x'], spot['x'], places=4)
+        self.assertAlmostEqual(ada['y'], spot['y'], places=4)
+        # village -> village: south -> winter
+        self.assertTrue(sim._teleport_to_village(state, 'ada', 'winter'))
+        self.assertEqual(state['agents']['ada']['villageId'], 'winter')
+        self.assertAlmostEqual(state['agents']['ada']['x'],
+                               sim._village_arrival_point('winter')['x'], places=4)
+
+    def test_teleport_to_village_refusals(self):
+        ada = _agent(sim.SPAWN['x'], sim.SPAWN['y'])
+        ada['villageId'] = 'main'
+        state = _village_state(ada, [{'id': 'main', 'name': 'Main Village'}])
+        # unregistered village: refused, identity untouched
+        self.assertFalse(sim._teleport_to_village(state, 'ada', 'narnia'))
+        self.assertEqual(state['agents']['ada']['villageId'], 'main')
+        # a busy agent is not movable
+        ada['busy'] = True
+        state = _village_state(ada, [{'id': 'main'}, {'id': 'south'}])
+        self.assertFalse(sim._teleport_to_village(state, 'ada', 'south'))
+        # unknown agent
+        self.assertFalse(sim._teleport_to_village(state, 'ghost', 'south'))
+
+    def test_arrival_points_are_inside_the_map(self):
+        # Every constant access point sits inside the world bounds and, for
+        # the villages with their own geometry, on walkable ground.
+        for village in ('main', 'south', 'winter'):
+            spot = sim._village_arrival_point(village)
+            self.assertGreaterEqual(spot['x'], 0)
+            self.assertGreaterEqual(spot['y'], 0)
+            self.assertLessEqual(spot['x'], sim.GROUND_W)
+            self.assertLessEqual(spot['y'], sim.GROUND_H)
+
+    def test_unknown_village_arrival_falls_back_to_main(self):
+        self.assertEqual(sim._village_arrival_point('narnia'),
+                         sim._village_arrival_point('main'))
+
+
 if __name__ == '__main__':
     unittest.main()

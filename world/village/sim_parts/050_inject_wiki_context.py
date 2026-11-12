@@ -288,6 +288,51 @@ def _teleport_assignment():
         return False
 
 
+def _village_arrival_point(village):
+    """Where a traveler LANDS when entering `village` -- its access point.
+    Mirrors the client's scene spawns (world.js SCENES): a satellite arrival
+    is the inside face of its connecting road/gate, and a return to main lands
+    just north of the south_outlet. A schematic village id without constants
+    falls back to main's arrival point, matching _load_outdoor_geometry's
+    fall-back-to-main-files rule so position and geometry can never disagree."""
+    points = {
+        'main': {'x': (448 + 44) * SCALE, 'y': 370 * SCALE - 10},
+        'south': {'x': 320 * SCALE - 10, 'y': 34 * SCALE},
+        'winter': {'x': 12, 'y': 29 * 8 * SCALE},
+    }
+    return dict(points.get(village) or points['main'])
+
+
+def _teleport_to_village(state, agent_id, village_id):
+    """Leg 1 of a cross-village teleport: relocate a free agent to `village_id`'s
+    access point ("accessing the other village first"). The identity flip goes
+    through set_agent_village, so a village that is not registered in
+    state['villages'] is refused (False) rather than desyncing an agent from
+    the village registry. Pure bookkeeping: clears any transit fields, stands
+    the agent outdoors at the arrival point, logs sim_arrive kind='village'.
+    Callers then run their own leg 2 (into a room, or stay outdoors)."""
+    agents = state.get('agents') or {}
+    a = agents.get(agent_id)
+    if not a or a.get('busy') or a.get('task'):
+        return False
+    if not set_agent_village(state, agent_id, village_id):
+        return False
+    spot = _village_arrival_point(village_id)
+    a['x'], a['y'] = spot['x'], spot['y']
+    a['path'] = None
+    a['pathIndex'] = 0
+    a['pathTarget'] = None
+    a['stuckTimer'] = 0
+    a['replanCount'] = 0
+    a['respawnedForTask'] = False
+    a['visible'] = True
+    a['inRoom'] = None
+    from serve import log_action
+    log_action(None, 'sim_arrive', {'kind': 'village', 'agent': agent_id,
+                                    'village': village_id}, authorized=True)
+    return True
+
+
 def assign_task(state, agent_id, title, room, instructions, project_label,
                 extra, grid, doors, now_ms, task_id_holder):
     """Port of tasks.js assignTask (deterministic -- no JEV, the chosen agent is
@@ -299,22 +344,52 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     nextTaskId counter across ticks (server in-memory, like the JS module var).
     With TELEPORT_ASSIGNMENT=1 the walk half is skipped: the agent is placed
     at the door front and _arrive_at_task fires immediately (see
-    _teleport_assignment), so a pathless map can no longer fail an assignment."""
+    _teleport_assignment), so a pathless map can no longer fail an assignment.
+    Cross-village work resolves in legs: a task filed for another village first
+    teleports the agent to THAT village's access point (leg 1, the
+    access-before-entry rule) and then into the room (leg 2, same tick). A
+    village teleport that is refused (target not in state['villages']) falls
+    back to working the same-named room in the agent's current village rather
+    than losing the assignment."""
     room = resolve_room_with_overflow(state, room)
     agents = state.get('agents') or {}
     a = agents.get(agent_id)
     door = (doors or {}).get(room)
-    if not a or a.get('busy') or a.get('task') or not door:
+    teleport = _teleport_assignment()
+    # The caller-passed doors are the agent's CURRENT village geometry; a
+    # cross-village teleport validates the room against the TASK village's
+    # doors below, so the early gate only enforces the walk-mode prerequisite.
+    if not a or a.get('busy') or a.get('task'):
+        return None
+    if not teleport and not door:
         return None
 
-    target_x = door['x'] + door['w'] / 2
-    target_y = door['y'] + door['h'] + 4
-    teleport = _teleport_assignment()
     if teleport:
+        # The room's door is looked up in the TASK's village geometry: room
+        # names repeat across villages and each village has its own map.
+        task_village = ((extra or {}).get('villageId')
+                        or village_of_agent(state, agent_id) or DEFAULT_VILLAGE)
+        if task_village != village_of_agent(state, agent_id) \
+                and not _teleport_to_village(state, agent_id, task_village):
+            # Access refused (unregistered village): work the same-named room
+            # at home. Geometry falls back to main files, so coordinates stay
+            # consistent -- the assignment is never lost to a village gap.
+            task_village = village_of_agent(state, agent_id)
+        if task_village in (DEFAULT_VILLAGE, 'main'):
+            tdoors = doors
+        else:
+            _tgrid, tdoors = _load_outdoor_geometry(task_village)
+        door = (tdoors or {}).get(room)
+        if not door:
+            return None
+        target_x = door['x'] + door['w'] / 2
+        target_y = door['y'] + door['h'] + 4
         # One synthetic step: the arrive path consumes a non-empty path, and
         # the door front is where a real walk would have stopped anyway.
         path = [{'x': target_x, 'y': target_y}]
     else:
+        target_x = door['x'] + door['w'] / 2
+        target_y = door['y'] + door['h'] + 4
         path = find_path(a['x'], a['y'], target_x, target_y, agent_id, agents, grid)
     if not path:
         # An idle agent standing in a corridor must not permanently block the
