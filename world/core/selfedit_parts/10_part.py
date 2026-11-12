@@ -138,12 +138,25 @@ def _run_post_apply_tests():
 
 
 PRE_APPLY_IGNORE = (
-    '.git', '.github', 'agents', 'sandboxes', 'library', 'datasets',
-    'think-tank-db-backups', 'design-references', 'tinyprobe_test',
+    '.git', '.github', 'think-tank-db-backups', 'design-references',
+    'tinyprobe_test',
     '__pycache__', '.pytest_cache', '.mypy_cache', 'node_modules',
     '.selfedit_staging', '.selfedit_backups', '.selfedit_failed',
     'think_tank.db', '*.db', '*.db.bak*', '.env*', '.youtube-cookies.txt',
+    # Runtime browser-session state: the Chrome profile's Singleton* files
+    # vanish between the directory listing and the copy (the live browser
+    # owns them) and one vanished file aborts the whole copytree with a
+    # shutil.Error triple-list -- the pre-apply gate never ran while an
+    # agent browser was up (observed 2026-11-12). The gate compiles/tests
+    # Python; browser profiles carry nothing it reads.
+    '.browser-profiles',
 )
+# `agents/` is deliberately NOT ignored: serve's own header imports
+# agents.memory/training_capture/browser_session, and the 2026-11-12 copy
+# died on `No module named agents` before the gate could even start.
+# `library/` and `sandboxes/` stay in too: the skill-prompt tests load
+# library/skills and the prototype tests import sandboxes/sb-p1 -- the gate
+# must test the tree the CI gate sees, not a hollowed-out one.
 
 # The pre-apply copy must not carry real credentials. Keys whose names look
 # secret get a placeholder value; everything else (numbers, booleans, URLs,
@@ -224,6 +237,12 @@ def _run_pre_apply_tests(rows):
         shutil.copytree(repo_root, tmp,
                         ignore=shutil.ignore_patterns(*PRE_APPLY_IGNORE),
                         dirs_exist_ok=True)
+        # `.env*` keeps real secrets out of the copy, but it also swallows
+        # `.env.template`, which the env-template contract test reads -- put
+        # the public template back (it documents keys; it carries no values).
+        template = os.path.join(repo_root, '.env.template')
+        if os.path.isfile(template):
+            shutil.copy2(template, os.path.join(tmp, '.env.template'))
         _write_preapply_env(repo_root, tmp)
         db_path, err = _init_preapply_db(tmp)
         if err:

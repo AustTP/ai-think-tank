@@ -108,8 +108,15 @@ class ColabStandbyTests(unittest.TestCase):
                         'the standby is loopback-only by construction')
         # _colab_standby_enabled() also requires the colab CLI to be present
         # (machine state) -- pin it so the chain under test is deterministic.
+        # A LIVE ssh forward is also required (2026-11-12: a torn-down
+        # standby's route stays OFF the chain so it stops tripping spurious
+        # circuit breakers) -- pin one so the chain under test is deterministic.
+        live = {'pid': 1, 'proc': object(), 'session': 'think-tank-standby'}
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
-             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True):
+             unittest.mock.patch.object(serve, 'COLAB_STANDBY_ENABLED', True), \
+             unittest.mock.patch.object(serve, '_COLAB_STANDBY_FORWARD', live), \
+             unittest.mock.patch.object(serve.os, 'kill',
+                                        side_effect=lambda pid, sig: None):
             self.assertEqual(serve._decision_model_chain(),
                              ['primary-x', serve.COLAB_STANDBY_URL + serve.COLAB_STANDBY_DECISION_PATH],
                              'the standby trails the chain as the LAST fallback')

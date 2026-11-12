@@ -6,6 +6,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent.parent
 TEMPLATE = ROOT / '.env.template'
 WORLD = ROOT / 'world'
 IGNORE = {'PYTEST_CURRENT_TEST', 'PYTHONPATH'}
+# Runtime directories a failed window preserves INSIDE world/: their copies
+# of production files re-read every env key and would shadow the live tree
+# in this scan (the 2026-11-12 preserved pre-apply copies did exactly that).
+SKIP_DIRS = {'tests', '__pycache__', '.selfedit_staging', '.selfedit_backups',
+             '.selfedit_failed'}
 
 READ_PATTERNS = (
     re.compile(r"(?:_load_env\(\)\.get|os\.environ\.get|os\.getenv)\(\s*['\"]([A-Z][A-Z0-9_]*)['\"]"),
@@ -16,7 +21,7 @@ READ_PATTERNS = (
 
 def _production_files():
     for path in WORLD.rglob('*.py'):
-        if 'tests' in path.parts or '__pycache__' in path.parts:
+        if SKIP_DIRS & set(path.parts) or path.parts[-1].startswith('.'):
             continue
         yield path
 
