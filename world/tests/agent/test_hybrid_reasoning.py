@@ -162,13 +162,17 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
                                         lambda *a, **k: rows.append((a, k))):
             content._hybrid_prepare({}, 'ruth', task, {})
 
+        # Only the hybrid_mode rows are this test's contract: a background
+        # worker finishing late can legitimately log an unrelated action
+        # (live 2026-11-12: a leftover chat thread's api_key_auth_failure
+        # row landed inside the mock window on CI) and must not fail this.
+        hy = [r for r in rows if r[0][1] == 'hybrid_mode']
         self.assertEqual(
-            len(rows), 1,
+            len(hy), 1,
             f'unexpected log rows: {[(a[0], a[1], str(a[2])[:120]) for a, _k in rows]}')
-        args, kwargs = rows[0]
+        args, kwargs = hy[0]
         # log_action(agent_id, action, details, authorized=...)
         self.assertEqual(args[0], 'ruth')
-        self.assertEqual(args[1], 'hybrid_mode')
         row = args[2]
         self.assertEqual(row.get('task'), task['id'])
         # and no memory file was written
@@ -194,10 +198,13 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
             digest = content._hybrid_prepare({}, 'ruth', task, {})
 
         self.assertEqual(digest, '')
+        # Same contract scoping as the test above: only hybrid_mode rows
+        # count here; late background logging is not this test's business.
+        hy = [r for r in rows if r[0][1] == 'hybrid_mode']
         self.assertEqual(
-            len(rows), 1,
+            len(hy), 1,
             f'unexpected log rows: {[(a[0], a[1], str(a[2])[:120]) for a, _k in rows]}')
-        row = rows[0][0][2]
+        row = hy[0][0][2]
         self.assertEqual(row.get('decision'), 'latent-failed')
         err = row.get('error') or ''
         self.assertIn('replyKeys', err)
