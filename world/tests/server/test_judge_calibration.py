@@ -47,6 +47,10 @@ def setUpModule():
 def tearDownModule():
     _PATCHER.stop()
     shutil.rmtree(_TMP_DIR, ignore_errors=True)
+    # In-memory breaker state is process-global: leave it exactly as found
+    # so no later suite inherits an armed key or model breaker.
+    serve._api_key_health.clear()
+    serve._model_circuit_state.clear()
 
 
 def _wipe():
@@ -232,7 +236,13 @@ class TapeMeta(unittest.TestCase):
             captured['questions'] = questions
             raise RuntimeError('stop before the network')
 
+        # BOTH transports are stubbed: the chat-completions fallback now
+        # rides the shared egress path, and an unstubbed leg would make REAL
+        # OpenRouter calls whose 401s arm the api-key breaker for every
+        # later test in the process (the 2026-11-12 egress-suite poisoning).
         with unittest.mock.patch.object(serve, '_decision_request', fake_request), \
+             unittest.mock.patch.object(serve, '_decision_via_chat_completions',
+                                        fake_request), \
              unittest.mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'):
             with self.assertRaises(Exception):
                 serve._call_openrouter_decision_sync(
