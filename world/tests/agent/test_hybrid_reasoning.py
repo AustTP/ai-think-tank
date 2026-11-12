@@ -19,7 +19,6 @@ serve._http_json; the chat-handler injection is tested through the handler
 function directly with TestClient-style callables faked at the boundary.
 """
 
-import importlib
 import os
 import sys
 import tempfile
@@ -163,7 +162,9 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
                                         lambda *a, **k: rows.append((a, k))):
             content._hybrid_prepare({}, 'ruth', task, {})
 
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            len(rows), 1,
+            f'unexpected log rows: {[(a[0], a[1], str(a[2])[:120]) for a, _k in rows]}')
         args, kwargs = rows[0]
         # log_action(agent_id, action, details, authorized=...)
         self.assertEqual(args[0], 'ruth')
@@ -193,7 +194,9 @@ class HybridPrepareRunsLatentPass(unittest.TestCase):
             digest = content._hybrid_prepare({}, 'ruth', task, {})
 
         self.assertEqual(digest, '')
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            len(rows), 1,
+            f'unexpected log rows: {[(a[0], a[1], str(a[2])[:120]) for a, _k in rows]}')
         row = rows[0][0][2]
         self.assertEqual(row.get('decision'), 'latent-failed')
         err = row.get('error') or ''
