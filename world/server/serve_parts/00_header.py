@@ -130,6 +130,8 @@ from integrations.bank import (  # noqa: E402,F401
     _record_unpriced_usage,
     _task_unpriced_blocked,
     _resolve_unpriced_usage,
+    _ALLOWANCE_NOTIFIED,
+    _note_allowance_exhausted,
     _apify_budget_exceeded,
     _apify_budget_month,
     _apify_spend_this_month,

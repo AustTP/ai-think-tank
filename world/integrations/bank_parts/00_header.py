@@ -547,7 +547,15 @@ def _think_tank_spend_cap_exceeded():
         ledger[_serve._SPEND_CAP_BASELINE_KEY] = {'period': period, 'baseline': total}
         _serve._spend_ledger_write(ledger)
         return False
-    return (total - baseline) >= _serve.SPEND_CAP_USD
+    exceeded = (total - baseline) >= _serve.SPEND_CAP_USD
+    _note_allowance_exhausted(
+        'monthlySpend',
+        f'Monthly USD spend cap reached (${_serve.SPEND_CAP_USD:.2f}/month)',
+        f'Tracked spend this month: ${total - baseline:.2f}. Every paid '
+        'chokepoint now refuses until next month (or raise SPEND_CAP_USD in '
+        '.env and restart -- deliberately manual, no live reset).',
+        exceeded)
+    return exceeded
 
 
 def _spend_cap_month_view():
@@ -942,7 +950,15 @@ def _page_budget_exhausted():
     import serve as _serve
     if not _serve.PAGE_REQUEST_MONTHLY_BUDGET:
         return False
-    return _serve._page_budget_used() >= _serve.PAGE_REQUEST_MONTHLY_BUDGET
+    exceeded = _serve._page_budget_used() >= _serve.PAGE_REQUEST_MONTHLY_BUDGET
+    _note_allowance_exhausted(
+        'pageRequests',
+        f'Monthly page-request budget exhausted ({_serve.PAGE_REQUEST_MONTHLY_BUDGET}/month)',
+        f'{_serve._page_budget_used()} external page requests used this month. '
+        'Browsing and search_web refuse until next month (or raise '
+        'PAGE_REQUEST_MONTHLY_BUDGET in .env).',
+        exceeded)
+    return exceeded
 
 
 @_serialized_ledger
@@ -1004,6 +1020,45 @@ def _high_tier_budget_exceeded():
     import serve as _serve
     if not _serve.HIGH_TIER_MONTHLY_BUDGET_USD:
         return False
-    return _serve._high_tier_spend_this_month() >= _serve.HIGH_TIER_MONTHLY_BUDGET_USD
+    exceeded = _serve._high_tier_spend_this_month() >= _serve.HIGH_TIER_MONTHLY_BUDGET_USD
+    _note_allowance_exhausted(
+        'highTier',
+        f'High-tier model budget exhausted (${_serve.HIGH_TIER_MONTHLY_BUDGET_USD:.2f}/month)',
+        f'High-tier spend this month: ${_serve._high_tier_spend_this_month():.2f}. '
+        'New high-tier calls fail closed to the mid tier until next month '
+        '(or raise HIGH_TIER_MONTHLY_BUDGET_USD in .env).',
+        exceeded)
+    return exceeded
+
+
+# The operator learns an allowance is GONE the same way everything else
+# reaches them: the standing health-alert pipeline. The latch fires on the
+# False->True transition only (one alert per trip; the pipeline's own
+# (category, severity) dedup window absorbs restart re-fires), and a fresh
+# month or a raised cap re-arms it silently -- the month-view endpoints
+# remain the "how much is left" view.
+_ALLOWANCE_NOTIFIED = {}
+
+
+def _note_allowance_exhausted(kind, subject, body, active):
+    """Emit ONE 'allowance' health alert when `kind` first trips. Never
+    raises: an allowance is a visibility feature, and a notification failure
+    must never turn into a rejection of the real work being gated."""
+    active = bool(active)
+    if _ALLOWANCE_NOTIFIED.get(kind) == active:
+        return
+    _ALLOWANCE_NOTIFIED[kind] = active
+    if not active:
+        return
+    try:
+        import serve as _serve
+        alerts = _serve._persist_new_health_alerts([{
+            'category': 'allowance', 'severity': 'critical',
+            'message': f'{subject}. {body}',
+        }])
+        if alerts:
+            _serve._push_new_health_alerts(alerts)
+    except Exception:  # noqa: BLE001 -- never break the gated call
+        pass
 
 
