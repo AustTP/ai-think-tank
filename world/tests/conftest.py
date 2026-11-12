@@ -185,6 +185,29 @@ def _reset_credit_pause():
 
 
 @pytest.fixture(autouse=True)
+def _reset_breakers():
+    """Keep one test's armed circuit breakers from leaking into the next.
+
+    The model-circuit and api-key-health dicts are process-global (like the
+    credit pause above). A single test that exercises a REAL 401 path -- e.g.
+    a decision test whose fallback transport is left unstubbed -- records
+    auth failures that block OpenRouter for every later test in the run
+    (2026-11-12: the judge-calibration/ask-telegram cross-file poisoning).
+    """
+    def reset():
+        try:
+            import serve
+        except Exception:
+            return
+        serve._api_key_health.clear()
+        serve._model_circuit_state.clear()
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
 def _clear_unpriced_receipts():
     """Keep a mocked no-cost task call from blocking an unrelated later test."""
     yield
