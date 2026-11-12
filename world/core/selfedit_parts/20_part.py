@@ -78,6 +78,26 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 # before the push). Labeling routine work as tank-down is a Rule 12
 # violation of the same kind as labeling it emergency.
 WINDOW_MIN_LEAD_S = 12 * 60 * 60
+
+
+def _owner_min_lead_s():
+    """Owner-configurable notice for NORMAL change requests, in hours, via
+    the CHANGE_WINDOW_MIN_LEAD_HOURS env key. The constitution default stays
+    WINDOW_MIN_LEAD_S (12h). The owner may lower it when they are personally
+    authorizing a request (they watch it fire) -- the veto link, supervisor
+    review, validator, and rollback all still apply; 0 explicitly waives
+    notice. An unreadable value fails SAFE to the default rule, not shorter."""
+    serve = _s()
+    raw = serve._load_env().get('CHANGE_WINDOW_MIN_LEAD_HOURS')
+    if raw is None:
+        return WINDOW_MIN_LEAD_S
+    try:
+        hours = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return WINDOW_MIN_LEAD_S
+    if hours <= 0:
+        return 0
+    return hours * 3600.0
 WINDOW_MAX_LEAD_S = 7 * 24 * 60 * 60
 WINDOW_EMERGENCY_MIN_LEAD_S = 60 * 60
 WINDOW_TANK_DOWN_MIN_LEAD_S = 0
@@ -666,7 +686,7 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                                 'the think tank from running'}
     min_lead = (WINDOW_TANK_DOWN_MIN_LEAD_S if tank_down else
                 (WINDOW_EMERGENCY_MIN_LEAD_S if emergency
-                 else WINDOW_MIN_LEAD_S))
+                 else _owner_min_lead_s()))
     if start_ts < now + min_lead:
         if tank_down:
             pass  # the tank is down: the window may start now
@@ -675,9 +695,12 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
                                     'least 1 hour from now -- the owner '
                                     'still needs a chance to veto'}
         else:
-            return False, {'error': 'the window must start at least 12 hours '
-                                    'from now -- change requests need half a '
-                                    'day of notice so the owner can review '
+            hours = min_lead / 3600.0
+            lead_txt = (f'{int(hours)} hours' if hours == int(hours)
+                        else f'{hours:g} hours')
+            return False, {'error': f'the window must start at least '
+                                    f'{lead_txt} from now -- change requests '
+                                    'need notice so the owner can review '
                                     'and veto'}
     if start_ts > now + WINDOW_MAX_LEAD_S:
         return False, {'error': 'the window may not be more than 7 days out '
