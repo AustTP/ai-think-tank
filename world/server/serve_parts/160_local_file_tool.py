@@ -410,7 +410,11 @@ def _decision_via_chat_completions(slug, state, questions):
     payload = json.dumps({
         'model': slug,
         'messages': [{'role': 'user', 'content': prompt}],
-        'max_tokens': 200,
+        # Reasoning models spend tokens THINKING before the JSON: a 200 cap
+        # made glm-5.3 finish with reason=length and content=None (the whole
+        # budget went to the preamble). The JSON reply itself is tiny; give
+        # the reasoning room.
+        'max_tokens': 2000,
     }).encode()
     req = urllib.request.Request(
         'https://openrouter.ai/api/v1/chat/completions',

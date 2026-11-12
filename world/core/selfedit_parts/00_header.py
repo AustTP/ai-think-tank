@@ -855,10 +855,26 @@ def _validate(edit_id, resolved, candidate):
         shutil.copytree(_world(), tmp,
                         ignore=shutil.ignore_patterns(
                             '__pycache__', '.selfedit_staging',
-                            '.selfedit_backups', '.selfedit_failed'),
+                            '.selfedit_backups', '.selfedit_failed',
+                            # Runtime browser-session state: the Chrome
+                            # profile's Singleton* sockets vanish between
+                            # the directory listing and the copy (the live
+                            # browser owns them), and one vanished file
+            # aborts the whole copytree with a shutil.Error triple-list --
+            # the quarantine never validates while an agent browser is up
+            # (observed 2026-11-12). The gate only compiles/lints/imports;
+            # browser profiles carry nothing it reads.
+                            '.browser-profiles'),
+                        ignore_dangling_symlinks=True,
                         dirs_exist_ok=True)
-        with open(os.path.join(tmp, os.path.basename(resolved)), 'w',
-                  encoding='utf-8') as fh:
+        # The candidate lands at its REAL tree-relative path, not flat in the
+        # staging root: the repo's flake8 per-file-ignores are path-globbed
+        # (*\u2060/sim_parts/*.py: F821...), so a flat staged copy surfaced
+        # cross-part F821s the live tree is exempt from (2026-11-12).
+        rel_parts = os.path.relpath(resolved, _world()).split(os.sep)
+        staged_target = os.path.join(tmp, *rel_parts)
+        os.makedirs(os.path.dirname(staged_target), exist_ok=True)
+        with open(staged_target, 'w', encoding='utf-8') as fh:
             fh.write(candidate)
         py = sys.executable
         step = subprocess.run([py, '-m', 'compileall', '-q', tmp],
@@ -868,6 +884,18 @@ def _validate(edit_id, resolved, candidate):
         else:
             checks.append('compileall ok')
         is_python = str(resolved).endswith('.py')
+        # A fragment of a source split (sim_parts / serve_parts /
+        # content_parts / selfedit_parts...) is EXEC-assembled into its
+        # module: standalone flake8 sees undefined names that the assembly
+        # defines in a sibling part (030's WORK_PRIORITY lives in 020), and
+        # a standalone import is meaningless. For fragments the honest
+        # pre-checks are compileall + a flake8 BASELINE DIFF (the candidate
+        # must not ADD findings the original file lacks); the window's
+        # post-apply repo gate is the real bar. 030's traceback-splice was
+        # the first part-file change request and died here (2026-11-12).
+        _dir = os.path.dirname(resolved)
+        is_part_fragment = (_parts_dir(resolved) is not None
+                            or os.path.basename(_dir).endswith('_parts'))
         if not is_python:
             # HTML/JS/CSS assets are valid change-request targets. Python's
             # flake8 and import smoke do not apply; the repo gate still runs
@@ -877,17 +905,36 @@ def _validate(edit_id, resolved, candidate):
             # serve.py deliberately imports after config/root setup (E402) and
             # predates this gate; the full preflight suite is its real bar.
             checks.append('flake8 skipped for the kernel')
+        elif is_part_fragment:
+            def _flake_pairs(target):
+                out = subprocess.run(
+                    [py, '-m', 'flake8', target, '--max-line-length=100'],
+                    capture_output=True, text=True, timeout=180)
+                pairs = set()
+                for line in (out.stdout or '').splitlines():
+                    # path:line:col: CODE message -- line numbers shift with
+                    # the splice, so the identity is (code, message).
+                    tail = line.split(':', 3)
+                    if len(tail) == 4:
+                        pairs.add((tail[3].strip()))
+                return pairs
+            baseline = _flake_pairs(resolved)
+            staged = _flake_pairs(staged_target)
+            fresh = staged - baseline
+            if fresh:
+                errors.append('flake8: ' + ' | '.join(sorted(fresh)[:6]))
+            else:
+                checks.append('flake8 ok (no new findings vs the original)')
         else:
             flake = subprocess.run(
-                [py, '-m', 'flake8',
-                 os.path.join(tmp, os.path.basename(resolved)),
+                [py, '-m', 'flake8', staged_target,
                  '--max-line-length=100'],
                 capture_output=True, text=True, timeout=180)
             if flake.returncode != 0:
                 errors.append('flake8: ' + (flake.stdout or flake.stderr)[-400:])
             else:
                 checks.append('flake8 ok')
-        if is_python and not is_kernel(resolved):
+        if is_python and not is_kernel(resolved) and not is_part_fragment:
             modname = os.path.splitext(os.path.basename(resolved))[0]
             smoke_src = (f'import sys; sys.path.insert(0, {tmp!r}); '
                          f'import {modname}')
