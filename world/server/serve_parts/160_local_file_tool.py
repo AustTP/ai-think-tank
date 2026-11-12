@@ -412,9 +412,11 @@ def _decision_via_chat_completions(slug, state, questions):
         'messages': [{'role': 'user', 'content': prompt}],
         # Reasoning models spend tokens THINKING before the JSON: a 200 cap
         # made glm-5.3 finish with reason=length and content=None (the whole
-        # budget went to the preamble). The JSON reply itself is tiny; give
-        # the reasoning room.
-        'max_tokens': 2000,
+        # budget went to the preamble). glm-5.3 also MANDATES reasoning --
+        # disabling it 400s -- so cap its effort instead; 'low' keeps the
+        # preamble tiny and the JSON answer within budget.
+        'max_tokens': 3000,
+        'reasoning': {'effort': 'low'},
     }).encode()
     req = urllib.request.Request(
         'https://openrouter.ai/api/v1/chat/completions',
