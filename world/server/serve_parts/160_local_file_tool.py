@@ -333,9 +333,19 @@ def _normalize_decision_questions(questions):
         record = {}
         for item in criteria:
             if isinstance(item, dict):
-                key = str(item.get('id') or '').strip()
+                # Call sites use TWO list-item shapes: {id, description} (the
+                # shape this normalizer was written for) and {name, criteria}
+                # (the shape _jev_quorum_choice_sync / every decider actually
+                # builds). The id-only read produced an EMPTY record for the
+                # name-shape: every decision went out offering zero options,
+                # which is exactly the model-answers-garbage instability that
+                # looked like flaky providers. Accept both, plus bare strings.
+                key = str(item.get('id') or item.get('name') or '').strip()
+                text = str(item.get('description') or item.get('criteria') or '')
                 if key:
-                    record[key] = str(item.get('description') or '')
+                    record[key] = text
+            elif isinstance(item, str) and item.strip():
+                record[item.strip()] = item.strip()
         public['choice'] = {**choice, 'criteria': record}
     return public
 
@@ -362,6 +372,90 @@ def _decision_request(model, state, questions):
         },
         method='POST',
     )
+
+
+def _decision_via_chat_completions(slug, state, questions):
+    """Chat-completions transport for one decision call.
+
+    The /api/alpha/decisions endpoint is experimental and has already broken
+    twice under us: first the criteria shape (fixed by
+    _normalize_decision_questions), then on 2026-11-12 it rejected EVERY
+    model id with 'Model ... does not exist' while the same slugs kept
+    answering on the standard /v1/chat/completions -- so all Jev decisions
+    degraded to deterministic fallbacks tank-wide (18/18 failures in one
+    hour, escalation storms, edits reviewers unavailable). The typed
+    endpoint stays FIRST choice; this plain-text protocol is the per-slug
+    fallback INSIDE the failover loop, so an alpha-endpoint outage costs
+    latency, not decisions.
+
+    Returns the same {answers, usage} shape _jev_choice parses; a reply that
+    carries no parseable choice yields answers WITHOUT a choice key, which
+    _jev_choice reads as (None, 0.0) -- fail closed, never a confident
+    hallucination."""
+    questions = _normalize_decision_questions(questions)
+    choice_q = (questions or {}).get('choice') or {}
+    instructions = choice_q.get('instructions') or ''
+    criteria = choice_q.get('criteria') or {}
+    if isinstance(criteria, dict):
+        options = '\n'.join(f'- {k}: {v}' for k, v in criteria.items())
+        names = list(criteria.keys())
+    else:
+        options = '\n'.join(f'- {c}' for c in criteria)
+        names = list(criteria)
+    prompt = (f'{instructions}\n\nChoose exactly one of these options by NAME:\n{options}\n\n'
+              'Reply with ONLY a JSON object, no other text, in this exact shape:\n'
+              '{"choice": "<the name of one option, copied exactly>", "confidence": <0.0 to 1.0>}\n'
+              'The choice value MUST be one of these exact names: '
+              f'{", ".join(names) if names else "(none provided)"}')
+    payload = json.dumps({
+        'model': slug,
+        'messages': [{'role': 'user', 'content': prompt}],
+        'max_tokens': 200,
+    }).encode()
+    req = urllib.request.Request(
+        'https://openrouter.ai/api/v1/chat/completions',
+        data=payload,
+        headers={
+            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    data = json.loads(_urlopen_with_resilience(req, timeout=45))
+    text = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '')
+    usage = (data.get('usage') or {}) if isinstance(data.get('usage'), dict) else {}
+    parsed = None
+    try:
+        # The model was told JSON-only; find the first {...} block anyway.
+        start = text.find('{')
+        end = text.rfind('}')
+        if 0 <= start < end:
+            parsed = json.loads(text[start:end + 1])
+    except Exception:
+        parsed = None
+    if not isinstance(parsed, dict) or not parsed.get('choice'):
+        # Last resort: a bare option name as the whole reply.
+        low = (text or '').strip().lower()
+        parsed = next(({'choice': n} for n in names
+                       if n and n.lower() in low), None)
+    answer = {}
+    if isinstance(parsed, dict) and parsed.get('choice'):
+        raw = str(parsed['choice']).strip()
+        # The protocol wants the option NAME, but models echo criterion TEXT
+        # or paraphrase ('Yes' instead of 'approve'). Accept the name exactly,
+        # then case-insensitively; an unmatchable answer is NO answer (the
+        # caller fails closed) -- never a fabricated option.
+        if raw in names:
+            answer['choice'] = raw
+        else:
+            low = raw.lower()
+            answer['choice'] = next((n for n in names if n.lower() == low), None)
+        conf = parsed.get('confidence')
+        answer['confidence'] = conf if isinstance(conf, (int, float)) else 0.0
+        if answer['choice'] is None:
+            answer = {}
+    cost = usage.get('cost', 0.0)
+    return {'answers': {'choice': answer}, 'usage': {'cost': cost}}
 
 
 def _finalize_decision(data, prompt, criteria, trace_id, model, village_id=None, kind=None, meta=None):
@@ -632,12 +726,31 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     for slug in chain:
         try:
             data = json.loads(_urlopen_with_resilience(_decision_request(slug, state, questions), timeout=30))
-        except Exception as e:
-            attempted.append(slug)
-            last_error = e
+        except Exception:
+            # The typed endpoint failed for this slug. Before giving the slug
+            # up entirely, try the same choice protocol over the STANDARD
+            # chat-completions transport (see _decision_via_chat_completions
+            # for why: the alpha endpoint has broken endpoint-wide while the
+            # plain one kept answering). A fallback answer counts as the
+            # slug succeeding; a fallback failure counts as it failing.
+            try:
+                data = _decision_via_chat_completions(slug, state, questions)
+            except Exception as fallback_exc:
+                attempted.append(slug)
+                last_error = fallback_exc
+                if armed:
+                    record_model_result(slug, False)
+                continue
             if armed:
-                record_model_result(slug, False)
-            continue
+                record_model_result(slug, True)
+            tape_meta = dict(tape_meta or {})
+            tape_meta['transport'] = 'chat-fallback'
+            if _jev_choice(data)[0] is not None:
+                # Cache only decisions that actually chose something: an
+                # unparseable reply is an outage-shaped result, not a fact
+                # about this question worth remembering for the TTL.
+                _decision_cache_put(model, state, questions, data, cache_chain)
+            return _finalize_decision(data, prompt, criteria, trace_id, slug, village_id=village_id, kind=kind, meta=tape_meta)
         if armed:
             record_model_result(slug, True)
         _decision_cache_put(model, state, questions, data, cache_chain)
