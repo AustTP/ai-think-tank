@@ -258,6 +258,36 @@ def _spawn_at_room_door(state, agent_id, room, agents, grid, doors):
     a['x'], a['y'] = chosen or (base_x, base_y)
 
 
+def _teleport_assignment():
+    """TELEPORT_ASSIGNMENT (.env; default '0' = walk). When '1', task
+    assignment TELEPORTS the assigned agent to the room's door front and
+    arrives in the same tick, instead of issuing a walking path.
+
+    Why this switch exists: the observed walk overhead is pathing, not
+    distance -- the map is 13s end-to-end at TASK_WALK_SPEED, but live walks
+    measure median 52s / p90 234s (4x-18x direct-line) from doors, crowding,
+    and re-pathing. Worse, a walk can FAIL, and failure is the only mechanism
+    in the tank that loses work outright: cancel -> requeue with an
+    _unreachableBy skip-list -> after 3 distinct failed agents the card parks
+    (task_parked_unreachable) and dies into the parking lot. Teleport makes
+    reachability total: assignment cannot fail for path reasons, so the whole
+    stuck/parked failure tree goes unreachable-by-construction. Measured cost
+    of keeping walking: ~4 agent-hours/day of busy walking (2026-11-12, 137
+    walks) -- small, but the parkings are not.
+
+    The arrive bookkeeping (status, room presence, desk position, content
+    dispatch, workUntil) is the REAL _arrive_at_task, so every downstream
+    consumer sees exactly what a completed walk produces -- just with zero
+    transit time. Read at call time so a .env flip takes effect on the next
+    assignment without a restart. Pair/handoff navigation is untouched
+    (client-owned sessions keep their own movement)."""
+    import serve
+    try:
+        return (serve._load_env().get('TELEPORT_ASSIGNMENT') or '0').strip() == '1'
+    except Exception:  # noqa: BLE001 -- a broken env read walks, as before
+        return False
+
+
 def assign_task(state, agent_id, title, room, instructions, project_label,
                 extra, grid, doors, now_ms, task_id_holder):
     """Port of tasks.js assignTask (deterministic -- no JEV, the chosen agent is
@@ -266,7 +296,10 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     task/path and the durable state['tasks'] mirror, logs task_assigned.
     Returns the task dict, or None on failure (-> caller requeues/attempt++).
     `task_id_holder` is a mutable init([count]) carrying the server's
-    nextTaskId counter across ticks (server in-memory, like the JS module var)."""
+    nextTaskId counter across ticks (server in-memory, like the JS module var).
+    With TELEPORT_ASSIGNMENT=1 the walk half is skipped: the agent is placed
+    at the door front and _arrive_at_task fires immediately (see
+    _teleport_assignment), so a pathless map can no longer fail an assignment."""
     room = resolve_room_with_overflow(state, room)
     agents = state.get('agents') or {}
     a = agents.get(agent_id)
@@ -276,7 +309,13 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
 
     target_x = door['x'] + door['w'] / 2
     target_y = door['y'] + door['h'] + 4
-    path = find_path(a['x'], a['y'], target_x, target_y, agent_id, agents, grid)
+    teleport = _teleport_assignment()
+    if teleport:
+        # One synthetic step: the arrive path consumes a non-empty path, and
+        # the door front is where a real walk would have stopped anyway.
+        path = [{'x': target_x, 'y': target_y}]
+    else:
+        path = find_path(a['x'], a['y'], target_x, target_y, agent_id, agents, grid)
     if not path:
         # An idle agent standing in a corridor must not permanently block the
         # room. Retry against the STATIC map only. This still honors walls and
@@ -407,6 +446,25 @@ def assign_task(state, agent_id, title, room, instructions, project_label,
     }
     state.setdefault('tasks', {})[task_id] = task
     a['task'] = task_id
+    if teleport:
+        # Skip the transit entirely: stand at the door front and arrive in the
+        # same bookkeeping a real walk would produce (status -> working, room
+        # presence, desk position, content dispatch / workUntil). pathTarget
+        # stays None because there is nothing left to walk toward.
+        a['x'], a['y'] = target_x, target_y
+        a['path'] = None
+        a['pathIndex'] = 0
+        a['pathTarget'] = None
+        a['stuckTimer'] = 0
+        a['replanCount'] = 0
+        a['respawnedForTask'] = False
+        from serve import log_action
+        log_action(agent_id, 'task_assigned',
+                   {'taskId': task_id, 'title': title, 'room': room}, authorized=True)
+        log_action(None, 'sim_arrive', {'kind': 'task', 'agent': agent_id},
+                   authorized=True)
+        _arrive_at_task(state, agent_id, now=now_ms / 1000.0)
+        return task
     a['path'] = path
     a['pathIndex'] = 0
     a['pathTarget'] = {'x': target_x, 'y': target_y}
