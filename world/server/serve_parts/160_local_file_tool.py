@@ -767,11 +767,31 @@ def _decision_model_chain():
     # Laya provider is advertised so the failover can reach it during an outage
     # -- nothing is registered, keyed, or paired; like every OpenRouter
     # candidate it is just a chain entry that _decision_request routes by '://'.
-    if _colab_standby_enabled():
+    # A TORN-DOWN standby (teardown after healthy cycles) owns no forward, so
+    # advertising the route would only trip its breaker on every sweep --
+    # 14 spurious model_circuit_broken rows overnight (2026-11-12). Advertise
+    # it only while its forward process is actually alive.
+    if _colab_standby_enabled() and _colab_standby_forward_alive():
         provider = COLAB_STANDBY_URL.rstrip('/') + COLAB_STANDBY_DECISION_PATH
         if provider not in chain:
             chain.append(provider)
     return chain
+
+
+def _colab_standby_forward_alive():
+    """Cheap liveness for the ssh forward: a held pid that still exists for
+    the CURRENT session. No network probe -- the /v1/systemone reachability
+    poll (15-min cadence) is what actually raises/tears the standby down;
+    this only keeps a torn-down standby's route OFF the decision chain."""
+    state = _COLAB_STANDBY_FORWARD
+    pid = state.get('pid')
+    if pid is None or not state.get('session'):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
 def _provider_key_of(slug):

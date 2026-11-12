@@ -495,6 +495,8 @@ _TELEGRAM_HELP = (
     '/plans -- plans waiting for approval\n'
     '/approve <planId> [version] -- approve and apply a plan\n'
     '/reject <planId> [version] [reason] -- reject a plan\n'
+    '/cr -- change requests awaiting action (with veto codes)\n'
+    '/veto <code> [reason] -- veto a change request\n'
     '/status -- agent, task, and queue counts\n'
     '/prices [service] -- API price catalog, budgets, and drift\n'
     '/help -- this list\n'
@@ -624,6 +626,43 @@ async def _telegram_operator_command(chat_id, text):
         return chat_id, '\n'.join(lines)
     if verb == 'status':
         return chat_id, _telegram_status_text()
+    if verb in ('cr', 'change-requests'):
+        # Active change requests with their veto codes (owner direction
+        # 2026-11-12: veto from Telegram without copying a link).
+        try:
+            import serve as _serve_mod
+            rows = _serve_mod._selfedit.active_window_rows(8)
+        except Exception as e:  # noqa: BLE001 -- a listing must never kill the bridge
+            return chat_id, f'Could not read change requests: {e}'
+        if not rows:
+            return chat_id, 'No pending or approved change requests.'
+        lines = [f'{len(rows)} change request(s):']
+        for r in rows:
+            title = (r.get('title') or r.get('reason') or '(untitled)')[:70]
+            lines.append(f"{r['id']} [{r.get('status')}] {r.get('date')} "
+                         f"{r.get('start')} ({r.get('duration_min')}min) "
+                         f'code={_serve_mod._selfedit._veto_code(r["id"])}')
+            lines.append(f'  {title}')
+        lines.append('Veto with /veto <code> [reason].')
+        return chat_id, '\n'.join(lines)
+    if verb == 'veto':
+        if not args:
+            return chat_id, 'Usage: /veto <code> [reason]'
+        code = args[0]
+        reason = ' '.join(args[1:]).strip() or 'Vetoed from Telegram'
+        try:
+            import serve as _serve_mod
+            ok, payload = _serve_mod._selfedit.veto_window_by_code(code, reason)
+        except Exception as e:  # noqa: BLE001
+            return chat_id, f'Veto failed: {e}'
+        if ok:
+            window_id = (payload or {}).get('id')
+            log_action('player', 'selfedit_window_vetoed',
+                       {'windowId': window_id, 'code': code,
+                        'reason': reason[:300], 'via': f'telegram:{chat_id}'},
+                       authorized=True)
+            return chat_id, f'Vetoed {window_id or code}.'
+        return chat_id, (payload or {}).get('error') or 'Veto failed.'
     return chat_id, f'Unknown command /{verb}.\n' + _TELEGRAM_HELP
 
 

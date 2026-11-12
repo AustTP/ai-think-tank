@@ -499,10 +499,54 @@ def window_validator(window_id):
     return _window_field(window_id, 'validator')
 
 
+def _veto_code(window_id):
+    """The short veto code for a change request: the first 10 chars of the
+    window's veto token. Telegram cannot click a URL mid-sentence reliably
+    and the operator should not have to copy a 32-char token out of a
+    message, so the created-message carries the code and the bridge's
+    /veto command matches it (prefix compare, constant-time)."""
+    row = _window_row(window_id) or {}
+    return str(row.get('veto_token') or '')[:10]
+
+
+def active_window_rows(limit=8):
+    """Pending/approved change requests, newest first -- the /cr listing."""
+    with _s()._db() as conn:
+        conn.row_factory = sqlite3.Row
+        _ensure_windows_table(conn)
+        rows = conn.execute(
+            "SELECT * FROM dormancy_windows "
+            "WHERE status IN ('pending', 'approved') "
+            'ORDER BY created DESC LIMIT ?', (limit,)).fetchall()
+    return [dict(r) for r in (rows or [])]
+
+
+def veto_window_by_code(code, reason='Vetoed from Telegram'):
+    """Owner veto by the short code from the change-request Telegram message.
+    Matches pending/approved windows by 10-char token prefix; the full token
+    also matches (a leaked prefix only lets the operator VETO, never
+    approve, so the shorter form is safe to print in a chat). Fails closed
+    when nothing matches and delegates every status rule to veto_window."""
+    code = str(code or '').strip()
+    if not code:
+        return False, {'error': 'usage: /veto <code> [reason]'}
+    with _s()._db() as conn:
+        _ensure_windows_table(conn)
+        rows = conn.execute(
+            "SELECT id, veto_token FROM dormancy_windows "
+            "WHERE status IN ('pending', 'approved')").fetchall()
+    for window_id, token in rows or []:
+        token = str(token or '')
+        if token and secrets.compare_digest(token[:len(code)], code):
+            return veto_window(window_id, 'player', (reason or 'Vetoed from Telegram')[:300])
+    return False, {'error': 'no pending change request matches that code'}
+
+
 def _telegram_change_request_created(window_id):
     """Player Telegram message when a change request is created, with the
-    details needed to judge it and a one-click veto link. The link is
-    token-gated and needs no login. Telegram caps a message at 4096 chars."""
+    details needed to judge it, a one-click veto link, and the short veto
+    code for the bridge's /veto command. The link is token-gated and needs
+    no login. Telegram caps a message at 4096 chars."""
     row = _window_row(window_id) or {}
     token = row.get('veto_token') or ''
     base = _s().ESCALATION_BASE_URL.rstrip('/')
@@ -524,6 +568,7 @@ def _telegram_change_request_created(window_id):
         f'mode: {row.get("service_mode") or "idle_ok"}\n'
         f'Files: {", ".join(str(f) for f in files) or "(none)"}\n'
         f'Reason: {(row.get("reason") or "")[:500]}\n\n'
+        f'Veto code: {_veto_code(window_id)} (reply /veto <code>)\n'
         f'Veto this change request: {veto_url}'
     )
     return _notify_player_telegram('[AI Think Tank] Change request created',

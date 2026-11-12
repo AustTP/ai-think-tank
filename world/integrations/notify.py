@@ -444,13 +444,30 @@ def create_escalation(kind, question, on_approve_note='', what_checked='', look_
     except Exception:
         pass
 
-    # Human-only kinds (floor >= 1.0) notify the player immediately -- the
-    # director loop is barred from them, so the email link IS the only path.
-    # Delegable kinds (floor < 1.0) stay SILENT here: the director loop
-    # resolves them on its next pass; the human is notified only if the
-    # director gives up (ask cap / judge-drift circuit, see the loop).
+    # Owner direction 2026-11-12: the operator does not make the tank's
+    # safety calls. Human-only kinds (floor >= 1.0 -- the director chain is
+    # barred from approving them) used to page the player for an override
+    # and then sit pending in limbo; now they resolve TANK-SIDE at creation:
+    # the block STANDS and the digest channel sees it. The requester's own
+    # tool refusal already told them the command is blocked and to find
+    # another route. Delegable kinds (floor < 1.0) stay SILENT here: the
+    # director loop resolves them on its next pass, and a chain that
+    # exhausts fails closed tank-side too (see the escalation loop) --
+    # never a player page.
     if _serve._escalation_floor(kind) >= 1.0:
-        notify_human_of_escalation(esc_id, escalations[esc_id])
+        denied = escalations[esc_id]
+        denied['status'] = 'denied'
+        denied['resolvedBy'] = ('hard-blocked kind: the tank fails closed '
+                                '(the operator does not make tank safety calls)')
+        denied['resolvedAt'] = time.time()
+        try:
+            _serve._push_new_health_alerts([{
+                'category': 'safety', 'severity': 'info',
+                'message': (f'Hard-blocked {kind} for '
+                            f'{agent_id or "?"} denied tank-side; the block '
+                            'stands and no operator action is needed.')}])
+        except Exception:
+            pass
     return esc_id
 
 def _verify_escalation_checksum(serve_mod):

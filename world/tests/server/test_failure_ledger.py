@@ -24,7 +24,6 @@ import os
 import shutil
 import sys
 import tempfile
-import time
 import unittest
 import unittest.mock
 
@@ -33,7 +32,7 @@ import unittest.mock
 # a missing module and the whole file silently covers nothing.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-import serve
+import serve  # noqa: E402
 
 _FAILURE_TYPES = serve.FAILURE_TYPES
 _MODULE_TMP_DIR = None
@@ -229,59 +228,60 @@ class MineRuleProposals(_LedgerTestCase):
 
 
 class CreateEscalationTwoLineHandoff(unittest.TestCase):
-    # Message-FORMAT tests: they use a HUMAN-ONLY kind (floor 1.0) because
-    # that is the kind that still notifies at creation. Delegable kinds are
-    # silent at creation (see CreateEscalationRouting below) -- their notify
-    # fires when the director loop gives up, not here.
+    # Message-FORMAT tests: they call notify_human_of_escalation DIRECTLY.
+    # Owner direction 2026-11-12: creation no longer pages the player (a
+    # floor-1.0 kind denies at creation; a delegable kind fails closed at
+    # chain exhaustion), but the message format contract still holds for the
+    # operator-linked surfaces that use this notifier.
+    _ESC = {'id': 'esc-x', 'token': 'tok', 'kind': 'blocked command',
+            'question': 'Q?', 'status': 'denied'}
+
     def test_email_carries_two_line_handoff(self):
         sent = {}
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
-             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
-             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+        with unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b)), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
-            serve.create_escalation('blocked command', 'Q?',
-                                    what_checked='Graded 3 requirements', look_first='Q?')
+            serve.notify_human_of_escalation(
+                'esc-x', dict(self._ESC, question='Q?',
+                              whatChecked='Graded 3 requirements',
+                              lookFirst='Q?'))
         self.assertIn('What I checked: Graded 3 requirements', sent['body'])
         self.assertIn('Look here first: Q?', sent['body'])
 
     def test_defaults_when_lines_empty(self):
         sent = {}
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
-             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
-             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+        with unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b)), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync', return_value=False):
-            serve.create_escalation('blocked command', 'the question')
+            serve.notify_human_of_escalation(
+                'esc-x', dict(self._ESC, question='the question'))
         self.assertIn('What I checked: (see question)', sent['body'])
         self.assertIn('Look here first: the question above', sent['body'])
 
     def test_telegram_push_carries_resolve_links(self):
         sent = {}
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
-             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
-             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+        with unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync', return_value=False), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync',
                                         side_effect=lambda s, b: sent.update(subject=s, body=b) or True):
-            esc_id = serve.create_escalation('blocked command', 'Story X is frozen')
+            serve.notify_human_of_escalation(
+                'esc-x', dict(self._ESC, question='Story X is frozen'))
         self.assertIn('Approve: http://x/api/escalation/resolve?id=', sent['body'])
         self.assertIn('Deny: http://x/api/escalation/resolve?id=', sent['body'])
-        self.assertIn(esc_id, sent['body'])
+        self.assertIn('esc-x', sent['body'])
         self.assertIn('Story X is frozen', sent['body'])
 
     def test_telegram_truncates_body_but_keeps_urls(self):
         sent = {}
         huge_q = 'q' * 10000
-        with unittest.mock.patch.object(serve, '_load_escalations', return_value={}), \
-             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
-             unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
+        with unittest.mock.patch.object(serve, 'ESCALATION_BASE_URL', 'http://x'), \
              unittest.mock.patch.object(serve, '_send_escalation_email_sync', return_value=False), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync',
                                         side_effect=lambda s, b: sent.update(body=b) or True):
-            serve.create_escalation('blocked command', huge_q)
+            serve.notify_human_of_escalation(
+                'esc-x', dict(self._ESC, question=huge_q))
         self.assertLessEqual(len(sent['body']), 4096, 'Telegram hard cap')
         self.assertIn('Approve: http://x/api/escalation/resolve?id=', sent['body'])
         self.assertIn('Deny: http://x/api/escalation/resolve?id=', sent['body'])
@@ -303,9 +303,11 @@ class CreateEscalationDedup(unittest.TestCase):
 
     def test_pending_duplicate_is_reused_not_recreated(self):
         load, save, email, tg, store = self._patched()
-        with load, save, email, tg:
-            first = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
-            second = serve.create_escalation('blocked command', 'Agent ada wants to run: cat > x.py')
+        with load, save, email, tg, \
+             unittest.mock.patch.object(serve, '_push_new_health_alerts', lambda a: None):
+            # A DELEGABLE kind stays pending, so the dedup guard applies.
+            first = serve.create_escalation('allowlist candidate', 'Agent ada wants host.example')
+            second = serve.create_escalation('allowlist candidate', 'Agent ada wants host.example')
         self.assertEqual(first, second, 'same pending kind+question reuses the existing escalation')
         self.assertEqual(len(store), 1, 'no duplicate record is created')
 
@@ -348,12 +350,28 @@ class CreateEscalationRouting(unittest.TestCase):
             esc_id = serve.create_escalation(kind, question)
         return esc_id, sent
 
-    def test_human_only_kind_notifies_at_creation(self):
-        # floor 1.0: the director can never resolve it -- the human MUST hear
-        # about it now or it waits forever with no ping.
-        _esc_id, sent = self._create('blocked command')
-        self.assertEqual(len(sent['email']), 1)
-        self.assertEqual(len(sent['tg']), 1)
+    def test_human_only_kind_denies_at_creation(self):
+        # Owner direction 2026-11-12: the operator does not make the tank's
+        # safety calls. floor 1.0: the director can never resolve it, so
+        # instead of paging the player (the old behavior) it DENIES at
+        # creation -- the block stands, nobody is pinged.
+        esc_id, sent = self._create('blocked command')
+        self.assertEqual(sent['email'], [], 'no owner page at creation')
+        self.assertEqual(sent['tg'], [], 'no owner page at creation')
+        with unittest.mock.patch.object(serve, '_load_escalations',
+                                        return_value={esc_id: {'status': 'denied'}}):
+            pass
+        # the created record itself was denied
+        self.assertEqual(esc_id, esc_id)  # identity; the record assertion lives below
+        # re-create against a real store to assert the record's status
+        store = {}
+        with unittest.mock.patch.object(serve, '_load_escalations', return_value=store), \
+             unittest.mock.patch.object(serve, '_save_escalations', lambda d: None), \
+             unittest.mock.patch.object(serve, '_send_escalation_email_sync', lambda s, b: None), \
+             unittest.mock.patch.object(serve, 'send_player_telegram_sync', lambda s, b: False), \
+             unittest.mock.patch.object(serve, '_push_new_health_alerts', lambda a: None):
+            new_id = serve.create_escalation('blocked command', 'Q?')
+        self.assertEqual(store[new_id]['status'], 'denied')
 
     def test_allowlist_request_is_delegable_silent_at_creation(self):
         # Operator decision 2026-10-13: 'allowlist request' dropped from
@@ -403,8 +421,12 @@ class CreateEscalationRouting(unittest.TestCase):
                                         side_effect=lambda s, b: bodies.append(b)), \
              unittest.mock.patch.object(serve, 'send_player_telegram_sync',
                                         side_effect=lambda s, b: True):
-            serve.create_escalation('blocked command', 'rm -rf /tmp/x was requested')
-        self.assertEqual(len(bodies), 1, 'floor-1.0 kind still notifies at creation')
+            serve.notify_human_of_escalation(
+                'esc-x', {'id': 'esc-x', 'token': 'tok', 'kind': 'blocked command',
+                          'question': 'rm -rf /tmp/x was requested'},
+                context='creation page (function retained for the operator-linked kinds)')
+        self.assertEqual(len(bodies), 1,
+                         'the handoff message carries the two-line contract')
         self.assertIn('What is blocked:', bodies[0])
         self.assertIn('Suggested call:', bodies[0])
         self.assertIn('did NOT run', bodies[0])
@@ -425,9 +447,11 @@ class CreateEscalationRouting(unittest.TestCase):
 
 
 class DirectorGivesUpNotifiesHuman(unittest.TestCase):
-    """The director loop's give-up transitions notify the human ONCE (the
-    humanNotified flag), for the two ways it abandons a delegable kind: the
-    re-ask cap, and a tripped judge-drift circuit."""
+    """Owner direction 2026-11-12: the operator does not make the tank's
+    safety calls. The director loop's give-up transitions now FAIL CLOSED
+    tank-side (deny + digest note, humanNotified set), for the two ways it
+    abandons a delegable kind: the re-ask cap, and a tripped judge-drift
+    circuit. No player page is sent."""
 
     def _run_resolver(self, esc, drift=0):
         pending_id = 'esc-giveup'
@@ -443,30 +467,33 @@ class DirectorGivesUpNotifiesHuman(unittest.TestCase):
             self.addCleanup(patcher.stop)
         sent = []
         with unittest.mock.patch.object(serve, 'notify_human_of_escalation',
-                                        side_effect=lambda eid, e, context='': sent.append(context)):
+                                        side_effect=lambda eid, e, context='': sent.append(context)), \
+             unittest.mock.patch.object(serve, '_push_new_health_alerts',
+                                        side_effect=lambda a: sent.append('digest')):
             serve._resolve_pending_escalations_sync()
         return sent
 
-    def test_all_rungs_tried_notifies_once(self):
+    def test_all_rungs_tried_fails_closed_once(self):
         esc = {'status': 'pending', 'kind': 'allowlist candidate', 'question': 'host?',
                'askCount': 0, 'lastAskedAt': 0,
                '_immediateTried': True, '_seniorTried': True, '_adminTried': True}
         sent = self._run_resolver(esc)
-        self.assertEqual(len(sent), 1, 'the exhausted chain must notify once')
+        self.assertEqual(sent, ['digest'], 'the exhausted chain denies tank-side, digest-only')
         self.assertTrue(esc.get('humanNotified'))
-        self.assertEqual(esc['status'], 'pending', 'give-up leaves it pending for the human link')
+        self.assertEqual(esc['status'], 'denied', 'give-up denies; no player page')
+        self.assertIn('fails closed', esc.get('resolvedBy') or '')
         sent2 = self._run_resolver(esc)
         self.assertEqual(sent2, [], 'humanNotified guards against repeat pings')
 
-    def test_judge_drift_tripped_notifies_once(self):
+    def test_judge_drift_tripped_fails_closed_once(self):
         esc = {'status': 'pending', 'kind': 'allowlist candidate', 'question': 'host?',
                'askCount': 0, 'lastAskedAt': 0}
         sent = self._run_resolver(esc, drift=serve.ESCALATION_JUDGE_DRIFT_CIRCUIT)
-        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent, ['digest'])
         self.assertTrue(esc.get('humanNotified'))
-        self.assertEqual(esc['status'], 'pending')
+        self.assertEqual(esc['status'], 'denied')
         sent2 = self._run_resolver(esc, drift=serve.ESCALATION_JUDGE_DRIFT_CIRCUIT)
-        self.assertEqual(sent2, [], 'drift-branch notify is also once-only')
+        self.assertEqual(sent2, [], 'drift-branch deny is also once-only')
 
 
 class RuleProposalsEndpoint(_LedgerTestCase):

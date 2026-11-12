@@ -296,6 +296,37 @@ _STALE_DENY_KINDS = ('owner safety decision', 'allowlist candidate',
                      'allowlist request', 'dormancy window request')
 
 
+def _fail_closed_chain_exhausted(esc_id, esc):
+    """Owner direction 2026-11-12: the operator does not make the tank's
+    safety calls. When the full director chain declines or cannot decide a
+    delegable safety question -- rungs exhausted, judge-drift circuit, or an
+    admin model that could not decide -- the tank FAILS CLOSED: the request
+    is denied, the digest channel sees it, and no player page is sent. The
+    stale-TTL deny already worked this way (see _expire_stale_escalation);
+    this just removes the 6-hour limbo in the middle."""
+    esc['status'] = 'denied'
+    esc['resolvedBy'] = ('the full director chain declined or could not '
+                         'decide; the tank fails closed (the operator does '
+                         'not make tank safety calls)')
+    esc['resolvedAt'] = time.time()
+    esc['humanNotified'] = True
+    log_action(None, 'escalation_fail_closed', {
+        'escalationId': esc_id, 'kind': (esc or {}).get('kind'),
+        'requester': (esc or {}).get('agentId'),
+        'reason': 'director chain exhausted; denied tank-side, no owner page'},
+        authorized=False)
+    try:
+        _push_new_health_alerts([{
+            'category': 'coordination', 'severity': 'info',
+            'message': (f'Escalation {esc_id} ({(esc or {}).get("kind")}) from '
+                        f'{(esc or {}).get("agentId") or "?"} was denied '
+                        'tank-side: the director chain could not decide it. '
+                        'No operator action needed.')}])
+    except Exception:
+        pass
+    return True
+
+
 def _dormancy_window_start(esc_id, esc=None):
     try:
         with _db() as conn:
@@ -480,26 +511,17 @@ def _resolve_pending_escalations_sync():
         if (esc.get('_modelCooldownUntil') or 0) > now:
             continue
         # Heterogeneous-judge drift circuit: a kind whose judge cross-check has
-        # repeatedly failed closed is taken out of delegation entirely and waits
-        # for the human's link. Notify once, immediately; do not spend a pass
-        # marking rungs or re-asking a chain the judge gate no longer trusts.
+        # repeatedly failed closed is taken out of delegation entirely. Owner
+        # direction 2026-11-12: the tank fails closed tank-side -- the player
+        # is never asked to make a tank safety call.
         if _escalation_judge_drift(esc_kind) >= ESCALATION_JUDGE_DRIFT_CIRCUIT:
             if not esc.get('humanNotified'):
-                esc['humanNotified'] = True
-                notify_human_of_escalation(
-                    esc_id, esc,
-                    context='The director chain could not resolve this automatically '
-                            '(the judge cross-check kept failing closed), so it is now yours.')
+                _fail_closed_chain_exhausted(esc_id, esc)
                 dirty = True
             continue
         if rung is None:
             if not esc.get('humanNotified'):
-                esc['humanNotified'] = True
-                notify_human_of_escalation(
-                    esc_id, esc,
-                    context='The full director chain (the requester\'s managers, the senior '
-                            'directors, and the chief of staff) declined or could not '
-                            'decide this, so it is now yours.')
+                _fail_closed_chain_exhausted(esc_id, esc)
                 dirty = True
             continue
         if rung == 'admin':
@@ -519,12 +541,7 @@ def _resolve_pending_escalations_sync():
             esc.setdefault('_chainTried', []).append(reviewer_id)
             dirty = True
             if not esc.get('humanNotified'):
-                esc['humanNotified'] = True
-                notify_human_of_escalation(
-                    esc_id, esc,
-                    context='The full director chain (the requester\'s managers, the senior '
-                            'directors, and the chief of staff) declined or could not '
-                            'decide this, so it is now yours.')
+                _fail_closed_chain_exhausted(esc_id, esc)
             continue
         esc['lastAskedAt'] = now
         esc['askCount'] = (esc.get('askCount') or 0) + 1
