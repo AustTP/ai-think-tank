@@ -72,13 +72,12 @@ class ChainExhaustedFailsClosed(unittest.TestCase):
 
 class VetoByCode(unittest.TestCase):
     def setUp(self):
-        # One registered window with a known token, in the temp test DB.
+        # One registered window with a known token. The REAL schema comes
+        # from selfedit's own _ensure_windows_table (veto_window writes
+        # note/vetoed_by/vetoed_at/veto_reason -- a hand-rolled table broke
+        # this on the fresh CI database).
         with serve._db() as conn:
-            conn.execute(
-                'CREATE TABLE IF NOT EXISTS dormancy_windows ('
-                'id TEXT PRIMARY KEY, created TEXT, agent TEXT, date TEXT, '
-                'start TEXT, start_ts REAL, end_ts REAL, duration_min INTEGER, '
-                'reason TEXT, status TEXT, veto_token TEXT)')
+            serve._selfedit._ensure_windows_table(conn)
             conn.execute(
                 'INSERT INTO dormancy_windows (id, created, agent, date, start, '
                 'start_ts, end_ts, duration_min, reason, status, veto_token) VALUES '
