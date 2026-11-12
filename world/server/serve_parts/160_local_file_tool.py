@@ -407,17 +407,29 @@ def _decision_via_chat_completions(slug, state, questions):
               '{"choice": "<the name of one option, copied exactly>", "confidence": <0.0 to 1.0>}\n'
               'The choice value MUST be one of these exact names: '
               f'{", ".join(names) if names else "(none provided)"}')
-    data = _call_openrouter_once_sync(
-        slug, [{'role': 'user', 'content': prompt}], 3000,
-        # A freepool band token ('@freepool:low:gemini-free') is NOT a
-        # postable chat-completions model -- the raw urllib transport 400'd
-        # on it (2026-11-12 live: the tank's glm breaker was open, the chain
-        # fell through to the freepool route, and the fallback died on the
-        # slug itself). _call_openrouter_once_sync expands the band to its
-        # current concrete free slug and carries the whole free-pool
-        # fallback + key-rotation machinery, so the decision fallback rides
-        # the same path every other chat call uses.
-        reasoning_override={'effort': 'low'})
+    # The failover loop owns breaker bookkeeping for this slug: the typed
+    # failure is already recorded, and the transport leg must neither
+    # double-count it on failure nor wipe it on success -- so snapshot the
+    # slug's circuit state and restore it after the call.
+    saved_circuit = _model_circuit_state.get(slug)
+    try:
+        data = _call_openrouter_once_sync(
+            slug, [{'role': 'user', 'content': prompt}], 3000,
+            # A freepool band token ('@freepool:low:gemini-free') is NOT a
+            # postable chat-completions model -- the raw urllib transport
+            # 400'd on it (2026-11-12 live: the tank's glm breaker was open,
+            # the chain fell through to the freepool route, and the fallback
+            # died on the slug itself). _call_openrouter_once_sync expands
+            # the band to its current concrete free slug and carries the
+            # whole free-pool fallback + key-rotation machinery, so the
+            # decision fallback rides the same path every other chat call
+            # uses.
+            reasoning_override={'effort': 'low'})
+    finally:
+        if saved_circuit is None:
+            _model_circuit_state.pop(slug, None)
+        else:
+            _model_circuit_state[slug] = saved_circuit
     text = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '')
     usage = (data.get('usage') or {}) if isinstance(data.get('usage'), dict) else {}
     parsed = None
