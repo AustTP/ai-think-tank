@@ -553,7 +553,20 @@ SANDBOX_IMAGE = 'ai-think-tank-work-sandbox'  # world/sandbox/Dockerfile -- has 
 # device. The profile lives outside every agent sandbox and is never committed.
 SAFARI_COOKIES_PATH = os.environ.get(
     'SAFARI_COOKIES_PATH') or os.path.expanduser('~/Library/Cookies/Cookies.binarycookies')
-_SAFARI_SYNC_DOMAINS = ('facebook.com', 'instagram.com')
+# Which domains the consent-gated cookie sync may ever touch. DATA, not code:
+# the operator edits the env var (comma-separated registrable domains) instead
+# of a Python tuple. A domain here is still gated twice more -- SAFARI_COOKIE_
+# CONSENT=1 AND the agent being in SAFARI_COOKIE_AGENTS -- so widening this
+# list alone changes nothing until both consent gates also pass.
+_SAFARI_SYNC_DOMAINS_DEFAULT = ('facebook.com', 'instagram.com')
+
+
+def _safari_sync_domains():
+    raw = _load_env().get('SAFARI_COOKIE_DOMAINS') or ''
+    items = tuple(d.strip().lower() for d in raw.split(',') if d.strip())
+    if not items:
+        return _SAFARI_SYNC_DOMAINS_DEFAULT
+    return items or _SAFARI_SYNC_DOMAINS_DEFAULT
 
 
 def _parse_safari_binarycookies(data):
@@ -617,7 +630,7 @@ def _sync_safari_cookies(agent_id, host):
     if agent_id.strip().lower() not in allowed:
         return 0
     host = host.strip().lower()
-    matched = tuple(d for d in _SAFARI_SYNC_DOMAINS
+    matched = tuple(d for d in _safari_sync_domains()
                     if host == d or host.endswith('.' + d))
     if not matched:
         return 0
