@@ -407,27 +407,17 @@ def _decision_via_chat_completions(slug, state, questions):
               '{"choice": "<the name of one option, copied exactly>", "confidence": <0.0 to 1.0>}\n'
               'The choice value MUST be one of these exact names: '
               f'{", ".join(names) if names else "(none provided)"}')
-    payload = json.dumps({
-        'model': slug,
-        'messages': [{'role': 'user', 'content': prompt}],
-        # Reasoning models spend tokens THINKING before the JSON: a 200 cap
-        # made glm-5.3 finish with reason=length and content=None (the whole
-        # budget went to the preamble). glm-5.3 also MANDATES reasoning --
-        # disabling it 400s -- so cap its effort instead; 'low' keeps the
-        # preamble tiny and the JSON answer within budget.
-        'max_tokens': 3000,
-        'reasoning': {'effort': 'low'},
-    }).encode()
-    req = urllib.request.Request(
-        'https://openrouter.ai/api/v1/chat/completions',
-        data=payload,
-        headers={
-            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        method='POST',
-    )
-    data = json.loads(_urlopen_with_resilience(req, timeout=45))
+    data = _call_openrouter_once_sync(
+        slug, [{'role': 'user', 'content': prompt}], 3000,
+        # A freepool band token ('@freepool:low:gemini-free') is NOT a
+        # postable chat-completions model -- the raw urllib transport 400'd
+        # on it (2026-11-12 live: the tank's glm breaker was open, the chain
+        # fell through to the freepool route, and the fallback died on the
+        # slug itself). _call_openrouter_once_sync expands the band to its
+        # current concrete free slug and carries the whole free-pool
+        # fallback + key-rotation machinery, so the decision fallback rides
+        # the same path every other chat call uses.
+        reasoning_override={'effort': 'low'})
     text = (((data.get('choices') or [{}])[0].get('message') or {}).get('content') or '')
     usage = (data.get('usage') or {}) if isinstance(data.get('usage'), dict) else {}
     parsed = None

@@ -4,7 +4,6 @@ while the same slugs kept answering on /v1/chat/completions. These tests pin
 the two fixes: criteria normalization keeps every call site's option list,
 and the chat-completions fallback parses a reply or yields NO choice (fail
 closed, never a fabricated option)."""
-import json
 import os
 import sys
 import unittest
@@ -53,10 +52,22 @@ class ChatFallbackParse(unittest.TestCase):
 
     def _fallback(self, text):
         data = {'choices': [{'message': {'content': text}}], 'usage': {'cost': 0.001}}
-        with unittest.mock.patch.object(serve, '_urlopen_with_resilience',
-                                        return_value=json.dumps(data)):
+        # The transport is the shared chat caller (it expands freepool band
+        # tokens and carries the pool's fallback machinery) -- pin it so the
+        # parse tests stay offline.
+        with unittest.mock.patch.object(serve, '_call_openrouter_once_sync',
+                                        return_value=data):
             return serve._decision_via_chat_completions(
                 'm', {'messages': [], 'signals': {}}, self.QUESTIONS)
+
+    def test_freepool_band_token_goes_through_the_shared_chat_transport(self):
+        data = {'choices': [{'message': {'content': 'approve'}}], 'usage': {'cost': 0.0}}
+        with unittest.mock.patch.object(serve, '_call_openrouter_once_sync',
+                                        return_value=data) as chat:
+            out = serve._decision_via_chat_completions(
+                '@freepool:low:gemini-free', {'messages': [], 'signals': {}}, self.QUESTIONS)
+        self.assertEqual(chat.call_args[0][0], '@freepool:low:gemini-free')
+        self.assertEqual(out['answers']['choice']['choice'], 'approve')
 
     def test_exact_name_parsed_with_confidence(self):
         out = self._fallback('{"choice": "approve", "confidence": 0.9}')
