@@ -37,6 +37,61 @@ _INJECTION_PATTERNS = (
     ('command-payload', r'\bsudo\b'),
 )
 
+# The pattern list is DATA (config-not-code, same pattern as redaction.json):
+# injection_flags.json overrides the shipped defaults; an unreadable file or a
+# single invalid regex falls back to the shipped pattern, so a broken edit can
+# only restore today's behavior, never turn the detector off.
+INJECTION_FLAGS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'injection_flags.json')
+_INJECTION_FLAGS_CACHE = {'mtime': None, 'patterns': None}
+
+
+def _injection_patterns_effective():
+    """The live (name, compiled-regex) pairs, from injection_flags.json when
+    it reads, else the shipped _INJECTION_PATTERNS."""
+    global _INJECTION_FLAGS_CACHE
+    mtime = None
+    try:
+        mtime = os.path.getmtime(INJECTION_FLAGS_PATH)
+    except OSError:
+        pass
+    if (_INJECTION_FLAGS_CACHE['patterns'] is None
+            or _INJECTION_FLAGS_CACHE['mtime'] != mtime):
+        import re as _re
+        import json as _json
+        pairs = None
+        if mtime is not None:
+            try:
+                with open(INJECTION_FLAGS_PATH, encoding='utf-8') as fh:
+                    raw = _json.load(fh).get('patterns')
+            except Exception as exc:  # noqa: BLE001 -- corrupt file falls back
+                print(f'[injection-flags] file unreadable, using shipped '
+                      f'patterns: {exc}', flush=True)
+                raw = None
+            if isinstance(raw, list):
+                pairs = []
+                for spec in raw:
+                    if not isinstance(spec, dict):
+                        continue
+                    name = str(spec.get('name') or '').strip()[:40]
+                    pattern = spec.get('regex')
+                    if not name or not isinstance(pattern, str) or not pattern:
+                        continue
+                    try:
+                        pairs.append((name, _re.compile(pattern)))
+                    except _re.error as exc:
+                        print(f'[injection-flags] pattern "{name}" ignored '
+                              f'(invalid regex: {exc})', flush=True)
+                if not pairs:
+                    pairs = None  # an empty file section keeps the shipped set
+        _INJECTION_FLAGS_CACHE = {
+            'mtime': mtime,
+            'patterns': pairs or [(n, _re.compile(p))
+                                  for n, p in _INJECTION_PATTERNS],
+        }
+    return _INJECTION_FLAGS_CACHE['patterns']
+
 
 def _external_content_flags(text):
     """Lexical+structural injection scan. Returns {'flags': [names...],
@@ -47,7 +102,7 @@ def _external_content_flags(text):
     if not text:
         return {'flags': flags, 'score': score}
     lowered = str(text).lower()
-    for name, pattern in _INJECTION_PATTERNS:
+    for name, pattern in _injection_patterns_effective():
         hits = len(_re.findall(pattern, lowered))
         if hits:
             score += hits

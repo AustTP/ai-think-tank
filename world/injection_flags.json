@@ -1,0 +1,16 @@
+{
+  "comment": "Injection-detector patterns for externally-sourced library content (386_injection_flags.py): (name, regex) pairs scanned against LOWERCASED text at ingest time. The tank decides nothing here -- matched names are FLAGS on the write (action_log + passport chain + endpoint response) so reviewers get a concrete reason to look harder. This file OVERRIDES the shipped defaults in the code; an unreadable file or an entry with an invalid regex falls back to the shipped pattern individually, so a broken edit can only restore today's behavior, never turn the detector off. Write regexes for lowercase text (the scanner lowercases first). Bias stays recall-over-precision by design: a false flag costs one human glance, a missed planted instruction costs an agent's next hundred decisions.",
+  "patterns": [
+    {"name": "instruction-override", "regex": "ignore\\s+(?:all\\s+|any\\s+|the\\s+)?(?:previous|prior|above|earlier|earlier)\\s+instructions?"},
+    {"name": "instruction-override", "regex": "disregard\\s+(?:all\\s+|the\\s+|your\\s+)?(?:previous|prior|above)\\s+(?:instructions?|prompts?|rules?)"},
+    {"name": "instruction-override", "regex": "new\\s+instructions?\\s*:"},
+    {"name": "roleplay-hijack", "regex": "you\\s+are\\s+now\\s+(?:a|an|the)\\b"},
+    {"name": "roleplay-hijack", "regex": "\\bassistant\\s*:\\s"},
+    {"name": "prompt-templates", "regex": "</?system>"},
+    {"name": "prompt-templates", "regex": "<\\|[a-z_]+\\|>"},
+    {"name": "credential-fishing", "regex": "\\b(?:api[_\\s-]?key|secret[_\\s-]?key|access[_\\s-]?token|password)\\b\\s*[:=]"},
+    {"name": "command-payload", "regex": "\\b(?:curl|wget)\\b\\s+(?:-\\S+\\s+)*https?://"},
+    {"name": "command-payload", "regex": "\\brm\\s+-rf\\b"},
+    {"name": "command-payload", "regex": "\\bsudo\\b"}
+  ]
+}
