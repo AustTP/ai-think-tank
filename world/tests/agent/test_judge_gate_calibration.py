@@ -294,13 +294,17 @@ class DirectorJudgeGateTests(unittest.TestCase):
         self.assertEqual(jev.call_count, 1, 'a judge identical to the primary adds no second call')
 
     def test_drift_circuit_trips_before_any_primary_call(self):
-        # Drift >= ESCALATION_JUDGE_DRIFT_CIRCUIT makes the kind human-only and
-        # is checked BEFORE the primary Jev call, so a tripped circuit doesn't
-        # burn model spend.
+        # Drift >= ESCALATION_JUDGE_DRIFT_CIRCUIT takes the kind out of
+        # delegation and is checked BEFORE the primary Jev call, so a tripped
+        # circuit doesn't burn model spend. Owner direction 2026-11-12: the
+        # operator does not make tank safety calls, so the tripped circuit
+        # FAILS CLOSED tank-side (denied + digest note), not pending-for-human.
         esc = {'status': 'pending', 'kind': self.KIND, 'question': 'docs?'}
         esc, jev = self._run_resolver(esc, self._both(('approve', 0.95), ('approve', 0.95)),
                                       drift=serve.ESCALATION_JUDGE_DRIFT_CIRCUIT)
-        self.assertEqual(esc['status'], 'pending')
+        self.assertEqual(esc['status'], 'denied')
+        self.assertTrue(esc.get('humanNotified'))
+        self.assertIn('fails closed', esc.get('resolvedBy') or '')
         jev.assert_not_called()
 
     def test_low_confidence_primary_never_reaches_the_judge(self):
