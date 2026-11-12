@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "comment": "The escalation-kind registry: everything known about an escalation KIND in one data file, tunable without a code change (the same config-not-code path as api_services.json). floor = minimum composite director-trust score needed to auto-resolve one of these escalations; 1.0 = NEVER auto-resolved, always the human. Omit 'floor' for a kind whose bar should track the live routine default (JEV_SAFETY_CONFIDENCE + calibration) rather than a pinned number. impact/action are the operator-facing copy embedded in every notification (email + Telegram) for that kind. This file OVERRIDES the built-in defaults per kind and per field; an unreadable or corrupt file falls back to the shipped defaults in core/jev.py and integrations/notify.py, so a broken edit can only restore today's behavior, never weaken a gate silently. A floor outside 0..1 (or non-numeric) is ignored loudly.",
+  "kinds": {
+    "unsure safety decision": {
+      "floor": 0.85,
+      "impact": "A worker paused on a genuinely unclear safety call and is waiting on yours.",
+      "action": "Decide from the question above; deny if the case for safety is not clearly made."
+    },
+    "owner safety decision": {
+      "floor": 0.95,
+      "impact": "The full Jev decision chain could not decide; the action has not run.",
+      "action": "Read the command/code above. Approve only if it is ordinary, in-scope work; deny if it is unsafe, destructive, or unjustified."
+    },
+    "blocked command": {
+      "floor": 1.0,
+      "impact": "The command did NOT run -- the assigned task may be stalled waiting on it.",
+      "action": "Approve only if you recognize this exact command and want it run; otherwise deny and the worker should find another approach."
+    },
+    "blocked pipeline step": {
+      "floor": 1.0,
+      "impact": "The pipeline step did NOT run -- the delivery it belongs to is held up.",
+      "action": "Approve only if the step is the one you expect from this card; otherwise deny."
+    },
+    "blocked browser action": {
+      "floor": 1.0,
+      "impact": "The browser action was refused -- the investigation either adapted or stalled on it.",
+      "action": "Approve only if the page/action is clearly in scope; otherwise deny."
+    },
+    "unresolved review requirement": {
+      "impact": "A review requirement could not be resolved by the team -- the card is waiting.",
+      "action": "Approve the resolution described if it genuinely addresses the requirement; else deny so it goes back for real work."
+    },
+    "allowlist request": {
+      "impact": "Agent research on this host is waiting on this decision. Meanwhile the host still works through the normal per-request Jev gate (each visit judged individually) -- work is slowed, not stopped. Approving grants standing read+write reachability for sandbox scripts too.",
+      "action": "If the domain is an ordinary public source that fits the stated purpose, approve; deny otherwise. Denying is safe -- agents keep using the per-request gate."
+    },
+    "allowlist candidate": {
+      "impact": "This host earned confident Jev approvals repeatedly; approving makes that standing permanent (full read+write reach for sandbox scripts). Until then every visit re-runs Jev.",
+      "action": "Approve for routine public sources with a clean history; deny if the host's standing has changed."
+    },
+    "dormancy window request": {
+      "floor": 0.85,
+      "impact": "The self-edit lander is waiting for a dormancy slot -- no code has been applied yet.",
+      "action": "Approve only if the requested window and reason are legitimate and the edits were reviewed; otherwise deny so the change is re-planned."
+    },
+    "personnel_strike": {
+      "impact": "A firing strike is on record for this agent -- no personnel action was taken automatically.",
+      "action": "Read the cited reports first; this is informational unless you act on it."
+    }
+  }
+}

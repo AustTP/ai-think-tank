@@ -727,7 +727,7 @@ def _escalation_floor(kind):
     through the LIVE calibration-adjusted threshold (_effective_safety_confidence)
     so the feedback loop can raise/lower the whole routine bar without a restart
     (see _calibration_adjust_pass)."""
-    entry = ESCALATION_KIND_RISK.get(kind)
+    entry = escalation_kinds_effective().get(kind)
     if entry is None or entry.get('floor', JEV_SAFETY_CONFIDENCE) == JEV_SAFETY_CONFIDENCE:
         return _effective_safety_confidence()
     return entry['floor']

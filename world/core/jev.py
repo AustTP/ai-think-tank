@@ -23,6 +23,7 @@ Call/patch contract (must hold for every future edit of this file):
 """
 
 import asyncio
+import os
 
 # Any safety gate that gets a Jev "allow/approve" below this confidence is
 # treated as "unsure" and escalated to a human instead of acted on -- the
@@ -272,3 +273,95 @@ ESCALATION_KIND_RISK = {
 ESCALATION_DEFAULT_FLOOR = JEV_SAFETY_CONFIDENCE  # unknown kinds keep the old bar
 ESCALATION_ERROR_PENALTY_STEP = 0.10               # composite hit per consecutive Jev error
 ESCALATION_ERROR_PENALTY_CAP = 0.40                # ... capped so one bad streak can't zero a confident call
+
+
+# The escalation-kind REGISTRY (config-not-code, same pattern as api_services.json).
+# ESCALATION_KIND_RISK above stays the shipped fail-safe: escalation_kinds.json
+# OVERRIDES it per kind and per field, and an unreadable/corrupt file falls back
+# to the built-in, so a broken edit can only restore today's behavior -- it can
+# never silently weaken a gate. The file also carries the operator-facing
+# guidance copy (impact/action) that notifications embed; core keeps the floor
+# half, integrations/notify.py keeps the copy half, this loader merges both.
+ESCALATION_KINDS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'escalation_kinds.json')
+
+_KINDS_TABLE_CACHE = {'mtime': None, 'table': None}
+
+
+def escalation_kinds_effective():
+    """The live per-kind escalation policy: {kind: {'floor': float,
+    'impact': str|None, 'action': str|None}}.
+
+    Merge rules, deliberately fail-safe:
+      * floor -- file value wins over the built-in when it is a number in
+        0..1; anything else is ignored loudly and the built-in (or the
+        default floor for kinds only in the file) applies. A kind whose
+        bar should track the LIVE default omits 'floor' entirely in the
+        file, so the built-in default-floor rule (which returns the live
+        calibration-adjusted threshold) still applies.
+      * impact/action -- passed through verbatim when they are strings;
+        consumers fall back to their own built-in copy when a field is
+        missing or non-string.
+      * A kind present only in the file is a legitimate new kind; its
+        missing floor defaults to the delegable bar, never to 1.0 (new
+        kinds start routinable and get pinned DOWN only on purpose).
+    """
+    global _KINDS_TABLE_CACHE
+    table = _KINDS_TABLE_CACHE['table']
+    mtime = None
+    try:
+        mtime = os.path.getmtime(ESCALATION_KINDS_PATH)
+    except OSError:
+        mtime = None
+    if table is None or _KINDS_TABLE_CACHE['mtime'] != mtime:
+        table = {}
+        if mtime is not None:
+            try:
+                import json as _json
+                with open(ESCALATION_KINDS_PATH, encoding='utf-8') as fh:
+                    raw = _json.load(fh).get('kinds')
+                if isinstance(raw, dict):
+                    for kind, spec in raw.items():
+                        if not isinstance(spec, dict):
+                            print(f'[jev] escalation kind "{kind}" ignored '
+                                  '(entry is not an object)', flush=True)
+                            continue
+                        entry = {}
+                        floor = spec.get('floor')
+                        if floor is not None:
+                            try:
+                                floor = float(floor)
+                            except (TypeError, ValueError):
+                                floor = None
+                            if floor is None or not (0.0 <= floor <= 1.0):
+                                print(f'[jev] escalation kind "{kind}" floor '
+                                      f'{spec.get("floor")!r} ignored '
+                                      '(must be 0..1)', flush=True)
+                                floor = None
+                            else:
+                                entry['floor'] = floor
+                        for field in ('impact', 'action'):
+                            value = spec.get(field)
+                            if isinstance(value, str) and value.strip():
+                                entry[field] = value
+                        if entry:
+                            table[str(kind)] = entry
+            except Exception as exc:  # noqa: BLE001 -- corrupt file falls back
+                table = {}
+                print(f'[jev] escalation_kinds.json unreadable, using built-in '
+                      f'defaults: {exc}', flush=True)
+        _KINDS_TABLE_CACHE = {'mtime': mtime, 'table': table}
+    merged = {}
+    for kind, entry in table.items():
+        merged_kind = dict(entry)
+        if 'floor' not in merged_kind and kind not in ESCALATION_KIND_RISK:
+            merged_kind['floor'] = ESCALATION_DEFAULT_FLOOR
+        merged[kind] = merged_kind
+    for kind, floor in ESCALATION_KIND_RISK.items():
+        if kind in merged:
+            if 'floor' not in merged[kind]:
+                merged[kind]['floor'] = floor.get('floor', ESCALATION_DEFAULT_FLOOR)
+        else:
+            merged[kind] = {'floor': floor.get('floor', ESCALATION_DEFAULT_FLOOR)}
+    return merged

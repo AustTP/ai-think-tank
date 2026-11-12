@@ -308,6 +308,33 @@ _ESCALATION_KIND_GUIDANCE = {
 }
 
 
+_DEFAULT_ESCALATION_GUIDANCE = (
+    'Something an agent asked for is waiting on this decision; nothing has been applied yet.',
+    'Approve only if the request above is clearly safe and in scope; otherwise deny -- '
+    'denying is always the safe default.')
+
+
+def _escalation_guidance(kind):
+    """(impact, action) for one escalation kind. escalation_kinds.json is the
+    tunable override (per kind, per field); anything a file entry omits
+    falls back to the shipped _ESCALATION_KIND_GUIDANCE copy for that kind,
+    then the generic default."""
+    shipped_impact, shipped_action = _ESCALATION_KIND_GUIDANCE.get(
+        kind, _DEFAULT_ESCALATION_GUIDANCE)
+    entry = None
+    try:
+        import serve as _serve
+        table = getattr(_serve, 'escalation_kinds_effective', None)
+        if callable(table):
+            entry = table().get(kind)
+    except Exception:  # noqa: BLE001 -- guidance must never break a notification
+        entry = None
+    if isinstance(entry, dict):
+        return (entry.get('impact') or shipped_impact,
+                entry.get('action') or shipped_action)
+    return (shipped_impact, shipped_action)
+
+
 def notify_human_of_escalation(esc_id, esc, context=''):
     """Send the approve/deny email + Telegram for one escalation. Called at
     creation for HUMAN-ONLY kinds (risk floor >= 1.0 -- the director loop is
@@ -328,11 +355,7 @@ def notify_human_of_escalation(esc_id, esc, context=''):
             question = reviewed['text']
             decoded_note = ' (decoded from a base64 wrapper for review)'
     prefix = f'{context}\n\n' if context else ''
-    impact, action = _ESCALATION_KIND_GUIDANCE.get(
-        kind,
-        ('Something an agent asked for is waiting on this decision; nothing has been applied yet.',
-         'Approve only if the request above is clearly safe and in scope; otherwise deny -- '
-         'denying is always the safe default.'))
+    impact, action = _escalation_guidance(kind)
     approve_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=approve'
     deny_url = f'{_serve.ESCALATION_BASE_URL}/api/escalation/resolve?id={esc_id}&token={token}&decision=deny'
     body = (f'{prefix}{question}{decoded_note}\n\n'
