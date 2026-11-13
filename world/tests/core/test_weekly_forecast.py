@@ -7,6 +7,8 @@ Run:
   cd /Users/poole86/ai-village-template/world
   python3 -m pytest tests/core/test_weekly_forecast.py
 """
+import io
+import json
 import os
 import shutil
 import sys
@@ -118,6 +120,64 @@ class SessionsView(unittest.TestCase):
         by_name = {v['name']: v for v in serve._sessions_view(now)['venues']}
         self.assertTrue(by_name['NYSE']['open'])
         self.assertTrue(by_name['LSE']['open'])
+
+
+class StraitlyCredits(unittest.TestCase):
+    """The prepaid balance probe: the operator funds Straitly once (~$99)
+    and the digest must SHOW that number, fail-closed (omit on failure,
+    never stale). Mirrors the OpenRouter credits probe contract."""
+
+    def setUp(self):
+        serve._STRAITLY_CREDITS_CACHE['at'] = 0.0
+        serve._STRAITLY_CREDITS_CACHE['data'] = None
+
+    def tearDown(self):
+        serve._STRAITLY_CREDITS_CACHE['at'] = 0.0
+        serve._STRAITLY_CREDITS_CACHE['data'] = None
+
+    def test_parses_purchased_minus_spent(self):
+        body = json.dumps({'data': {'total_credits': 98.87,
+                                    'total_usage': 0.0}}).encode()
+
+        class Resp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={'STRAITLY_API_KEY': 'k'}), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=Resp(body)):
+            view = serve._straitly_account_credits()
+        self.assertAlmostEqual(view['remaining'], 98.87)
+        self.assertEqual(view['totalUsage'], 0.0)
+
+    def test_no_key_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={}):
+            self.assertIsNone(serve._straitly_account_credits())
+
+    def test_network_failure_fails_closed(self):
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={'STRAITLY_API_KEY': 'k'}), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        side_effect=OSError('down')):
+            self.assertIsNone(serve._straitly_account_credits())
+
+    def test_digest_shows_prepaid_line(self):
+        with unittest.mock.patch.object(serve, '_straitly_account_credits',
+                                        return_value={'remaining': 98.87,
+                                                      'totalUsage': 0.0}), \
+             unittest.mock.patch.object(serve, '_openrouter_account_credits',
+                                        return_value=None), \
+             unittest.mock.patch.object(serve, '_telegram_send_text_sync',
+                                        return_value=1), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            text = serve._send_weekly_forecast(_fri_evening())
+        self.assertIn('straitly credits: $98.87 prepaid left', text)
+        self.assertNotIn('openrouter credits:', text)
 
 
 class DigestBody(unittest.TestCase):

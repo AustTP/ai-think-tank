@@ -19,8 +19,48 @@
 # A report is not an action: the loop is read-only (DB reads + one Telegram
 # push), so it needs no change-window. Scheduling is zone-aware
 # (America/New_York) so DST can never drift the fire time.
+import json
+import time
+import urllib.request
 import zoneinfo as _zoneinfo
 from datetime import datetime as _datetime, timedelta as _timedelta
+
+_FORECAST_CREDITS_TTL_S = 300
+_STRAITLY_CREDITS_CACHE = {'at': 0.0, 'data': None}
+
+
+def _straitly_account_credits():
+    """Live GET api.straitly.ai/api/v1/credits -- the operator's prepaid
+    balance on the Straitly account (2026-11-13: they fund it once, ~$99,
+    and expect it to last the month; the digest should SHOW that number,
+    not just the monthly cap). Same fail-closed contract as the OpenRouter
+    probe: None on any failure, so the digest omits the line rather than
+    showing stale or fabricated numbers."""
+    key = (_load_env().get('STRAITLY_API_KEY') or '').strip()
+    if not key:
+        return None
+    now = time.time()
+    cached = _STRAITLY_CREDITS_CACHE
+    if cached['data'] is not None and (now - cached['at']) < _FORECAST_CREDITS_TTL_S:
+        return cached['data']
+    try:
+        req = urllib.request.Request(
+            'https://api.straitly.ai/api/v1/credits',
+            headers={'Authorization': f'Bearer {key}',
+                     'User-Agent': 'AIThinkTankAgent/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- fixed Straitly API host
+            data = json.loads(resp.read().decode('utf-8', errors='replace')) \
+                .get('data') or {}
+        total_credits = float(data.get('total_credits') or 0)
+        total_usage = float(data.get('total_usage') or 0)
+        result = {'totalCredits': total_credits, 'totalUsage': total_usage,
+                  'remaining': max(0.0, total_credits - total_usage)}
+        cached['at'] = now
+        cached['data'] = result
+        return result
+    except Exception:
+        return None
+
 
 FORECAST_TZ = 'America/New_York'
 WEEKLY_FORECAST_LOCAL_HOUR = 20      # 8:00 pm Eastern, Fridays
@@ -206,6 +246,17 @@ def _weekly_forecast_text(now=None):
             cap = _provider_spend_cap(provider)
             flag = ' TRIPPED' if _provider_cap_exceeded(provider) else ''
             lines.append(f'  {provider}: ${used:.2f}/${cap:.2f}{flag}')
+        # Prepaid balances (operator, 2026-11-13): the caps divide the $50
+        # monthly budget across the routers, but Straitly is FUNDED once
+        # (~$99 prepaid) -- the digest shows what is actually left on each
+        # account, not just the monthly allowance. Omitted when the probe
+        # fails: never stale, never fabricated.
+        or_credits = _openrouter_account_credits()
+        if or_credits:
+            lines.append(f"  openrouter credits: ${or_credits['remaining']:.2f} prepaid left")
+        st_credits = _straitly_account_credits()
+        if st_credits:
+            lines.append(f"  straitly credits: ${st_credits['remaining']:.2f} prepaid left")
         jev = _service_month_to_date(ledger, '__jev__')
         lines.append(f'  JEV lane: ${jev:.2f}/${float(JEV_SPEND_CAP_USD or 0):.2f}')
         mpp = _service_month_to_date(ledger, _MPP_LEDGER_KEY)
