@@ -529,6 +529,22 @@ def _fetch_openrouter_catalog_sync():
         return json.loads(resp.read())['data']
 
 
+def _fetch_straitly_catalog_sync():
+    """Straitly AI's /v1/models -- an OpenRouter-shaped catalog sold by a
+    different vendor. Empty list when STRAITLY_API_KEY is unset: an
+    unconfigured provider contributes nothing to the sync instead of
+    failing the whole refresh (per-provider fail-open, never fail the
+    catalog because one vendor has no key)."""
+    key = _load_env().get('STRAITLY_API_KEY')
+    if not key:
+        return []
+    req = urllib.request.Request(
+        'https://api.straitly.ai/v1/models',
+        headers={'Authorization': f'Bearer {key}'})
+    with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- fixed known-good URL, no user input, SSRF guard applies at callers
+        return json.loads(resp.read())['data']
+
+
 def _bucket_models_by_price(models):
     buckets = {band: [] for band in MODEL_PRICE_BANDS}
     for m in models:

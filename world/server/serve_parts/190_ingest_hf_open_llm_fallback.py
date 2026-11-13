@@ -66,26 +66,134 @@ def _ingest_hf_open_llm_fallback(models):
     return added
 
 
-def _sync_model_catalog(models):
-    """Persist the current OpenRouter catalog snapshot into model_catalog and
-    reconcile it against what the DB already knows:
-      * new models are inserted (first_seen = now)
-      * known models get refreshed prices + carried-over benchmark scores
-        (the catalog's own Artificial Analysis indices are auto-ingested into
-        model_benchmark_scores first -- _ingest_catalog_benchmarks -- then
-        copied into the catalog row; player-entered research under other
-        benchmark names is carried over untouched)
-      * catalog models the OpenRouter entry carries no AA data for are
-        backfilled from Artificial Analysis's own public leaderboard
-        (_ingest_aa_leaderboard), then from the HF Open LLM Leaderboard's
-        MMLU-Pro fallback for open-weights models AA never measured
-        (_ingest_hf_open_llm_fallback); vision MMMU scores -- carried by no
-        catalog or AA page -- come from the operator-registered MMMU
-        leaderboard (_ingest_mmmu_leaderboard)
-      * models that vanished from the live catalog are removed from BOTH
-        model_catalog and model_benchmark_scores -- a score record for a model
-        that no longer exists on OpenRouter is dead weight the value pick can
-        never use, and letting it accumulate would mislead later refreshes.
+# --- multi-provider catalog -------------------------------------------------
+# A model id that is a provider's OWN meta-router, not a real model:
+# routing through one would hand the tank's model choice to the vendor's
+# router stacked on top of the tank's own JEV routing. Never stored, never
+# scored, never picked, no matter which provider lists it.
+_PROVIDER_ROUTER_MODELS = {'jev-router'}
+
+# Provider registry: catalog name -> name of the module-level fetcher that
+# returns that provider's OpenRouter-shaped model list. Resolved through
+# globals() AT CALL TIME so tests and operators can monkeypatch any fetcher
+# without touching the registry. Adding a provider is one fetcher plus one
+# entry here -- nothing downstream knows OpenRouter's name except the call
+# transport the tier picks are dialed through.
+PROVIDER_CATALOGS = {
+    'openrouter': '_fetch_openrouter_catalog_sync',
+    'straitly': '_fetch_straitly_catalog_sync',
+}
+
+
+def _sync_provider_catalog_rows(provider, models):
+    """Persist one provider's raw catalog slice into model_provider_catalog
+    (its own table, its own rows -- a provider-wide outage or price change
+    never corrupts another provider's record). Returns the count of rows
+    dropped by this provider's own one-cycle grace, mirroring the canonical
+    purge policy below."""
+    keep = set()
+    now = time.time()
+    grace = now - MODEL_TIER_REFRESH_INTERVAL_S
+    with _db() as conn:
+        for m in models:
+            mid = m.get('id')
+            if not mid or mid in _PROVIDER_ROUTER_MODELS:
+                continue
+            try:
+                prompt_price = float(m['pricing']['prompt'])
+                completion_price = float(m['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            keep.add(mid)
+            arch = m.get('architecture') or {}
+            conn.execute(
+                'INSERT INTO model_provider_catalog (provider, model_id, name, context_length, prompt_price, completion_price, price_per_m, image_capable, last_seen) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(provider, model_id) DO UPDATE SET name=excluded.name, '
+                'context_length=excluded.context_length, prompt_price=excluded.prompt_price, '
+                'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
+                'image_capable=excluded.image_capable, last_seen=excluded.last_seen',
+                (provider, mid, m.get('name', mid), m.get('context_length'),
+                 prompt_price, completion_price,
+                 (prompt_price + completion_price) * 1_000_000,
+                 1 if 'image' in (arch.get('input_modalities') or []) else 0, now),
+            )
+        if keep:
+            placeholders = ','.join('?' * len(keep))
+            gone = [r[0] for r in conn.execute(
+                f'SELECT model_id FROM model_provider_catalog WHERE provider = ? '
+                f'AND model_id NOT IN ({placeholders}) AND last_seen < ?',  # nosec B608 -- placeholders are parameterized '?'
+                tuple([provider] + sorted(keep) + [grace])).fetchall()]
+        else:
+            gone = [r[0] for r in conn.execute(
+                'SELECT model_id FROM model_provider_catalog WHERE provider = ? AND last_seen < ?',
+                (provider, grace)).fetchall()]
+        for mid in gone:
+            conn.execute('DELETE FROM model_provider_catalog WHERE provider = ? AND model_id = ?',
+                         (provider, mid))
+    return len(gone)
+
+
+def _merge_provider_catalogs(per_provider):
+    """Union every provider's catalog into one canonical model list, deduped
+    by id. A model listed by several providers keeps its first-listed entry's
+    metadata but carries the CHEAPEST listing's prices -- the market price a
+    value pick actually pays -- plus a `providers` key naming every catalog
+    that lists it. Returns (union_models, keep_ids): keep_ids is every id at
+    least one provider still lists, i.e. the purge scope for the canonical
+    table (a row survives as long as ANY provider still sells the model)."""
+    merged = {}
+    keep_ids = set()
+    # Registry order first (deterministic), then any provider a caller saw
+    # fit to pass that the registry doesn't know yet -- a registry trim (or
+    # a provider added before its fetcher is registered) must not silently
+    # drop that provider's slice.
+    for provider in list(PROVIDER_CATALOGS) + \
+            [p for p in per_provider if p not in PROVIDER_CATALOGS]:
+        for m in per_provider.get(provider) or []:
+            mid = m.get('id')
+            if not mid or mid in _PROVIDER_ROUTER_MODELS:
+                continue
+            try:
+                price = float(m['pricing']['prompt']) + float(m['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            keep_ids.add(mid)
+            entry = merged.get(mid)
+            if entry is None:
+                entry = dict(m)
+                entry['providers'] = [provider]
+                merged[mid] = entry
+                continue
+            if provider not in entry['providers']:
+                entry['providers'].append(provider)
+            if price < float(entry['pricing']['prompt']) + float(entry['pricing']['completion']):
+                entry['pricing'] = m['pricing']
+    return list(merged.values()), keep_ids
+
+
+def _sync_model_catalog(models, keep_ids=None):
+    """Persist the current multi-provider catalog UNION into model_catalog
+    and reconcile it against what the DB already knows:
+      * new models are inserted (first_seen = now); `providers` records the
+        comma list of catalogs listing the model (absent on legacy callers
+        keeps whatever the row already says)
+      * known models get refreshed prices -- the merge already selected the
+        CHEAPEST provider's listing -- plus carried-over benchmark scores
+        (catalog AA indices are auto-ingested first -- _ingest_catalog_benchmarks;
+        player-entered research under other benchmark names is carried over)
+      * models no catalog scores yet are backfilled from Artificial
+        Analysis's public leaderboard (_ingest_aa_leaderboard), then the HF
+        Open LLM Leaderboard's MMLU-Pro fallback for open-weights models AA
+        never measured (_ingest_hf_open_llm_fallback); vision MMMU scores
+        come from the operator-registered MMMU leaderboard
+        (_ingest_mmmu_leaderboard)
+      * models gone from EVERY provider are removed from BOTH model_catalog
+        and model_benchmark_scores -- a score record for a model nobody
+        sells anymore is dead weight the value pick can never use. keep_ids
+        is that every-provider scope (from _merge_provider_catalogs); None
+        (legacy single-catalog callers/tests) scopes the purge to `models`
+        alone.
     Returns the number of models purged (0 normally), so callers can surface
     catalog churn."""
     _ingest_catalog_benchmarks(models)
@@ -107,14 +215,16 @@ def _sync_model_catalog(models):
             arch = m.get('architecture') or {}
             image_capable = 1 if 'image' in (arch.get('input_modalities') or []) else 0
             _blended = (prompt_price + completion_price) * 1_000_000
+            _providers = ','.join(m['providers']) if m.get('providers') else None
             conn.execute(
-                'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, first_seen, last_seen) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?) '
+                'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, providers, first_seen, last_seen) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(model_id) DO UPDATE SET name=excluded.name, prompt_price=excluded.prompt_price, '
                 'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
-                'image_capable=excluded.image_capable, last_seen=excluded.last_seen',
+                'image_capable=excluded.image_capable, '
+                'providers=COALESCE(excluded.providers, model_catalog.providers), last_seen=excluded.last_seen',
                 (mid, m.get('name', mid), prompt_price, completion_price,
-                 _blended, image_capable, now, now),
+                 _blended, image_capable, _providers, now, now),
             )
             # Daily price snapshot: append today's price for every model so
             # the market-wide history survives model_catalog's in-place
@@ -133,28 +243,32 @@ def _sync_model_catalog(models):
                 'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
                 (json.dumps(bench_scores), mid),
             )
-        # Purge models that are gone from the live catalog -- both the catalog
-        # row and any player-entered benchmark scores for that model. Scanned
-        # from BOTH tables: a score row can exist for a model that was never
-        # inserted into model_catalog (e.g. pre-catalog research), so a purge
-        # keyed only on catalog rows would orphan it forever.
+        # Purge models that are gone from EVERY provider -- both the catalog
+        # row and any player-entered benchmark scores for that model.
+        # Scanned from BOTH tables: a score row can exist for a model that
+        # was never inserted into model_catalog (e.g. pre-catalog research),
+        # so a purge keyed only on catalog rows would orphan it forever.
         #
         # One-cycle GRACE period before purging: a model absent for a single
-        # refresh is presumed a transient fetch gap (partial OpenRouter
-        # response), and its player-entered scores are research that cannot be
-        # re-created from a retry -- same "never cache a blip as permanent"
-        # rule as MODEL_VERIFY_ATTEMPTS. Only a model missing from TWO
-        # consecutive daily syncs (last_seen older than one refresh interval)
-        # is treated as genuinely removed.
+        # refresh is presumed a transient fetch gap (partial provider
+        # response, one vendor's outage while another still lists it), and
+        # its player-entered scores are research that cannot be re-created
+        # from a retry -- same "never cache a blip as permanent" rule as
+        # MODEL_VERIFY_ATTEMPTS. Only a model missing from TWO consecutive
+        # daily syncs (last_seen older than one refresh interval) is treated
+        # as genuinely removed. keep_ids is the every-provider scope from
+        # _merge_provider_catalogs; None scopes the purge to `models` alone
+        # (legacy single-catalog callers).
+        scope_ids = set(keep_ids) if keep_ids is not None else seen_ids
         grace_floor = now - MODEL_TIER_REFRESH_INTERVAL_S
-        placeholders = ','.join('?' * len(seen_ids)) if seen_ids else ''
+        placeholders = ','.join('?' * len(scope_ids)) if scope_ids else ''
         if placeholders:
             gone = {r[0] for r in conn.execute(
                 f'SELECT model_id FROM model_catalog WHERE model_id NOT IN ({placeholders}) AND last_seen < ?',  # nosec B608 -- placeholders are parameterized '?'
-                tuple(seen_ids) + (grace_floor,)).fetchall()}
+                tuple(scope_ids) + (grace_floor,)).fetchall()}
             gone |= {r[0] for r in conn.execute(
                 f'SELECT model_id FROM model_benchmark_scores WHERE model_id NOT IN ({placeholders}) AND checked_at < ?',  # nosec B608 -- placeholders are parameterized '?'
-                tuple(seen_ids) + (grace_floor,)).fetchall()}
+                tuple(scope_ids) + (grace_floor,)).fetchall()}
         else:
             gone = {r[0] for r in conn.execute(
                 'SELECT model_id FROM model_catalog WHERE last_seen < ?', (grace_floor,)).fetchall()}
@@ -217,11 +331,33 @@ def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
 
 
 async def refresh_model_tiers():
-    models = await asyncio.to_thread(_fetch_openrouter_catalog_sync)
-    _sync_model_catalog(models)
-    buckets = _bucket_models_by_price(models)
+    # Multi-provider catalog sync: every provider in PROVIDER_CATALOGS is
+    # fetched independently -- one vendor failing logs and contributes an
+    # empty slice instead of blanking the catalog -- its raw slice is
+    # persisted to model_provider_catalog, and the UNION drives the
+    # canonical rows, the benchmark backfills (so a model only one provider
+    # sells still gets scored), and the purge scope. The call-ability pools
+    # (price buckets, band pools, live-verify probes) stay on the OpenRouter
+    # listing alone: that is the transport the tier picks are dialed through
+    # today; other providers join the dialing layer through pins, not by
+    # leaking into these pools.
+    per_provider = {}
+    for provider, fetch_name in PROVIDER_CATALOGS.items():
+        try:
+            per_provider[provider] = await asyncio.to_thread(globals()[fetch_name]) or []
+        except Exception as exc:
+            print(f'[model-tiers] {provider} catalog fetch failed: {exc}', flush=True)
+            per_provider[provider] = []
+        try:
+            _sync_provider_catalog_rows(provider, per_provider[provider])
+        except Exception as exc:
+            print(f'[model-tiers] {provider} catalog rows sync failed: {exc}', flush=True)
+    openrouter_models = per_provider.get('openrouter') or []
+    union_models, keep_ids = _merge_provider_catalogs(per_provider)
+    _sync_model_catalog(union_models, keep_ids=keep_ids)
+    buckets = _bucket_models_by_price(openrouter_models)
     all_benchmark_rows = get_model_benchmark_scores()
-    pools = _band_candidate_pools(models)
+    pools = _band_candidate_pools(openrouter_models)
     chosen = {}
     fallbacks = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():

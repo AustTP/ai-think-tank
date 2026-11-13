@@ -652,8 +652,39 @@ def init_db():
             price_per_m REAL NOT NULL,
             image_capable INTEGER NOT NULL DEFAULT 0,
             scores TEXT,
+            providers TEXT,
             first_seen REAL NOT NULL,
             last_seen REAL NOT NULL
+        )''')
+        # model_catalog is the PROVIDER-AGNOSTIC canonical registry: one row
+        # per model, whoever sells it. `providers` is the comma list of
+        # catalogs currently listing it ('openrouter', 'straitly', ...); the
+        # price columns hold the CHEAPEST listing's price -- the market price
+        # a value-driven pick actually cares about. Each provider's raw
+        # catalog slice lives in model_provider_catalog below, keyed
+        # (provider, model_id), so a provider-wide outage or price change
+        # never corrupts another provider's record and the canonical row
+        # survives as long as ANY provider still lists the model.
+        catalog_cols = {r[1] for r in conn.execute('PRAGMA table_info(model_catalog)')}
+        if 'providers' not in catalog_cols:
+            conn.execute('ALTER TABLE model_catalog ADD COLUMN providers TEXT')
+            conn.execute("UPDATE model_catalog SET providers = 'openrouter' "
+                         'WHERE providers IS NULL')
+        # Per-provider raw catalog rows: one row per (provider, model_id)
+        # exactly as that provider's own /models endpoint reports it. A
+        # provider is just another fetcher + key in PROVIDER_CATALOGS --
+        # nothing in the schema or the sync knows OpenRouter's name.
+        conn.execute('''CREATE TABLE IF NOT EXISTS model_provider_catalog (
+            provider TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            context_length INTEGER,
+            prompt_price REAL NOT NULL,
+            completion_price REAL NOT NULL,
+            price_per_m REAL NOT NULL,
+            image_capable INTEGER NOT NULL DEFAULT 0,
+            last_seen REAL NOT NULL,
+            PRIMARY KEY (provider, model_id)
         )''')
         # BP-63 observed-latency samples: one row per successful OpenRouter
         # POST, wall-clock ms written by _post_once_tracked through

@@ -208,6 +208,29 @@ def _reset_breakers():
 
 
 @pytest.fixture(autouse=True)
+def _provider_catalogs_offline():
+    """Keep the multi-provider catalog sync network-free in tests.
+
+    refresh_model_tiers() fetches EVERY provider in PROVIDER_CATALOGS at
+    call time. The OpenRouter fetcher is mocked per-test where it matters,
+    but any provider whose key sits in the operator's real .env (STRAITLY_
+    API_KEY locally) would otherwise make a real HTTP call from any test
+    that runs a refresh -- the same background-traffic poisoning that the
+    breaker reset above exists to stop. Trim the registry to the OpenRouter
+    fetcher by default (that transport stays mocked per-test); tests that
+    need provider data re-patch PROVIDER_CATALOGS themselves, and the
+    fetchers themselves stay unstubbed so their guards are testable."""
+    import serve
+    saved = serve.PROVIDER_CATALOGS
+    serve.PROVIDER_CATALOGS = {
+        name: fetch for name, fetch in saved.items() if name == 'openrouter'}
+    try:
+        yield
+    finally:
+        serve.PROVIDER_CATALOGS = saved
+
+
+@pytest.fixture(autouse=True)
 def _clear_unpriced_receipts():
     """Keep a mocked no-cost task call from blocking an unrelated later test."""
     yield
