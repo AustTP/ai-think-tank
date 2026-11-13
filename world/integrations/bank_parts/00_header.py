@@ -652,6 +652,11 @@ def _openrouter_month_to_date(ledger):
 
 _PROVIDER_ROLLUP_PREFIX = '__provider__/'
 _JEV_LEDGER_KEY = '__jev__'
+# Machine-payments treasury (MPP, 2026-11-13): real per-call settlements to
+# vendors that price through a payment rail. One bounded lane like JEV --
+# monthly treasury cap in MPP_SPEND_CAP_USD, trip alert, no payments once
+# exceeded. Empty cap = empty treasury = the rail stays inert.
+_MPP_LEDGER_KEY = '__mpp__'
 
 
 def _provider_spend_key(provider):
@@ -762,14 +767,38 @@ def env_name_of(provider):
 
 
 # Lane caps: a NAMED LANE (a class of calls, whichever provider served it)
-# can carry its own allowance on top of any provider cap. The JEV decisions
-# lane is the one entry: the tank's decisions model keeps working after the
-# general chat spend stops, on its own much smaller budget.
+# can carry its own allowance on top of any provider cap. Two entries:
+#   * __jev__ -- the tank's decisions model keeps working after the general
+#     chat spend stops, on its own much smaller budget.
+#   * __mpp__ -- the machine-payments treasury: per-call MPP settlements
+#     answer to their own monthly cap and stop dead on trip.
+_LANE_SPECS = {
+    _JEV_LEDGER_KEY: {
+        'cap_attr': 'JEV_SPEND_CAP_USD',
+        'alert_key': 'jevSpend',
+        'trip_title': 'JEV decisions spend cap reached (${cap:.2f}/month)',
+        'trip_body': ('Decisions spend this month: ${used:.2f}. The failover '
+                      'chain now serves decisions from the Colab/Laya standby '
+                      'first, then the free pool. Raise JEV_SPEND_CAP_USD in '
+                      '.env to restore the paid slugs.'),
+    },
+    _MPP_LEDGER_KEY: {
+        'cap_attr': 'MPP_SPEND_CAP_USD',
+        'alert_key': 'mppSpend',
+        'trip_title': 'Machine payments treasury cap reached (${cap:.2f}/month)',
+        'trip_body': ('Machine payments this month: ${used:.2f}. Every MPP '
+                      'settlement is refused until the treasury resets or '
+                      'MPP_SPEND_CAP_USD is raised in .env.'),
+    },
+}
+
+
 def _lane_spend_cap(lane):
     import serve as _serve
-    if lane == _JEV_LEDGER_KEY:
-        return float(_serve.JEV_SPEND_CAP_USD or 0)
-    return 0.0
+    spec = _LANE_SPECS.get(lane)
+    if not spec:
+        return 0.0
+    return float(getattr(_serve, spec['cap_attr'], None) or 0)
 
 
 def _lane_cap_exceeded(lane):
@@ -783,12 +812,11 @@ def _lane_cap_exceeded(lane):
     except Exception:
         return False
     exceeded = used >= cap
+    spec = _LANE_SPECS[lane]
     _note_allowance_exhausted(
-        'jevSpend',
-        f'JEV decisions spend cap reached (${cap:.2f}/month)',
-        f'Decisions spend this month: ${used:.2f}. The failover chain now '
-        'serves decisions from the Colab/Laya standby first, then the free '
-        'pool. Raise JEV_SPEND_CAP_USD in .env to restore the paid slugs.',
+        spec['alert_key'],
+        spec['trip_title'].format(cap=cap),
+        spec['trip_body'].format(used=used),
         exceeded)
     return exceeded
 

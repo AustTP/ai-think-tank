@@ -625,6 +625,16 @@ OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions
 # reads the same registry to re-select from a provider with spend left.
 DEFAULT_DIALING_PROVIDER = 'openrouter'
 DIALING_PROVIDERS = ('openrouter', 'straitly')
+# `settlement` marks how a vendor prices its calls (2026-11-13):
+#   * absent          -- prepaid key (the normal shape; spend caps only)
+#   * 'mpp'           -- per-call machine payments: a 402 with a
+#                        Payment-Required challenge is settled through the
+#                        MPP treasury (see 105_mpp_payments.py: enable
+#                        switch, per-call cap, escalation floor, treasury
+#                        and per-vendor caps, full ledger). No entry here
+#                        uses it yet -- the rail is dormant until the
+#                        operator registers an MPP-priced vendor and funds
+#                        the treasury.
 _PROVIDER_DIALING = {
     'straitly': {
         'base_url': 'https://api.straitly.ai/v1/chat/completions',
@@ -871,6 +881,17 @@ def _openrouter_chat_post(body, provider=None):
             # OpenRouter refused this :free model outright (harness-gated or
             # gone): ban it and let the pick rotate to the next candidate.
             _freepool_note_rejected(provider)
+        if (e.code == 402 and is_custom
+                and (provider or {}).get('settlement') == 'mpp'
+                and _mpp_settle_and_retry(e, provider, body.get('model'))):
+            # The vendor prices this call through a machine-payment challenge
+            # (MPP, operator decision 2026-11-13) and the payment just
+            # SETTLED through the treasury: exactly one retry of the same
+            # body. Every fence (enable switch, per-call cap, escalation
+            # floor, treasury + vendor caps) is enforced inside
+            # _mpp_settle_and_retry -- a refusal raises and the call fails
+            # like any other error, feeding the normal fallbacks.
+            return _post_once_tracked(body)
         if e.code == 402 and not is_custom:
             _set_credits_pause(True, source='openrouter_402')
         if e.code != 400 or 'reasoning is mandatory' not in detail:

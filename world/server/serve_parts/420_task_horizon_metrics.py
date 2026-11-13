@@ -517,6 +517,15 @@ def compute_health_snapshot():
                 'capUsd': float(_serve_mod.JEV_SPEND_CAP_USD or 0),
                 'exceeded': _serve_mod._lane_cap_exceeded('__jev__'),
             },
+            # Machine-payments treasury (MPP, 2026-11-13): settled
+            # per-call payments answer to their own monthly lane cap and
+            # show up in the Bank like every other spend dimension.
+            'mppLane': {
+                'enabled': _serve_mod._mpp_enabled(),
+                'usedUsd': _serve_mod._service_month_to_date(ledger, '__mpp__'),
+                'capUsd': float(_serve_mod.MPP_SPEND_CAP_USD or 0),
+                'exceeded': _serve_mod._lane_cap_exceeded('__mpp__'),
+            },
         }
     except Exception:
         pass
