@@ -609,8 +609,14 @@ class ContentGraceHelpers(unittest.TestCase):
             time.sleep(0.05)
         first = sim._CONTENT_HEARTBEATS.get('keepalive-1')
         self.assertIsInstance(first, float)
+        # A tick that was mid-flight when the context exited still lands
+        # within one interval plus scheduling jitter (2026-11-13 window:
+        # 45 microseconds leaked through and failed the exact-equality
+        # read). Wait past the worst-case landing, THEN require stillness.
+        time.sleep(0.25)
+        settled = sim._CONTENT_HEARTBEATS.get('keepalive-1')
         time.sleep(0.05)
-        self.assertEqual(sim._CONTENT_HEARTBEATS.get('keepalive-1'), first,
+        self.assertEqual(sim._CONTENT_HEARTBEATS.get('keepalive-1'), settled,
                          'the keepalive thread must stop when the call returns')
 
     def test_process_registry_keeps_a_live_run_alive_after_a_stale_save(self):
