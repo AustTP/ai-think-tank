@@ -130,6 +130,11 @@ async def _lifespan(app):
         else asyncio.create_task(_tier_failure_recheck_loop())
     calibration_task = None if VILLAGE_MODE \
         else asyncio.create_task(_calibration_loop())
+    # Weekly forecast (operator, 2026-11-13): Friday 20:00 ET digest --
+    # spend burn forecast, world clock (who is awake), sessions, dormant
+    # revenue section. Read-only report; parent-only like the review loop.
+    weekly_forecast_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_weekly_forecast_loop())
     weekly_review_task = None if VILLAGE_MODE \
         else asyncio.create_task(_weekly_review_loop())
     colab_task = None if VILLAGE_MODE \
@@ -200,6 +205,8 @@ async def _lifespan(app):
         calibration_task.cancel()
     if weekly_review_task is not None:
         weekly_review_task.cancel()
+    if weekly_forecast_task is not None:
+        weekly_forecast_task.cancel()
     if colab_task is not None:
         colab_task.cancel()
     if colab_compute_task is not None:
