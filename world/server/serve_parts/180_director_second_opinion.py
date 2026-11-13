@@ -501,7 +501,7 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None,
 
 
 async def _best_value_pick(candidates, scores, floor_gap=None, band=None,
-                           min_score=None):
+                           min_score=None, provider=None):
     # Shared by every band (restored): score keeps its place. Among
     # candidates with a real stored score, keep only those within the band's
     # quality floor of the best score present, then take the first one on
@@ -513,13 +513,18 @@ async def _best_value_pick(candidates, scores, floor_gap=None, band=None,
     # cheapest-and-slowest model no longer wins a band it barely deserved on
     # price alone. The reorder only runs for bands in TIER_SPEED_BANDS;
     # band=None (and every band outside the tuple) keeps cheapest-first.
-    # Returns None if nothing in `candidates` has a stored score yet, or
-    # nothing verified works -- callers fall back to Jev's classifier in
-    # that case.
+    # `provider` names the DIALING provider the candidates come from: the
+    # probes must dial THAT transport (its base_url/key), not the default --
+    # otherwise a Straitly candidate is "verified" against OpenRouter, which
+    # does not even list it, and every band falls through to the classifier
+    # fallback (fixed 2026-11-13). Returns None if nothing in `candidates`
+    # has a stored score yet, or nothing verified works -- callers fall back
+    # to Jev's classifier in that case.
     for candidate in _speed_tie_order(
             _best_value_qualifiers_sync(candidates, scores, floor_gap,
                                         min_score=min_score), band):
-        if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+        if await asyncio.to_thread(_verify_model_works_sync, candidate['id'],
+                                   provider):
             return candidate
     return None
 

@@ -355,6 +355,68 @@ def _pick_provider(per_provider):
     return fallback
 
 
+# --- Cap-crossing watch -----------------------------------------------------
+# A provider's spend crossing its monthly cap is a re-pick EVENT, not
+# something the 30-min price watch or the 2h sweep should be first to notice
+# (operator, 2026-11-13): every band still dialing a capped provider would
+# keep burning against a gate that refuses the calls until the next scheduled
+# sweep. The watch polls the cap state directly and runs one full re-pick the
+# minute a provider crosses its threshold IN EITHER DIRECTION (month reset
+# migrates the picks back to the cheaper registry-first provider the same
+# way). The JEV decisions lane is NOT part of this: it is its own spend lane
+# (`__jev__`) with its own cap and its own failover chain -- crossing it
+# reroutes decisions, never the band picks.
+_PROVIDER_CAP_STATE: dict = {}    # provider -> last observed cap-exceeded bool
+PROVIDER_CAP_WATCH_INTERVAL_S = 60
+
+
+def _provider_cap_transitions_sync():
+    """(provider, now_capped) pairs whose cap state FLIPPED since the last
+    poll, either direction. The first poll only seeds the cache -- a process
+    boot into an already-capped world must not fire a spurious re-pick (the
+    picks were migrated before the restart, or _pick_provider handles it on
+    the next sweep). A provider whose cap read FAILS contributes nothing:
+    an unreadable cap never fabricates a crossing."""
+    current = {}
+    for provider in PROVIDER_CATALOGS:
+        try:
+            current[provider] = bool(_provider_cap_exceeded(provider))
+        except Exception:
+            continue
+    flipped = []
+    if _PROVIDER_CAP_STATE:
+        for provider, now_capped in current.items():
+            was = _PROVIDER_CAP_STATE.get(provider)
+            if was is not None and was != now_capped:
+                flipped.append((provider, now_capped))
+    for provider, now_capped in current.items():
+        _PROVIDER_CAP_STATE[provider] = now_capped
+    return flipped
+
+
+async def _provider_cap_watch_loop():
+    while True:
+        await asyncio.sleep(PROVIDER_CAP_WATCH_INTERVAL_S)
+        try:
+            flipped = await asyncio.to_thread(_provider_cap_transitions_sync)
+        except Exception as e:
+            print(f'[model-tiers] provider cap watch failed: {e}', flush=True)
+            import traceback
+            print(traceback.format_exc(), flush=True)
+            continue
+        if not flipped:
+            continue
+        named = ', '.join(f'{p} {"hit" if capped else "fell under"} its cap'
+                          for p, capped in flipped)
+        try:
+            await _tier_refresh_logged(f'cap watch: {named}')
+        except Exception as e:
+            # Same fail-open rule as every other tier loop: keep current
+            # tiers and let the next crossing poll or sweep retry.
+            import traceback
+            print(f'[model-tiers] cap-crossing re-pick failed: {e}\n{traceback.format_exc()}', flush=True)
+
+
 async def refresh_model_tiers():
     # Multi-provider catalog sync: every provider in PROVIDER_CATALOGS is
     # fetched independently -- one vendor failing logs and contributes an
@@ -430,7 +492,7 @@ async def refresh_model_tiers():
             # different scale, so a numeric floor there is not meaningful.
             min_score = BAND_MIN_SCORE.get(band) if benchmark == BAND_BENCHMARK[band][0] else None
             picked = await _best_value_pick(candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band), band=band,
-                                            min_score=min_score)
+                                            min_score=min_score, provider=pick_provider)
             if picked is not None:
                 # Cheapest in-floor qualifier under the winning benchmark's
                 # scores: the baseline the BP-63 audit compares this pick
@@ -543,7 +605,8 @@ async def refresh_model_tiers():
     # doesn't win just for being cheap.
     vision_pool = pools['vision']
     vision_scores = {r['model_id']: r['score'] for r in all_benchmark_rows if r['benchmark'] == 'MMMU'}
-    vision_pick = await _best_value_pick(vision_pool, vision_scores, band='vision')
+    vision_pick = await _best_value_pick(vision_pool, vision_scores, band='vision',
+                                         provider=pick_provider)
     if vision_pick is None and vision_pool:
         # Same fallback the cost bands use: MMMU is player-entered (the
         # catalog carries no image-comprehension metric), so when no MMMU
@@ -634,8 +697,10 @@ async def refresh_model_tiers():
 
 def get_cached_model_tiers():
     with _db() as conn:
-        rows = conn.execute('SELECT band, slug, name, price_per_m FROM model_tiers').fetchall()
-    return {band: {'slug': slug, 'name': name, 'price': price} for band, slug, name, price in rows}
+        rows = conn.execute(
+            'SELECT band, slug, name, price_per_m, provider FROM model_tiers').fetchall()
+    return {band: {'slug': slug, 'name': name, 'price': price, 'provider': provider}
+            for band, slug, name, price, provider in rows}
 
 
 def get_tier_daily_log(band=None, days=30):

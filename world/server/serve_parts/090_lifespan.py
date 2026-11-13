@@ -117,6 +117,13 @@ async def _lifespan(app):
         else asyncio.create_task(_photo_album_watch_loop())
     tier_price_watch_task = None if VILLAGE_MODE \
         else asyncio.create_task(_tier_price_watch_loop())
+    # Provider cap crossings (operator, 2026-11-13): spend crossing a
+    # provider's monthly cap re-picks the tiers within a minute, so the
+    # bands migrate off a capped provider instead of waiting for the next
+    # scheduled sweep. The JEV decisions lane has its own cap and is not
+    # part of this watch. Parent-only like the other tier loops.
+    provider_cap_watch_task = None if VILLAGE_MODE \
+        else asyncio.create_task(_provider_cap_watch_loop())
     service_price_drift_task = None if VILLAGE_MODE \
         else asyncio.create_task(_service_price_drift_loop())
     tier_failure_recheck_task = None if VILLAGE_MODE \
@@ -205,6 +212,8 @@ async def _lifespan(app):
         photo_watch_task.cancel()
     if tier_price_watch_task is not None:
         tier_price_watch_task.cancel()
+    if provider_cap_watch_task is not None:
+        provider_cap_watch_task.cancel()
     if service_price_drift_task is not None:
         service_price_drift_task.cancel()
     if tier_failure_recheck_task is not None:

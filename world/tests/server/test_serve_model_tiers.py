@@ -601,7 +601,8 @@ class GetCachedModelTiers(unittest.TestCase):
                 ('low', 'low/m1', 'Low1', 0.2, time.time()),
             )
         tiers = serve.get_cached_model_tiers()
-        self.assertEqual(tiers['low'], {'slug': 'low/m1', 'name': 'Low1', 'price': 0.2})
+        self.assertEqual(tiers['low'], {'slug': 'low/m1', 'name': 'Low1', 'price': 0.2,
+                                        'provider': None})
 
 
 

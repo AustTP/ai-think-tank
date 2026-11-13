@@ -422,5 +422,184 @@ class RefreshMovesPicksToAvailableProvider(unittest.TestCase):
         self.assertEqual(logged, ('straitly',))
 
 
+class CapCrossingWatch(unittest.TestCase):
+    """A provider spend crossing its monthly cap is a re-pick EVENT within
+    one watch poll (operator, 2026-11-13), in EITHER direction (a month
+    reset migrates the picks back). The JEV decisions lane is its own spend
+    lane with its own failover -- crossing it never re-picks the bands."""
+
+    _CATALOGS = {'openrouter': '_fetch_openrouter_catalog_sync',
+                 'straitly': '_fetch_straitly_catalog_sync'}
+
+    def setUp(self):
+        serve._PROVIDER_CAP_STATE.clear()
+        _reg = unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', self._CATALOGS)
+        _reg.start()
+        self.addCleanup(_reg.stop)
+
+    def tearDown(self):
+        serve._PROVIDER_CAP_STATE.clear()
+
+    def test_first_poll_seeds_without_firing(self):
+        # Booting into an already-capped world must not fire a spurious
+        # re-pick: the picks were migrated before the restart.
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=True):
+            self.assertEqual(serve._provider_cap_transitions_sync(), [])
+        self.assertEqual(serve._PROVIDER_CAP_STATE,
+                         {'openrouter': True, 'straitly': True})
+
+    def test_crossing_fires_once_then_quiets(self):
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            self.assertEqual(serve._provider_cap_transitions_sync(), [])
+        states = {'openrouter': True, 'straitly': False}
+
+        def capped(provider):
+            return states[provider]
+
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        side_effect=capped):
+            flipped = serve._provider_cap_transitions_sync()
+        self.assertEqual(flipped, [('openrouter', True)])
+        # Same state on the next poll: no new crossing, no second re-pick.
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        side_effect=capped):
+            self.assertEqual(serve._provider_cap_transitions_sync(), [])
+
+    def test_month_reset_crosses_back(self):
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=True):
+            serve._provider_cap_transitions_sync()
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            self.assertEqual(serve._provider_cap_transitions_sync(),
+                             [('openrouter', False), ('straitly', False)])
+
+    def test_failed_cap_read_never_fabricates_a_crossing(self):
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            serve._provider_cap_transitions_sync()
+
+        def boom(provider):
+            raise RuntimeError('rollup read failed')
+
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        side_effect=boom):
+            self.assertEqual(serve._provider_cap_transitions_sync(), [])
+        # The failed provider keeps its last known state.
+        self.assertEqual(serve._PROVIDER_CAP_STATE,
+                         {'openrouter': False, 'straitly': False})
+
+
+class WatchReadsTheServingProviderCatalog(unittest.TestCase):
+    """The price watch must read the SAME catalog the next pick draws from:
+    after a cap crossing migrated the picks to Straitly, reading OpenRouter
+    alone made every migrated slug look delisted and re-fired a full re-pick
+    on every watch cycle (fixed 2026-11-13)."""
+
+    _CATALOGS = {'openrouter': '_fetch_openrouter_catalog_sync',
+                 'straitly': '_fetch_straitly_catalog_sync'}
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_tiers')
+            conn.execute('DELETE FROM model_benchmark_scores')
+
+    def tearDown(self):
+        self.setUp()
+
+    def _m(self, mid, price):
+        half = str(price / 2_000_000)
+        return {'id': mid, 'name': mid,
+                'pricing': {'prompt': half, 'completion': half},
+                'architecture': {'input_modalities': ['text'],
+                                 'output_modalities': ['text']}}
+
+    def _select(self, band, slug, price, provider):
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO model_tiers (band, slug, name, price_per_m, provider, chosen_at) '
+                'VALUES (?,?,?,?,?,?) ON CONFLICT(band) DO UPDATE SET '
+                'slug=excluded.slug, price_per_m=excluded.price_per_m, provider=excluded.provider',
+                (band, slug, slug, price, provider, 0.0))
+
+    def test_straitly_picks_do_not_look_delisted_on_openrouter(self):
+        self._select('mid', 'st/pick', 0.5, 'straitly')
+        fetches = []
+
+        def fake_openrouter():
+            fetches.append('openrouter')
+            return []
+
+        def fake_straitly():
+            fetches.append('straitly')
+            return [self._m('st/pick', 0.5)]
+
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', self._CATALOGS), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        side_effect=fake_openrouter), \
+             unittest.mock.patch.object(serve, '_fetch_straitly_catalog_sync',
+                                        side_effect=fake_straitly):
+            self.assertEqual(serve._tier_watch_moves_sync(), set())
+        self.assertEqual(fetches, ['straitly'])
+
+    def test_unknown_provider_stamp_fails_the_cycle(self):
+        self._select('mid', 'x/pick', 0.5, 'ghost-vendor')
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', self._CATALOGS):
+            with self.assertRaises(RuntimeError):
+                serve._tier_watch_moves_sync()
+
+    def test_openrouter_outage_never_reads_as_mass_delisting(self):
+        self._select('mid', 'or/pick', 0.5, None)
+
+        def down():
+            raise RuntimeError('catalog unreachable')
+
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', self._CATALOGS), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        side_effect=down):
+            with self.assertRaises(RuntimeError):
+                serve._tier_watch_moves_sync()
+
+
+class BestValuePickProbesItsOwnProvider(unittest.TestCase):
+    """A candidate from a non-default provider must be VERIFY-PROBED through
+    that provider's transport: verifying a Straitly slug against OpenRouter
+    (which does not list it) fails every band and falls through to the
+    classifier fallback (fixed 2026-11-13)."""
+
+    def test_provider_rides_the_verify_probe(self):
+        cands = [{'id': 'st/only', 'name': 'st/only', 'price': 0.5}]
+        scores = {'st/only': 41.0}
+        seen = []
+
+        def probe(model_id, provider=None):
+            seen.append((model_id, provider))
+            return True
+
+        with unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        side_effect=probe):
+            picked = serve.asyncio.run(serve._best_value_pick(
+                cands, scores, provider='straitly'))
+        self.assertEqual(picked['id'], 'st/only')
+        self.assertEqual(seen, [('st/only', 'straitly')])
+
+    def test_default_probe_keeps_the_legacy_signature(self):
+        cands = [{'id': 'or/a', 'name': 'or/a', 'price': 0.5}]
+        scores = {'or/a': 41.0}
+        seen = []
+
+        def probe(model_id, provider=None):
+            seen.append((model_id, provider))
+            return True
+
+        with unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        side_effect=probe):
+            picked = serve.asyncio.run(serve._best_value_pick(cands, scores))
+        self.assertEqual(picked['id'], 'or/a')
+        self.assertEqual(seen, [('or/a', None)])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -514,7 +514,10 @@ async def _model_tier_refresh_loop():
         except Exception as e:
             # A refresh failure is not fatal -- keep the previous tiers and
             # retry on the next cycle (fails open to the last good choice).
-            print(f'[model-tiers] tier refresh failed (keeping current tiers): {e}', flush=True)
+            # The traceback rides the log: these crashes were IndexError
+            # ghosts for a day because the message alone named no frame.
+            import traceback
+            print(f'[model-tiers] tier refresh failed (keeping current tiers): {e}\n{traceback.format_exc()}', flush=True)
 
 
 def _tier_watch_moves_sync():
@@ -530,22 +533,48 @@ def _tier_watch_moves_sync():
     Uses the exact price metric _bucket_models_by_price stores --
     (prompt + completion) * 1e6 -- and the SAME candidate pools + quality
     floor the pick uses, so a "cheaper qualifier" here is exactly one the
-    next pick would choose. Free: one catalog read + local score math, no
+    next pick would choose. Free: catalog reads only + local score math, no
     verify probes (the re-pick it triggers does the probing). Returns a set
     of band names; empty = nothing moved."""
-    models = _fetch_openrouter_catalog_sync()
-    catalog = {}
-    for m in models:
-        if ':batch' in m['id']:
-            continue
-        try:
-            p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
-        except (KeyError, TypeError, ValueError):
-            continue
-        catalog[m['id']] = (p + c) * 1_000_000
     selected = get_cached_model_tiers()
+    # Provider-aware (operator, 2026-11-13): the watch must read the SAME
+    # catalog the next pick draws from. After a cap crossing migrated the
+    # picks to another provider, reading the default provider's catalog made
+    # every migrated slug look "delisted" here and the watch re-fired a full
+    # re-pick on every cycle. Fetch exactly the providers the picks name
+    # (a NULL provider stamp is a legacy row: the default transport's
+    # provider); a fetch failure of a NEEDED provider fails the whole cycle
+    # (fail-open as before -- a vendor outage must not read as a mass
+    # delisting), and a provider stamp outside the registry contributes no
+    # catalog.
+    wanted = sorted({(meta.get('provider') or DEFAULT_DIALING_PROVIDER)
+                     for meta in selected.values()})
+    per_provider = {}
+    for provider in wanted:
+        fetch_name = PROVIDER_CATALOGS.get(provider)
+        if not fetch_name:
+            continue
+        per_provider[provider] = globals()[fetch_name]() or []
+    if wanted and not per_provider:
+        raise RuntimeError(f'no catalog fetchable for the selected providers: {wanted}')
+    catalog = {}
+    for models in per_provider.values():
+        for m in models:
+            if ':batch' in m['id']:
+                continue
+            try:
+                p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            catalog[m['id']] = (p + c) * 1_000_000
     benchmark_rows = get_model_benchmark_scores()
-    pools = _band_candidate_pools(models)
+    # The pools a fresh pick would draw from: whatever _pick_provider
+    # selects among the catalogs this cycle fetched. A provider MIGRATION
+    # itself is the cap watch's job; this watch owns price, delisting and
+    # cheaper-qualifier moves within the serving provider.
+    pick_provider = _pick_provider(per_provider)
+    pools = _band_candidate_pools(
+        per_provider.get(pick_provider) or next(iter(per_provider.values()), []))
     moves = set()
     for band, meta in selected.items():
         if _provider_spec_for_band(band):
@@ -596,7 +625,8 @@ async def _tier_price_watch_loop():
         except Exception as e:
             # Same fail-open rule as the full loop: keep current tiers, retry
             # on the next cycle -- a watch failure never drops a working pick.
-            print(f'[model-tiers] price watch failed (keeping current tiers): {e}', flush=True)
+            import traceback
+            print(f'[model-tiers] price watch failed (keeping current tiers): {e}\n{traceback.format_exc()}', flush=True)
 
 
 # --- Third re-pick trigger: a selected model becoming UNAVAILABLE ----------
@@ -674,7 +704,8 @@ async def _tier_failure_recheck_loop():
         except Exception as e:
             # Fail-open like the other loops -- keep current tiers, the queue
             # admission cooldown still bounds how often this can retry.
-            print(f'[model-tiers] availability re-pick failed (keeping current tiers): {e}', flush=True)
+            import traceback
+            print(f'[model-tiers] availability re-pick failed (keeping current tiers): {e}\n{traceback.format_exc()}', flush=True)
 
 
 async def _auto_failover_jev_if_gone(fresh, actor):
