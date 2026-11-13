@@ -121,7 +121,7 @@ def test_free_custom_provider_does_not_respect_openrouter_spend_cap(monkeypatch)
     monkeypatch.setattr(serve, 'is_model_circuit_broken', lambda model: False)
     monkeypatch.setattr(serve, 'record_model_result', lambda *a, **k: None)
     monkeypatch.setattr(serve, '_openrouter_chat_post',
-                        lambda body: {'choices': [{}], 'usage': {'cost': 0.0}})
+                        lambda body, provider=None: {'choices': [{}], 'usage': {'cost': 0.0}})
     out = serve._call_openrouter_once_sync('@provider:3d', [], 10)
     assert out['usage']['cost'] == 0.0
 

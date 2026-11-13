@@ -645,16 +645,22 @@ MODEL_VERIFY_MAX_TOKENS = 512
 MODEL_VERIFY_ATTEMPTS = 2
 
 
-def _verify_model_works_sync(model_id):
+def _verify_model_works_sync(model_id, provider=None):
     # Catalog metadata alone can't catch this -- a model can be listed
     # with valid pricing and architecture yet have zero actual serving
     # endpoints behind it right now (confirmed: openai/gpt-5.2-chat
     # 404'd with "No endpoints found" despite a perfectly normal-looking
     # catalog entry). A real test call is the only real authority, same
     # lesson as Jev's own routing earlier in.
+    # `provider` names a non-default DIALING provider: a candidate from
+    # that provider's catalog must be probed through ITS transport, not the
+    # default -- the refresh verifies picks before any tier row exists, so
+    # slug-based provider resolution cannot see the dialing vendor yet.
     for attempt in range(MODEL_VERIFY_ATTEMPTS):
         try:
-            data = _call_openrouter_sync(model_id, [{'role': 'user', 'content': 'hi'}], MODEL_VERIFY_MAX_TOKENS)
+            data = _call_openrouter_sync(model_id, [{'role': 'user', 'content': 'hi'}],
+                                         MODEL_VERIFY_MAX_TOKENS,
+                                         provider_name=provider)
             content = data['choices'][0]['message']['content']
             if content and content.strip():
                 # Housekeeping spend is real spend: the daily tier-refresh

@@ -549,6 +549,15 @@ def init_db():
             price_per_m REAL NOT NULL,
             chosen_at REAL NOT NULL
         )''')
+        # The DIALING provider a band's pick is served through (the key into
+        # DIALING_PROVIDERS / PROVIDER_CATALOGS: 'openrouter' today, NULL on
+        # legacy rows meaning the same). A tier pick is provider-agnostic --
+        # same score/price policy whoever sells it -- so the pick carries WHO
+        # must serve it, and the transport resolves base_url/key from the
+        # provider registry at call time.
+        _tiers_cols = {r[1] for r in conn.execute('PRAGMA table_info(model_tiers)')}
+        if 'provider' not in _tiers_cols:
+            conn.execute('ALTER TABLE model_tiers ADD COLUMN provider TEXT')
         # Ordered alternates for each tier: when a band's selected model stops
         # answering (delisted / no endpoints), a real call retries down this
         # list immediately instead of waiting for the minute-scale re-pick
@@ -564,6 +573,9 @@ def init_db():
             chosen_at REAL NOT NULL,
             PRIMARY KEY (band, rank)
         )''')
+        _fallback_cols = {r[1] for r in conn.execute('PRAGMA table_info(model_tier_fallbacks)')}
+        if 'provider' not in _fallback_cols:
+            conn.execute('ALTER TABLE model_tier_fallbacks ADD COLUMN provider TEXT')
         # Daily tier price/score log: one row per (date, band) recording
         # which model the tier picked, its blended price, and the benchmark
         # score the pick was grounded on. model_tiers keeps only the CURRENT
@@ -586,6 +598,9 @@ def init_db():
             speed_picked INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (log_date, band)
         )''')
+        _daily_cols = {r[1] for r in conn.execute('PRAGMA table_info(tier_daily_log)')}
+        if 'provider' not in _daily_cols:
+            conn.execute('ALTER TABLE tier_daily_log ADD COLUMN provider TEXT')
         # BP-63 audit columns: when a band's pick was latency-decided (a
         # pricier qualifier inside the price parity band won on observed
         # speed), the daily row records the median ms and the sample count

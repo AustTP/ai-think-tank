@@ -504,6 +504,19 @@ def compute_health_snapshot():
             'allServicesUsd': _serve_mod._ledger_month_to_date(ledger),
             'capUsd': float(_serve_mod.SPEND_CAP_USD or 0),
             'exceeded': _serve_mod._think_tank_spend_cap_exceeded(),
+            # Per-dialing-provider caps (operator, 2026-11-13): each vendor
+            # answers to its own monthly allowance; the tier pick layer
+            # re-selects from a provider with spend left.
+            'providers': {p: {
+                'usedUsd': _serve_mod._provider_month_used_for_cap(ledger, p),
+                'capUsd': _serve_mod._provider_spend_cap(p),
+                'exceeded': _serve_mod._provider_cap_exceeded(p),
+            } for p in _serve_mod.DIALING_PROVIDERS},
+            'jevLane': {
+                'usedUsd': _serve_mod._service_month_to_date(ledger, '__jev__'),
+                'capUsd': float(_serve_mod.JEV_SPEND_CAP_USD or 0),
+                'exceeded': _serve_mod._lane_cap_exceeded('__jev__'),
+            },
         }
     except Exception:
         pass

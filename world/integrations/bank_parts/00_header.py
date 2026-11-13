@@ -476,7 +476,7 @@ def _spend_cap_period():
     return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m')
 
 
-_ROLLUP_BUCKET_PREFIXES = ('__village__/', '__agent__/', '__director__/', '__receipts__')
+_ROLLUP_BUCKET_PREFIXES = ('__village__/', '__agent__/', '__director__/', '__provider__/', '__receipts__')
 
 
 def _is_tracked_service_bucket(key, value):
@@ -621,7 +621,7 @@ def _ledger_month_to_date(ledger):
 # account with its own monthly budget). The OpenRouter month-to-date
 # gauge excludes them; the per-service Bank view still shows each one's
 # own month-to-date.
-_NON_OPENROUTER_LEDGER_KEYS = frozenset({'treg'})
+_NON_OPENROUTER_LEDGER_KEYS = frozenset({'treg', '__straitly__'})
 
 
 def _openrouter_month_to_date(ledger):
@@ -635,6 +635,162 @@ def _openrouter_month_to_date(ledger):
     return round(sum(_service_month_to_date(ledger, svc)
                      for svc, v in (ledger or {}).items()
                      if svc not in excluded and _is_tracked_service_bucket(svc, v)), 6)
+
+
+# ---------------------------------------------------------------------------
+# Per-provider spend caps (operator, 2026-11-13). Each DIALING provider --
+# whoever a model call is actually sent to -- gets its own monthly dollar
+# cap from PROVIDER_SPEND_CAPS, enforced at that provider's transport, so
+# one provider running dry never takes the whole tank down: the tier pick
+# layer re-selects from a provider with spend left (refresh_model_tiers),
+# and adding a provider is a registry entry + one cap constant, never new
+# cap logic. The JEV decisions lane is deliberately NOT part of its
+# transport provider's general cap: decisions are the tank's nervous
+# system, so the `__jev__` lane carries its own smaller allowance
+# (JEV_SPEND_CAP_USD) via the lane-cap check.
+# ---------------------------------------------------------------------------
+
+_PROVIDER_ROLLUP_PREFIX = '__provider__/'
+_JEV_LEDGER_KEY = '__jev__'
+
+
+def _provider_spend_key(provider):
+    """Ledger rollup key for one dialing provider's spend -- same
+    namespacing rule as the village/agent/director rollups: excluded from
+    every shared cap total so it never double-counts the dollars already
+    sitting in the callers' service lanes."""
+    return _PROVIDER_ROLLUP_PREFIX + str(provider)
+
+
+@_serialized_ledger
+def _accrue_provider_spend(provider, cost):
+    """Roll one dialed call's cost into `__provider__/<name>`. Called by the
+    transports once per priced POST (the layer that actually knows which
+    vendor served), so per-provider caps read real money regardless of which
+    caller lane the same dollar also landed in. Best-effort like every
+    accrual."""
+    import serve as _serve
+    if not provider or not isinstance(cost, (int, float)) or not cost:
+        return
+    cost = float(cost)
+    try:
+        ledger = _serve._spend_ledger_read()
+        bucket = ledger.setdefault(_provider_spend_key(provider),
+                                   {'used': 0.0, 'calls': 0})
+        bucket['used'] = float(bucket.get('used', 0) or 0) + cost
+        bucket['calls'] = int(bucket.get('calls', 0) or 0) + 1
+        bucket['lastAt'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        series = bucket.setdefault('byMonth', {})
+        series[_spend_cap_period()] = float(series.get(_spend_cap_period(), 0) or 0) + cost
+        _serve._spend_ledger_write(ledger)
+    except Exception:
+        pass
+
+
+def _provider_month_used(ledger, provider):
+    """Month-to-date USD dialed through ONE provider, from its rollup."""
+    import serve as _serve
+    bucket = (ledger or {}).get(_provider_spend_key(provider))
+    if not isinstance(bucket, dict):
+        return 0.0
+    series = bucket.get('byMonth') or {}
+    month = _serve._spend_cap_period()
+    return round(sum(float(v or 0) for k, v in series.items()
+                     if isinstance(k, str) and k.startswith(month)), 6)
+
+
+def _provider_month_used_for_cap(ledger, provider):
+    """The month-used number a provider's cap is measured against. The
+    DEFAULT transport's provider (today OpenRouter) is special only because
+    history predates per-provider rollups: its dollars sit directly in the
+    callers' service lanes, so its usage is the tracked-lane estimate minus
+    every OTHER provider's rollup and the decisions lane. Every other
+    provider reads its own rollup -- clean, no subtraction chain. When
+    OpenRouter is eventually ripped out, its entry simply leaves the
+    registries and the next default transport takes this role."""
+    import serve as _serve
+    if provider == _serve.DEFAULT_DIALING_PROVIDER:
+        total = _openrouter_month_to_date(ledger)
+        total -= _service_month_to_date(ledger, _JEV_LEDGER_KEY)
+        others = [p for p in _serve.DIALING_PROVIDERS if p != provider]
+        for other in others:
+            total -= _provider_month_used(ledger, other)
+        return round(max(0.0, total), 6)
+    return _provider_month_used(ledger, provider)
+
+
+def _provider_spend_cap(provider):
+    """A provider's monthly USD cap from its env constant
+    (`<NAME>_SPEND_CAP_USD`, e.g. OPENROUTER_SPEND_CAP_USD), 0 = uncapped.
+    Read through serve at call time so tests and operators can retune it
+    without restarting the cap logic."""
+    import serve as _serve
+    env_name = f"{str(provider).upper().replace('-', '_')}_SPEND_CAP_USD"
+    return float(getattr(_serve, env_name, 0) or 0)
+
+
+def _provider_cap_exceeded(provider):
+    """One provider's monthly cap, consulted by that provider's transport
+    BEFORE a paid call goes out. False when the cap is 0 (disabled) or a
+    ledger read fails (never a false block). Tripping it fires one
+    allowance alert; the tier pick layer then re-selects from a provider
+    with spend left."""
+    import serve as _serve
+    cap = _provider_spend_cap(provider)
+    if not cap:
+        return False
+    try:
+        ledger = _serve._spend_ledger_read()
+        used = _provider_month_used_for_cap(ledger, provider)
+    except Exception:
+        return False
+    exceeded = used >= cap
+    _note_allowance_exhausted(
+        f'{provider}Spend',
+        f'{provider} spend cap reached (${cap:.2f}/month)',
+        f'{provider}-dialed spend this month: ${used:.2f}. New model work '
+        're-picks tiers from providers with spend left. Raise '
+        f'{env_name_of(provider)} in .env to restore.',
+        exceeded)
+    return exceeded
+
+
+def env_name_of(provider):
+    """The .env constant name for a provider's cap (single convention:
+    uppercase provider id + _SPEND_CAP_USD)."""
+    return f"{str(provider).upper().replace('-', '_')}_SPEND_CAP_USD"
+
+
+# Lane caps: a NAMED LANE (a class of calls, whichever provider served it)
+# can carry its own allowance on top of any provider cap. The JEV decisions
+# lane is the one entry: the tank's decisions model keeps working after the
+# general chat spend stops, on its own much smaller budget.
+def _lane_spend_cap(lane):
+    import serve as _serve
+    if lane == _JEV_LEDGER_KEY:
+        return float(_serve.JEV_SPEND_CAP_USD or 0)
+    return 0.0
+
+
+def _lane_cap_exceeded(lane):
+    import serve as _serve
+    cap = _lane_spend_cap(lane)
+    if not cap:
+        return False
+    try:
+        ledger = _serve._spend_ledger_read()
+        used = _service_month_to_date(ledger, lane)
+    except Exception:
+        return False
+    exceeded = used >= cap
+    _note_allowance_exhausted(
+        'jevSpend',
+        f'JEV decisions spend cap reached (${cap:.2f}/month)',
+        f'Decisions spend this month: ${used:.2f}. The failover chain now '
+        'serves decisions from the Colab/Laya standby first, then the free '
+        'pool. Raise JEV_SPEND_CAP_USD in .env to restore the paid slugs.',
+        exceeded)
+    return exceeded
 
 
 def _bank_budget_view(snapshot):

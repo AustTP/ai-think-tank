@@ -163,6 +163,9 @@ from integrations.bank import (  # noqa: E402,F401
     _quota_used_today,
     _vt_spacing_ok,
     _mark_vt_call,
+    _service_month_to_date,
+    _ROLLUP_BUCKET_PREFIXES,
+    _is_tracked_service_bucket,
     _spend_cap_month_view,
     _spend_cap_period,
     _spend_ledger_read,
@@ -172,6 +175,15 @@ from integrations.bank import (  # noqa: E402,F401
     _task_spend_key,
     _think_tank_spend_cap_exceeded,
     _village_spend_view,
+    _accrue_provider_spend,
+    _provider_spend_key,
+    _provider_month_used,
+    _provider_month_used_for_cap,
+    _provider_spend_cap,
+    _provider_cap_exceeded,
+    _lane_spend_cap,
+    _lane_cap_exceeded,
+    env_name_of,
 )
 # The curated RSS/ATOM aggregator (see DESIGN.md "Current events"). Extracted
 # into rss.py the same way: the poll loop, tolerant parser, ring buffer, and

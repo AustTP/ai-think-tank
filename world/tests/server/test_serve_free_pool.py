@@ -549,7 +549,7 @@ class CallLayerTests(_CallLayerBase):
         err = urllib.error.HTTPError('http://x', 429, 'quota', {}, None)
         called = []
 
-        def fake_post(body):
+        def fake_post(body, provider=None):
             called.append(body['model'])
             if body['model'].startswith('@freepool:'):
                 raise err
@@ -573,7 +573,7 @@ class CallLayerTests(_CallLayerBase):
                                   'paid/low-model'])
 
     def test_free_starvation_falls_through_to_paid(self):
-        def fake_post(body):
+        def fake_post(body, provider=None):
             if body['model'].startswith('@freepool:'):
                 return dict(_STARVED_RESULT)
             return _GOOD_RESULT
@@ -587,7 +587,7 @@ class CallLayerTests(_CallLayerBase):
         self.assertEqual(result['choices'][0]['message']['content'], 'ok')
 
     def test_paid_low_failure_assists_with_free(self):
-        def fake_post(body):
+        def fake_post(body, provider=None):
             if body['model'] == 'paid/low-model':
                 raise RuntimeError('paid endpoint down')
             return _GOOD_RESULT
@@ -684,7 +684,7 @@ class PaidSwitchTests(_CallLayerBase):
         err = urllib.error.HTTPError('http://x', 503, 'unavailable', {}, None)
         called = []
 
-        def fake_post(body):
+        def fake_post(body, provider=None):
             called.append(body['model'])
             if body['model'].startswith('@freepool:'):
                 raise err

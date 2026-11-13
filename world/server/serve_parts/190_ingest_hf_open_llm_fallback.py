@@ -330,6 +330,31 @@ def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
     return out
 
 
+def _pick_provider(per_provider):
+    """The provider tier picks are selected from: the first DIALING provider
+    (registry order) that lists models and has spend left under its own
+    monthly cap. A capped provider is skipped, so the picks -- and every
+    call the bands then dial -- move to a provider with budget, under the
+    SAME evaluation-score and cost policy per band (operator, 2026-11-13).
+    When every provider is capped or empty, the first listing provider
+    still wins: the transports gate per call, and the bands keep their
+    previous picks rather than going blank."""
+    fallback = None
+    for provider in PROVIDER_CATALOGS:
+        models = per_provider.get(provider) or []
+        if not models:
+            continue
+        if fallback is None:
+            fallback = provider
+        try:
+            capped = _provider_cap_exceeded(provider)
+        except Exception:
+            capped = False
+        if not capped:
+            return provider
+    return fallback
+
+
 async def refresh_model_tiers():
     # Multi-provider catalog sync: every provider in PROVIDER_CATALOGS is
     # fetched independently -- one vendor failing logs and contributes an
@@ -352,12 +377,18 @@ async def refresh_model_tiers():
             _sync_provider_catalog_rows(provider, per_provider[provider])
         except Exception as exc:
             print(f'[model-tiers] {provider} catalog rows sync failed: {exc}', flush=True)
-    openrouter_models = per_provider.get('openrouter') or []
     union_models, keep_ids = _merge_provider_catalogs(per_provider)
     _sync_model_catalog(union_models, keep_ids=keep_ids)
-    buckets = _bucket_models_by_price(openrouter_models)
+    # Provider selection: the default transport's provider while its cap has
+    # spend left, else the next DIALING provider with budget -- the same
+    # score/price policy per band, whoever sells the model. The pick's
+    # provider rides the tier rows, and the transport resolves base_url and
+    # key from the dialing registry at call time.
+    pick_provider = _pick_provider(per_provider)
+    pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
+    buckets = _bucket_models_by_price(pick_models)
     all_benchmark_rows = get_model_benchmark_scores()
-    pools = _band_candidate_pools(openrouter_models)
+    pools = _band_candidate_pools(pick_models)
     chosen = {}
     fallbacks = {}
     for band, purpose in MODEL_BAND_PURPOSE.items():
@@ -455,7 +486,8 @@ async def refresh_model_tiers():
                         wide_pool, wide_scores, BAND_QUALITY_FLOOR_GAP.get(band),
                         min_score=wide_min_score),
                     band):
-                if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+                if await asyncio.to_thread(_verify_model_works_sync,
+                                           candidate['id'], pick_provider):
                     picked = candidate
                     break
             if picked is None:
@@ -487,7 +519,8 @@ async def refresh_model_tiers():
             # than caching something that 404s the first time an agent
             # actually needs to talk.
             for candidate in ranked[:3]:
-                if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+                if await asyncio.to_thread(_verify_model_works_sync,
+                                           candidate['id'], pick_provider):
                     picked = candidate
                     break
         if picked is None:
@@ -533,7 +566,8 @@ async def refresh_model_tiers():
             pick_id = None
         ranked = [m for m in shortlist if m['id'] == pick_id] + [m for m in shortlist if m['id'] != pick_id]
         for candidate in ranked[:3]:
-            if await asyncio.to_thread(_verify_model_works_sync, candidate['id']):
+            if await asyncio.to_thread(_verify_model_works_sync,
+                                       candidate['id'], pick_provider):
                 vision_pick = candidate
                 break
     if vision_pick:
@@ -547,16 +581,16 @@ async def refresh_model_tiers():
         _ensure_tier_fallbacks_table(conn)
         for band, m in chosen.items():
             conn.execute(
-                'INSERT INTO model_tiers (band, slug, name, price_per_m, chosen_at) VALUES (?, ?, ?, ?, ?) '
-                'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, name=excluded.name, price_per_m=excluded.price_per_m, chosen_at=excluded.chosen_at',
-                (band, m['id'], m['name'], m['price'], time.time()),
+                'INSERT INTO model_tiers (band, slug, name, price_per_m, provider, chosen_at) VALUES (?, ?, ?, ?, ?, ?) '
+                'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, name=excluded.name, price_per_m=excluded.price_per_m, provider=excluded.provider, chosen_at=excluded.chosen_at',
+                (band, m['id'], m['name'], m['price'], pick_provider, time.time()),
             )
             conn.execute('DELETE FROM model_tier_fallbacks WHERE band = ?', (band,))
             for _rank, _fb in enumerate(fallbacks.get(band, []), 1):
                 conn.execute(
-                    'INSERT INTO model_tier_fallbacks (band, rank, slug, name, price_per_m, chosen_at) '
-                    'VALUES (?, ?, ?, ?, ?, ?)',
-                    (band, _rank, _fb['id'], _fb['name'], _fb['price'], time.time()),
+                    'INSERT INTO model_tier_fallbacks (band, rank, slug, name, price_per_m, provider, chosen_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?)',
+                    (band, _rank, _fb['id'], _fb['name'], _fb['price'], pick_provider, time.time()),
                 )
             # Daily price/score log: look up the benchmark score the pick was
             # grounded on (first metric in the band's chain that has a score
@@ -580,16 +614,18 @@ async def refresh_model_tiers():
             # cheapest in-floor qualifier (i.e. speed decided the order).
             _lat_ms, _lat_n, _speed = m.get('_latencyAudit') or (None, None, False)
             conn.execute(
-                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, logged_at, '
+                'INSERT INTO tier_daily_log (log_date, band, slug, name, price_per_m, benchmark, score, provider, logged_at, '
                 'median_latency_ms, latency_samples, speed_picked) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(log_date, band) DO UPDATE SET slug=excluded.slug, name=excluded.name, '
                 'price_per_m=excluded.price_per_m, benchmark=excluded.benchmark, score=excluded.score, '
+                'provider=excluded.provider, '
                 'median_latency_ms=excluded.median_latency_ms, latency_samples=excluded.latency_samples, '
                 'speed_picked=excluded.speed_picked, '
                 'logged_at=CASE WHEN tier_daily_log.slug = excluded.slug '
                 'THEN tier_daily_log.logged_at ELSE excluded.logged_at END',
-                (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score, time.time(),
+                (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score,
+                 pick_provider, time.time(),
                  _lat_ms, _lat_n, int(bool(_speed))),
             )
     log_action(None, 'model_tiers_refreshed', {band: m['id'] for band, m in chosen.items()})

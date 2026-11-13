@@ -84,7 +84,7 @@ def test_breaker_open_primary_rotates_to_healthy_pool_sibling():
     rotate instead of refusing."""
     posts = []
 
-    def fake_post(body):
+    def fake_post(body, provider=None):
         posts.append(body.get('model'))
         if body.get('model') == '@freepool:low:primary':
             raise AssertionError('the breaker-open primary must never reach the network')

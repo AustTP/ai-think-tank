@@ -100,7 +100,7 @@ class AvailabilityFailoverTest(unittest.TestCase):
     def test_availability_error_serves_from_the_next_slug(self):
         calls = []
 
-        def post(body):
+        def post(body, provider=None):
             calls.append(body['model'])
             if body['model'] == 'primary':
                 raise self._http_error(True)
@@ -114,7 +114,7 @@ class AvailabilityFailoverTest(unittest.TestCase):
     def test_non_availability_error_does_not_fail_over(self):
         calls = []
 
-        def post(body):
+        def post(body, provider=None):
             calls.append(body['model'])
             raise self._http_error(False)
 
@@ -124,7 +124,7 @@ class AvailabilityFailoverTest(unittest.TestCase):
         self.assertEqual(calls, ['primary'])
 
     def test_all_fallbacks_failing_reraises_the_original(self):
-        def post(body):
+        def post(body, provider=None):
             raise self._http_error(True)
 
         with mock.patch.object(serve, '_openrouter_chat_post', side_effect=post):

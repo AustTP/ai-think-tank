@@ -416,6 +416,15 @@ PLAYER_EMAIL_ENABLED = _load_env().get('PLAYER_EMAIL_ENABLED', 'true').strip().l
 # real ceiling).
 SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 
+# Per-provider monthly spend caps (operator, 2026-11-13). Each dialing
+# vendor stops at its own ceiling; the tier pick layer then selects from a
+# provider with spend left. The JEV decisions lane is EXCLUDED from the
+# OpenRouter general cap and carries its own smaller allowance -- decisions
+# outlive general chat spend. 0 disables a cap.
+OPENROUTER_SPEND_CAP_USD = float(_load_env().get('OPENROUTER_SPEND_CAP_USD', '5') or 0)
+JEV_SPEND_CAP_USD = float(_load_env().get('JEV_SPEND_CAP_USD', '0.5') or 0)
+STRAITLY_SPEND_CAP_USD = float(_load_env().get('STRAITLY_SPEND_CAP_USD', '0.5') or 0)
+
 # Per-agent monthly spend ceiling, checked at the model chokepoints that know
 # WHO is spending (/api/chat, _api_execute): a prompt-injected or runaway
 # agent can otherwise burn the WHOLE shared monthly budget (and every shared

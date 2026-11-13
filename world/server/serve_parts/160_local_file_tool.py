@@ -856,46 +856,39 @@ def _decision_model_chain():
                 chain = cand
     if chain is None:
         chain = [JEV_MODEL]
-    # Credits-aware candidate set (operator, 2026-11-04): the paid slug stops
-    # at the credits floor ($3.00, the credits watchdog), the FREE low pool
-    # keeps JEV usable down to the free floor ($0.05), and the Colab/Laya
-    # standby is the bottom of the chain. The CACHED OpenRouter balance (the
-    # 300s probe -- never a network call here) picks who serves; a cold cache
-    # fails open to the full chain.
+    # Failover order (operator, 2026-11-13): paid JEV slugs first, then the
+    # Colab/Laya standby (our own GPU -- decisions are the tank's most
+    # frequent calls, and burning the free tier's minute/daily allowance on
+    # them starves the low band's agent work), then the free pool as the
+    # LAST resort, only when Laya is unavailable.
+    laya = None
+    if _colab_standby_enabled() and _colab_standby_forward_alive():
+        laya = COLAB_STANDBY_URL.rstrip('/') + COLAB_STANDBY_DECISION_PATH
+    if laya and laya not in chain:
+        chain.append(laya)
     free_low = None
     try:
         free_low = _freepool_route_for_band('low', force=True)
     except Exception:
         free_low = None
     if free_low and free_low not in chain:
-        # Insert ahead of the first '://' provider (the laya standby) so the
-        # free pool is tried before the last-resort runtime.
-        laya_at = next((i for i, c in enumerate(chain) if '://' in c),
-                       len(chain))
-        chain.insert(laya_at, free_low)
+        laya_at = next((i for i, c in enumerate(chain) if c == laya), None)
+        if laya_at is not None:
+            chain.insert(laya_at + 1, free_low)
+        else:
+            chain.append(free_low)
     remaining = _credits_remaining_cached()
     if remaining is not None and remaining <= _credits_free_floor():
         # Below the free floor even free routes stop: JEV serves from the
         # laya/colab standby only.
         chain = [c for c in chain if '://' in c]
-    elif credits_pause_active():
-        # Paid spend is paused at the credits floor; free-pool candidates (and
-        # the laya standby) keep the decisions model alive.
+    elif credits_pause_active() or _lane_cap_exceeded('__jev__'):
+        # Paid spend is paused -- the account is dry, or the JEV decisions
+        # lane has hit its OWN monthly cap (JEV_SPEND_CAP_USD): the paid
+        # slugs drop, Laya then the free pool keep the decisions model
+        # alive. Decisions never stop; only the paid spend does.
         chain = [c for c in chain
                  if '://' in c or c.startswith('@freepool:')]
-    # The CLI-managed Colab/Laya standby trails the chain as the LAST fallback:
-    # when the colab CLI is available (and not operator-disabled), the loopback
-    # Laya provider is advertised so the failover can reach it during an outage
-    # -- nothing is registered, keyed, or paired; like every OpenRouter
-    # candidate it is just a chain entry that _decision_request routes by '://'.
-    # A TORN-DOWN standby (teardown after healthy cycles) owns no forward, so
-    # advertising the route would only trip its breaker on every sweep --
-    # 14 spurious model_circuit_broken rows overnight (2026-11-12). Advertise
-    # it only while its forward process is actually alive.
-    if _colab_standby_enabled() and _colab_standby_forward_alive():
-        provider = COLAB_STANDBY_URL.rstrip('/') + COLAB_STANDBY_DECISION_PATH
-        if provider not in chain:
-            chain.append(provider)
     return chain
 
 

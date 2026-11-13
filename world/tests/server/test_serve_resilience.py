@@ -866,7 +866,7 @@ class CreditsPauseTest(unittest.TestCase):
         with mock.patch.object(serve, '_freepool_route_for_band',
                                return_value='@freepool:low:gemini-free'), \
              mock.patch.object(serve, '_openrouter_chat_post',
-                               side_effect=lambda body: seen.setdefault(
+                               side_effect=lambda body, provider=None: seen.setdefault(
                                    'messages', body.get('messages')) or {'choices': []}):
             serve._call_openrouter_once_sync('test/paid-model', messages, 10)
         sent = seen.get('messages') or []
@@ -906,7 +906,7 @@ class CreditsPauseTest(unittest.TestCase):
         with mock.patch.object(serve, '_freepool_route_for_band',
                                return_value='@freepool:low:gemini-free') as route, \
              mock.patch.object(serve, '_openrouter_chat_post',
-                               side_effect=lambda body: seen.setdefault(
+                               side_effect=lambda body, provider=None: seen.setdefault(
                                    'model', body.get('model')) or {'choices': []}):
             serve._call_openrouter_once_sync('test/paid-model', [], 10)
         self.assertEqual(route.call_args[0][0], 'low')

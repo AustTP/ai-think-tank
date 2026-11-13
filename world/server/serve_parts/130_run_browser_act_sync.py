@@ -614,17 +614,100 @@ def _apply_plain_writing(messages):
 
 OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
+# --- dialing-provider registry (provider-agnostic transports) ---------------
+# Every vendor a model call can be sent to. The DEFAULT transport is the
+# plain OpenRouter-shaped chat-completions POST with OPENROUTER_API_KEY; any
+# other provider is an OpenAI-compatible endpoint dialed through its
+# base_url + key env. Ripping a provider out (even the default) is: remove
+# it from these two tuples + PROVIDER_CATALOGS -- nothing downstream knows
+# the name. Per-provider spend caps are env constants
+# (<NAME>_SPEND_CAP_USD) enforced at the transport; the tier pick layer
+# reads the same registry to re-select from a provider with spend left.
+DEFAULT_DIALING_PROVIDER = 'openrouter'
+DIALING_PROVIDERS = ('openrouter', 'straitly')
+_PROVIDER_DIALING = {
+    'straitly': {
+        'base_url': 'https://api.straitly.ai/v1/chat/completions',
+        'api_key_env': 'STRAITLY_API_KEY',
+    },
+}
+
+
+def _serving_provider(provider):
+    """Which registry provider a resolved spec dials; the default transport
+    when there is no spec."""
+    if provider and provider.get('is_custom') and provider.get('provider'):
+        return provider['provider']
+    return DEFAULT_DIALING_PROVIDER
+
+
+def _provider_dialing_spec(model_id, provider_name):
+    """A transport spec for `model_id` explicitly dialed through a
+    non-default provider (the tier-refresh verify path: the candidate is not
+    in model_tiers yet, so slug-based resolution cannot see it). Price is
+    the provider's own listing price, falling back to the canonical row."""
+    entry = _PROVIDER_DIALING.get(provider_name)
+    if not entry:
+        return None
+    price = 0.0
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT price_per_m FROM model_provider_catalog WHERE provider = ? AND model_id = ?',
+                (provider_name, model_id)).fetchone()
+            if not row:
+                row = conn.execute(
+                    'SELECT price_per_m FROM model_catalog WHERE model_id = ?',
+                    (model_id,)).fetchone()
+            price = float(row[0]) if row else 0.0
+    except Exception:
+        price = 0.0
+    return {'provider': provider_name, 'band': None, 'model': model_id,
+            'base_url': entry['base_url'], 'api_key_env': entry['api_key_env'],
+            'price_per_m': price, 'send_reasoning': False, 'is_custom': True}
+
+
+def _tier_provider_spec(model):
+    """The dialing spec for a PLAIN slug from the tier tables: its band pick
+    (model_tiers) or a fallback row (model_tier_fallbacks). Only a
+    non-default provider produces a spec -- an 'openrouter'/NULL provider
+    returns None and rides the default transport exactly as before."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT provider, price_per_m FROM model_tiers WHERE slug = ? AND provider IS NOT NULL',
+                (model,)).fetchone()
+            if not row:
+                row = conn.execute(
+                    'SELECT provider, price_per_m FROM model_tier_fallbacks '
+                    'WHERE slug = ? AND provider IS NOT NULL', (model,)).fetchone()
+    except Exception:
+        return None
+    if not row:
+        return None
+    name = row[0]
+    entry = _PROVIDER_DIALING.get(name)
+    if not entry:
+        return None
+    return {'provider': name, 'band': None, 'model': model,
+            'base_url': entry['base_url'], 'api_key_env': entry['api_key_env'],
+            'price_per_m': float(row[1] or 0), 'send_reasoning': False,
+            'is_custom': True}
+
 
 def _model_provider_for(model):
-    """Resolve a synthetic @provider:<band> slug to its operator override, or
-    a synthetic @freepool:<band>:<endpoint> slug to its free-pool endpoint
-    spec. Returns None for ordinary OpenRouter slugs. `is_custom` is true only
-    when a base_url is configured, so a model-only override still rides
-    OpenRouter auth, credits, and failover."""
+    """Resolve a synthetic @provider:<band> slug to its operator override, a
+    synthetic @freepool:<band>:<endpoint> slug to its free-pool endpoint
+    spec, or a plain slug whose tier row names a non-default DIALING
+    provider to that provider's transport spec. Returns None for ordinary
+    OpenRouter slugs. `is_custom` is true only when a base_url is in play,
+    so a model-only override still rides the default auth and failover."""
     cfg = MODEL_PROVIDER_OVERRIDES or {}
     if isinstance(model, str) and model.startswith('@freepool:'):
         return _freepool_provider_for(model)
-    if not isinstance(model, str) or not model.startswith('@provider:'):
+    if isinstance(model, str) and not model.startswith('@provider:'):
+        return _tier_provider_spec(model)
+    if not isinstance(model, str):
         return None
     band = model.split(':', 1)[1]
     spec = (cfg.get('tiers') or {}).get(band) or cfg.get('default')
@@ -673,7 +756,7 @@ def _apply_provider_cost(result, provider):
     return result
 
 
-def _openrouter_chat_post(body):
+def _openrouter_chat_post(body, provider=None):
     """Single POST of a chat-completions body, shared by the two call layers
     (_call_openrouter_once_sync and _post_openrouter_raw), with one recovery
     retry for MANDATORY-reasoning models: OpenRouter rejects an explicit
@@ -684,8 +767,23 @@ def _openrouter_chat_post(body):
     CAPPED reasoning budget answers fine at any size (same model, verified
     at 64 and 16000 tokens), so on that exact error retry once with
     reasoning capped to half the request budget. Returns the parsed JSON
-    document; re-raises every other failure unchanged."""
-    provider = _model_provider_for((body or {}).get('model'))
+    document; re-raises every other failure unchanged.
+
+    `provider` (optional) is a pre-resolved transport spec -- the verify
+    path passes one because its candidate has no tier row yet; None
+    resolves from the body's model exactly as before. The per-provider
+    spend cap is enforced HERE, at the single POST every layer shares: a
+    billable dial answers to its vendor's own monthly allowance, and a
+    tripped cap raises so the caller's free-pool/tier fallbacks take over."""
+    provider = provider if provider is not None else _model_provider_for((body or {}).get('model'))
+    if (not provider or not provider.get('free')) \
+            and (not provider or not provider.get('is_custom')
+                 or _provider_is_billable(provider)) \
+            and _provider_cap_exceeded(_serving_provider(provider)):
+        _name = _serving_provider(provider)
+        raise RuntimeError(
+            f'{_name} spend cap (${_provider_spend_cap(_name):.2f}/month) '
+            'reached -- tier picks move to a provider with spend left')
     is_custom = bool(provider and provider.get('is_custom'))
     if provider:
         body = dict(body)
@@ -733,6 +831,13 @@ def _openrouter_chat_post(body):
             raise
         duration_ms = int((time.monotonic() - start) * 1000)
         _apply_provider_cost(result, provider)
+        if provider and provider.get('is_custom') and not provider.get('free') \
+                and provider.get('provider'):
+            # Per-provider rollup (the dimension the provider caps read):
+            # the same dollar also lands in the caller's service lane, this
+            # names WHO served it. Fail-open like every accrual.
+            _accrue_provider_spend(provider['provider'],
+                                   (result.get('usage') or {}).get('cost') or 0.0)
         if provider and provider.get('free'):
             # Quota accounting for the free pool: RPM/TPM/RPD windows are fed
             # from the real POST, not the pick, so the picker's view stays
@@ -897,7 +1002,8 @@ def _degrade_fit_free_pool(messages):
 
 
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
-                               reasoning_override=None, _tried=None):
+                               reasoning_override=None, _tried=None,
+                               provider_name=None):
     # A BARE tier string ('@freepool:low', two segments) is a band name, not
     # a postable model id (2026-11-02 live bug: POSTing it verbatim earns
     # OpenRouter's 400 'not a valid model', the fallback generator sees
@@ -913,6 +1019,12 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         if resolved and resolved != model:
             model = resolved
     provider = _model_provider_for(model)
+    if provider is None and provider_name \
+            and provider_name != DEFAULT_DIALING_PROVIDER:
+        # Explicit non-default dialing (the tier-refresh verify path: the
+        # candidate has no tier row yet, so slug-based resolution cannot
+        # see its provider).
+        provider = _provider_dialing_spec(model, provider_name)
     is_custom = bool(provider and provider.get('is_custom'))
     free_route = bool(provider and provider.get('free'))
     # Free routes are exempt from the credits pause and the monthly spend cap
@@ -971,7 +1083,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         reasoning = {'enabled': False}
     body = {'model': model, 'messages': messages, 'max_tokens': max_tokens, 'reasoning': reasoning}
     try:
-        result = _openrouter_chat_post(body)
+        result = _openrouter_chat_post(body, provider=provider)
         if _reasoning_starved(result):
             if free_route:
                 # A free 200 with null content is a FAILED free attempt, not a
@@ -984,7 +1096,7 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                 if provider.get('openrouter_free'):
                     _freepool_note_rejected(provider)
                 raise RuntimeError(f'{model} returned no content (reasoning starved)')
-            recovered = _retry_reasoning_starved(body, result)
+            recovered = _retry_reasoning_starved(body, result, provider=provider)
             if recovered is not None:
                 result = recovered
     except urllib.error.HTTPError as e:
@@ -1079,7 +1191,7 @@ def _reasoning_starved(data):
         return False
 
 
-def _retry_reasoning_starved(body, first):
+def _retry_reasoning_starved(body, first, provider=None):
     """One recovery attempt for a reasoning-starved response: re-POST the same
     body with reasoning disabled so the full max_tokens budget goes to the
     visible answer. A mandatory-reasoning model rejects `enabled: False` with
@@ -1093,7 +1205,8 @@ def _retry_reasoning_starved(body, first):
     wasted = ((first.get('usage') or {}).get('cost') or 0.0)
     for payload in ({'enabled': False}, {'max_tokens': 64}):
         try:
-            retry = _openrouter_chat_post(dict(body, reasoning=payload))
+            retry = _openrouter_chat_post(dict(body, reasoning=payload),
+                                          provider=provider)
         except Exception:
             continue
         retry_cost = ((retry.get('usage') or {}).get('cost') or 0.0)
@@ -1112,9 +1225,12 @@ def _call_openrouter_sync_reasoning_off(model, messages, max_tokens):
     return _call_openrouter_once_sync(
         model, messages, max_tokens, reasoning_override={'enabled': False})
 
-def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
-    """The plain OpenRouter chat-completions call. With `best_of=1` (the
-    default) it returns a single parsed result dict exactly as before.
+def _call_openrouter_sync(model, messages, max_tokens, best_of=1,
+                          provider_name=None):
+    """The plain chat-completions call (default transport, or a non-default
+    provider when `provider_name` names one -- the tier-refresh verify
+    path). With `best_of=1` (the default) it returns a single parsed result
+    dict exactly as before.
 
     `best_of>1` is the test-time-compute sampling primitive: it returns a
     LIST of `best_of` independent completions (self-consistency samples) that
@@ -1123,10 +1239,12 @@ def _call_openrouter_sync(model, messages, max_tokens, best_of=1):
     through the same circuit breaker, retry, and model-result bookkeeping as
     a lone call."""
     if best_of is None or best_of <= 1:
-        return _call_openrouter_once_sync(model, messages, max_tokens)
+        return _call_openrouter_once_sync(model, messages, max_tokens,
+                                          provider_name=provider_name)
     samples = []
     for _ in range(int(best_of)):
-        samples.append(_call_openrouter_once_sync(model, messages, max_tokens))
+        samples.append(_call_openrouter_once_sync(model, messages, max_tokens,
+                                                  provider_name=provider_name))
     return samples
 
 
@@ -1217,7 +1335,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
             reasoning = {'max_tokens': max_tokens // 2}
     body['reasoning'] = reasoning
     try:
-        result = _openrouter_chat_post(body)
+        result = _openrouter_chat_post(body, provider=provider)
         if _reasoning_starved(result):
             if free_route:
                 # Same rule as the plain call layer: a free 200 with null
@@ -1226,7 +1344,7 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
                 if provider.get('openrouter_free'):
                     _freepool_note_rejected(provider)
                 raise RuntimeError(f'{model} returned no content (reasoning starved)')
-            recovered = _retry_reasoning_starved(body, result)
+            recovered = _retry_reasoning_starved(body, result, provider=provider)
             if recovered is not None:
                 result = recovered
     except urllib.error.HTTPError as e:
