@@ -240,6 +240,7 @@ def _run_pre_apply_tests(rows):
     repo_root = os.path.dirname(os.path.abspath(_world()))
     staging_root = os.path.join(_world(), '.selfedit_staging')
     os.makedirs(staging_root, exist_ok=True)
+    _sweep_stale_quarantines()
     tmp = os.path.join(staging_root, f'pre-{secrets.token_hex(6)}')
     ok = False
     try:

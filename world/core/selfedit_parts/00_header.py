@@ -554,6 +554,42 @@ def _staging_candidate(edit_id):
     return os.path.join(_world(), '.selfedit_staging', f'{edit_id}.cand')
 
 
+# Quarantine copies (q-*/pre-*) are per-operation temporaries that live
+# minutes. The retention window is deliberately generous: a LIVE run on
+# another tank must never be reaped mid-copy, and a stalled gate is still
+# minutes, not hours.
+STALE_QUARANTINE_MAX_AGE_S = 6 * 3600
+
+
+def _sweep_stale_quarantines():
+    """Delete q-*/pre-* quarantine copies older than the retention window
+    (2026-11-14: seven 2.3-2.6 GB pre-apply repo copies leaked over Nov
+    12-14 -- the finally-rmtree never ran when a restart or crash landed
+    mid-copytree). Candidate files (*.cand) are never touched: armed edits
+    still read them. Called before a new quarantine is created, so the next
+    run cleans up the last crash's litter even when the process died
+    mid-copy. Returns the reaped names."""
+    root = os.path.join(_world(), '.selfedit_staging')
+    cutoff = time.time() - STALE_QUARANTINE_MAX_AGE_S
+    freed = []
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return freed
+    for name in names:
+        if not (name.startswith('q-') or name.startswith('pre-')):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue  # young: possibly a live run on another tank
+            shutil.rmtree(path, ignore_errors=True)
+            freed.append(name)
+        except OSError:
+            continue
+    return freed
+
+
 def _compile_error(text, path=''):
     # Python's compiler only applies to Python modules. HTML, JS, CSS, and
     # other assets are valid self-edit targets; compiling them as Python
@@ -849,6 +885,7 @@ def _validate(edit_id, resolved, candidate):
     serve = _s()
     staging_root = os.path.join(_world(), '.selfedit_staging')
     os.makedirs(staging_root, exist_ok=True)
+    _sweep_stale_quarantines()
     tmp = os.path.join(staging_root, f'q-{secrets.token_hex(6)}')
     checks, errors = [], []
     try:
