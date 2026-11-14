@@ -117,6 +117,18 @@ class WakeRules(unittest.TestCase):
         self.assertFalse(serve._should_wake(self._req('GET', '/api/escalation/pending')))
         self.assertTrue(serve._should_wake(self._req('GET', '/api/escalation/resolve')))
 
+    def test_fired_window_suppresses_wake(self):
+        # 2026-11-14: a waking poller oscillated wake/set-dormant through the
+        # whole noon window and apply_pass never got a quiet second -- the
+        # splice never applied. Inside a FIRED window nothing wakes the tank;
+        # outside one (cache expired, no window) wake behaves as before.
+        serve._fired_quiet_cache.update({'at': 9e9, 'window': 'win-x'})
+        try:
+            self.assertTrue(serve._selfedit_fired_window_quiet())
+        finally:
+            serve._fired_quiet_cache.update({'at': 0.0, 'window': None})
+        self.assertFalse(serve._selfedit_fired_window_quiet())
+
 
 if __name__ == '__main__':
     unittest.main()

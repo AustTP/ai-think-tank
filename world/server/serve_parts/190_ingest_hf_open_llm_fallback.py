@@ -933,6 +933,30 @@ def _selfedit_validate_headers(agent_id):
     return {'X-Dormancy-Window': active, 'X-Dormancy-Agent': agent_id or ''}
 
 
+_fired_quiet_cache = {'at': 0.0, 'window': None}
+
+
+def _selfedit_fired_window_quiet():
+    """True while a FIRED dormancy window covers now: the quiet slot the
+    approval chain scheduled is exactly when apply_pass needs the tank to
+    STAY dormant, so no request may wake it (2026-11-14: a waking poller
+    oscillated wake/set-dormant through the whole noon slot, apply_pass
+    never got a quiet second, and the window closed unsuccessful with the
+    splice unapplied). The operator's explicit Telegram wake command runs in
+    its own poller and bypasses this middleware entirely -- it stays the
+    escape hatch. Cached ten seconds so the hot path stays cheap."""
+    now = time.time()
+    if now - _fired_quiet_cache['at'] < 10.0:
+        return bool(_fired_quiet_cache['window'])
+    try:
+        _fired_quiet_cache['window'] = _selfedit._active_window_id()
+        _fired_quiet_cache['at'] = now
+    except Exception:
+        _fired_quiet_cache['window'] = None
+        _fired_quiet_cache['at'] = now
+    return bool(_fired_quiet_cache['window'])
+
+
 @app.middleware('http')
 async def no_store(request: Request, call_next):
     # Local dev server for actively-edited files -- a cached stale
@@ -967,6 +991,12 @@ async def no_store(request: Request, call_next):
             # decision (two-agent change requests): the validator must
             # review and approve/deny without disturbing the quiet slot
             # the player approved.
+            pass
+        elif _selfedit_fired_window_quiet():
+            # Any other traffic inside a fired window: serve it without
+            # waking (2026-11-14). A wake here would undo the dormancy the
+            # window exists to provide -- apply_pass only runs while
+            # dormant -- and a waking poller can starve the whole slot.
             pass
         else:
             _set_dormant(False)
