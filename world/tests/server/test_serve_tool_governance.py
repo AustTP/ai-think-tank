@@ -443,16 +443,21 @@ class BandConfiguration(unittest.TestCase):
         self.assertEqual(serve.SUBLOW_TIER_MAX_PRICE_USD, 0.09)
 
     def test_sublow_accessor_never_falls_back_to_low(self):
-        # No sublow row in model_tiers (fresh DB, or nothing qualified under
-        # the ceiling) must return None, never the low tier: sublow-scale
-        # work running at ~5x the ceiling is exactly what the ceiling
-        # exists to prevent. Callers refuse/503 on a missing pick.
+        # No free-pool route for sublow (fresh DB, pool down, nothing
+        # qualified) must return None -- never the low tier (sublow-scale
+        # work at ~5x the ceiling is what the ceiling prevents) and never a
+        # paid leg. Operator directive 2026-11-14: sublow never spends, so
+        # the accessor ignores model_tiers entirely.
         def fake_slug(band):
-            return {'low': 'low-slug'}.get(band)
-        with unittest.mock.patch.object(serve, '_model_tier_slug', side_effect=fake_slug):
+            return {'low': 'low-slug', 'sublow': 'paid-slug'}.get(band)
+        with unittest.mock.patch.object(serve, '_model_tier_slug', side_effect=fake_slug), \
+                unittest.mock.patch.object(serve, '_freepool_route_for_band',
+                                           return_value=None):
             self.assertIsNone(serve._sublow_tier_slug())
-        with unittest.mock.patch.object(serve, '_model_tier_slug', return_value='x'):
-            self.assertEqual(serve._sublow_tier_slug(), 'x')
+        with unittest.mock.patch.object(serve, '_freepool_route_for_band',
+                                        return_value='@freepool:sublow:or-free'):
+            self.assertEqual(serve._sublow_tier_slug(),
+                             '@freepool:sublow:or-free')
 
     def test_verify_probe_budget_is_large_enough_for_a_reasoning_model(self):
         # Real bug: a 5-token probe made every hidden-reasoning model look

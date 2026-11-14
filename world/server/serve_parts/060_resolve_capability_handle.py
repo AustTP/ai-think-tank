@@ -280,10 +280,14 @@ def _sublow_tier_slug():
     # returns the band, and the normal _resolve_model_tier ladder bottoms
     # out at low. Do not add a sublow branch to any default path without an
     # operator decision recorded here.
-    free = _freepool_route_for_band('sublow')
-    if free:
-        return free
-    return _model_tier_slug('sublow')
+    #
+    # OPERATOR DIRECTIVE (2026-11-14): sublow never spends. The band rides
+    # the free models that fall BELOW the quality the low tier accepts (the
+    # pool's weakest-model pick), so the paid leg the refresh keeps writing
+    # is dead weight: with no free route the band fails closed exactly like
+    # a missing pick (callers already refuse/503), instead of spending. This
+    # also keeps the band out of the budget-aware Straitly pivot.
+    return _freepool_route_for_band('sublow')
 
 
 def _high_tier_slug():

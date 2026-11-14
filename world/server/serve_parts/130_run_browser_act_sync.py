@@ -649,6 +649,170 @@ _PROVIDER_DIALING = {
     },
 }
 
+# Budget-aware provider pivot (operator, 2026-11-14): paid tier calls dial a
+# provider that still HAS budget. OpenRouter and Straitly are both prepaid
+# accounts; when OpenRouter's live balance falls to the pivot floor (default
+# $5 -- the existing balance-critical threshold), every non-JEV paid band call
+# reroutes to Straitly's catalog instead of draining the last OpenRouter
+# dollars (observed live 2026-11-14: $2.27 left on OpenRouter while ~$90 sat
+# in Straitly and the low band kept dialing paid Ling). Exemptions:
+#   * the JEV decisions lane -- the operator's deliberate model chain; its
+#     transports pass allow_provider_pivot=False.
+#   * the sublow band -- it never spends at all (see _sublow_tier_slug).
+#   * free routes and custom endpoints -- structurally exempt (they never
+#     reach the pivot check).
+# The pivot is runtime dialing only: model_tiers rows stay untouched, so the
+# spend-cap accrual, pool cap, and budget probes decide per call.
+OPENROUTER_PIVOT_FLOOR_USD = float(
+    _load_env().get('OPENROUTER_PIVOT_FLOOR_USD', '5.0') or 5.0)
+_PROVIDER_BUDGET_CACHE = {'openrouter': {'at': 0.0, 'remaining': None},
+                          'straitly': {'at': 0.0, 'remaining': None}}
+_PROVIDER_BUDGET_TTL_S = 300.0
+_STRAITLY_CATALOG_CACHE = {'at': 0.0, 'rows': None}
+_STRAITLY_CATALOG_TTL_S = 600.0
+
+
+def _provider_remaining_usd(name):
+    """Cached live prepaid balance for one dialing provider, or None when the
+    account does not expose a readable one. Informed by the REAL account
+    balance (the operator's numbers), not the local accrual -- the spend caps
+    stay the disaster brake behind it (a provider over its cap has no budget
+    regardless of what its account says)."""
+    now = time.time()
+    cached = _PROVIDER_BUDGET_CACHE.get(name)
+    if cached and (now - cached['at']) < _PROVIDER_BUDGET_TTL_S:
+        return cached['remaining']
+    hosts = {'openrouter': 'https://openrouter.ai/api/v1/credits',
+             'straitly': 'https://api.straitly.ai/api/v1/credits'}
+    env_keys = {'openrouter': 'OPENROUTER_API_KEY',
+                'straitly': 'STRAITLY_API_KEY'}
+    remaining = None
+    host = hosts.get(name)
+    key = (_load_env().get(env_keys.get(name, '')) or '').strip()
+    if host and key:
+        try:
+            req = urllib.request.Request(
+                host, headers={'Authorization': f'Bearer {key}',
+                               'User-Agent': 'AIThinkTankAgent/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:  # nosec B310 -- fixed provider host
+                data = json.loads(
+                    resp.read().decode('utf-8', errors='replace')).get('data') or {}
+            remaining = max(0.0, float(data.get('total_credits') or 0)
+                            - float(data.get('total_usage') or 0))
+        except Exception:
+            remaining = None
+    _PROVIDER_BUDGET_CACHE[name] = {'at': now, 'remaining': remaining}
+    return remaining
+
+
+def _openrouter_budget_below_pivot_floor():
+    """True when OpenRouter's live balance is at/below the pivot floor. When
+    the balance is unreadable, the credits-pause latch is the conservative
+    fallback -- an unreadable balance alone never blocks a call."""
+    remaining = _provider_remaining_usd('openrouter')
+    if remaining is not None:
+        return remaining <= OPENROUTER_PIVOT_FLOOR_USD
+    return credits_pause_active()
+
+
+def _straitly_has_budget():
+    """Straitly may take the pivoted call: neither local disaster cap has
+    tripped, and its live balance -- when readable -- is above zero."""
+    if _provider_cap_exceeded('straitly') or _model_pool_cap_exceeded():
+        return False
+    remaining = _provider_remaining_usd('straitly')
+    return remaining is None or remaining > 0.0
+
+
+def _straitly_catalog_rows():
+    """(model_id, price_per_m) rows Straitly's synced catalog carries, cached
+    ten minutes -- the pivot picks from THIS list only, never from OpenRouter's."""
+    now = time.time()
+    cached = _STRAITLY_CATALOG_CACHE
+    if cached['rows'] is not None and (now - cached['at']) < _STRAITLY_CATALOG_TTL_S:
+        return cached['rows']
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT model_id, price_per_m FROM model_provider_catalog '
+                "WHERE provider = 'straitly'").fetchall()
+        catalog = {}
+        for row in rows:
+            mid = str(row[0])
+            price = float(row[1] or 0)
+            if mid not in catalog or price < catalog[mid]:
+                catalog[mid] = price
+        cached['at'] = now
+        cached['rows'] = sorted(catalog.items())
+    except Exception:
+        cached['rows'] = cached['rows'] or []
+    return cached['rows']
+
+
+def _straitly_pick_for(model, ceiling_price):
+    """The Straitly catalog model for a pivoted call: the exact slug first,
+    then the same model family (publisher relay + quantization suffixes are
+    noise -- the same normalizer the free pool aligns with), then the
+    best-scored carried model at or under the original pick's price ceiling
+    (2x drift allowed; a quality collapse is not). None when nothing fits."""
+    rows = _straitly_catalog_rows()
+    ids = dict(rows)
+    if model in ids:
+        return model
+    fam = _freepool_model_family(model)
+    if fam:
+        for mid, _price in rows:
+            if _freepool_model_family(mid) == fam:
+                return mid
+    scores_by_id = {}
+    try:
+        with _db() as conn:
+            scored = conn.execute(
+                'SELECT model_id, scores FROM model_catalog '
+                'WHERE scores IS NOT NULL').fetchall()
+        for mid, raw in scored:
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                score = float((data.get('intelligence_index') or {}).get('score'))
+            except (TypeError, ValueError):
+                continue
+            scores_by_id[str(mid)] = score
+    except Exception:
+        return None
+    best = None
+    for mid, score in scores_by_id.items():
+        if mid not in ids:
+            continue
+        if ceiling_price and ids[mid] > ceiling_price:
+            continue
+        if best is None or score > best[1]:
+            best = (mid, score)
+    return best[0] if best else None
+
+
+def _straitly_pivot_provider(model):
+    """The Straitly dial spec for a paid pick whose provider is out of
+    budget, or None when no pivot applies: no carried model, Straitly out of
+    budget, or the sublow band (which never spends)."""
+    band, ceiling = None, 0.0
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT band, price_per_m FROM model_tiers WHERE slug = ?',
+                (model,)).fetchone()
+        if row:
+            band, ceiling = row[0], float(row[1] or 0)
+    except Exception:
+        pass
+    if band == 'sublow':
+        return None  # operator directive 2026-11-14: sublow never spends
+    if not _straitly_has_budget():
+        return None
+    pick = _straitly_pick_for(model, ceiling * 2.0 if ceiling else 0.0)
+    if not pick:
+        return None
+    return _provider_dialing_spec(pick, 'straitly')
+
 
 def _serving_provider(provider):
     """Which registry provider a resolved spec dials; the default transport
@@ -1121,7 +1285,7 @@ def _degrade_fit_free_pool(messages):
 
 def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
                                reasoning_override=None, _tried=None,
-                               provider_name=None):
+                               provider_name=None, allow_provider_pivot=True):
     # A BARE tier string ('@freepool:low', two segments) is a band name, not
     # a postable model id (2026-11-02 live bug: POSTing it verbatim earns
     # OpenRouter's 400 'not a valid model', the fallback generator sees
@@ -1145,6 +1309,26 @@ def _call_openrouter_once_sync(model, messages, max_tokens, _fallback_depth=0,
         provider = _provider_dialing_spec(model, provider_name)
     is_custom = bool(provider and provider.get('is_custom'))
     free_route = bool(provider and provider.get('free'))
+    # Budget-aware provider pivot (operator, 2026-11-14): a paid pick whose
+    # OpenRouter account is at/below the pivot floor dials Straitly instead.
+    # Runs BEFORE the free-pool degrade: band-quality work continues on the
+    # funded account, and the free pool stays the answer when Straitly has
+    # nothing to carry.
+    if not is_custom and not free_route and allow_provider_pivot \
+            and _openrouter_budget_below_pivot_floor():
+        pivot = _straitly_pivot_provider(model)
+        if pivot is not None:
+            print(f'[tier-pivot] {model} -> straitly:{pivot["model"]} '
+                  '(OpenRouter at/below the pivot floor)', flush=True)
+            try:
+                log_action('system', 'provider_pivot',
+                           {'from': model, 'to': pivot['model'],
+                            'provider': 'straitly'}, authorized=True)
+            except Exception:
+                pass  # the pivot itself must not fail the call
+            model = pivot['model']
+            provider = pivot
+            is_custom = True
     # Free routes are exempt from the credits pause and the monthly spend cap
     # by construction: price_per_m 0 spends nothing, and serving low-band work
     # for free while the account is out of credits is exactly the fallback the
@@ -1367,7 +1551,7 @@ def _call_openrouter_sync(model, messages, max_tokens, best_of=1,
 
 
 def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choice=None,
-                         _fallback_depth=0, _tried=None):
+                         _fallback_depth=0, _tried=None, allow_provider_pivot=True):
     """Lowest-level OpenRouter chat-completions POST, shared by the plain
     `_call_openrouter_sync` and the /api/intent/ask tool loop. `tools`,
     `max_tokens`, and `tool_choice` are optional; bodies only include what
@@ -1380,6 +1564,24 @@ def _post_openrouter_raw(model, messages, tools=None, max_tokens=None, tool_choi
     provider = _model_provider_for(model)
     is_custom = bool(provider and provider.get('is_custom'))
     free_route = bool(provider and provider.get('free'))
+    # Budget-aware provider pivot, same placement and rationale as the plain
+    # call above (operator, 2026-11-14): paid work moves to the funded
+    # account before the free-pool degrade gets a turn.
+    if not is_custom and not free_route and allow_provider_pivot \
+            and _openrouter_budget_below_pivot_floor():
+        pivot = _straitly_pivot_provider(model)
+        if pivot is not None:
+            print(f'[tier-pivot] {model} -> straitly:{pivot["model"]} '
+                  '(OpenRouter at/below the pivot floor)', flush=True)
+            try:
+                log_action('system', 'provider_pivot',
+                           {'from': model, 'to': pivot['model'],
+                            'provider': 'straitly'}, authorized=True)
+            except Exception:
+                pass  # the pivot itself must not fail the call
+            model = pivot['model']
+            provider = pivot
+            is_custom = True
     if not is_custom and not free_route and credits_pause_active():
         # Same free-tier degrade as the plain call: the tank runs on the free
         # tier while the paid account is dry (operator directive 2026-11-05).

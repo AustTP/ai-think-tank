@@ -108,8 +108,10 @@ def mint_sublow_grant(agent_id, purpose, estimate_usd, granted_by,
         estimate = 0.0
     if estimate <= 0:
         return None, 'a declared estimateUsd greater than 0 is required -- the estimate is the authorization'
-    if not _serve._model_tier_slug('sublow'):
-        return None, 'no sublow model pick yet -- run a model-tier refresh first'
+    if not _serve._sublow_tier_slug():
+        return None, ('no sublow model pick -- the free pool is not serving '
+                      'the band right now (sublow never spends; operator '
+                      'directive 2026-11-14)')
     if _serve._think_tank_spend_cap_exceeded():
         return None, 'the shared monthly spend cap is already reached'
     cap = float(getattr(_serve, 'AGENT_SPEND_CAP_USD', 0) or 0)
@@ -194,14 +196,20 @@ def quote_sublow_grant(agent_id, estimated_calls=1, max_tokens_per_call=None):
     model = _serve._sublow_tier_slug()
     price_per_m = name = None
     if model:
-        try:
-            with _serve._db() as conn:
-                row = conn.execute('SELECT name, price_per_m FROM model_tiers WHERE slug = ?',
-                                   (model,)).fetchone()
-            if row:
-                name, price_per_m = row[0], float(row[1])
-        except Exception:
-            price_per_m = None
+        if model.startswith('@freepool:'):
+            # Free-pool routes cost nothing (operator, 2026-11-14: sublow
+            # never spends); the worksheet names the carrying endpoint.
+            name = model.split(':')[2] if model.count(':') == 2 else 'freepool'
+            price_per_m = 0.0
+        else:
+            try:
+                with _serve._db() as conn:
+                    row = conn.execute('SELECT name, price_per_m FROM model_tiers WHERE slug = ?',
+                                       (model,)).fetchone()
+                if row:
+                    name, price_per_m = row[0], float(row[1])
+            except Exception:
+                price_per_m = None
     # Estimate basis: the per-call token cap is the billed-token budget for
     # one call (input + output), priced at the band's blended rate. The proxy
     # still accrues REAL reported cost against the grant, so a call that

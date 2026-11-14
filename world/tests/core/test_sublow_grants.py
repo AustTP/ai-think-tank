@@ -29,15 +29,36 @@ import core.sublow as sublow
 from fastapi.testclient import TestClient
 
 
+_SUBLOW_FREE_ROUTE = '@freepool:sublow:test-free'
+_SUBLOW_FREE_SPEC = {
+    'free': True, 'is_custom': True, 'provider': 'gemini',
+    'model': 'test-free-model', 'base_url': 'https://gemini.example/v1',
+    'api_key_env': 'GEMINI_API_KEY', 'price_per_m': 0,
+    'send_reasoning': False,
+}
+
+
+def _install_free_route(case):
+    """The operator's 2026-11-14 directive: sublow never spends. The band's
+    pick IS the free-pool route, so these patches stand in for the pool being
+    up -- no paid model_tiers row is seeded at all (the refresh's sublow row
+    is dead weight by the same directive)."""
+    case._fp_route = unittest.mock.patch.object(
+        serve, '_freepool_route_for_band',
+        side_effect=lambda band, force=False:
+            _SUBLOW_FREE_ROUTE if band == 'sublow' else None)
+    case._fp_route.start()
+    case._fp_spec = unittest.mock.patch.object(
+        serve, '_freepool_provider_for', return_value=dict(_SUBLOW_FREE_SPEC))
+
+
 def _seed_sublow_tier(price=0.083):
-    """Write the sublow pick into the temp DB's model_tiers, exactly where the
-    daily refresh would leave it, so the accessor and the quote's price read
-    resolve without a refresh."""
-    with serve._db() as conn:
-        conn.execute("DELETE FROM model_tiers WHERE band = 'sublow'")
-        conn.execute("INSERT INTO model_tiers (band, slug, name, price_per_m, chosen_at) "
-                     "VALUES ('sublow', 'test-org/test-sublow', 'Test Sublow', ?, ?)",
-                     (price, time.time()))
+    """RETIRED (operator directive 2026-11-14): sublow never spends, so no
+    paid model_tiers row is seeded anywhere in this suite. Kept as a named
+    no-op so any stray caller fails loudly instead of silently seeding
+    spend."""
+    raise AssertionError(
+        'sublow tier seeding is retired -- sublow rides the free pool only')
 
 
 class SublowGrantCase(unittest.TestCase):
@@ -54,7 +75,7 @@ class SublowGrantCase(unittest.TestCase):
         )
         self._cm.start()
         serve.init_db()
-        _seed_sublow_tier()
+        _install_free_route(self)
         # Quiet the shared/agent caps and fake the key so the inference
         # endpoint's OPENROUTER_API_KEY check passes; individual tests raise
         # a cap again inside their own patch when they need a gate to trip.
@@ -65,6 +86,8 @@ class SublowGrantCase(unittest.TestCase):
         self.client = TestClient(serve.app)
 
     def tearDown(self):
+        self._fp_spec.stop()
+        self._fp_route.stop()
         self._env.stop()
         self._cm.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -107,9 +130,12 @@ class SublowGrants(SublowGrantCase):
         self.assertEqual(row[2], 0.5)
 
     def test_mint_refuses_without_a_sublow_pick(self):
-        with serve._db() as conn:
-            conn.execute("DELETE FROM model_tiers WHERE band = 'sublow'")
-        token, refusal = self._mint()
+        # The pick IS the free-pool route now (sublow never spends): with the
+        # pool not serving the band, mint refuses -- deleting a paid tier row
+        # is irrelevant because the accessor never reads model_tiers.
+        with unittest.mock.patch.object(serve, '_freepool_route_for_band',
+                                        return_value=None):
+            token, refusal = self._mint()
         self.assertIsNone(token)
         self.assertIn('sublow model pick', refusal)
 
@@ -195,11 +221,12 @@ class SublowGrants(SublowGrantCase):
             serve._accrue_spend('__general__', 1.25, agent_id='agent-a')
             quote = serve.quote_sublow_grant('agent-a', estimated_calls=10,
                                              max_tokens_per_call=1000)
-        self.assertEqual(quote['model'], 'test-org/test-sublow')
-        self.assertEqual(quote['pricePerM'], 0.083)
-        # 1000 billed tokens at $0.083/M = $0.000083 per call, x10 calls.
-        self.assertAlmostEqual(quote['perCallUsd'], 0.000083, places=6)
-        self.assertAlmostEqual(quote['totalUsd'], 0.00083, places=6)
+        self.assertEqual(quote['model'], _SUBLOW_FREE_ROUTE)
+        self.assertEqual(quote['pricePerM'], 0.0)
+        self.assertEqual(quote['modelName'], 'test-free')
+        # 1000 billed tokens at $0/M = free per call, x10 calls.
+        self.assertAlmostEqual(quote['perCallUsd'], 0.0, places=6)
+        self.assertAlmostEqual(quote['totalUsd'], 0.0, places=6)
         self.assertAlmostEqual(quote['agentMonthUsd'], 1.25, places=6)
         self.assertAlmostEqual(quote['agentRemainingUsd'], 3.75, places=6)
         self.assertEqual(quote['agentCapUsd'], 5.0)
@@ -238,9 +265,9 @@ class SublowGrantFailures(SublowGrantCase):
         self.assertEqual(quote['estimatedCalls'], 1)
 
     def test_sublow_slug_resolves_the_free_pool_first(self):
-        # The operator's rule: sublow uses the free endpoints below threshold
-        # before any spend -- the slug resolves the free-pool route when one
-        # is ready, and only reaches the paid pick when it is not.
+        # The operator's rule, tightened 2026-11-14: sublow uses the free
+        # endpoints below threshold, and there is NO paid leg underneath --
+        # with no free route the band fails closed instead of spending.
         with unittest.mock.patch.object(
                 serve, '_freepool_route_for_band',
                 return_value='@freepool:sublow:gemini-3.5-flash'), \
@@ -251,9 +278,9 @@ class SublowGrantFailures(SublowGrantCase):
         with unittest.mock.patch.object(serve, '_freepool_route_for_band',
                                         return_value=None), \
              unittest.mock.patch.object(serve, '_model_tier_slug',
-                                        return_value='inclusionai/ling-3.0-flash'):
-            self.assertEqual(serve._sublow_tier_slug(),
-                             'inclusionai/ling-3.0-flash')
+                                        return_value='inclusionai/ling-3.0-flash') as tier:
+            self.assertIsNone(serve._sublow_tier_slug())
+            tier.assert_not_called()
 
     def test_quote_degrades_when_the_tiers_read_fails(self):
         # The sublow lane has NO fallback price (it must never price
@@ -332,7 +359,7 @@ class SublowEndpoints(SublowGrantCase):
         self.assertTrue(body['ok'])
         token = body['token']
         self.assertTrue(token)
-        self.assertEqual(body['model'], 'test-org/test-sublow')
+        self.assertEqual(body['model'], _SUBLOW_FREE_ROUTE)
         self.assertEqual(body['estimateUsd'], 0.5)
         # Live grant, same agent/purpose as the response said.
         grant = serve.validate_sublow_grant(token)
@@ -361,10 +388,10 @@ class SublowEndpoints(SublowGrantCase):
         self.assertEqual(r.status_code, 200, r.text)
         quote = r.json()
         self.assertTrue(quote['ok'])
-        self.assertEqual(quote['model'], 'test-org/test-sublow')
+        self.assertEqual(quote['model'], _SUBLOW_FREE_ROUTE)
         self.assertEqual(quote['estimatedCalls'], 10)
-        self.assertAlmostEqual(quote['perCallUsd'], 0.000083, places=6)
-        self.assertAlmostEqual(quote['totalUsd'], 0.00083, places=6)
+        self.assertAlmostEqual(quote['perCallUsd'], 0.0, places=6)
+        self.assertAlmostEqual(quote['totalUsd'], 0.0, places=6)
         self.assertIsNotNone(quote['tankCapUsd'])
 
     def test_revoke_endpoint_removes_the_grant(self):
@@ -415,8 +442,8 @@ class SublowEndpoints(SublowGrantCase):
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual(body['reply'], 'pong')
-        self.assertEqual(body['model'], 'test-org/test-sublow')
-        mock_call.assert_called_once_with('test-org/test-sublow', messages, 600)
+        self.assertEqual(body['model'], _SUBLOW_FREE_ROUTE)
+        mock_call.assert_called_once_with(_SUBLOW_FREE_ROUTE, messages, 600)
         # Burn-down + ledger + audit all saw the same $0.01.
         grant = serve.validate_sublow_grant(token)
         self.assertAlmostEqual(grant['accrued_usd'], 0.01, places=6)
@@ -431,7 +458,7 @@ class SublowEndpoints(SublowGrantCase):
             row = conn.execute("SELECT details FROM action_log "
                                "WHERE action = 'sublow_experiment_call'").fetchone()
         self.assertIsNotNone(row)
-        self.assertEqual(json.loads(row[0])['model'], 'test-org/test-sublow')
+        self.assertEqual(json.loads(row[0])['model'], _SUBLOW_FREE_ROUTE)
 
     def test_inference_authenticates_with_a_bearer_header_too(self):
         token, _ = self._mint()

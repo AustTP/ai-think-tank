@@ -427,7 +427,11 @@ def _decision_via_chat_completions(slug, state, questions):
             # whole free-pool fallback + key-rotation machinery, so the
             # decision fallback rides the same path every other chat call
             # uses.
-            reasoning_override={'effort': 'low'})
+            # allow_provider_pivot=False (operator, 2026-11-14): the JEV
+            # decisions lane is exempt from the budget-aware Straitly pivot
+            # -- the decision model chain is deliberate; it never silently
+            # reroutes to another provider.
+            reasoning_override={'effort': 'low'}, allow_provider_pivot=False)
     finally:
         if saved_circuit is None:
             _model_circuit_state.pop(slug, None)

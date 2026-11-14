@@ -385,7 +385,7 @@ async def sublow_inference(request: Request):
         return JSONResponse({'error': 'messages is required'}, status_code=400)
     model = _sublow_tier_slug()
     if not model:
-        return JSONResponse({'error': 'no sublow model pick yet -- run a model-tier refresh first'},
+        return JSONResponse({'error': 'no sublow model pick -- the free pool is not serving the band right now (sublow never spends)'},
                             status_code=503)
     # Shared input guard, identical rule to /api/chat.
     violation = _input_guard_violation(messages)
