@@ -93,6 +93,41 @@
     "rpm": 30,
     "rpd": 1000,
     "tpm": 12000
+   },
+   {
+    "name": "numes-deepseek-v4.1-flash",
+    "service": "numes",
+    "base_url": "https://api.numes.ai/api/v1/chat/completions",
+    "model": "deepseek/deepseek-v4.1-flash",
+    "api_key_env": "NUMES_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "numes",
+    "rpm": 10,
+    "rpd": 300,
+    "tpm": 0,
+    "comment": "Numes marketplace free tier (verified 2026-11-13: usage.cost 0). No published rate limits -- 429+Retry-After server-side, so these client caps are deliberately conservative. provider.data_collection=deny pins Numes' no-collection routing so request bodies are contractually excluded from provider training/logging; outbound masking (130) is the second layer.",
+    "extra": {
+     "provider": {
+      "data_collection": "deny"
+     }
+    }
+   },
+   {
+    "name": "numes-glm-5.3",
+    "service": "numes",
+    "base_url": "https://api.numes.ai/api/v1/chat/completions",
+    "model": "z-ai/glm-5.3",
+    "api_key_env": "NUMES_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "numes",
+    "rpm": 10,
+    "rpd": 300,
+    "tpm": 0,
+    "extra": {
+     "provider": {
+      "data_collection": "deny"
+     }
+    }
    }
   ],
   "or_free_min_score": 20,

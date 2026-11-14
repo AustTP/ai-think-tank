@@ -240,7 +240,7 @@ def _reload_free_pool_config():
 # are governed by the global switches only -- which is the correct reading:
 # those calls are not any team's work.
 
-FREE_POOL_SERVICES = ('gemini', 'groq', 'openrouter')
+FREE_POOL_SERVICES = ('gemini', 'groq', 'openrouter', 'numes')
 # The paid switch rides the same policy document and the same team/global
 # scopes, but it is not a pool endpoint: it blocks the LOW band's paid leg
 # (the DB pick or a @provider:low pin) so the free pool can be tested with
