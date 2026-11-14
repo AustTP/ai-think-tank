@@ -227,3 +227,26 @@ def test_propose_refuses_test_gate_files(fake_repo):
     (world / 'tests').mkdir()
     (world / 'tests' / 'run_all.sh').write_text('# gate\n', encoding='utf-8')
     assert selfedit.is_gate_file(str(world / 'tests' / 'run_all.sh'))
+
+
+def test_read_only_replica_never_applies_or_gates(monkeypatch, fake_repo):
+    # 2026-11-13 win-e091858e8d: the read-only replica's dormancy loop won
+    # the apply race, its THINK_TANK_READ_ONLY env leaked into the gate
+    # subprocess, every write-endpoint test 405'd, and the window rolled
+    # back on a healthy splice. A replica must leave armed edits for the
+    # primary's pass.
+    _, world = fake_repo
+    _approve(monkeypatch)
+    monkeypatch.setattr(serve, '_set_dormant', lambda v: None)
+    monkeypatch.setattr(serve, '_dormant', lambda: True)
+    monkeypatch.setattr(serve, 'READ_ONLY_MODE', True)
+    (world / 'marker.py').write_text(_MARK)
+    _notify_log(monkeypatch)
+    ok, payload = selfedit.propose('worker', 'world/marker.py',
+                                   'MARKER_VALUE = 1', 'MARKER_VALUE = 2',
+                                   'bump the marker')
+    assert ok is True, payload
+    assert selfedit.apply_pass() == 0
+    row = selfedit.status_snapshot()[0]
+    assert row['status'] == 'armed'
+    assert (world / 'marker.py').read_text() == _MARK

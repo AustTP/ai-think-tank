@@ -33,6 +33,15 @@ def apply_pass():
                 'ORDER BY created').fetchall()
     if not rows:
         return 0
+    if getattr(serve, 'READ_ONLY_MODE', False):
+        # A read-only replica must never become the apply/test runner. Its
+        # THINK_TANK_READ_ONLY env leaks into the gate subprocess, the test
+        # server boots with writes refused, and every write-endpoint test
+        # 405s (win-e091858e8d, 2026-11-13: 1265 gate failures on a healthy
+        # splice, then an automatic rollback). Every tank's dormancy loop
+        # races this pass; the primary's pass lands the same armed edits
+        # moments later.
+        return 0
     kernel_rows = [r for r in rows if is_kernel(_target_from_display(r[1]))]
     if kernel_rows:
         # A kernel edit is applied alone: the restart replaces the process, so
