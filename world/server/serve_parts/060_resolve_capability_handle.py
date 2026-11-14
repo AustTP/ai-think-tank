@@ -297,6 +297,23 @@ def _coding_tier_slug():
     # from runCodingTask's pickModelTierForAction, which deliberately routes
     # ANY real coding through the coding tier regardless of how small the
     # task sounds (code correctness doesn't scale down with apparent size).
+    # OPERATOR DIRECTIVE (2026-11-14): the coding band's PRIMARY leg is the
+    # Numes free pool when ready -- z-ai/glm-5.3 is full-strength GLM and
+    # out-codes the paid flash pick at $0 -- with this DB pick as the paid
+    # leg underneath on quota exhaustion or call failure, exactly the
+    # conjunction _low_tier_slug serves. Deliberate exception to the
+    # budget-band rule (2026-11-10: paid mid when credits exist): the pool
+    # engagement here rides _freepool_declared_route, which only ever
+    # returns endpoints that explicitly declare the coding band, so the
+    # generic gemini/groq endpoints can never degrade real coding work.
+    # The aligned route extends the primary leg (same directive, 2026-11-14):
+    # an endpoint whose pinned model is a variation of the paid pick's own
+    # model (glm-5.3-flash-uncensored-fp8 aligns with glm-5.3-flash) serves
+    # anytime too -- same weights, so no quality tradeoff.
+    free = _freepool_declared_route('coding') \
+        or _freepool_aligned_route('coding')
+    if free:
+        return free
     return _model_tier_slug('coding') or _mid_tier_slug()
 
 

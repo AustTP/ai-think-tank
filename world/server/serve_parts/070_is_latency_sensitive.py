@@ -15,7 +15,15 @@ def _slug_for_band(band):
     if band in ('3d', '3d-modeling'):
         return _3d_tier_slug() or _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()
     if band == 'bounty':
-        return _model_tier_slug('bounty') or _coding_tier_slug() \
+        # OPERATOR DIRECTIVE (2026-11-14): the Numes free models serve the
+        # bounty band directly -- deepseek-v4.1-flash's 1M context fits
+        # bounty-scale research -- with the existing bounty->coding ladder
+        # underneath (which itself rides the Numes coding leg first).
+        # The aligned route lets a same-model free variation (e.g.
+        # deepseek-flash-uncensored) serve the band anytime as well.
+        return _freepool_declared_route('bounty') \
+            or _freepool_aligned_route('bounty') \
+            or _model_tier_slug('bounty') or _coding_tier_slug() \
             or _mid_tier_slug() or _low_tier_slug()
     if band == 'coding':
         return _coding_tier_slug() or _mid_tier_slug() or _low_tier_slug()

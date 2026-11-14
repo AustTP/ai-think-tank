@@ -1289,7 +1289,11 @@ class NumesEndpointTests(unittest.TestCase):
     """The Numes.ai marketplace endpoint (2026-11-13): a pinned-model
     OpenAI-compatible free endpoint whose extra pins Numes'
     provider.data_collection=deny so request bodies are contractually
-    excluded from provider training/logging."""
+    excluded from provider training/logging. OPERATOR DIRECTIVE
+    (2026-11-14): the Numes models are scoped OUT of low/sublow via the
+    per-endpoint 'bands' key -- glm-5.3 serves coding, deepseek-v4.1-flash
+    serves bounty -- and those bands ride the pool free-first through
+    _freepool_declared_route with the paid picks underneath."""
 
     def setUp(self):
         _reset_pool_state()
@@ -1297,30 +1301,42 @@ class NumesEndpointTests(unittest.TestCase):
     def tearDown(self):
         _reset_pool_state()
 
-    def test_numes_parses_routes_and_carries_data_policy(self):
-        env = {'GEMINI_API_KEY': 'test-gemini-key',
-               'GROQ_API_KEY': 'test-groq-key',
-               'NUMES_API_KEY': 'test-numes-key'}
-        cfg = {
-            'enabled': True, 'bands': ['low'], 'mode': 'free-first',
-            'endpoints': [{
-                'name': 'numes-x', 'service': 'numes',
-                'base_url': 'https://numes.example/api/v1/chat/completions',
-                'model': 'deepseek/deepseek-v4.1-flash',
-                'api_key_env': 'NUMES_API_KEY',
-                'price_per_m': 0, 'pool_key': 'numes',
-                'rpm': 10, 'rpd': 300, 'tpm': 0,
-                'extra': {'provider': {'data_collection': 'deny'}},
-            }],
+    @staticmethod
+    def _numes_endpoint(bands=None, model='deepseek/deepseek-v4.1-flash',
+                        name='numes-x'):
+        ep = {
+            'name': name, 'service': 'numes',
+            'base_url': 'https://numes.example/api/v1/chat/completions',
+            'model': model,
+            'api_key_env': 'NUMES_API_KEY',
+            'price_per_m': 0, 'pool_key': 'numes',
+            'rpm': 10, 'rpd': 300, 'tpm': 0,
+            'extra': {'provider': {'data_collection': 'deny'}},
         }
+        if bands:
+            ep['bands'] = bands
+        return ep
+
+    def _install(self, cfg, env=None):
+        env = env or {'GEMINI_API_KEY': 'test-gemini-key',
+                      'GROQ_API_KEY': 'test-groq-key',
+                      'NUMES_API_KEY': 'test-numes-key'}
         patcher = _write_pool_config(cfg)
         env_patcher = unittest.mock.patch.object(serve, '_load_env',
                                                  lambda key=None: env)
         env_patcher.start()
+        return env_patcher, patcher
+
+    def test_numes_parses_routes_and_carries_data_policy(self):
+        cfg = {
+            'enabled': True, 'bands': ['low', 'bounty'], 'mode': 'free-first',
+            'endpoints': [self._numes_endpoint(bands=['bounty'])],
+        }
+        env_patcher, patcher = self._install(cfg)
         try:
-            self.assertEqual(serve._freepool_route_for_band('low'),
-                             '@freepool:low:numes-x')
-            spec = serve._freepool_provider_for('@freepool:low:numes-x')
+            self.assertEqual(serve._freepool_declared_route('bounty'),
+                             '@freepool:bounty:numes-x')
+            spec = serve._freepool_provider_for('@freepool:bounty:numes-x')
             self.assertEqual(spec['provider'], 'freepool-numes')
             self.assertEqual(spec['model'], 'deepseek/deepseek-v4.1-flash')
             self.assertEqual(spec['api_key_env'], 'NUMES_API_KEY')
@@ -1331,24 +1347,195 @@ class NumesEndpointTests(unittest.TestCase):
             env_patcher.stop()
             patcher.stop()
 
+    def test_scoped_numes_never_serves_low(self):
+        cfg = {
+            'enabled': True, 'bands': ['low', 'coding', 'bounty'],
+            'mode': 'free-first',
+            'endpoints': [self._numes_endpoint(bands=['coding'])],
+        }
+        env_patcher, patcher = self._install(cfg)
+        try:
+            self.assertIsNone(serve._freepool_route_for_band('low'))
+            self.assertIsNone(serve._freepool_declared_route('bounty'))
+            self.assertEqual(serve._freepool_declared_route('coding'),
+                             '@freepool:coding:numes-x')
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_generic_endpoint_still_serves_low_alongside_scoped_numes(self):
+        cfg = {
+            'enabled': True, 'bands': ['low', 'coding'],
+            'mode': 'free-first',
+            'endpoints': [
+                {'name': 'groq-free', 'service': 'groq',
+                 'base_url': 'https://groq.example/openai/v1/chat/completions',
+                 'model': 'qwen/qwen3.8-27b', 'api_key_env': 'GROQ_API_KEY',
+                 'price_per_m': 0, 'pool_key': 'groq',
+                 'rpm': 5, 'rpd': 100, 'tpm': 0},
+                self._numes_endpoint(bands=['coding'],
+                                     model='z-ai/glm-5.3',
+                                     name='numes-glm'),
+            ],
+        }
+        env_patcher, patcher = self._install(cfg)
+        try:
+            route = serve._freepool_route_for_band('low')
+            self.assertTrue(route and route.startswith('@freepool:low:'))
+            self.assertNotIn('numes', route)
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_declared_route_ignores_budget_band_gate(self):
+        """The 2026-11-14 operator exception: coding rides the declared
+        Numes leg free-first even with credits healthy, while the GENERIC
+        route for a budget band stays gated."""
+        cfg = {
+            'enabled': True, 'bands': ['coding'], 'mode': 'free-first',
+            'budget_bands': ['coding'],
+            'endpoints': [self._numes_endpoint(bands=['coding'],
+                                               model='z-ai/glm-5.3')],
+        }
+        env_patcher, patcher = self._install(cfg)
+        try:
+            self.assertIsNone(serve._freepool_route_for_band('coding'))
+            self.assertEqual(serve._freepool_declared_route('coding'),
+                             '@freepool:coding:numes-x')
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_bounty_ladder_prefers_declared_route(self):
+        cfg = {
+            'enabled': True, 'bands': ['bounty'], 'mode': 'free-first',
+            'endpoints': [self._numes_endpoint(bands=['bounty'])],
+        }
+        env_patcher, patcher = self._install(cfg)
+        try:
+            self.assertEqual(serve._slug_for_band('bounty'),
+                             '@freepool:bounty:numes-x')
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
     def test_numes_endpoint_without_key_is_not_ready(self):
         env = {'GEMINI_API_KEY': 'test-gemini-key',
                'GROQ_API_KEY': 'test-groq-key'}
         cfg = {
-            'enabled': True, 'bands': ['low'], 'mode': 'free-first',
-            'endpoints': [{
-                'name': 'numes-x', 'service': 'numes',
-                'base_url': 'https://numes.example/api/v1/chat/completions',
-                'model': 'deepseek/deepseek-v4.1-flash',
-                'api_key_env': 'NUMES_API_KEY', 'price_per_m': 0,
-            }],
+            'enabled': True, 'bands': ['bounty'], 'mode': 'free-first',
+            'endpoints': [self._numes_endpoint(bands=['bounty'])],
         }
-        patcher = _write_pool_config(cfg)
-        env_patcher = unittest.mock.patch.object(serve, '_load_env',
-                                                 lambda key=None: env)
-        env_patcher.start()
+        env_patcher, patcher = self._install(cfg, env=env)
         try:
-            self.assertIsNone(serve._freepool_route_for_band('low'))
+            self.assertIsNone(serve._freepool_declared_route('bounty'))
+            self.assertIsNone(serve._freepool_route_for_band('bounty'))
         finally:
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_aligned_flash_uncensored_serves_coding_anytime(self):
+        """OPERATOR DIRECTIVE (2026-11-14): glm-5.3-flash-uncensored-fp8
+        aligns with the paid coding pick z-ai/glm-5.3-flash (same model,
+        publisher relay + quantization/censorship suffixes are noise), so
+        the aligned route serves coding regardless of the budget gate --
+        and needs NO band declaration: the family match is the credential.
+        The Numes endpoint still carries bands=['coding'] in production to
+        stay out of low/sublow; this test drops the key to prove alignment
+        alone is sufficient."""
+        cfg = {
+            'enabled': True, 'bands': ['coding'], 'mode': 'free-first',
+            'budget_bands': ['coding'],
+            'endpoints': [self._numes_endpoint(
+                model='dealignai/glm-5.3-flash-uncensored-fp8',
+                name='numes-flash-u')],
+        }
+        env_patcher, patcher = self._install(cfg)
+        tier_patcher = unittest.mock.patch.object(
+            serve, '_model_tier_slug',
+            lambda band, *a, **k: 'z-ai/glm-5.3-flash'
+            if band == 'coding' else None)
+        env_patcher.start()
+        tier_patcher.start()
+        try:
+            self.assertIsNone(serve._freepool_route_for_band('coding'))
+            self.assertIsNone(serve._freepool_declared_route('coding'))
+            self.assertEqual(serve._freepool_aligned_route('coding'),
+                             '@freepool:coding:numes-flash-u')
+            self.assertEqual(serve._coding_tier_slug(),
+                             '@freepool:coding:numes-flash-u')
+        finally:
+            tier_patcher.stop()
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_declared_beats_aligned_and_paid_is_last_leg(self):
+        cfg = {
+            'enabled': True, 'bands': ['coding'], 'mode': 'free-first',
+            'budget_bands': ['coding'],
+            'endpoints': [
+                self._numes_endpoint(bands=['coding'],
+                                     model='z-ai/glm-5.3',
+                                     name='numes-glm'),
+                self._numes_endpoint(
+                    bands=['coding'],
+                    model='dealignai/glm-5.3-flash-uncensored-fp8',
+                    name='numes-flash-u'),
+            ],
+        }
+        env_patcher, patcher = self._install(cfg)
+        tier_patcher = unittest.mock.patch.object(
+            serve, '_model_tier_slug',
+            lambda band, *a, **k: 'z-ai/glm-5.3-flash'
+            if band == 'coding' else None)
+        env_patcher.start()
+        tier_patcher.start()
+        try:
+            self.assertEqual(serve._coding_tier_slug(),
+                             '@freepool:coding:numes-glm')
+            with unittest.mock.patch.object(
+                    serve, '_freepool_declared_route', return_value=None):
+                self.assertEqual(serve._coding_tier_slug(),
+                                 '@freepool:coding:numes-flash-u')
+            with unittest.mock.patch.object(
+                    serve, '_freepool_declared_route', return_value=None), \
+                unittest.mock.patch.object(serve, '_freepool_aligned_route',
+                                           return_value=None):
+                self.assertEqual(serve._coding_tier_slug(),
+                                 'z-ai/glm-5.3-flash')
+        finally:
+            tier_patcher.stop()
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_family_normalizer_aligns_variations_only(self):
+        f = serve._freepool_model_family
+        self.assertEqual(f('dealignai/glm-5.3-flash-uncensored-fp8'),
+                         f('z-ai/glm-5.3-flash'))
+        self.assertEqual(f('z-ai/glm-5.3-flash:free'), 'glm-5.3-flash')
+        self.assertNotEqual(f('z-ai/glm-5.3'), f('z-ai/glm-5.3-flash'))
+        self.assertNotEqual(f('mistralai/mistral-small'), 'glm-5.3-flash')
+        self.assertEqual(f(''), '')
+        self.assertEqual(f('@freepool:low:numes-x'), '')
+        self.assertEqual(f('~deepseek/deepseek-flash-latest'), '')
+
+    def test_unaligned_pinned_model_gets_no_aligned_route(self):
+        cfg = {
+            'enabled': True, 'bands': ['coding'], 'mode': 'free-first',
+            'endpoints': [self._numes_endpoint(
+                model='mistralai/mistral-small-3.2',
+                name='numes-other')],
+        }
+        env_patcher, patcher = self._install(cfg)
+        tier_patcher = unittest.mock.patch.object(
+            serve, '_model_tier_slug',
+            lambda band, *a, **k: 'z-ai/glm-5.3-flash'
+            if band == 'coding' else None)
+        env_patcher.start()
+        tier_patcher.start()
+        try:
+            self.assertIsNone(serve._freepool_aligned_route('coding'))
+        finally:
+            tier_patcher.stop()
             env_patcher.stop()
             patcher.stop()

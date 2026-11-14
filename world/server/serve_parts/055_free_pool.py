@@ -157,6 +157,14 @@ def _load_free_pool_config():
                              if isinstance(ep.get('model_family'), list)
                              else (['flash'] if is_gemini_auto else [])),
             'pool_key': str(ep.get('pool_key') or '').strip() or name,
+            # Per-endpoint band scoping (operator, 2026-11-14): an endpoint
+            # listing 'bands' serves ONLY those bands -- the capable Numes
+            # models are reserved for coding/bounty and must never surface
+            # in the low/sublow rotation. None = every pool band, exactly
+            # as every existing endpoint keeps behaving.
+            'bands': ([str(b).strip() for b in ep['bands']
+                       if isinstance(b, str) and b.strip()]
+                      if isinstance(ep.get('bands'), list) else None),
             'rpm': _limit('rpm'), 'rpd': _limit('rpd'), 'tpm': _limit('tpm'),
             # Per-model daily cap map (gemini auto picks): keys match model
             # names by substring, longest key wins (see _freepool_model_cap).
@@ -715,6 +723,102 @@ def _freepool_route_for_band(band, force=False):
                         or paid_blocked):
                     return None
         for ep in cfg['endpoints']:
+            # Per-endpoint band scoping (operator, 2026-11-14): an endpoint
+            # listing 'bands' serves ONLY those bands -- the capable Numes
+            # models are reserved for coding/bounty and must never surface
+            # in the low/sublow rotation. Endpoints without the key keep
+            # serving every pool band exactly as before.
+            if band not in (ep.get('bands') or (band,)):
+                continue
+            if not _freepool_kind_allows(ep, kind):
+                continue
+            if _freepool_ready(ep, band):
+                return f'@freepool:{band}:{ep["name"]}'
+    except Exception:
+        return None
+    return None
+
+
+# Tokens that mark a model VARIATION rather than a different model
+# (operator, 2026-11-14): 'glm-5.3-flash-uncensored-fp8' is the same model
+# as 'z-ai/glm-5.3-flash' relayed by another publisher, so the free relay
+# may serve anywhere the paid pick could. Size modifiers (flash, mini, pro)
+# are NOT noise -- glm-5.3 and glm-5.3-flash are genuinely different models
+# and never align. Quantization does cost a little fidelity (fp8 vs bf16);
+# the operator accepted that trade explicitly with this rule.
+_MODEL_FAMILY_NOISE = frozenset(('uncensored', 'abliterated', 'fp8', 'fp4',
+                                 'int4', 'int8', 'bf16', 'fp16', 'quantized',
+                                 'latest'))
+
+
+def _freepool_model_family(model_id):
+    """The alignment key for a model slug: lowercase, publisher-stripped,
+    variation tokens dropped. 'dealignai/glm-5.3-flash-uncensored-fp8' and
+    'z-ai/glm-5.3-flash' both normalize to 'glm-5.3-flash'; a non-pinned
+    or alias-only slug (gemini 'auto', openrouter-free) yields ''. """
+    raw = str(model_id or '').strip()
+    if not raw or raw.startswith(('~', '@freepool:')):
+        return ''
+    name = raw.split('/')[-1].split(':')[0].strip().lower()
+    tokens = [t for t in name.split('-') if t and t not in _MODEL_FAMILY_NOISE]
+    return '-'.join(tokens)
+
+
+def _freepool_aligned_route(band):
+    """Free-first route for an endpoint whose pinned model is a VARIATION
+    OF THE SAME MODEL as the band's paid pick (operator, 2026-11-14:
+    'GLM 5.3 Flash Uncensored would align with GLM 5.3 Flash'). Same
+    weights means the free relay may serve the band ANYTIME regardless of
+    spend/budget state -- the same recorded exception as the declared
+    route, earned by capability equivalence INSTEAD of an explicit band
+    declaration: no 'bands' key is required, because the family match IS
+    the capability credential. Unpinned endpoints (gemini auto,
+    openrouter-free) can never align; unrelated pinned models do not
+    align; quota exhaustion and call failures still fall through to the
+    paid pick via the callers' conjunction."""
+    try:
+        cfg = _free_pool_cfg()
+        if not cfg or band not in cfg['bands']:
+            return None
+        paid_family = _freepool_model_family(_model_tier_slug(band))
+        if not paid_family:
+            return None
+        kind = _free_pool_active_kind()
+        for ep in cfg['endpoints']:
+            if not _freepool_kind_allows(ep, kind):
+                continue
+            pinned = (ep.get('model') or '').strip()
+            if not pinned or pinned == 'auto' or ep.get('openrouter_free'):
+                continue
+            if _freepool_model_family(pinned) != paid_family:
+                continue
+            if _freepool_ready(ep, band):
+                return f'@freepool:{band}:{ep["name"]}'
+    except Exception:
+        return None
+    return None
+
+
+def _freepool_declared_route(band):
+    """Free-first route restricted to endpoints that EXPLICITLY declare
+    this band via their 'bands' key, ignoring the budget-band and mode
+    gates. Operator directive (2026-11-14): the capable Numes free models
+    are the coding and bounty bands' PRIMARY leg when ready -- full
+    glm-5.3 at $0 out-codes the paid flash pick -- not an emergency-only
+    leg, which is what plain budget-band semantics would make them. This
+    is a deliberate, recorded exception to the 2026-11-10 mid rule ('paid
+    mid when credits exist'): that rule keeps generic endpoints (gemini,
+    groq) off the strong bands' primary leg, while declared capable
+    endpoints opt INTO it. Quota exhaustion and call failures still fall
+    through to the paid pick via the callers' conjunction."""
+    try:
+        cfg = _free_pool_cfg()
+        if not cfg or band not in cfg['bands']:
+            return None
+        kind = _free_pool_active_kind()
+        for ep in cfg['endpoints']:
+            if band not in (ep.get('bands') or ()):
+                continue
             if not _freepool_kind_allows(ep, kind):
                 continue
             if _freepool_ready(ep, band):

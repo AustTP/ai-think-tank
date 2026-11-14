@@ -24,7 +24,8 @@
    "sublow",
    "mid",
    "coding",
-   "high"
+   "high",
+   "bounty"
   ],
   "mode": "free-first",
   "endpoints": [
@@ -99,13 +100,14 @@
     "service": "numes",
     "base_url": "https://api.numes.ai/api/v1/chat/completions",
     "model": "deepseek/deepseek-v4.1-flash",
+    "bands": ["bounty"],
     "api_key_env": "NUMES_API_KEY",
     "price_per_m": 0,
     "pool_key": "numes",
     "rpm": 10,
     "rpd": 300,
     "tpm": 0,
-    "comment": "Numes marketplace free tier (verified 2026-11-13: usage.cost 0). No published rate limits -- 429+Retry-After server-side, so these client caps are deliberately conservative. provider.data_collection=deny pins Numes' no-collection routing so request bodies are contractually excluded from provider training/logging; outbound masking (130) is the second layer.",
+    "comment": "Numes marketplace free tier (verified 2026-11-13: usage.cost 0). No published rate limits -- 429+Retry-After server-side (limits are per key/account/creator, never per model), so these client caps are deliberately conservative. provider.data_collection=deny pins Numes' no-collection routing so request bodies are contractually excluded from provider training/logging; outbound masking (130) is the second layer. OPERATOR DIRECTIVE 2026-11-14: the capable Numes models are scoped OUT of low/sublow and reserved for the coding and bounty bands -- deepseek-v4.1-flash's 1M context takes bounty, z-ai/glm-5.3 takes coding -- via the per-endpoint 'bands' key (endpoints without the key keep serving every pool band).",
     "extra": {
      "provider": {
       "data_collection": "deny"
@@ -117,12 +119,32 @@
     "service": "numes",
     "base_url": "https://api.numes.ai/api/v1/chat/completions",
     "model": "z-ai/glm-5.3",
+    "bands": ["coding"],
     "api_key_env": "NUMES_API_KEY",
     "price_per_m": 0,
     "pool_key": "numes",
     "rpm": 10,
     "rpd": 300,
     "tpm": 0,
+    "extra": {
+     "provider": {
+      "data_collection": "deny"
+     }
+    }
+   },
+   {
+    "name": "numes-glm-5.3-flash-uncensored",
+    "service": "numes",
+    "base_url": "https://api.numes.ai/api/v1/chat/completions",
+    "model": "dealignai/glm-5.3-flash-uncensored-fp8",
+    "bands": ["coding"],
+    "api_key_env": "NUMES_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "numes",
+    "rpm": 10,
+    "rpd": 300,
+    "tpm": 0,
+    "comment": "Aligned free variation of the coding band's paid pick (z-ai/glm-5.3-flash): _freepool_aligned_route matches the normalized family (uncensored/fp8 are noise tokens), so this relay serves coding ANYTIME regardless of spend/budget. fp8 quantization costs a little fidelity vs the paid bf16 pick; operator accepted that trade explicitly (2026-11-14).",
     "extra": {
      "provider": {
       "data_collection": "deny"
