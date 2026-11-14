@@ -613,6 +613,13 @@ def _apply_plain_writing(messages):
 
 
 OPENROUTER_CHAT_COMPLETIONS_URL = 'https://openrouter.ai/api/v1/chat/completions'
+# Hosts whose chat endpoint understands OpenRouter's provider preference
+# object: OpenRouter enforces data_collection=deny router-side (documented
+# per-request, plus an account-wide privacy toggle); Straitly accepts the
+# same OpenRouter-shaped field. Gemini/Groq/Numes endpoints are NOT on this
+# list -- Numes pins data_collection=deny in its endpoint spec's extra, and
+# the other hosts must not receive an unknown top-level provider field.
+_MODEL_DATA_DENY_HOSTS = ('openrouter.ai', 'api.straitly.ai')
 
 # --- dialing-provider registry (provider-agnostic transports) ---------------
 # Every vendor a model call can be sent to. The DEFAULT transport is the
@@ -766,6 +773,66 @@ def _apply_provider_cost(result, provider):
     return result
 
 
+# --- Outbound secret masking (2026-11-13, operator direction) ------------
+# Free-tier providers may log or train on request bodies (Numes declares a
+# per-endpoint data policy; Google's free Gemini tier trains on content).
+# Capability handles keep raw keys out of agent context, but one pasted
+# value in one prompt would still reach the wire and sit in a provider's
+# logs forever. Before any chat payload leaves the process, every long,
+# secret-named env VALUE is replaced with a stable placeholder. Header auth
+# is untouched -- masking covers the BODY only.
+_MODEL_MASK_ENV_BITS = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'COOKIE',
+                        'ACCOUNT', 'REFRESH', 'HASH', 'SALT', 'NUMBER')
+_MODEL_MASK_MIN_LEN = 16
+_MODEL_MASK_TTL_S = 60.0
+_model_mask_cache = {'at': 0.0, 'pairs': ()}
+
+
+def _model_secret_pairs():
+    """(value, placeholder) pairs for every env var whose NAME looks
+    secret-shaped and whose value is long enough to be a real credential.
+    Longest first so a long value cannot be partially unmasked by a shorter
+    prefix of itself. Numeric-looking values are skipped: they are config,
+    not credentials."""
+    now = time.time()
+    if now - _model_mask_cache['at'] < _MODEL_MASK_TTL_S:
+        return _model_mask_cache['pairs']
+    pairs = []
+    for name, value in (_load_env() or {}).items():
+        if not any(bit in str(name).upper() for bit in _MODEL_MASK_ENV_BITS):
+            continue
+        value = str(value or '').strip()
+        if len(value) < _MODEL_MASK_MIN_LEN:
+            continue
+        try:
+            float(value)
+            continue
+        except ValueError:
+            pass
+        pairs.append((value, f'[REDACTED:{name}]'))
+    pairs.sort(key=lambda pair: -len(pair[0]))
+    _model_mask_cache.update(at=now, pairs=tuple(pairs))
+    return _model_mask_cache['pairs']
+
+
+def _mask_model_secrets(obj):
+    """Recursively replace secret env values inside strings of an outbound
+    JSON payload. Returns the same structure; non-string leaves untouched."""
+    pairs = _model_secret_pairs()
+    if not pairs:
+        return obj
+    if isinstance(obj, str):
+        for value, placeholder in pairs:
+            if value in obj:
+                obj = obj.replace(value, placeholder)
+        return obj
+    if isinstance(obj, list):
+        return [_mask_model_secrets(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _mask_model_secrets(val) for key, val in obj.items()}
+    return obj
+
+
 def _openrouter_chat_post(body, provider=None):
     """Single POST of a chat-completions body, shared by the two call layers
     (_call_openrouter_once_sync and _post_openrouter_raw), with one recovery
@@ -813,6 +880,20 @@ def _openrouter_chat_post(body, provider=None):
     body = constitution.with_rules(body)
     source = provider.get('provider') if provider and is_custom else 'openrouter'
     base_url = provider.get('base_url') if is_custom else OPENROUTER_CHAT_COMPLETIONS_URL
+    if (urllib.parse.urlparse(base_url).hostname or '') in _MODEL_DATA_DENY_HOSTS:
+        # Paid lanes carry the same data policy the free-pool endpoint
+        # specs pin (operator, 2026-11-13): OpenRouter's documented
+        # provider preference data_collection=deny refuses every
+        # endpoint whose policy trains on request data (verified live
+        # 2026-11-13 against z-ai/glm-5.3-flash), and Straitly accepts
+        # the same OpenRouter-shaped field without error -- enforcement
+        # on Straitly's side is unverified, so it is a best-effort hint
+        # there. Merge, never clobber: an endpoint spec or caller that
+        # already set provider prefs wins.
+        prefs = body.get('provider')
+        prefs = dict(prefs) if isinstance(prefs, dict) else {}
+        prefs.setdefault('data_collection', 'deny')
+        body['provider'] = prefs
     api_key = None
     if is_custom:
         key_env = provider.get('api_key_env') or ''
@@ -824,6 +905,7 @@ def _openrouter_chat_post(body, provider=None):
         # A real User-Agent on every model POST: Groq's edge blocks the bare
         # Python-urllib signature with a Cloudflare 403 (error 1010) before
         # auth is even considered -- confirmed live against api.groq.com.
+        payload = _mask_model_secrets(payload)
         headers = {'Content-Type': 'application/json', 'User-Agent': 'AIThinkTankAgent/1.0'}
         if api_key:
             headers['Authorization'] = f'Bearer {api_key}'

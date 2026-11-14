@@ -357,12 +357,15 @@ def _decision_request(model, state, questions):
     # internally on the Colab runtime. The standby is LOCALHOST-only (loopback
     # ssh forward), so there is no bearer key to attach and nothing public.
     questions = _normalize_decision_questions(questions)
+    # Masked like every other model POST (see _mask_model_secrets in 130):
+    # decision prompts carry agent state that could quote a pasted secret.
+    masked = _mask_model_secrets({'state': state, 'questions': questions})
     if '://' in model:
-        src = json.dumps({'state': state, 'questions': questions}).encode()
+        src = json.dumps(masked).encode()
         return urllib.request.Request(
             model, data=src, headers={'Content-Type': 'application/json'},
             method='POST')
-    payload = json.dumps({'model': model, 'state': state, 'questions': questions}).encode()
+    payload = json.dumps({**masked, 'model': model}).encode()
     return urllib.request.Request(
         'https://openrouter.ai/api/alpha/decisions',
         data=payload,

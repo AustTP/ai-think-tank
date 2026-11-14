@@ -1283,3 +1283,72 @@ class BudgetBandTests(unittest.TestCase):
         finally:
             patcher.stop()
             _reset_pool_state()
+
+
+class NumesEndpointTests(unittest.TestCase):
+    """The Numes.ai marketplace endpoint (2026-11-13): a pinned-model
+    OpenAI-compatible free endpoint whose extra pins Numes'
+    provider.data_collection=deny so request bodies are contractually
+    excluded from provider training/logging."""
+
+    def setUp(self):
+        _reset_pool_state()
+
+    def tearDown(self):
+        _reset_pool_state()
+
+    def test_numes_parses_routes_and_carries_data_policy(self):
+        env = {'GEMINI_API_KEY': 'test-gemini-key',
+               'GROQ_API_KEY': 'test-groq-key',
+               'NUMES_API_KEY': 'test-numes-key'}
+        cfg = {
+            'enabled': True, 'bands': ['low'], 'mode': 'free-first',
+            'endpoints': [{
+                'name': 'numes-x', 'service': 'numes',
+                'base_url': 'https://numes.example/api/v1/chat/completions',
+                'model': 'deepseek/deepseek-v4.1-flash',
+                'api_key_env': 'NUMES_API_KEY',
+                'price_per_m': 0, 'pool_key': 'numes',
+                'rpm': 10, 'rpd': 300, 'tpm': 0,
+                'extra': {'provider': {'data_collection': 'deny'}},
+            }],
+        }
+        patcher = _write_pool_config(cfg)
+        env_patcher = unittest.mock.patch.object(serve, '_load_env',
+                                                 lambda key=None: env)
+        env_patcher.start()
+        try:
+            self.assertEqual(serve._freepool_route_for_band('low'),
+                             '@freepool:low:numes-x')
+            spec = serve._freepool_provider_for('@freepool:low:numes-x')
+            self.assertEqual(spec['provider'], 'freepool-numes')
+            self.assertEqual(spec['model'], 'deepseek/deepseek-v4.1-flash')
+            self.assertEqual(spec['api_key_env'], 'NUMES_API_KEY')
+            self.assertEqual(spec['pool_key'], 'numes')
+            self.assertEqual(spec['extra'],
+                             {'provider': {'data_collection': 'deny'}})
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
+    def test_numes_endpoint_without_key_is_not_ready(self):
+        env = {'GEMINI_API_KEY': 'test-gemini-key',
+               'GROQ_API_KEY': 'test-groq-key'}
+        cfg = {
+            'enabled': True, 'bands': ['low'], 'mode': 'free-first',
+            'endpoints': [{
+                'name': 'numes-x', 'service': 'numes',
+                'base_url': 'https://numes.example/api/v1/chat/completions',
+                'model': 'deepseek/deepseek-v4.1-flash',
+                'api_key_env': 'NUMES_API_KEY', 'price_per_m': 0,
+            }],
+        }
+        patcher = _write_pool_config(cfg)
+        env_patcher = unittest.mock.patch.object(serve, '_load_env',
+                                                 lambda key=None: env)
+        env_patcher.start()
+        try:
+            self.assertIsNone(serve._freepool_route_for_band('low'))
+        finally:
+            env_patcher.stop()
+            patcher.stop()
