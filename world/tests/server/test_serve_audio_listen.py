@@ -13,9 +13,11 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 import urllib.error
+import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 import serve  # noqa: E402
@@ -300,6 +302,156 @@ class LoopGateTests(AudioListenBase):
                 unittest.mock.patch.object(shutil, 'which',
                                            return_value=None):
             asyncio.run(serve._audio_listen_loop())
+
+
+class ColabOverflowTests(AudioListenBase):
+    """The Colab overflow leg (operator, 2026-11-14): segments the Groq leg
+    cannot take queue for a batched faster-whisper job on the standby CPU
+    session -- borrowed only when it already exists, never provisioned."""
+
+    def setUp(self):
+        super().setUp()
+        serve._audio_state.update(colab=[], colab_pending=set(),
+                                  colab_next=0.0, colab_enabled=True,
+                                  colab_ok=None)
+
+    def tearDown(self):
+        serve._audio_state.update(colab=[], colab_pending=set(),
+                                  colab_next=0.0, colab_enabled=False,
+                                  colab_ok=None)
+
+    def _wav(self, label='x', name=None):
+        feed = self._feed(label)
+        os.makedirs(feed['dir'], exist_ok=True)
+        name = name or '%s.wav' % uuid.uuid4().hex
+        path = os.path.join(feed['dir'], name)
+        with open(path, 'wb') as f:
+            f.write(b'RIFFfake')
+        return feed, path
+
+    def test_enqueue_requires_enabled_leg(self):
+        serve._audio_state['colab_enabled'] = False
+        feed, path = self._wav()
+        self.assertFalse(serve._audio_colab_enqueue(feed, path))
+        serve._audio_state['colab_enabled'] = True
+        self.assertTrue(serve._audio_colab_enqueue(feed, path))
+        self.assertEqual(serve._audio_state['colab'],
+                         [(feed['label'], path)])
+        # Already claimed: idempotent True, no duplicate entry.
+        self.assertTrue(serve._audio_colab_enqueue(feed, path))
+        self.assertEqual(len(serve._audio_state['colab']), 1)
+
+    def test_enqueue_honors_queue_cap(self):
+        serve._audio_state['colab_enabled'] = True
+        feed, path = self._wav()
+        serve._audio_state['colab'] = [
+            ('x', '/tmp/%d.wav' % i)
+            for i in range(serve._AUDIO_COLAB_QUEUE_MAX)]
+        self.assertFalse(serve._audio_colab_enqueue(feed, path))
+        self.assertEqual(len(serve._audio_state['colab']),
+                         serve._AUDIO_COLAB_QUEUE_MAX)
+
+    def test_rate_refusal_enqueues_when_leg_enabled(self):
+        feed, path = self._wav()
+        serve._audio_state['rate'] = [time.time()] * \
+            serve._AUDIO_LISTEN_TRANSCRIBE_PER_MIN
+        self.assertFalse(serve._audio_handle_segment(feed, path, time.time()))
+        self.assertEqual(serve._audio_state['colab'],
+                         [(feed['label'], path)])
+        self.assertTrue(os.path.exists(path), 'file stays on disk')
+
+    def test_groq_failure_enqueues_when_leg_enabled(self):
+        feed, path = self._wav()
+        with unittest.mock.patch.object(serve, '_load_env',
+                                        return_value={}), \
+                unittest.mock.patch.object(serve, '_audio_rate_ok',
+                                           return_value=True):
+            self.assertFalse(
+                serve._audio_handle_segment(feed, path, time.time()))
+        self.assertEqual(serve._audio_state['colab'],
+                         [(feed['label'], path)])
+
+    def test_pending_paths_are_never_redispatched(self):
+        _, path = self._wav()
+        serve._audio_state['colab_pending'].add(path)
+        feed = self._feed()
+        # The leg owning the path is invisible to a re-enqueue attempt.
+        self.assertTrue(serve._audio_colab_enqueue(feed, path))
+        self.assertEqual(serve._audio_state['colab'], [])
+
+    def test_tick_skips_without_a_live_cpu_session(self):
+        feed, path = self._wav()
+        serve._audio_state['colab'] = [(feed['label'], path)]
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+                unittest.mock.patch.object(serve, '_colab_session_exists',
+                                           return_value=False):
+            serve._audio_colab_tick(time.time())
+        self.assertEqual(serve._audio_state['colab'],
+                         [(feed['label'], path)],
+                         'the batch stays queued for a later tick')
+        self.assertIs(serve._audio_state['colab_ok'], False)
+
+    def test_tick_harness_failure_keeps_batch_queued(self):
+        feed, path = self._wav()
+        serve._audio_state['colab'] = [(feed['label'], path)]
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+                unittest.mock.patch.object(serve, '_colab_session_exists',
+                                           return_value=True), \
+                unittest.mock.patch.object(
+                    serve, '_audio_colab_transcribe_batch',
+                    side_effect=RuntimeError('colab exec failed: x')):
+            serve._audio_colab_tick(time.time())
+        self.assertEqual(serve._audio_state['colab'],
+                         [(feed['label'], path)])
+        self.assertTrue(os.path.exists(path), 'no file is consumed')
+        self.assertIsNot(serve._audio_state['colab_next'], 0.0,
+                         'a failure arms the backoff')
+
+    def test_tick_records_results_and_consumes_the_batch(self):
+        feed, path = self._wav(label='x', name='seg.wav')
+        other = self._feed('x')
+        serve._audio_state['feeds'] = [feed]
+        serve._audio_state['colab'] = [(feed['label'], path)]
+        with unittest.mock.patch.object(serve, 'COLAB_ENABLED', True), \
+                unittest.mock.patch.object(serve, '_colab_session_exists',
+                                           return_value=True), \
+                unittest.mock.patch.object(
+                    serve, '_audio_colab_transcribe_batch',
+                    return_value={path: ' tank said hello  '}):
+            serve._audio_colab_tick(time.time())
+        self.assertEqual(serve._audio_state['colab'], [])
+        self.assertNotIn(path, serve._audio_state['colab_pending'])
+        self.assertFalse(os.path.exists(path), 'the segment is consumed')
+        self.assertEqual(other['ring'], [])
+        self.assertEqual(feed['ring'][-1][1], 'tank said hello')
+        self.assertEqual(feed['pending'][-1][1], 'tank said hello')
+
+    def test_transcribe_batch_uploads_tars_and_parses_result(self):
+        feed, path = self._wav(label='cam', name='seg1.wav')
+        batch = [(feed['label'], path)]
+        calls = []
+
+        def fake_cli(*args, **kwargs):
+            calls.append(list(args))
+            if args[0] == 'upload':
+                # The tar exists at upload time: prove the arc names here.
+                import tarfile as _tf
+                arc = serve._audio_colab_arcname('cam', path)
+                with _tf.open(args[3]) as t:
+                    assert t.getnames() == [arc], t.getnames()
+                return 0, 'ok'
+            if args[0] == 'exec':
+                arc = serve._audio_colab_arcname('cam', path)
+                return 0, ('noise\n%s{"%s": " hello from colab "}\ntrailer'
+                           % (serve._AUDIO_COLAB_RESULT_TAG, arc))
+            return 1, 'unexpected call'
+
+        with unittest.mock.patch.object(serve, '_colab_cli', fake_cli):
+            results = serve._audio_colab_transcribe_batch(batch)
+        self.assertEqual(results, {path: ' hello from colab '})
+        upload_call = [c for c in calls if c[0] == 'upload'][0]
+        self.assertEqual(upload_call[1], '-s')
+        self.assertIn('think-tank-cpu', upload_call)
 
 
 if __name__ == '__main__':

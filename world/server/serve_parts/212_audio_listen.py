@@ -41,8 +41,27 @@ _AUDIO_LISTEN_SEG_MAX_AGE_S = 600.0
 _AUDIO_LISTEN_ALERT_DEDUPE_S = 300.0
 _AUDIO_LISTEN_FFMPEG_BACKOFF_MAX_S = 300.0
 
+# Colab overflow leg (operator, 2026-11-14): multiple feeds can saturate the
+# Groq whisper free-tier gate (10/min shared across ALL feeds), and segments
+# the gate refused age out through the sweep after 10 minutes -- lost
+# transcripts under sustained load. When AUDIO_LISTEN_COLAB=1, segments the
+# Groq leg cannot take (rate-refused or failed) queue for a BATCHED job on
+# the standby's CPU runtime (faster-whisper on the runtime, one tar upload
+# + one exec per batch of 8). The listener only BORROWS an already-alive
+# CPU session -- it never provisions compute of its own, so the leg costs
+# nothing when the standby is stood down and silently falls back to the
+# Groq leg when it is not.
+AUDIO_LISTEN_COLAB_ENV = 'AUDIO_LISTEN_COLAB'
+_AUDIO_COLAB_BATCH_MAX = 8
+_AUDIO_COLAB_QUEUE_MAX = 24
+_AUDIO_COLAB_BACKOFF_S = 120.0
+_AUDIO_COLAB_EXEC_TIMEOUT_S = 600.0
+_AUDIO_COLAB_MODEL = 'small'
+_AUDIO_COLAB_RESULT_TAG = 'AUDIO_BATCH_RESULT '
+
 _audio_state = {'feeds': [], 'alerts_last': {}, 'digest_at': 0.0, 'rate': [],
-                'patterns': []}
+                'patterns': [], 'colab': [], 'colab_pending': set(),
+                'colab_next': 0.0, 'colab_enabled': False, 'colab_ok': None}
 # Indirection so tests can fast-forward retry backoffs without real sleeps.
 _audio_transcribe_sleep = time.sleep
 
@@ -185,6 +204,142 @@ def _audio_transcribe_wav(path):
             raise
 
 
+def _audio_colab_enabled():
+    """The overflow leg is opt-in: AUDIO_LISTEN_COLAB=1. Default off keeps
+    the feature fully dormant for existing installs."""
+    return (_load_env().get(AUDIO_LISTEN_COLAB_ENV) or '').strip() == '1'
+
+
+def _audio_colab_enqueue(feed, path):
+    """Queue a segment for the Colab batch leg. Returns True when the path
+    is (or already was) claimed by the leg, so the caller stops treating it
+    as Groq work; False when the leg is disabled or the queue is full (the
+    file stays on disk and ages out through the sweep exactly as before)."""
+    if not _audio_state.get('colab_enabled'):
+        return False
+    if path in _audio_state['colab_pending']:
+        return True
+    if len(_audio_state['colab']) >= _AUDIO_COLAB_QUEUE_MAX:
+        return False
+    _audio_state['colab'].append((feed['label'], path))
+    _audio_state['colab_pending'].add(path)
+    return True
+
+
+# Runs ON the Colab runtime per batch: pip once (marker file), untar,
+# transcribe every wav, print one tagged JSON line the host parses out of
+# stdout. A segment that fails on the runtime yields '' -- an honest drop,
+# identical in shape to the Groq leg's empty transcript.
+_AUDIO_COLAB_SCRIPT = '''
+import json, os, subprocess, tarfile
+if not os.path.exists('/tmp/.fw-ok'):
+    subprocess.run(['pip', 'install', '-q', 'faster-whisper'], check=False)
+    open('/tmp/.fw-ok', 'w').write('1')
+from faster_whisper import WhisperModel
+os.makedirs('/tmp/audio-batch', exist_ok=True)
+with tarfile.open('/tmp/audio-batch.tar') as t:
+    t.extractall('/tmp/audio-batch')
+model = WhisperModel('__MODEL__', device='cpu', compute_type='int8')
+out = {}
+for name in sorted(os.listdir('/tmp/audio-batch')):
+    if not name.endswith('.wav'):
+        continue
+    try:
+        segs, _info = model.transcribe('/tmp/audio-batch/' + name, beam_size=1)
+        out[name] = ' '.join(s.text.strip() for s in segs).strip()
+    except Exception:
+        out[name] = ''
+print('__TAG__' + json.dumps(out))
+'''.replace('__MODEL__', _AUDIO_COLAB_MODEL).replace(
+    '__TAG__', _AUDIO_COLAB_RESULT_TAG)
+
+
+def _audio_colab_arcname(label, path):
+    return '%s-%s' % (label, os.path.basename(path))
+
+
+def _audio_colab_transcribe_batch(batch):
+    """One batched transcription job on the standby CPU session: tar the
+    segments, upload, exec faster-whisper on the runtime, parse the tagged
+    result line from stdout. Returns {abs_path: text} for segments that
+    produced text. Raises on any HARNESS failure (upload/exec/parse) so the
+    caller keeps the whole batch queued and backs off -- a batch is only
+    consumed after the runtime answered."""
+    import tarfile
+    import tempfile
+    session = COLAB_CPU_SESSION
+    with tempfile.TemporaryDirectory(prefix='audio-colab-') as work:
+        tar_path = os.path.join(work, 'audio-batch.tar')
+        with tarfile.open(tar_path, 'w') as t:
+            for label, path in batch:
+                t.add(path, arcname=_audio_colab_arcname(label, path))
+        rc, out = _colab_cli('upload', '-s', session, tar_path,
+                             '/tmp/audio-batch.tar', timeout=300)
+        if rc != 0:
+            raise RuntimeError('colab upload failed: %s' % out[:200])
+        script = os.path.join(work, 'transcribe.py')
+        with open(script, 'w', encoding='utf-8') as fh:
+            fh.write(_AUDIO_COLAB_SCRIPT)
+        rc, out = _colab_cli('exec', '-s', session, '--file', script,
+                             '--timeout', str(_AUDIO_COLAB_EXEC_TIMEOUT_S),
+                             timeout=_AUDIO_COLAB_EXEC_TIMEOUT_S + 120.0)
+        if rc != 0:
+            raise RuntimeError('colab exec failed: %s' % out[:200])
+        payload = None
+        for line in out.splitlines():
+            if line.startswith(_AUDIO_COLAB_RESULT_TAG):
+                payload = line[len(_AUDIO_COLAB_RESULT_TAG):]
+        if payload is None:
+            raise RuntimeError('colab exec produced no result line')
+        by_arc = json.loads(payload)
+        return {path: str(by_arc[_audio_colab_arcname(label, path)])
+                for label, path in batch
+                if by_arc.get(_audio_colab_arcname(label, path))}
+
+
+def _audio_colab_tick(now):
+    """Dispatch queued overflow segments to the Colab batch leg. Borrows the
+    standby CPU session only when it is already alive; one log line per
+    state transition, then a backoff so the listener never hammers the
+    runtime. A harness failure keeps the whole batch queued (segments age
+    out through the sweep, same bound as before this leg existed)."""
+    queue = _audio_state['colab']
+    if not queue or now < _audio_state['colab_next']:
+        return
+    if not COLAB_ENABLED or not _colab_session_exists(COLAB_CPU_SESSION):
+        if _audio_state['colab_ok'] is not False:
+            _audio_state['colab_ok'] = False
+            print('[audio-listen] colab leg idle -- no standby CPU session; '
+                  'overflow stays on disk for the Groq leg', flush=True)
+        return
+    batch = list(queue[:_AUDIO_COLAB_BATCH_MAX])
+    _audio_state['colab_next'] = now + _AUDIO_COLAB_BACKOFF_S
+    try:
+        results = _audio_colab_transcribe_batch(batch)
+    except Exception as e:  # noqa: BLE001
+        if _audio_state['colab_ok'] is not False:
+            _audio_state['colab_ok'] = False
+            print('[audio-listen] colab leg failed: %s' % e, flush=True)
+        return
+    _audio_state['colab_next'] = 0.0
+    if _audio_state['colab_ok'] is not True:
+        _audio_state['colab_ok'] = True
+        print('[audio-listen] colab leg active (%d-segment batch)'
+              % len(batch), flush=True)
+    for label, path in batch:
+        queue.remove((label, path))
+        _audio_state['colab_pending'].discard(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass  # gone already (swept); nothing to record
+        feed = next((f for f in _audio_state['feeds']
+                     if f['label'] == label), None)
+        text = results.get(path)
+        if feed is not None and text:
+            _audio_record_transcript(feed, text, now)
+
+
 def _audio_alert_patterns(raw):
     """Compile AUDIO_LISTEN_KEYWORDS (CSV regex). A bad regex logs and is
     skipped: one typo must not take down the listener."""
@@ -258,30 +413,42 @@ def _audio_digest_write(now):
     return path
 
 
+def _audio_record_transcript(feed, text, now):
+    """Shared downstream for both transcription legs: strip, ring, pending,
+    alerts. Empty text (silence, or a segment the leg could not transcribe)
+    is an honest drop."""
+    text = ' '.join((text or '').split())
+    if not text:
+        return
+    entry = (now, text)
+    feed['ring'].append(entry)
+    del feed['ring'][:-_AUDIO_LISTEN_RING_MAX]
+    feed['pending'].append(entry)
+    _audio_alert_scan(feed['label'], text, now)
+
+
 def _audio_handle_segment(feed, path, now):
     """Transcribe one closed segment, record the text, scan alerts, and
     remove the file. On rate-window exhaustion the file stays for the next
-    tick; on transcription failure it stays too (bounded by the sweep)."""
+    tick; on transcription failure it stays too (bounded by the sweep).
+    When the Colab overflow leg is enabled, a segment this leg cannot take
+    is queued for the runtime batch instead of aging out under sustained
+    multi-feed load."""
     if not _audio_rate_ok(now):
+        _audio_colab_enqueue(feed, path)
         return False
     try:
         text = _audio_transcribe_wav(path)
     except Exception as e:  # noqa: BLE001
         print('[audio-listen] %s transcribe failed (%s): %s'
               % (feed['label'], os.path.basename(path), e), flush=True)
+        _audio_colab_enqueue(feed, path)
         return False
     try:
         os.remove(path)
     except OSError:
         pass
-    text = ' '.join((text or '').split())
-    if not text:
-        return True
-    entry = (now, text)
-    feed['ring'].append(entry)
-    del feed['ring'][:-_AUDIO_LISTEN_RING_MAX]
-    feed['pending'].append(entry)
-    _audio_alert_scan(feed['label'], text, now)
+    _audio_record_transcript(feed, text, now)
     return True
 
 
@@ -335,8 +502,11 @@ async def _audio_listen_loop():
          'proc': None, 'backoff': 5.0, 'next_start': 0.0,
          'ring': [], 'pending': []}
         for label, url in parsed]
-    print('[audio-listen] %d feed(s) active: %s' % (
-        len(parsed), ', '.join(label for label, _ in parsed)), flush=True)
+    _audio_state['colab_enabled'] = _audio_colab_enabled()
+    print('[audio-listen] %d feed(s) active: %s%s' % (
+        len(parsed), ', '.join(label for label, _ in parsed),
+        ' + colab overflow leg' if _audio_state['colab_enabled'] else ''),
+        flush=True)
     inflight = {}
     try:
         while True:
@@ -347,7 +517,8 @@ async def _audio_listen_loop():
                 for path in _audio_ready_segments(feed, now):
                     if len(inflight) >= _AUDIO_LISTEN_INFLIGHT_MAX:
                         break
-                    if path in inflight:
+                    if path in inflight \
+                            or path in _audio_state['colab_pending']:
                         continue
                     inflight[path] = asyncio.ensure_future(
                         asyncio.to_thread(_audio_handle_segment,
@@ -360,6 +531,7 @@ async def _audio_listen_loop():
                         print('[audio-listen] segment worker failed: %s' % e,
                               flush=True)
                     del inflight[path]
+            _audio_colab_tick(now)
             if now - _audio_state['digest_at'] >= _AUDIO_LISTEN_DIGEST_S:
                 _audio_state['digest_at'] = now
                 try:
