@@ -424,6 +424,12 @@ SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 OPENROUTER_SPEND_CAP_USD = float(_load_env().get('OPENROUTER_SPEND_CAP_USD', '5') or 0)
 JEV_SPEND_CAP_USD = float(_load_env().get('JEV_SPEND_CAP_USD', '0.5') or 0)
 STRAITLY_SPEND_CAP_USD = float(_load_env().get('STRAITLY_SPEND_CAP_USD', '0.5') or 0)
+# The shared model-router pool (operator, 2026-11-13): OpenRouter and
+# Straitly draw from ONE monthly budget -- not a hard half each. Either
+# router may spend the whole pool; THIS gate at the transport is the binding
+# constraint. The per-provider caps above are disaster brakes set at the
+# same size (one router alone cannot exceed the pool).
+MODEL_ROUTER_POOL_USD = float(_load_env().get('MODEL_ROUTER_POOL_USD', '50') or 0)
 
 # Per-agent monthly spend ceiling, checked at the model chokepoints that know
 # WHO is spending (/api/chat, _api_execute): a prompt-injected or runaway

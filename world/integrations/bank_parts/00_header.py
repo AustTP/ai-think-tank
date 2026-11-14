@@ -734,6 +734,46 @@ def _provider_spend_cap(provider):
     return float(getattr(_serve, env_name, 0) or 0)
 
 
+# The shared model-router pool (operator, 2026-11-13): OpenRouter and
+# Straitly draw from ONE monthly budget -- not a hard half each. Either
+# router may spend the whole pool; the POOL is the binding constraint, and
+# the per-provider caps are disaster brakes set at the same pool size.
+def _model_pool_month_used(ledger):
+    """Month-to-date spend across the dialing routers -- what the shared
+    pool gate bounds. MPP settlements land in the same vendor rollups, so
+    machine payments draw the pool like any other model spend."""
+    import serve as _serve
+    return round(sum(_provider_month_used_for_cap(ledger or {}, p)
+                     for p in _serve.DIALING_PROVIDERS), 6)
+
+
+def _model_pool_cap():
+    import serve as _serve
+    return float(getattr(_serve, 'MODEL_ROUTER_POOL_USD', 0) or 0)
+
+
+def _model_pool_cap_exceeded():
+    """The shared model budget: trips when BOTH routers' combined
+    month-to-date spend reaches the pool. One trip alert, like every lane."""
+    import serve as _serve
+    cap = _model_pool_cap()
+    if not cap:
+        return False
+    try:
+        used = _model_pool_month_used(_serve._spend_ledger_read())
+    except Exception:
+        return False
+    exceeded = used >= cap
+    _note_allowance_exhausted(
+        'modelPool',
+        f'Model router pool exhausted (${cap:.2f}/month)',
+        f'OpenRouter + Straitly spend this month: ${used:.2f}. The shared '
+        'model budget is gone -- band calls fall back to the free pool '
+        'until the month resets or MODEL_ROUTER_POOL_USD is raised.',
+        exceeded)
+    return exceeded
+
+
 def _provider_cap_exceeded(provider):
     """One provider's monthly cap, consulted by that provider's transport
     BEFORE a paid call goes out. False when the cap is 0 (disabled) or a

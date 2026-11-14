@@ -507,6 +507,13 @@ def compute_health_snapshot():
             # Per-dialing-provider caps (operator, 2026-11-13): each vendor
             # answers to its own monthly allowance; the tier pick layer
             # re-selects from a provider with spend left.
+            # Shared model-router pool (2026-11-13): the binding constraint
+            # across OpenRouter + Straitly -- no hard half per router.
+            'modelPool': {
+                'usedUsd': _serve_mod._model_pool_month_used(ledger),
+                'capUsd': _serve_mod._model_pool_cap(),
+                'exceeded': _serve_mod._model_pool_cap_exceeded(),
+            },
             'providers': {p: {
                 'usedUsd': _serve_mod._provider_month_used_for_cap(ledger, p),
                 'capUsd': _serve_mod._provider_spend_cap(p),

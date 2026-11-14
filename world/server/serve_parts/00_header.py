@@ -184,6 +184,9 @@ from integrations.bank import (  # noqa: E402,F401
     _lane_spend_cap,
     _lane_cap_exceeded,
     _MPP_LEDGER_KEY,
+    _model_pool_month_used,
+    _model_pool_cap,
+    _model_pool_cap_exceeded,
     env_name_of,
 )
 # The curated RSS/ATOM aggregator (see DESIGN.md "Current events"). Extracted

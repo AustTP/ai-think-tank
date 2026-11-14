@@ -241,6 +241,12 @@ def _weekly_forecast_text(now=None):
         lines.append(f'  budget view unavailable: {e}')
     try:
         ledger = _spend_ledger_read() or {}
+        # The shared model-router pool is the binding constraint (operator,
+        # 2026-11-13): OpenRouter + Straitly draw from ONE monthly budget,
+        # no hard half each. Per-router lines show where it went.
+        pool_used = _model_pool_month_used(ledger)
+        pool_flag = ' TRIPPED' if _model_pool_cap_exceeded() else ''
+        lines.append(f'  model pool: ${pool_used:.2f}/${_model_pool_cap():.2f}{pool_flag}')
         for provider in DIALING_PROVIDERS:
             used = _provider_month_used_for_cap(ledger, provider)
             cap = _provider_spend_cap(provider)

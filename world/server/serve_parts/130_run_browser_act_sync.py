@@ -788,12 +788,20 @@ def _openrouter_chat_post(body, provider=None):
     provider = provider if provider is not None else _model_provider_for((body or {}).get('model'))
     if (not provider or not provider.get('free')) \
             and (not provider or not provider.get('is_custom')
-                 or _provider_is_billable(provider)) \
-            and _provider_cap_exceeded(_serving_provider(provider)):
+                 or _provider_is_billable(provider)):
+        # The SHARED model-router pool is the binding constraint (operator,
+        # 2026-11-13): OpenRouter and Straitly draw from ONE monthly budget,
+        # no hard half per router. The per-provider cap is the disaster
+        # brake behind it (one router alone cannot exceed the pool).
+        if _model_pool_cap_exceeded():
+            raise RuntimeError(
+                f'model router pool (${MODEL_ROUTER_POOL_USD:.2f}/month) '
+                'exhausted -- paid calls fall back to the free pool')
         _name = _serving_provider(provider)
-        raise RuntimeError(
-            f'{_name} spend cap (${_provider_spend_cap(_name):.2f}/month) '
-            'reached -- tier picks move to a provider with spend left')
+        if _provider_cap_exceeded(_name):
+            raise RuntimeError(
+                f'{_name} spend cap (${_provider_spend_cap(_name):.2f}/month) '
+                'reached -- tier picks move to a provider with spend left')
     is_custom = bool(provider and provider.get('is_custom'))
     if provider:
         body = dict(body)

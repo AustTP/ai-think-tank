@@ -601,5 +601,79 @@ class BestValuePickProbesItsOwnProvider(unittest.TestCase):
         self.assertEqual(seen, [('or/a', None)])
 
 
+class ModelRouterPool(unittest.TestCase):
+    """The shared model-router pool (operator, 2026-11-13): OpenRouter and
+    Straitly draw from ONE monthly budget -- no hard half per router. Either
+    router may spend the whole pool; the POOL gate at the transport is the
+    binding constraint and the per-provider caps are disaster brakes."""
+
+    def setUp(self):
+        serve._ALLOWANCE_NOTIFIED.clear()
+
+    def tearDown(self):
+        serve._ALLOWANCE_NOTIFIED.clear()
+
+    def test_pool_used_sums_provider_rollups(self):
+        with unittest.mock.patch.object(serve, 'DIALING_PROVIDERS',
+                                        ('a', 'b')):
+            before = serve._model_pool_month_used(serve._spend_ledger_read())
+            serve._accrue_provider_spend('a', 30.0)
+            serve._accrue_provider_spend('b', 0.5)
+            used = serve._model_pool_month_used(serve._spend_ledger_read())
+        self.assertAlmostEqual(used - before, 30.5)
+
+    def test_pool_trips_at_cap_with_one_alert(self):
+        with unittest.mock.patch.object(serve, 'DIALING_PROVIDERS', ('a',)):
+            serve._accrue_provider_spend('a', 3.0)
+            with unittest.mock.patch.object(serve, 'MODEL_ROUTER_POOL_USD', 2.0):
+                self.assertTrue(serve._model_pool_cap_exceeded())
+                # Same state on the next poll: still exceeded, still one alert.
+                self.assertTrue(serve._model_pool_cap_exceeded())
+            with unittest.mock.patch.object(serve, 'MODEL_ROUTER_POOL_USD', 0):
+                self.assertFalse(serve._model_pool_cap_exceeded())
+
+    def test_transport_refuses_when_pool_trips_even_if_provider_cap_does_not(self):
+        spec = {'is_custom': True, 'free': False, 'provider': 'straitly',
+                'model': 'st/m',
+                'base_url': 'https://api.straitly.ai/v1/chat/completions',
+                'api_key_env': 'STRAITLY_API_KEY', 'price_per_m': 2.0}
+        with unittest.mock.patch.object(serve, '_model_pool_cap_exceeded',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_urlopen_with_resilience') as post:
+            with self.assertRaisesRegex(RuntimeError, 'model router pool'):
+                serve._openrouter_chat_post({'model': 'st/m'}, provider=spec)
+        post.assert_not_called()
+
+    def test_free_dial_skips_the_pool_gate(self):
+        spec = {'is_custom': True, 'free': True, 'provider': 'freepool',
+                'model': '@freepool:low:x', 'base_url': 'http://127.0.0.1:9/v1'}
+
+        def fake_open(req, timeout=None):
+            return json.dumps({'choices': [{'message': {'content': 'hi'}}],
+                               'usage': {'cost': 0.0}}).encode()
+
+        with unittest.mock.patch.object(serve, '_model_pool_cap_exceeded',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_urlopen_with_resilience',
+                                        fake_open), \
+             unittest.mock.patch.object(serve, 'training_capture'):
+            result = serve._openrouter_chat_post({'model': '@freepool:low:x'},
+                                                 provider=spec)
+        self.assertEqual(result['choices'][0]['message']['content'], 'hi')
+
+    def test_mpp_settlements_draw_the_pool(self):
+        with unittest.mock.patch.object(serve, 'DIALING_PROVIDERS',
+                                        ('mppvendor',)):
+            serve._accrue_provider_spend('mppvendor', 1.0)
+            used_before = serve._model_pool_month_used(
+                serve._spend_ledger_read())
+            serve._accrue_provider_spend('mppvendor', 0.25)
+            used_after = serve._model_pool_month_used(
+                serve._spend_ledger_read())
+        # A machine payment lands in the vendor rollup, so it draws the
+        # shared pool like any other model spend.
+        self.assertAlmostEqual(used_after - used_before, 0.25)
+
+
 if __name__ == '__main__':
     unittest.main()
