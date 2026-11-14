@@ -1481,7 +1481,6 @@ class NumesEndpointTests(unittest.TestCase):
             serve, '_model_tier_slug',
             lambda band, *a, **k: 'z-ai/glm-5.3-flash'
             if band == 'coding' else None)
-        env_patcher.start()
         tier_patcher.start()
         try:
             self.assertIsNone(serve._freepool_route_for_band('coding'))
@@ -1514,7 +1513,6 @@ class NumesEndpointTests(unittest.TestCase):
             serve, '_model_tier_slug',
             lambda band, *a, **k: 'z-ai/glm-5.3-flash'
             if band == 'coding' else None)
-        env_patcher.start()
         tier_patcher.start()
         try:
             self.assertEqual(serve._coding_tier_slug(),
@@ -1557,7 +1555,6 @@ class NumesEndpointTests(unittest.TestCase):
             serve, '_model_tier_slug',
             lambda band, *a, **k: 'z-ai/glm-5.3-flash'
             if band == 'coding' else None)
-        env_patcher.start()
         tier_patcher.start()
         try:
             self.assertIsNone(serve._freepool_aligned_route('coding'))
