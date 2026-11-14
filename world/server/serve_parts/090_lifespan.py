@@ -154,6 +154,16 @@ async def _lifespan(app):
     avatar_task = asyncio.create_task(_avatar_task_loop())
     rss_task = asyncio.create_task(_rss_poll_loop())
     ws_supervisor_task = asyncio.create_task(_ws_supervisor_loop())
+    # Live audio listen (operator, 2026-11-14): env-gated owner loop. Capture
+    # stays local under launchd supervision; transcription rides Groq's free
+    # whisper tier, whose per-endpoint quota is separate from Groq chat, so
+    # Groq stays in the chat free pool untouched. Fully dormant without
+    # AUDIO_LISTEN_FEEDS; villages never listen.
+    audio_listen_task = None
+    if not VILLAGE_MODE \
+            and _audio_feeds_parse(_load_env().get('AUDIO_LISTEN_FEEDS') or ''):
+        audio_listen_task = asyncio.create_task(_audio_listen_loop())
+        print('[audio-listen] feeds configured; listener starting', flush=True)
     # The ALWAYS-RUNNING owner of approved one-shot dormancy windows and of
     # apply_pass for armed self-edits (dormant-only by contract). Must NOT be
     # gated on --max-idle-minutes: an armed edit has to land at its dormancy
@@ -244,6 +254,8 @@ async def _lifespan(app):
         avatar_task.cancel()
     rss_task.cancel()
     ws_supervisor_task.cancel()
+    if audio_listen_task is not None:
+        audio_listen_task.cancel()
     if dormancy_window_task is not None:
         dormancy_window_task.cancel()
     if idle_shutdown_task is not None:
