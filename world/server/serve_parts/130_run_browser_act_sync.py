@@ -1057,6 +1057,13 @@ def _free_pool_fallback_slugs(model, _fallback_depth, _tried=None):
         for ep in cfg.get('endpoints') or []:
             if ep['name'] == failed_name or band not in (cfg.get('bands') or []):
                 continue
+            # Band scoping (operator, 2026-11-14): the fallback cascade
+            # must respect it exactly like the picker, or a groq hiccup
+            # funnels the reserved coding/bounty models into low-band
+            # traffic (observed live 2026-11-13: groq unavailable served
+            # numes-deepseek on low).
+            if band not in (ep.get('bands') or (band,)):
+                continue
             slug = f'@freepool:{band}:{ep["name"]}'
             if slug in tried:
                 continue

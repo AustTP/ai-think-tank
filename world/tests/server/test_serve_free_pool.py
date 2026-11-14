@@ -1419,6 +1419,32 @@ class NumesEndpointTests(unittest.TestCase):
             env_patcher.stop()
             patcher.stop()
 
+    def test_fallback_cascade_respects_band_scoping(self):
+        """A failed low-band free call must not cascade into the reserved
+        Numes coding/bounty endpoints (observed live 2026-11-13: groq
+        unavailable served numes-deepseek on low)."""
+        cfg = {
+            'enabled': True, 'bands': ['low', 'coding'], 'mode': 'free-first',
+            'endpoints': [
+                {'name': 'groq-x', 'service': 'groq',
+                 'base_url': 'https://groq.example/openai/v1/chat/completions',
+                 'model': 'qwen/qwen3.8-27b', 'api_key_env': 'GROQ_API_KEY',
+                 'price_per_m': 0, 'pool_key': 'groq',
+                 'rpm': 5, 'rpd': 100, 'tpm': 0},
+                self._numes_endpoint(bands=['coding'],
+                                     model='z-ai/glm-5.3',
+                                     name='numes-glm'),
+            ],
+        }
+        env_patcher, patcher = self._install(cfg)
+        try:
+            slugs = serve._free_pool_fallback_slugs('@freepool:low:other-x', 0)
+            self.assertIn('@freepool:low:groq-x', slugs)
+            self.assertNotIn('numes', ','.join(slugs))
+        finally:
+            env_patcher.stop()
+            patcher.stop()
+
     def test_numes_endpoint_without_key_is_not_ready(self):
         env = {'GEMINI_API_KEY': 'test-gemini-key',
                'GROQ_API_KEY': 'test-groq-key'}
