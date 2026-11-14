@@ -369,7 +369,21 @@ _WINDOW_CRITERIA = [
 ]
 
 
+_DORMANCY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(20261114)'
+
+
 def _ensure_windows_table(conn):
+    # Deadlock fix (2026-11-14): two tanks deadlocked on dormancy_windows --
+    # one held the CREATE/ALTER migration's AccessExclusiveLock while the
+    # other's window UPDATE waited on it, and Postgres killed the victim's
+    # whole schedule request. Every dormancy_windows access in selfedit goes
+    # through this function first, so a session-scoped advisory lock taken
+    # here serializes the migration and window writes across tanks and
+    # removes the lock-order inversion. pg_advisory_xact_lock is re-entrant
+    # within one transaction and holds until commit/rollback; SQLite
+    # (tests, THINK_TANK_DB) skips it entirely via the dialect flag.
+    if getattr(conn, 'postgres', False):
+        conn.execute(_DORMANCY_LOCK_SQL)
     conn.execute(
         'CREATE TABLE IF NOT EXISTS dormancy_windows ('
         'id TEXT PRIMARY KEY, created REAL NOT NULL, agent TEXT NOT NULL, '

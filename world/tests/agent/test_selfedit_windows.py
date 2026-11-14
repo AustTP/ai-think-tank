@@ -318,3 +318,32 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
         'date': _window_slot(), 'start': '03:10',
         'reason': 'nightly maintenance', 'validator': 'reviewer'})
     assert 'Engineering ritual block' in out
+
+
+def test_ensure_windows_table_takes_cross_tank_advisory_lock_on_postgres():
+    # Deadlock fix (2026-11-14): the migration ALTER and window writes must
+    # serialize across tanks via a session-scoped advisory lock, taken
+    # BEFORE any dormancy_windows statement in the transaction.
+    from unittest import mock
+    conn = mock.MagicMock()
+    conn.postgres = True
+    selfedit._ensure_windows_table(conn)
+    first_sql = conn.execute.call_args_list[0][0][0]
+    assert 'pg_advisory_xact_lock' in first_sql
+    create_sqls = [c[0][0] for c in conn.execute.call_args_list
+                   if 'CREATE TABLE' in c[0][0] or 'ALTER TABLE' in c[0][0]]
+    assert create_sqls, 'migration statements must still run'
+    assert conn.execute.call_args_list.index(
+        mock.call(first_sql)) < conn.execute.call_args_list.index(
+        mock.call(create_sqls[0]))
+
+
+def test_ensure_windows_table_skips_advisory_lock_on_sqlite():
+    # SQLite (tests, THINK_TANK_DB override) has no advisory locks; the
+    # dialect flag must route around them entirely.
+    from unittest import mock
+    conn = mock.MagicMock()
+    del conn.postgres  # a plain sqlite3.Connection has no such attribute
+    selfedit._ensure_windows_table(conn)
+    for c in conn.execute.call_args_list:
+        assert 'pg_advisory_xact_lock' not in c[0][0]

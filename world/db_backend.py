@@ -703,6 +703,9 @@ class CompatConnection:
         self._conn = pg_conn
         self._catalog = catalog
         self._pool = pool
+        # Dialect flag for callers that branch on backend without importing
+        # this module (part files never import siblings at module level).
+        self.postgres = True
         self.row_factory = None  # accepted; CompatRow is always provided
 
     def cursor(self, *a, **k):

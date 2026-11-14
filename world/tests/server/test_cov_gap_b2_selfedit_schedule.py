@@ -117,6 +117,44 @@ class SelfEditScheduleEndpointTests(unittest.TestCase):
         self.assertIn('the window request harness failed', resp.json()['error'])
         self.assertEqual('selfedit_crashed', log.call_args[0][1])
 
+    def test_deadlock_is_retried_then_succeeds(self):
+        # Deadlock fix (2026-11-14): a cross-tank dormancy_windows deadlock
+        # used to kill the whole request; it must retry in place instead.
+        fake = _fake_selfedit()
+        fake.request_window.side_effect = [
+            RuntimeError('deadlock detected'),
+            (True, {'id': 'w1', 'durationMin': 60, 'ok': True})]
+
+        async def _no_sleep(_delay):
+            return None
+
+        body = {'agentId': 'a', 'date': '2026-10-30', 'start': '03:00',
+                'reason': 'maintenance'}
+        with mock.patch.object(asyncio, 'sleep', _no_sleep):
+            resp, fake, _ = self._post(body, fake=fake)
+        self.assertEqual(200, resp.status_code)
+        self.assertEqual(2, fake.request_window.call_count)
+
+    def test_deadlock_exhaustion_crashes_loudly(self):
+        fake = _fake_selfedit()
+        fake.request_window.side_effect = RuntimeError(
+            'deadlock detected on dormancy_windows')
+
+        async def _no_sleep(_delay):
+            return None
+
+        body = {'agentId': 'a', 'date': '2026-10-30', 'start': '03:00',
+                'reason': 'maintenance'}
+        with mock.patch.object(asyncio, 'sleep', _no_sleep), \
+                mock.patch.object(serve, '_telegram_send_text_sync',
+                                  return_value=1) as tg:
+            resp, fake, log = self._post(body, fake=fake)
+        self.assertEqual(500, resp.status_code)
+        self.assertEqual(3, fake.request_window.call_count)
+        self.assertEqual('selfedit_crashed', log.call_args[0][1])
+        self.assertEqual(1, tg.call_count)
+        self.assertIn('after 3 attempt', tg.call_args[0][0])
+
 
 class SelfEditCancelVetoTests(unittest.TestCase):
     def _post(self, path, body, fake, session=False, agent=True, admin=False,

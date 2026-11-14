@@ -284,6 +284,70 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(counts['internalSignals'], 3)
         self.assertEqual(counts['internalClasses'], 3)
 
+    def test_digest_carries_selfedit_integrity_reconciliation(self):
+        # Owner direction 2026-11-14: the normalized-deviation review found
+        # selfedit deviations this scan could not see. The digest must
+        # surface the 7d selfedit trend, unescalated approved/fired windows,
+        # and staging growth next to the alerts.
+        now = datetime.datetime(2026, 11, 14, 12, 0,
+                                tzinfo=datetime.timezone.utc).timestamp()
+        telegram_rows = [(now - 3600, json.dumps({'preview':
+            '[AI Think Tank] Failure: A content run was abandoned\n\nAgent: tucker'}))]
+        integrity_rows = {
+            'action_log': [('self_edit_rolled_back', 2),
+                           ('selfedit_crashed', 1)],
+            'unescalated': [('win-19e1a3a954', 'approved', now - 14400)],
+        }
+        written = {}
+
+        class FakeFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def write(self, text):
+                written['text'] = text
+
+        def fake_db():
+            conn = mock.MagicMock()
+
+            def execute(sql, *params):
+                m = mock.MagicMock()
+                if 'telegram_sent' in sql or 'card_pattern_suppressed' in sql:
+                    m.fetchall.return_value = telegram_rows
+                elif 'GROUP BY action' in sql:
+                    m.fetchall.return_value = integrity_rows['action_log']
+                elif 'dormancy_windows' in sql:
+                    m.fetchall.return_value = integrity_rows['unescalated']
+                else:
+                    m.fetchall.return_value = []
+                return m
+
+            conn.execute.side_effect = execute
+            return mock.MagicMock(__enter__=lambda s: conn,
+                                  __exit__=lambda s, *a: False)
+
+        with mock.patch.object(serve, '_db', fake_db), \
+                mock.patch.object(serve, '_safe_library_path',
+                                  return_value='/tmp/digest.md'), \
+                mock.patch.object(serve, 'log_action'), \
+                mock.patch('builtins.open', return_value=FakeFile()), \
+                mock.patch.object(serve, '_staging_usage',
+                                  return_value=(2 * 1024 * 1024 * 1024, 410)), \
+                mock.patch.object(serve.os.path, 'dirname',
+                                  return_value='/tmp'):
+            path = serve.write_telegram_alert_digest(now=now)
+        self.assertIsNotNone(path)
+        text = written['text']
+        self.assertIn('Selfedit integrity', text)
+        self.assertIn('rollbacks=2', text)
+        self.assertIn('selfedit_crashed=1', text)
+        self.assertIn('win-19e1a3a954', text)
+        self.assertIn('NO escalation_id and NO validator', text)
+        self.assertIn('2048 MB in 410 files', text)
+
     def test_digest_writes_a_unique_file_per_scan(self):
         # A 30-min scan must NOT overwrite the day's earlier digests (the
         # RVP's second scan once read a 0-alert rolling window where the

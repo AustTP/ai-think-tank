@@ -56,6 +56,25 @@ def telegram_digest_scan_path(now=None):
             f'-{dt.strftime("%H%M")}.md')
 
 
+def _staging_usage():
+    """(bytes, files) across world/.selfedit_staging -- the selfedit
+    hygiene loops' own scratch. Surfaced by the digest so the VP sees when
+    it balloons instead of discovering it at a full disk."""
+    root = os.path.join(config.ROOT, '.selfedit_staging')
+    total = files = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(root):
+            for name in filenames:
+                try:
+                    total += os.path.getsize(os.path.join(dirpath, name))
+                    files += 1
+                except OSError:
+                    pass
+    except OSError:
+        return 0, 0
+    return total, files
+
+
 def write_telegram_alert_digest(now=None, since_ts=None):
     """Land the last 24h of outbound Telegram alerts into the Library so the
     regional VP's daily scan card can read them with read_library_file.
@@ -171,6 +190,58 @@ def write_telegram_alert_digest(now=None, since_ts=None):
             lines.append(f'- {stamp} UTC: {tail}'.rstrip())
         if len(occurrences) > 6:
             lines.append(f'- ... {len(occurrences) - 6} more')
+        lines.append('')
+    # Selfedit integrity reconciliation (owner direction 2026-11-14): the
+    # normalized-deviation review found deviations this scan could not see
+    # -- windows that processed without their approval chain, rollbacks
+    # whose candidate copy failed to land, crash counts, and staging
+    # scratch growth. Fold the checks in so the VP's triage sees them next
+    # to the alerts instead of nowhere.
+    integrity_lines = []
+    try:
+        week_cutoff = now - 7 * 24 * 3600
+        with _db() as conn:
+            counts = dict(conn.execute(
+                'SELECT action, COUNT(*) FROM action_log WHERE action IN '
+                "(?, ?, ?) AND ts >= ? GROUP BY action",
+                ('self_edit_rolled_back', 'self_edit_rollback_failed',
+                 'selfedit_crashed', week_cutoff)).fetchall())
+            unescalated = conn.execute(
+                'SELECT id, status, created FROM dormancy_windows '
+                "WHERE status IN ('approved', 'fired') "
+                "AND COALESCE(escalation_id, '') = '' "
+                "AND COALESCE(validator, '') = '' "
+                'ORDER BY created DESC LIMIT 5').fetchall()
+        stage_bytes, stage_files = _staging_usage()
+        integrity_lines.append(
+            '- 7d trend: rollbacks=%s, rollback_failures=%s, '
+            'selfedit_crashed=%s' % (
+                counts.get('self_edit_rolled_back', 0),
+                counts.get('self_edit_rollback_failed', 0),
+                counts.get('selfedit_crashed', 0)))
+        if counts.get('self_edit_rollback_failed'):
+            integrity_lines.append(
+                '- INVARIANT BREACH: a rollback ran but its candidate copy '
+                'did not land -- recover it from .selfedit_backups/*.cand '
+                'before the scratch is pruned')
+        for wid, status, created in unescalated:
+            stamp = datetime.datetime.fromtimestamp(
+                created, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M')
+            integrity_lines.append(
+                f'- window {wid} ({status}, created {stamp} UTC) processed '
+                'with NO escalation_id and NO validator -- expected only '
+                'when the operator explicitly waived the notice gate; '
+                'otherwise the approval chain silently did not run')
+        integrity_lines.append(
+            '- .selfedit_staging: %.0f MB in %d files (hygiene loops own '
+            'this scratch; growth past a few GB means a prune pass is '
+            'failing)' % (stage_bytes / (1024 * 1024), stage_files))
+    except Exception:
+        integrity_lines = []
+    if integrity_lines:
+        lines.append('## Selfedit integrity (7d trend + invariants)')
+        lines.append('')
+        lines.extend(integrity_lines)
         lines.append('')
     rel = telegram_digest_scan_path(now)
     target = _safe_library_path(rel)

@@ -24,36 +24,62 @@ async def selfedit_schedule(request: Request):
         return JSONResponse({'error': 'date (YYYY-MM-DD), start (HH:MM) and '
                                       'reason are required'}, status_code=400)
     try:
-        ok, payload = await asyncio.to_thread(
-            _selfedit.request_window, agent_id, date, start,
-            body.get('durationMin'), reason, validator,
-            title=body.get('title'),
-            description=body.get('description'),
-            change_type=body.get('changeType') or 'normal',
-            risk_level=body.get('riskLevel') or 'low',
-            service_mode=body.get('serviceMode') or 'idle_ok',
-            affected_services=body.get('affectedServices'),
-            file_manifest=body.get('fileManifest'),
-            rollback_plan=body.get('rollbackPlan'),
-            rollback_owner=body.get('rollbackOwner'),
-            success_criteria=body.get('successCriteria'),
-            abort_criteria=body.get('abortCriteria'),
-            post_apply_checks=body.get('postApplyChecks'),
-            safe_state_plan=body.get('safeStatePlan'),
-            restore_plan=body.get('restorePlan'),
-            on_call=body.get('onCall'),
-            acknowledgements=body.get('acknowledgements'),
-            blackout_windows=body.get('blackoutWindows'),
-            # Creation-time Telegram for every change request (owner
-            # direction 2026-11-11): the message carries the window's exact
-            # date/time and the token-gated veto link, and the approval
-            # chain still decides first -- the operator is informed, never a
-            # blocker; no veto means the window processes as planned.
-            notify_created=True)
+        # Deadlock retry (2026-11-14): a cross-tank dormancy_windows
+        # deadlock killed the whole request with a 500 and the agent had to
+        # re-call blind. The deadlocked transaction rolls back entirely and
+        # notify_created fires last inside request_window, so a bounded
+        # in-place retry is safe (worst case a duplicate announcement after
+        # an already-notified attempt, which the retries' own log lines
+        # disambiguate). Each attempt waits a little longer; non-deadlock
+        # failures still fall straight through to the crash handler.
+        attempt = 0
+        while True:
+            try:
+                ok, payload = await asyncio.to_thread(
+                    _selfedit.request_window, agent_id, date, start,
+                    body.get('durationMin'), reason, validator,
+                    title=body.get('title'),
+                    description=body.get('description'),
+                    change_type=body.get('changeType') or 'normal',
+                    risk_level=body.get('riskLevel') or 'low',
+                    service_mode=body.get('serviceMode') or 'idle_ok',
+                    affected_services=body.get('affectedServices'),
+                    file_manifest=body.get('fileManifest'),
+                    rollback_plan=body.get('rollbackPlan'),
+                    rollback_owner=body.get('rollbackOwner'),
+                    success_criteria=body.get('successCriteria'),
+                    abort_criteria=body.get('abortCriteria'),
+                    post_apply_checks=body.get('postApplyChecks'),
+                    safe_state_plan=body.get('safeStatePlan'),
+                    restore_plan=body.get('restorePlan'),
+                    on_call=body.get('onCall'),
+                    acknowledgements=body.get('acknowledgements'),
+                    blackout_windows=body.get('blackoutWindows'),
+                    # Creation-time Telegram for every change request (owner
+                    # direction 2026-11-11): the message carries the window's exact
+                    # date/time and the token-gated veto link, and the approval
+                    # chain still decides first -- the operator is informed, never a
+                    # blocker; no veto means the window processes as planned.
+                    notify_created=True)
+                break
+            except Exception as exc:
+                attempt += 1
+                if 'deadlock' not in str(exc).lower() or attempt >= 3:
+                    raise
+                print(f'[selfedit] schedule deadlock for {agent_id}, retry '
+                      f'{attempt}/2', flush=True)
+                await asyncio.sleep(2.0 * attempt)
     except Exception as exc:
         print(f'[selfedit] schedule crashed for {agent_id}: {exc}', flush=True)
         log_action(agent_id, 'selfedit_crashed', {'error': str(exc)[:300]},
                    authorized=authorized)
+        try:
+            await asyncio.to_thread(
+                _telegram_send_text_sync,
+                f'[AI Think Tank] selfedit schedule FAILED for {agent_id} '
+                f'after {attempt} attempt(s): {str(exc)[:200]}')
+        except Exception:
+            pass
         return JSONResponse({'error': f'the window request harness failed: {exc}'}, status_code=500)
     log_action(agent_id, 'selfedit_schedule',
                {'date': date, 'start': start,
