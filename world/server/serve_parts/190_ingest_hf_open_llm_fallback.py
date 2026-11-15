@@ -436,11 +436,14 @@ async def refresh_model_tiers():
             print(f'[model-tiers] {provider} catalog fetch failed: {exc}', flush=True)
             per_provider[provider] = []
         try:
-            _sync_provider_catalog_rows(provider, per_provider[provider])
+            # Catalog row upserts are bulk DB writes; on the Aiven backend each
+            # row is a network round trip, so keep them off the event loop.
+            await asyncio.to_thread(_sync_provider_catalog_rows,
+                                    provider, per_provider[provider])
         except Exception as exc:
             print(f'[model-tiers] {provider} catalog rows sync failed: {exc}', flush=True)
     union_models, keep_ids = _merge_provider_catalogs(per_provider)
-    _sync_model_catalog(union_models, keep_ids=keep_ids)
+    await asyncio.to_thread(_sync_model_catalog, union_models, keep_ids=keep_ids)
     # Provider selection: the default transport's provider while its cap has
     # spend left, else the next DIALING provider with budget -- the same
     # score/price policy per band, whoever sells the model. The pick's
