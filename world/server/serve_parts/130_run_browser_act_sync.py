@@ -631,7 +631,7 @@ _MODEL_DATA_DENY_HOSTS = ('openrouter.ai', 'api.straitly.ai')
 # (<NAME>_SPEND_CAP_USD) enforced at the transport; the tier pick layer
 # reads the same registry to re-select from a provider with spend left.
 DEFAULT_DIALING_PROVIDER = 'openrouter'
-DIALING_PROVIDERS = ('openrouter', 'straitly')
+DIALING_PROVIDERS = ('openrouter', 'straitly', 'cheaperinference')
 # `settlement` marks how a vendor prices its calls (2026-11-13):
 #   * absent          -- prepaid key (the normal shape; spend caps only)
 #   * 'mpp'           -- per-call machine payments: a 402 with a
@@ -646,6 +646,10 @@ _PROVIDER_DIALING = {
     'straitly': {
         'base_url': 'https://api.straitly.ai/v1/chat/completions',
         'api_key_env': 'STRAITLY_API_KEY',
+    },
+    'cheaperinference': {
+        'base_url': 'https://api.cheaperinference.com/v1/chat/completions',
+        'api_key_env': 'CHEAPER_INFERENCE_API_KEY',
     },
 }
 

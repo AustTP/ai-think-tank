@@ -534,20 +534,152 @@ def _fetch_openrouter_catalog_sync():
         return json.loads(resp.read())['data']
 
 
+# --- generic provider catalogs ----------------------------------------------
+# One declarative spec per vendor + one fetch engine. A spec declares the
+# vendor's catalog URL, the env var holding its API key (None = public
+# catalog), and the field mapping from the vendor's shape into the
+# OpenRouter shape the rest of the stack speaks (per-TOKEN float pricing
+# under pricing.prompt/completion, input modalities, context_length).
+# Adding a vendor is one spec entry plus a one-line named wrapper (the
+# wrappers keep the name-based monkeypatch/registry contract used by tests
+# and PROVIDER_CATALOGS); no vendor logic exists anywhere downstream.
+_PROVIDER_CATALOG_SPECS = {
+    'openrouter': {
+        'url': 'https://openrouter.ai/api/v1/models',
+        'key_env': None,
+        'items_path': 'data',
+        'price_unit': 1.0,     # already per token
+        'price_input': ('pricing', 'prompt'),
+        'price_output': ('pricing', 'completion'),
+        'context_path': ('context_length',),
+        'modalities_path': ('architecture', 'input_modalities'),
+        'name_path': ('name',),
+    },
+    'straitly': {
+        'url': 'https://api.straitly.ai/v1/models',
+        'key_env': 'STRAITLY_API_KEY',
+        'items_path': 'data',
+        'price_unit': 1.0,
+        'price_input': ('pricing', 'prompt'),
+        'price_output': ('pricing', 'completion'),
+        'context_path': ('context_length',),
+        'modalities_path': ('architecture', 'input_modalities'),
+        'name_path': ('name',),
+    },
+    'cheaperinference': {
+        'url': 'https://api.cheaperinference.com/v1/models',
+        'key_env': 'CHEAPER_INFERENCE_API_KEY',
+        'items_path': 'data',
+        # Their catalog carries every modality (embedding/image/video/...)
+        # under one endpoint; only chat-capable rows can dial a chat
+        # transport, so the rest are dropped here.
+        'chat_types': ('text',),
+        'price_unit': 1e-6,    # flat per-MILLION decimal strings -> per token
+        'price_input': ('pricing', 'input_per_million'),
+        'price_output': ('pricing', 'output_per_million'),
+        'context_path': ('context_length',),
+        'vision_path': ('capabilities', 'vision'),   # bool -> image modality
+        'name_template': '{owned_by}/{id}',
+    },
+}
+
+
+def _spec_dig(row, path):
+    """Walk a tuple path through a nested dict; any missing hop raises
+    KeyError so callers can treat malformed rows as unpriceable."""
+    value = row
+    for key in path:
+        if not isinstance(value, dict):
+            raise KeyError(key)
+        value = value[key]
+    return value
+
+
+class _SpecNameDefaults(dict):
+    """format_map defaults for name_template specs: a row missing a template
+    key renders it as empty instead of raising."""
+
+    def __missing__(self, key):
+        return ''
+
+
+def _fetch_provider_catalog_sync(spec):
+    """Fetch one vendor's model catalog and translate it into the OpenRouter
+    shape per its spec. An unconfigured provider (key_env set, key absent)
+    returns [] -- it contributes nothing to the sync instead of failing the
+    whole refresh (per-provider fail-open). Transport errors propagate;
+    the refresh catches them per provider. Rows with unparseable pricing
+    are skipped: a model the stack cannot price is a model it cannot
+    value-pick."""
+    headers = {}
+    if spec.get('key_env'):
+        key = (_load_env().get(spec['key_env']) or '').strip()
+        if not key:
+            return []
+        headers['Authorization'] = f'Bearer {key}'
+    req = urllib.request.Request(spec['url'], headers=headers)
+    with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- spec URLs are operator-pinned in _PROVIDER_CATALOG_SPECS, never user input
+        payload = json.loads(resp.read())
+    rows = payload.get(spec.get('items_path', 'data')) or []
+    chat_types = spec.get('chat_types')
+    unit = float(spec.get('price_unit', 1.0))
+    out = []
+    for m in rows:
+        if not isinstance(m, dict) or not m.get('id'):
+            continue
+        if chat_types and m.get('type') not in chat_types:
+            continue
+        try:
+            prompt = float(_spec_dig(m, spec['price_input'])) * unit
+            completion = float(_spec_dig(m, spec['price_output'])) * unit
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 'modalities_path' in spec:
+            try:
+                mods = list(_spec_dig(m, spec['modalities_path']) or ['text'])
+            except (KeyError, TypeError):
+                mods = ['text']
+        else:
+            try:
+                vision = bool(_spec_dig(m, spec['vision_path']))
+            except (KeyError, TypeError):
+                vision = False
+            mods = ['image', 'text'] if vision else ['text']
+        entry = {
+            'id': m['id'],
+            'name': (spec['name_template'].format_map(_SpecNameDefaults(m))
+                     if 'name_template' in spec else m['id']),
+            'pricing': {'prompt': str(prompt), 'completion': str(completion)},
+            'architecture': {'input_modalities': mods,
+                             'output_modalities': ['text']},
+        }
+        if 'name_path' in spec:
+            try:
+                entry['name'] = _spec_dig(m, spec['name_path']) or m['id']
+            except (KeyError, TypeError):
+                pass
+        if 'context_path' in spec:
+            try:
+                entry['context_length'] = _spec_dig(m, spec['context_path'])
+            except (KeyError, TypeError):
+                entry['context_length'] = None
+        out.append(entry)
+    return out
+
+
+def _fetch_openrouter_catalog_sync():
+    return _fetch_provider_catalog_sync(_PROVIDER_CATALOG_SPECS['openrouter'])
+
+
 def _fetch_straitly_catalog_sync():
-    """Straitly AI's /v1/models -- an OpenRouter-shaped catalog sold by a
-    different vendor. Empty list when STRAITLY_API_KEY is unset: an
-    unconfigured provider contributes nothing to the sync instead of
-    failing the whole refresh (per-provider fail-open, never fail the
-    catalog because one vendor has no key)."""
-    key = _load_env().get('STRAITLY_API_KEY')
-    if not key:
-        return []
-    req = urllib.request.Request(
-        'https://api.straitly.ai/v1/models',
-        headers={'Authorization': f'Bearer {key}'})
-    with urllib.request.urlopen(req, timeout=20) as resp:  # nosec B310 -- fixed known-good URL, no user input, SSRF guard applies at callers
-        return json.loads(resp.read())['data']
+    """Empty list when STRAITLY_API_KEY is unset: an unconfigured provider
+    contributes nothing to the sync instead of failing the whole refresh
+    (fail-open lives in the engine, keyed off the spec's key_env)."""
+    return _fetch_provider_catalog_sync(_PROVIDER_CATALOG_SPECS['straitly'])
+
+
+def _fetch_cheaperinference_catalog_sync():
+    return _fetch_provider_catalog_sync(_PROVIDER_CATALOG_SPECS['cheaperinference'])
 
 
 def _bucket_models_by_price(models):
