@@ -14,7 +14,6 @@
 set -euo pipefail
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 PG_DUMP_BIN="${PG_DUMP_BIN:-pg_dump}"
-if command -v sha256sum >/dev/null 2>&1; then SHASUM=sha256sum; else SHASUM=shasum; fi
 TANK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRIVATE_REPO="${THINK_TANK_PRIVATE_REPO:-AustTP/think-tank-private}"
 KEEP=1
@@ -26,7 +25,11 @@ mkdir -p "$BACKUPS"
 OUT="$BACKUPS/pg-$STAMP.dump"
 echo "[$(date '+%F %T')] dumping $DSN -> $OUT (using $PG_DUMP_BIN)"
 "$PG_DUMP_BIN" --format=custom --no-owner --no-privileges --no-comments -d "$DSN" > "$OUT"
-"$SHASUM" -a 256 "$OUT" > "$OUT.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "$OUT" > "$OUT.sha256"
+else
+  shasum -a 256 "$OUT" > "$OUT.sha256"
+fi
 SIZE="$(du -h "$OUT" | cut -f1)"
 echo "[$(date '+%F %T')] dump complete ($SIZE), uploading release"
 gh release create "db-backup-$STAMP" "$OUT" "$OUT.sha256" -R "$PRIVATE_REPO" \
