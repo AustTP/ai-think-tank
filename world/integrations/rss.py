@@ -344,7 +344,7 @@ async def _rss_poll_loop():
             url = feed.get('url') or ''
             try:
                 items = await asyncio.to_thread(_serve._fetch_feed_sync, feed_id, url)
-                n = _serve._rss_ingest(feed_id, items)
+                n = await asyncio.to_thread(_serve._rss_ingest, feed_id, items)
                 _serve._RSS_STATUS[feed_id] = {'ok': True, 'last_fetch_at': time.time(),
                                                'last_error': '', 'new': n}
             except Exception as e:  # noqa: BLE001 -- a bad feed/network hiccup must never kill the loop

@@ -919,9 +919,14 @@ def _get_pool(dsn):
     global _POOL
     with _POOL_LOCK:
         if _POOL is None:
+            import os
             import psycopg2.pool
+            try:
+                max_conn = int(os.environ.get('THINK_TANK_PG_POOL_MAX', '50'))
+            except ValueError:
+                max_conn = 50
             _POOL = psycopg2.pool.ThreadedConnectionPool(
-                1, 50, dsn, **_PG_CONNECT_KWARGS())
+                1, max(2, max_conn), dsn, **_PG_CONNECT_KWARGS())
         return _POOL
 
 
@@ -1008,12 +1013,17 @@ def _apply_socket_timeouts(raw):
 _SOCKET_TIMEOUT_S = 90
 
 
+_PRIMED_CONNS = set()
+
+
 def _checkout(dsn):
     try:
         pool = _get_pool(dsn)
         raw = pool.getconn()
         _apply_socket_timeouts(raw)
-        _prime_session(raw)
+        if id(raw) not in _PRIMED_CONNS:
+            _prime_session(raw)
+            _PRIMED_CONNS.add(id(raw))
         return raw, pool
     except Exception:
         # Pool exhausted or unusable: fall back to an unpooled connection
