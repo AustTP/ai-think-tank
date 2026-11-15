@@ -148,6 +148,30 @@ class IndexAndSearch(unittest.TestCase):
         self.assertTrue(any('token bucket' in h['snippet'].lower()
                             for h in second), second)
 
+    def test_purge_keeps_surviving_entries_in_place(self):
+        """Delta sync (2026-11-15): when rows leave the index, the search
+        cache must drop just those refs. Re-parsing the whole index per
+        deletion churned ~2 GB per cycle on the VM tank. Entry object
+        identity across a deletion proves the delta path ran; a full
+        reload would mint fresh dicts and fail this assert."""
+        _wipe()
+        _seed_archive('task-40', 'observatory', 'Backoff ledger',
+                      'Exponential backoff held the 429 storms inside '
+                      'the retry budget.')
+        _seed_archive('task-41', 'pressoffice', 'Footer mascot',
+                      'A decorative mascot footer with no data flows.')
+        serve._rag_index_pass(60)
+        serve._rag_search('429 storm backoff')
+        snap1 = serve._RAG_SEARCH_SNAPSHOT
+        keep = next(e for e in snap1 if e[1] == 'task-40')
+        with serve._db() as conn:
+            conn.execute("DELETE FROM rag_index WHERE ref = 'task-41'")
+        serve._rag_search('429 storm backoff')
+        snap2 = serve._RAG_SEARCH_SNAPSHOT
+        self.assertNotIn('task-41', [e[1] for e in snap2])
+        kept = next(e for e in snap2 if e[1] == 'task-40')
+        self.assertIs(kept, keep)
+
     def test_budget_bounds_the_pass(self):
         for i in range(10):
             _seed_archive(f'task-3{i}', 'bank', f'Ledger note {i}',

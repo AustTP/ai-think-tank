@@ -301,60 +301,90 @@ _RAG_SEARCH_LOCK = threading.Lock()
 
 
 def _rag_search_rows_sync():
-    """One parsed in-process copy of the index, refreshed on demand.
+    """One parsed in-process copy of the index, synced by delta.
 
     The row cache landed 2026-11-15 after the VM tank was OOM-killed:
     _rag_search used to fetch EVERY row's text + vector JSON per query
     (~400 MB moved from Postgres, every vector re-parsed), and the
     8192-slot parse memo thrashed once the index passed that size -- RSS
     climbed gigabytes per minute under the sim's steady search load.
-    This cache holds one parsed dict per ref. Freshness probe per query
-    is a cheap COUNT/MAX aggregate: any re-index bumps updated_at, so
-    reads see their own writes; new rows arrive via an incremental
-    upsert; a shrank count (deletes / fresh test DB) forces a full
-    reload. First use after a restart pays one full load."""
+    This cache holds one parsed dict per ref. The delta pass (same day,
+    after the cache's own full reload churned ~2 GB every time the index
+    pass purged stale rows and shrank COUNT) scans the cheap (ref,
+    updated_at) projection: new/changed refs are fetched in bounded
+    chunks, refs gone from the table are dropped from the cache, and an
+    unchanged index costs one COUNT/MAX probe per query."""
     global _RAG_SEARCH_SNAPSHOT
     with _db() as conn:
         count, max_ts = conn.execute(
             'SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM '
             'rag_index').fetchone()
     state = _RAG_SEARCH_STATE
-    fresh = (count == state['count'] and max_ts <= state['max_ts']
-             and _RAG_SEARCH_SNAPSHOT)
-    if fresh:
+    if count == state['count'] and max_ts <= state['max_ts'] \
+            and _RAG_SEARCH_SNAPSHOT:
         return _RAG_SEARCH_SNAPSHOT
     with _RAG_SEARCH_LOCK:
         if (count == state['count'] and max_ts <= state['max_ts']
                 and _RAG_SEARCH_SNAPSHOT):
             return _RAG_SEARCH_SNAPSHOT
-        full = (not _RAG_SEARCH_SNAPSHOT or count < state['count'])
-        cache = {} if full else dict(_RAG_SEARCH_CACHE)
-        with _db() as conn:
-            if full:
+        if not _RAG_SEARCH_SNAPSHOT:
+            # First build after a restart: one full load, then deltas only.
+            with _db() as conn:
                 rows = conn.execute(
                     'SELECT source, ref, title, room, village_id, text, '
                     'vec, updated_at FROM rag_index').fetchall()
-            else:
+            cache = _RAG_SEARCH_CACHE
+            cache.clear()
+            newest = 0.0
+            for source, ref, title, room, village_id, text, vec_raw, ts in rows:
+                try:
+                    dvec = {int(k): v
+                            for k, v in json.loads(vec_raw).items()}
+                except Exception:
+                    continue
+                if not dvec:
+                    continue
+                cache[ref] = (source, ref, title, room, village_id,
+                              (text or '')[:240], dvec, ts)
+                if ts > newest:
+                    newest = ts
+            state['count'] = count
+            state['max_ts'] = max(newest, max_ts)
+            _RAG_SEARCH_SNAPSHOT = tuple(cache.values())
+            return _RAG_SEARCH_SNAPSHOT
+        # Delta pass: a shrank count (the index pass purging stale rows) or
+        # fresh rows both land here. The (ref, updated_at) projection is
+        # ~1 MB for a 23k-row index -- never the blobs, never the vectors.
+        with _db() as conn:
+            live = dict(conn.execute(
+                'SELECT ref, updated_at FROM rag_index').fetchall())
+        stale = [ref for ref in _RAG_SEARCH_CACHE if ref not in live]
+        for ref in stale:
+            _RAG_SEARCH_CACHE.pop(ref, None)
+        fetch = [ref for ref, ts in live.items()
+                 if ref not in _RAG_SEARCH_CACHE
+                 or _RAG_SEARCH_CACHE[ref][7] != ts]
+        for i in range(0, len(fetch), 200):
+            batch = fetch[i:i + 200]
+            marks = ','.join('?' * len(batch))
+            with _db() as conn:
                 rows = conn.execute(
                     'SELECT source, ref, title, room, village_id, text, '
-                    'vec, updated_at FROM rag_index '
-                    'WHERE updated_at > ?', (state['max_ts'],)).fetchall()
-        newest = state['max_ts']
-        for source, ref, title, room, village_id, text, vec_raw, ts in rows:
-            try:
-                dvec = {int(k): v for k, v in json.loads(vec_raw).items()}
-            except Exception:
-                continue
-            if not dvec:
-                continue
-            cache[ref] = (source, ref, title, room, village_id,
-                          (text or '')[:240], dvec, ts)
-            if ts > newest:
-                newest = ts
+                    f'vec, updated_at FROM rag_index WHERE ref IN ({marks})',
+                    tuple(batch)).fetchall()  # nosec B608 -- '?' placeholders
+            for source, ref, title, room, village_id, text, vec_raw, ts in rows:
+                try:
+                    dvec = {int(k): v
+                            for k, v in json.loads(vec_raw).items()}
+                except Exception:
+                    continue
+                if not dvec:
+                    continue
+                _RAG_SEARCH_CACHE[ref] = (source, ref, title, room,
+                                          village_id, (text or '')[:240],
+                                          dvec, ts)
         state['count'] = count
-        state['max_ts'] = newest
-        _RAG_SEARCH_CACHE.clear()
-        _RAG_SEARCH_CACHE.update(cache)
+        state['max_ts'] = max_ts
         _RAG_SEARCH_SNAPSHOT = tuple(_RAG_SEARCH_CACHE.values())
         return _RAG_SEARCH_SNAPSHOT
 
