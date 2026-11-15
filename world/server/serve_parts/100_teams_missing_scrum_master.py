@@ -424,6 +424,7 @@ SPEND_CAP_USD = float(_load_env().get('SPEND_CAP_USD', '50') or 0)
 OPENROUTER_SPEND_CAP_USD = float(_load_env().get('OPENROUTER_SPEND_CAP_USD', '5') or 0)
 JEV_SPEND_CAP_USD = float(_load_env().get('JEV_SPEND_CAP_USD', '0.5') or 0)
 STRAITLY_SPEND_CAP_USD = float(_load_env().get('STRAITLY_SPEND_CAP_USD', '0.5') or 0)
+CHEAPERINFERENCE_SPEND_CAP_USD = float(_load_env().get('CHEAPERINFERENCE_SPEND_CAP_USD', '0.5') or 0)
 # The shared model-router pool (operator, 2026-11-13): OpenRouter and
 # Straitly draw from ONE monthly budget -- not a hard half each. Either
 # router may spend the whole pool; THIS gate at the transport is the binding
