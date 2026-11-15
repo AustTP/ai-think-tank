@@ -93,27 +93,43 @@ def ensure_schema(conn):
 
 def _upsert_tasks(conn, tasks) -> bool:
     changed = False
-    existing = {r[0]: r[1] for r in conn.execute(
-        'SELECT id, blob FROM mc_tasks').fetchall()}
-    wanted = {}
+    # (2026-11-15) This diff used to SELECT id, blob for every row on every
+    # sync -- at ~23k tasks that moved ~1.5 GB of blobs out of Postgres and
+    # re-serialized ~1.5 GB of task JSON per save. RSS then climbed
+    # ~2 GB/minute into the OOM killer on the VM tank (the projection table
+    # had simply grown past what a full-blob diff per save could survive).
+    # Diff on the cheap (id, updated_ms) projection instead: a task whose
+    # stored updated_ms already matches the incoming updatedAt needs no work
+    # at all, and only new or genuinely-bumped tasks pay a json.dumps.
+    # Honest limit: a change to a NON-mirrored field that does NOT bump
+    # updatedAt (e.g. deliverable text) is invisible here (the old blob diff
+    # caught it) -- the sim bumps updatedAt on every mutation it wants
+    # mirrored, so this matches the projection's contract rather than
+    # fighting the elephant. The cheap (id, updated_ms, status, assigned_to)
+    # triple still catches the mirrored-column drift SQL panels expose.
+    existing = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+        'SELECT id, updated_ms, status, assigned_to FROM mc_tasks').fetchall()}
+    wanted = set()
     for tid, t in _safe_items(tasks or {}):
         if not isinstance(t, dict):
             continue
+        wanted.add(tid)
+        updated = t.get('updatedAt') or t.get('createdAt')
+        if existing.get(tid) == (updated, t.get('status'),
+                                 t.get('assignedTo')):
+            continue
         blob = _safe_json(t)
-        wanted[tid] = blob
         row = (t.get('title') or '', t.get('status'),
                t.get('assignedTo'), t.get('taskType'),
                t.get('deliverable'), t.get('priority'),
-               t.get('feature'), t.get('createdAt'),
-               t.get('updatedAt') or t.get('createdAt'), blob)
-        if existing.get(tid) != blob:
-            conn.execute(
-                'INSERT OR REPLACE INTO mc_tasks (id, title, status, '
-                'assigned_to, task_type, deliverable, priority, feature, '
-                'created_ms, updated_ms, blob) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                (tid,) + row)
-            changed = True
-    gone = set(existing) - set(wanted)
+               t.get('feature'), t.get('createdAt'), updated, blob)
+        conn.execute(
+            'INSERT OR REPLACE INTO mc_tasks (id, title, status, '
+            'assigned_to, task_type, deliverable, priority, feature, '
+            'created_ms, updated_ms, blob) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (tid,) + row)
+        changed = True
+    gone = set(existing) - wanted
     for tid in gone:
         conn.execute('DELETE FROM mc_tasks WHERE id = ?', (tid,))
         changed = True
