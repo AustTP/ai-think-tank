@@ -33,7 +33,8 @@ fi
 SIZE="$(du -h "$OUT" | cut -f1)"
 echo "[$(date '+%F %T')] dump complete ($SIZE), uploading release"
 gh release create "db-backup-$STAMP" "$OUT" "$OUT.sha256" -R "$PRIVATE_REPO" \
-  --title "pg backup $STAMP" --notes "custom-format pg_dump ($SIZE); sha256 sidecar included"
+  --title "pg backup $STAMP" --notes "custom-format pg_dump ($SIZE); sha256 sidecar included" \
+|| gh release upload "db-backup-$STAMP" "$OUT" "$OUT.sha256" -R "$PRIVATE_REPO" --clobber
 set +e
 OLD_TAGS="$(gh api "repos/$PRIVATE_REPO/releases" --paginate \
   -q '.[] | select(.tag_name | startswith("db-backup-")) | .tag_name' | tail -n +$((KEEP + 1)))"
