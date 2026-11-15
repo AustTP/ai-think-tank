@@ -20,7 +20,11 @@
 #
 # Search NEVER touches kv_state (the hot blob): the index lives in its own
 # table and is refreshed incrementally by a bounded background pass, so a
-# retrieval is one table scan plus python dot products.
+# retrieval is one cached in-process scan plus python dot products (the row
+# cache with a per-query COUNT/MAX probe landed 2026-11-15: at ~23k rows the
+# old fetch-every-row-per-search path moved ~400 MB from Postgres and
+# re-parsed ~every vector per query, and RSS climbed until the VM tank was
+# OOM-killed).
 # ---------------------------------------------------------------------------
 
 _RAG_CHAR_NGRAM = 3
@@ -290,6 +294,71 @@ def _vec_parsed(vec_raw):
     return dvec
 
 
+_RAG_SEARCH_CACHE = {}            # ref -> cached (parsed) row tuple
+_RAG_SEARCH_SNAPSHOT = ()         # immutable reader-facing snapshot
+_RAG_SEARCH_STATE = {'count': -1, 'max_ts': 0.0}
+_RAG_SEARCH_LOCK = threading.Lock()
+
+
+def _rag_search_rows_sync():
+    """One parsed in-process copy of the index, refreshed on demand.
+
+    The row cache landed 2026-11-15 after the VM tank was OOM-killed:
+    _rag_search used to fetch EVERY row's text + vector JSON per query
+    (~400 MB moved from Postgres, every vector re-parsed), and the
+    8192-slot parse memo thrashed once the index passed that size -- RSS
+    climbed gigabytes per minute under the sim's steady search load.
+    This cache holds one parsed dict per ref. Freshness probe per query
+    is a cheap COUNT/MAX aggregate: any re-index bumps updated_at, so
+    reads see their own writes; new rows arrive via an incremental
+    upsert; a shrank count (deletes / fresh test DB) forces a full
+    reload. First use after a restart pays one full load."""
+    global _RAG_SEARCH_SNAPSHOT
+    with _db() as conn:
+        count, max_ts = conn.execute(
+            'SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM '
+            'rag_index').fetchone()
+    state = _RAG_SEARCH_STATE
+    fresh = (count == state['count'] and max_ts <= state['max_ts']
+             and _RAG_SEARCH_SNAPSHOT)
+    if fresh:
+        return _RAG_SEARCH_SNAPSHOT
+    with _RAG_SEARCH_LOCK:
+        if (count == state['count'] and max_ts <= state['max_ts']
+                and _RAG_SEARCH_SNAPSHOT):
+            return _RAG_SEARCH_SNAPSHOT
+        full = (not _RAG_SEARCH_SNAPSHOT or count < state['count'])
+        cache = {} if full else dict(_RAG_SEARCH_CACHE)
+        with _db() as conn:
+            if full:
+                rows = conn.execute(
+                    'SELECT source, ref, title, room, village_id, text, '
+                    'vec, updated_at FROM rag_index').fetchall()
+            else:
+                rows = conn.execute(
+                    'SELECT source, ref, title, room, village_id, text, '
+                    'vec, updated_at FROM rag_index '
+                    'WHERE updated_at > ?', (state['max_ts'],)).fetchall()
+        newest = state['max_ts']
+        for source, ref, title, room, village_id, text, vec_raw, ts in rows:
+            try:
+                dvec = {int(k): v for k, v in json.loads(vec_raw).items()}
+            except Exception:
+                continue
+            if not dvec:
+                continue
+            cache[ref] = (source, ref, title, room, village_id,
+                          (text or '')[:240], dvec, ts)
+            if ts > newest:
+                newest = ts
+        state['count'] = count
+        state['max_ts'] = newest
+        _RAG_SEARCH_CACHE.clear()
+        _RAG_SEARCH_CACHE.update(cache)
+        _RAG_SEARCH_SNAPSHOT = tuple(_RAG_SEARCH_CACHE.values())
+        return _RAG_SEARCH_SNAPSHOT
+
+
 def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
                 village=None):
     """Ranked semantic hits over the index: cosine similarity (the vectors
@@ -298,34 +367,21 @@ def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
     already scopes reads: docs stamped with another village are excluded;
     NULL-village docs (shared craft, legacy rows) stay visible to all.
     Empty index or empty query -> []. DB-only: no model calls, safe on
-    decision paths."""
+    decision paths. Rows come from the in-process cache (_rag_search_rows_sync)."""
     qvec = _rag_embed(query, cap=200)
     if not qvec:
         return []
     try:
-        with _db() as conn:
-            where, args = [], []
-            if sources:
-                marks = ','.join('?' for _ in sources)
-                where.append(f'source IN ({marks})')
-                args.extend(sources)
-            if village:
-                where.append('(village_id IS NULL OR village_id = ?)')
-                args.append(village)
-            sql = ('SELECT source, ref, title, room, text, vec FROM rag_index'
-                   + (f' WHERE {" AND ".join(where)}' if where else ''))
-            rows = conn.execute(sql, tuple(args)).fetchall()
+        rows = _rag_search_rows_sync()
     except Exception:
         return []
     hits = []
-    for source, ref, title, room, text, vec_raw in rows:
-        try:
-            # json.dumps stringifies dict keys; the embeddings were ints.
-            dvec = _vec_parsed(vec_raw)
-        except Exception:
+    for source, ref, title, room, village_id, snippet, dvec, _ts in rows:
+        if sources and source not in sources:
             continue
-        if not dvec:
+        if village and village_id is not None and village_id != village:
             continue
+        # json.dumps stringifies dict keys; the embeddings were ints.
         if len(qvec) < len(dvec):
             score = sum(w * dvec.get(key, 0.0) for key, w in qvec.items())
         else:
@@ -333,7 +389,7 @@ def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
         if score >= min_score:
             hits.append({'source': source, 'ref': ref, 'title': title,
                          'room': room, 'score': round(score, 4),
-                         'snippet': (text or '')[:240]})
+                         'snippet': snippet})
     hits.sort(key=lambda h: -h['score'])
     return hits[:k]
 

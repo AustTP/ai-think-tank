@@ -696,8 +696,8 @@ class RefreshVisionFallbackTest(unittest.TestCase):
         cm = mock.MagicMock()
         cm.__enter__.return_value = conn
 
-        async def to_thread(f, *a):
-            return f(*a)
+        async def to_thread(f, *a, **k):
+            return f(*a, **k)
         with mock.patch.object(serve, 'MODEL_BAND_PURPOSE', {}), \
              mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                return_value=models), \

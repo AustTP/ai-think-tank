@@ -126,6 +126,28 @@ class IndexAndSearch(unittest.TestCase):
         out = serve._rag_index_pass(60)
         self.assertGreaterEqual(out['indexed'], 1)
 
+    def test_search_sees_rows_indexed_after_a_prior_search(self):
+        """The 2026-11-15 row cache must re-probe freshness per query:
+        content indexed after an earlier search has to show up in the
+        next search (read-your-writes), not stay invisible behind a TTL."""
+        _wipe()
+        _seed_archive('task-30', 'observatory', 'Backoff retrofit',
+                      'Retrofitted exponential backoff for the 429 storms '
+                      'across the ingest loop.')
+        serve._rag_index_pass(60)
+        first = serve._rag_search('429 storm backoff')
+        self.assertTrue(first)
+        self.assertFalse(any('token bucket' in h['snippet'].lower()
+                             for h in first), first)
+        _seed_archive('task-31', 'observatory', 'Token bucket',
+                      'Added a token bucket limiter so the 429 storms '
+                      'cannot recur during bursts.')
+        serve._rag_index_pass(60)
+        second = serve._rag_search('token bucket 429 storms')
+        self.assertTrue(second)
+        self.assertTrue(any('token bucket' in h['snippet'].lower()
+                            for h in second), second)
+
     def test_budget_bounds_the_pass(self):
         for i in range(10):
             _seed_archive(f'task-3{i}', 'bank', f'Ledger note {i}',
