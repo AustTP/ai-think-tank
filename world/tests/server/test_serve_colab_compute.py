@@ -804,13 +804,35 @@ class IngestMmmuLeaderboard(unittest.TestCase):
 
 class FetchOpenRouterCatalog(unittest.TestCase):
     def test_fetches_catalog_json(self):
+        # The generic engine translates each row into the OpenRouter shape
+        # and drops rows it cannot price -- the fixture carries pricing.
+        resp = unittest.mock.MagicMock()
+        resp.read.return_value = json.dumps({'data': [{
+            'id': 'x', 'name': 'X', 'pricing': {'prompt': '0.001',
+                                                'completion': '0.002'},
+            'context_length': 4096,
+            'architecture': {'input_modalities': ['text']},
+        }]}).encode()
+        resp.__enter__.return_value = resp
+        resp.__exit__.return_value = False
+        with unittest.mock.patch.object(
+                serve.urllib.request, 'urlopen', return_value=resp):
+            out = serve._fetch_openrouter_catalog_sync()
+        self.assertEqual(len(out), 1)
+        row = out[0]
+        self.assertEqual(row['id'], 'x')
+        self.assertEqual(row['pricing'],
+                         {'prompt': '0.001', 'completion': '0.002'})
+        self.assertEqual(row['context_length'], 4096)
+
+    def test_unpriceable_row_is_dropped(self):
         resp = unittest.mock.MagicMock()
         resp.read.return_value = b'{"data": [{"id": "x"}]}'
         resp.__enter__.return_value = resp
         resp.__exit__.return_value = False
         with unittest.mock.patch.object(
                 serve.urllib.request, 'urlopen', return_value=resp):
-            self.assertEqual(serve._fetch_openrouter_catalog_sync(), [{'id': 'x'}])
+            self.assertEqual(serve._fetch_openrouter_catalog_sync(), [])
 
 
 
