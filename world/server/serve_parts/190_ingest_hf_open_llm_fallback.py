@@ -82,7 +82,6 @@ _PROVIDER_ROUTER_MODELS = {'jev-router'}
 PROVIDER_CATALOGS = {
     'openrouter': '_fetch_openrouter_catalog_sync',
     'straitly': '_fetch_straitly_catalog_sync',
-    'cheaperinference': '_fetch_cheaperinference_catalog_sync',
 }
 
 
