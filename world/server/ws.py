@@ -413,7 +413,7 @@ async def _ws_collector_loop(sid):
                     topic, fields, full = _serve._ws_extract_frame(ws, data)
                     if topic is None:
                         continue
-                    _serve._ws_ingest(sid, topic, fields, full)
+                    await asyncio.to_thread(_serve._ws_ingest, sid, topic, fields, full)
         except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
             buf['status'].update(connected=False, last_error=str(e)[:200])
             print(f'[ws:{sid}] collector error: {e}', flush=True)
