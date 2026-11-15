@@ -8,6 +8,17 @@
 #
 # Services are started again with /api/tank/start (launchctl bootstrap), or by
 # the operator: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<label>.plist
+#
+# Platform dispatch (2026-11-15): the deployment also runs on Linux (systemd),
+# where launchctl does not exist. There the stop/start verbs map to
+# `sudo -n systemctl stop|start <unit>` for services that HAVE a unit on the
+# host (main: think-tank.service); anything else answers honestly per label
+# instead of spawning a doomed command. The sudo side needs a sudoers
+# drop-in, installed by the operator:
+#   <user> ALL=(root) NOPASSWD: /usr/bin/systemctl stop think-tank.service, \
+#                                   /usr/bin/systemctl start think-tank.service
+import sys
+
 _TANK_SERVICES = {
     'main': 'com.austtp.ai-think-tank',
     'read': 'com.austtp.ai-think-tank-read',
@@ -17,6 +28,10 @@ _TANK_SERVICES = {
     'tank-fast': 'com.austtp.tank-fast',
 }
 _TANK_LAUNCHAGENTS_DIR = os.path.expanduser('~/Library/LaunchAgents')
+_TANK_IS_MAC = sys.platform == 'darwin'
+_TANK_LINUX_UNITS = {
+    'com.austtp.ai-think-tank': 'think-tank.service',
+}
 
 
 def _tank_requested_labels(body):
@@ -69,17 +84,28 @@ def _tank_auth_response(request, body):
 
 
 def _tank_run_ctl(verb, labels):
-    """launchctl bootout|bootstrap each label. Returns per-label results.
+    """launchctl bootout|bootstrap each label (macOS) or systemctl stop|start
+    each mapped unit (Linux). Returns per-label results.
     bootstrap takes the plist path; bootout takes the gui domain label."""
     results = []
     for label in labels:
-        if verb == 'bootstrap':
-            argv = ['/bin/launchctl', 'bootstrap',
-                    f'gui/{os.getuid()}',
-                    os.path.join(_TANK_LAUNCHAGENTS_DIR, f'{label}.plist')]
+        if _TANK_IS_MAC:
+            if verb == 'bootstrap':
+                argv = ['/bin/launchctl', 'bootstrap',
+                        f'gui/{os.getuid()}',
+                        os.path.join(_TANK_LAUNCHAGENTS_DIR, f'{label}.plist')]
+            else:
+                argv = ['/bin/launchctl', 'bootout',
+                        f'gui/{os.getuid()}/{label}']
         else:
-            argv = ['/bin/launchctl', 'bootout',
-                    f'gui/{os.getuid()}/{label}']
+            unit = _TANK_LINUX_UNITS.get(label)
+            if unit is None:
+                results.append({'service': label, 'ok': False,
+                                'detail': 'no systemd unit for this service '
+                                          'on this host'})
+                continue
+            argv = ['sudo', '-n', '/usr/bin/systemctl',
+                    'start' if verb == 'bootstrap' else 'stop', unit]
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,
                                   timeout=15)
@@ -100,24 +126,38 @@ def _tank_run_ctl(verb, labels):
 @app.get('/api/tank/status')
 async def tank_status():
     """What is running right now, per allowlisted tank service. Read-only and
-    unauthenticated-safe: reports launchctl state only, no state blob."""
+    unauthenticated-safe: reports launchctl/systemd state only, no state
+    blob."""
     try:
-        proc = subprocess.run(['/bin/launchctl', 'list'], capture_output=True,
-                              text=True, timeout=15)
-        listed = set()
-        for line in (proc.stdout or '').splitlines()[1:]:
-            parts = line.split('\t')
-            if len(parts) >= 3:
-                listed.add(parts[2].strip())
+        if _TANK_IS_MAC:
+            proc = subprocess.run(['/bin/launchctl', 'list'],
+                                  capture_output=True, text=True, timeout=15)
+            listed = set()
+            for line in (proc.stdout or '').splitlines()[1:]:
+                parts = line.split('\t')
+                if len(parts) >= 3:
+                    listed.add(parts[2].strip())
+            services = {}
+            for name, label in sorted(_TANK_SERVICES.items()):
+                services[name] = {
+                    'label': label,
+                    'running': label in listed,
+                }
+        else:
+            services = {}
+            for name, label in sorted(_TANK_SERVICES.items()):
+                running = False
+                unit = _TANK_LINUX_UNITS.get(label)
+                if unit:
+                    proc = subprocess.run(['systemctl', 'is-active', unit],
+                                          capture_output=True, text=True,
+                                          timeout=15)
+                    running = (proc.returncode == 0
+                               and (proc.stdout or '').strip() == 'active')
+                services[name] = {'label': label, 'running': running}
+        return JSONResponse({'services': services})
     except Exception as e:  # noqa: BLE001 -- status is best-effort
         return JSONResponse({'error': str(e)}, status_code=500)
-    services = {}
-    for name, label in sorted(_TANK_SERVICES.items()):
-        services[name] = {
-            'label': label,
-            'running': label in listed,
-        }
-    return JSONResponse({'services': services})
 
 
 @app.post('/api/tank/stop')

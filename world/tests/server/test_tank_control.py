@@ -41,7 +41,8 @@ class TankStatus(unittest.TestCase):
         self.client = TestClient(serve.app)
 
     def test_status_lists_allowlisted_services_only(self):
-        with mock.patch.object(serve, 'subprocess') as sp:
+        with mock.patch.object(serve, '_TANK_IS_MAC', True), \
+             mock.patch.object(serve, 'subprocess') as sp:
             sp.run.return_value = mock.Mock(
                 stdout='PID\tStatus\tLabel\n'
                        '123\t-\tcom.austtp.ai-think-tank\n'
@@ -127,7 +128,8 @@ class TankStopAuth(unittest.TestCase):
             seen[label] = argv
             return mock.Mock(returncode=0, stdout='', stderr='')
 
-        with mock.patch.object(serve, 'subprocess') as sp:
+        with mock.patch.object(serve, '_TANK_IS_MAC', True), \
+             mock.patch.object(serve, 'subprocess') as sp:
             sp.run.side_effect = fake_run
             results = serve._tank_run_ctl(
                 'bootout', sorted(serve._TANK_SERVICES.values()))
@@ -159,7 +161,8 @@ class TankStart(unittest.TestCase):
             seen.append(argv)
             return mock.Mock(returncode=0, stdout='', stderr='')
 
-        with mock.patch.object(serve, 'subprocess') as sp:
+        with mock.patch.object(serve, '_TANK_IS_MAC', True), \
+             mock.patch.object(serve, 'subprocess') as sp:
             sp.run.side_effect = fake_run
             r = self.client.post('/api/tank/start',
                                  json={'agentId': 'theo', 'services': ['read']})
@@ -171,7 +174,8 @@ class TankStart(unittest.TestCase):
         self.assertTrue(argv[3].endswith('com.austtp.ai-think-tank-read.plist'))
 
     def test_start_reports_launchctl_failures_per_label(self):
-        with mock.patch.object(serve, 'subprocess') as sp:
+        with mock.patch.object(serve, '_TANK_IS_MAC', True), \
+             mock.patch.object(serve, 'subprocess') as sp:
             sp.run.return_value = mock.Mock(returncode=5, stdout='',
                                             stderr='bootstrap failed')
             r = self.client.post('/api/tank/start',
@@ -182,6 +186,72 @@ class TankStart(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertFalse(results[0]['ok'])
         self.assertIn('bootstrap failed', results[0]['detail'])
+
+
+class TankLinuxDispatch(unittest.TestCase):
+    """The Linux branch: the launchd labels map to systemd units where the
+    deployment has one (main -> think-tank.service on the VM); everything
+    else answers honestly per label instead of spawning a doomed command.
+    `sudo -n` requires the operator's sudoers drop-in (see 420 header)."""
+
+    def setUp(self):
+        self.client = TestClient(serve.app)
+
+    def test_stop_maps_the_main_tank_to_systemctl(self):
+        seen = []
+
+        def fake_run(argv, **k):
+            seen.append(argv)
+            return mock.Mock(returncode=0, stdout='', stderr='')
+
+        with mock.patch.object(serve, '_TANK_IS_MAC', False), \
+             mock.patch.object(serve, 'subprocess') as sp:
+            sp.run.side_effect = fake_run
+            results = serve._tank_run_ctl(
+                'bootout', ['com.austtp.ai-think-tank'])
+        self.assertTrue(results[0]['ok'])
+        self.assertEqual(seen, [['sudo', '-n', '/usr/bin/systemctl',
+                                 'stop', 'think-tank.service']])
+
+    def test_start_maps_to_systemctl_start(self):
+        seen = []
+
+        def fake_run(argv, **k):
+            seen.append(argv)
+            return mock.Mock(returncode=0, stdout='', stderr='')
+
+        with mock.patch.object(serve, '_TANK_IS_MAC', False), \
+             mock.patch.object(serve, 'subprocess') as sp:
+            sp.run.side_effect = fake_run
+            results = serve._tank_run_ctl(
+                'bootstrap', ['com.austtp.ai-think-tank'])
+        self.assertTrue(results[0]['ok'])
+        self.assertEqual(seen, [['sudo', '-n', '/usr/bin/systemctl',
+                                 'start', 'think-tank.service']])
+
+    def test_unmapped_services_report_honestly_without_spawning(self):
+        with mock.patch.object(serve, '_TANK_IS_MAC', False), \
+             mock.patch.object(serve, 'subprocess') as sp:
+            results = serve._tank_run_ctl('bootout', ['com.austtp.tank-fast'])
+        self.assertEqual(results, [{'service': 'com.austtp.tank-fast',
+                                    'ok': False,
+                                    'detail': 'no systemd unit for this '
+                                              'service on this host'}])
+        sp.run.assert_not_called()
+
+    def test_linux_status_polls_is_active_per_mapped_unit(self):
+        with mock.patch.object(serve, '_TANK_IS_MAC', False), \
+             mock.patch.object(serve, 'subprocess') as sp:
+            sp.run.return_value = mock.Mock(returncode=0,
+                                            stdout='active\n', stderr='')
+            r = self.client.get('/api/tank/status')
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body['services']['main']['running'])
+        self.assertFalse(body['services']['read']['running'])
+        self.assertFalse(body['services']['tank-fast']['running'])
+        # only the mapped unit is polled; the rest need no command
+        self.assertEqual(sp.run.call_count, 1)
 
 
 if __name__ == '__main__':

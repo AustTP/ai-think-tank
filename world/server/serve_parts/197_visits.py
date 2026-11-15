@@ -35,7 +35,16 @@ import json
 import os
 import plistlib
 import subprocess
+import sys
 import time
+
+# The village stop/start surgery is launchd on macOS; the Linux deployment
+# has no launchd, so the same verbs dispatch to systemd USER units
+# (~/.config/systemd/user/<label>.service, stop/start) and the serving port
+# is read from the unit's ExecStart line.
+_VISITS_IS_MAC = sys.platform == 'darwin'
+_VISITS_USER_UNIT_DIR = os.path.join(os.path.expanduser('~'), '.config',
+                                     'systemd', 'user')
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -97,26 +106,46 @@ def _village_transport(village_id):
 
 
 def _village_port(label):
-    path = os.path.join(os.path.expanduser('~'), 'Library',
-                        'LaunchAgents', label + '.plist')
+    """The village's serving port: macOS reads the launchd plist's
+    ProgramArguments; Linux reads the systemd user unit's ExecStart."""
+    if _VISITS_IS_MAC:
+        path = os.path.join(os.path.expanduser('~'), 'Library',
+                            'LaunchAgents', label + '.plist')
+        try:
+            with open(path, 'rb') as fh:
+                plist = plistlib.load(fh)
+            return int(plist['ProgramArguments'][2])
+        except Exception:
+            return None
     try:
-        with open(path, 'rb') as fh:
-            plist = plistlib.load(fh)
-        return int(plist['ProgramArguments'][2])
+        with open(os.path.join(_VISITS_USER_UNIT_DIR,
+                               label + '.service')) as fh:
+            for line in fh:
+                if line.strip().startswith('ExecStart'):
+                    return int(line.split()[-1])
     except Exception:
         return None
+    return None
 
 
 def _bootout(label):
-    subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{label}'],
-                   capture_output=True)
+    if _VISITS_IS_MAC:
+        subprocess.run(['launchctl', 'bootout', f'gui/{os.getuid()}/{label}'],
+                       capture_output=True)
+    else:
+        subprocess.run(['systemctl', '--user', 'stop', label + '.service'],
+                       capture_output=True)
 
 
 def _bootstrap(label):
-    path = os.path.join(os.path.expanduser('~'), 'Library', 'LaunchAgents',
-                        label + '.plist')
-    subprocess.run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', path],
-                   capture_output=True)
+    if _VISITS_IS_MAC:
+        path = os.path.join(os.path.expanduser('~'), 'Library', 'LaunchAgents',
+                            label + '.plist')
+        subprocess.run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', path],
+                       capture_output=True)
+    else:
+        subprocess.run(['systemctl', '--user', 'start', label + '.service'],
+                       capture_output=True)
 
 
 def _wait_port(host, port, want_open, seconds):
