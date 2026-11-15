@@ -1229,12 +1229,114 @@ async def save_doors(request: Request):
     return PlainTextResponse('saved')
 
 
+_STATE_CACHE = {'version': None, 'data': None, 'text': None,
+                'text_session': None, 'at': 0.0}
+_STATE_CACHE_LOCK = threading.RLock()
+_STATE_REBUILD_MIN_GAP_S = 60.0
+
+
+def _state_session_text_locked(cache):
+    """Build (once per version) the agentKeys-carrying response text for
+    session callers. Lock held (RLock: pick() may re-enter from inside the
+    rebuild block)."""
+    if cache['text_session'] is None and cache['data'] is not None:
+        sess = dict(cache['data'])
+        agent_keys = {}
+        for def_ in sess.get('agentRoster', []):
+            agent_id = def_.get('id')
+            if agent_id:
+                agent_keys[agent_id] = get_or_create_agent_key(agent_id)
+        sess['agentKeys'] = agent_keys
+        cache['text_session'] = json.dumps(
+            sess, ensure_ascii=False, allow_nan=False,
+            separators=(',', ':'))
+    return cache['text_session']
+
+
+def _state_cache_version():
+    """Cheap version triple for the /api/state response cache: the kv blob's
+    updated_at plus the archive's row count and newest row. (2026-11-15)
+    /api/state used to re-read kv_state and merge every task_archive blob
+    PER REQUEST -- at ~23k archived tasks that parsed ~3 GB of JSON and
+    re-serialized a ~190 MB response per console poll, and RSS climbed
+    ~2 GB/minute into the OOM killer once the operator's console tab
+    started polling the VM tank (tracemalloc caught the giant
+    json.dumps strings live). The cache serves pre-serialized bytes until
+    the version moves, and rebuilds at most once a minute however fast
+    the sim saves, so bursty saves cannot bring the churn back."""
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT updated_at FROM kv_state WHERE id = 1').fetchone()
+            arch = conn.execute(
+                'SELECT COUNT(*), COALESCE(MAX(updated_at), 0) '
+                'FROM task_archive').fetchone()
+        if row is None:
+            return None
+        return (row[0], arch[0], arch[1])
+    except Exception:
+        return None
+
+
+def _state_response_bytes(session):
+    """(text, cold) for /api/state. text is the pre-serialized response for
+    this caller kind (session callers get the agentKeys variant, built once
+    per version -- the keys are stable get_or_create values). cold means an
+    empty database: the caller runs the legacy seed path. Stale-but-recent
+    views are served while inside the rebuild gap."""
+    version = _state_cache_version()
+    if version is None:
+        return None, 'cold'
+    cache = _STATE_CACHE
+
+    def pick():
+        if not session:
+            return cache['text']
+        with _STATE_CACHE_LOCK:
+            return _state_session_text_locked(cache)
+
+    if version == cache['version'] and cache['text'] is not None:
+        return pick(), None
+    rebuild_due = (time.time() - cache['at'] >= _STATE_REBUILD_MIN_GAP_S
+                   or cache['text'] is None)
+    if not rebuild_due:
+        return pick(), None
+    with _STATE_CACHE_LOCK:
+        if version == cache['version'] and cache['text'] is not None:
+            return pick(), None
+        if (time.time() - cache['at'] < _STATE_REBUILD_MIN_GAP_S
+                and cache['text'] is not None):
+            return pick(), None
+        # The gap timer advances BEFORE the build: a failing rebuild must
+        # still throttle the next attempt, or every poll would re-merge
+        # the whole archive while the DB is unhappy.
+        cache['at'] = time.time()
+        data = get_state_from_db(archive_merge='alias')
+        if data is None:
+            return None, 'cold'
+        if _heal_agent_identity(data) and not READ_ONLY_MODE:
+            save_state_to_db(data)
+        base = {k: v for k, v in data.items() if k != 'agentKeys'}
+        cache['text'] = json.dumps(base, ensure_ascii=False,
+                                   allow_nan=False, separators=(',', ':'))
+        cache['text_session'] = None
+        cache['data'] = data
+        cache['version'] = version
+        if session:
+            _state_session_text_locked(cache)
+        return pick(), None
+
+
 @app.get('/api/state')
 async def get_state(request: Request):
     # A genuinely empty database gets the server-owned default roster
     # seeded here (see _seed_default_roster) so the client never has to
     # generate or hardcode a single agent name -- cold start and warm
     # start both read names from the DB.
+    session = bool(verify_session(request.cookies.get(SESSION_COOKIE_NAME)))
+    text, cold = _state_response_bytes(session)
+    if not cold and text is not None:
+        return Response(content=text, media_type='application/json')
     data = get_state_from_db(archive_merge='alias')
     if data is None:
         _seed_default_roster()
@@ -1261,7 +1363,7 @@ async def get_state(request: Request):
     # content executor loopback) must NOT be handed every other agent's key:
     # those keys gate key-authenticated endpoints, and a hostile agent would
     # read all of them, mint its own, and impersonate anyone.
-    if verify_session(request.cookies.get(SESSION_COOKIE_NAME)):
+    if session:
         agent_keys = {}
         for def_ in data.get('agentRoster', []):
             agent_id = def_.get('id')
