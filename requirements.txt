@@ -10,6 +10,9 @@ httpx==0.28.1
 python-multipart==0.0.32  # fastapi form parsing (the /login form endpoint); another dependency the red-CI weeks hid  # starlette.testclient imports it; CI's suite step died on this for weeks (hidden behind the earlier gate failures)
 uvicorn==0.34.0
 websockets==15.0.1
+# PostgreSQL adapter for db_backend.py's postgres mode (Aiven/managed DSNs).
+# Not imported unless THINK_TANK_DB_URL points at postgres; sqlite tests skip it.
+psycopg2-binary==2.9.13
 pydantic==2.13.4
 # Credential vault encryption (world/serve.py _fernet) and host-side browser
 # rendering for browse_page(render=true). Pinned to the versions verified on
