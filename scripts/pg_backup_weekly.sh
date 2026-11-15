@@ -7,10 +7,14 @@
 # Restore:
 #   gh release download db-backup-YYYYMMDD -R AustTP/think-tank-private -p '*.dump' -D /tmp
 #   pg_restore --no-owner --no-privileges -j 4 -d "$THINK_TANK_DB_URL" /tmp/pg-YYYYMMDD.dump
-# Schedule: launchd job com.thinktank.pg-backup (Sundays 03:00). On the Linux VM
-# use the same script from a systemd timer / cron entry.
+# Schedule: systemd timer think-tank-db-backup on the VM (weekly, Sunday
+# 03:00 America/New_York). The VM runs pg_dump 18 via Docker (the distro
+# client is too old for Aiven's PostgreSQL 18 server):
+#   PG_DUMP_BIN="$HOME/bin/pg_dump18" bash scripts/pg_backup_weekly.sh
 set -euo pipefail
 export PATH="/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+PG_DUMP_BIN="${PG_DUMP_BIN:-pg_dump}"
+if command -v sha256sum >/dev/null 2>&1; then SHASUM=sha256sum; else SHASUM=shasum; fi
 TANK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRIVATE_REPO="${THINK_TANK_PRIVATE_REPO:-AustTP/think-tank-private}"
 KEEP=1
@@ -20,9 +24,9 @@ STAMP="$(date +%Y%m%d)"
 BACKUPS="$TANK_ROOT/think-tank-db-backups"
 mkdir -p "$BACKUPS"
 OUT="$BACKUPS/pg-$STAMP.dump"
-echo "[$(date '+%F %T')] dumping $DSN -> $OUT"
-pg_dump --format=custom --no-owner --no-privileges --no-comments -d "$DSN" -f "$OUT"
-shasum -a 256 "$OUT" > "$OUT.sha256"
+echo "[$(date '+%F %T')] dumping $DSN -> $OUT (using $PG_DUMP_BIN)"
+"$PG_DUMP_BIN" --format=custom --no-owner --no-privileges --no-comments -d "$DSN" > "$OUT"
+"$SHASUM" -a 256 "$OUT" > "$OUT.sha256"
 SIZE="$(du -h "$OUT" | cut -f1)"
 echo "[$(date '+%F %T')] dump complete ($SIZE), uploading release"
 gh release create "db-backup-$STAMP" "$OUT" "$OUT.sha256" -R "$PRIVATE_REPO" \
