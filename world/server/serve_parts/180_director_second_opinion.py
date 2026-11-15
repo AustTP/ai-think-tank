@@ -529,11 +529,6 @@ async def _best_value_pick(candidates, scores, floor_gap=None, band=None,
     return None
 
 
-def _fetch_openrouter_catalog_sync():
-    with urllib.request.urlopen('https://openrouter.ai/api/v1/models', timeout=20) as resp:  # nosec B310 -- fixed known-good URL, no user input, SSRF guard applies at callers
-        return json.loads(resp.read())['data']
-
-
 # --- generic provider catalogs ----------------------------------------------
 # One declarative spec per vendor + one fetch engine. A spec declares the
 # vendor's catalog URL, the env var holding its API key (None = public
