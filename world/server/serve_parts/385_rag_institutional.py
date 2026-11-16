@@ -466,6 +466,52 @@ def _rag_search_rows_sync():
         return _RAG_SEARCH_SNAPSHOT
 
 
+def _rag_search_sql(qvec, k, min_score, sources, village):
+    """Score in Postgres over the native sparsevec column. Returns hits, or
+    None when the SQL path is unavailable (no pgvector / no Postgres) so the
+    caller falls back to the legacy in-process loop. Score semantics are
+    IDENTICAL to the Python loop: cosine similarity of L2-normalized sparse
+    vectors (pgvector's <=> is cosine DISTANCE), the same min_score floor,
+    the same village/source scoping. Any query failure returns None -- the
+    accelerator never breaks retrieval."""
+    if not _RAG_PGVECTOR_OK:
+        return None
+    try:
+        import db_backend as _dbm
+        if not _dbm.is_postgres():
+            return None
+    except Exception:
+        return None
+    qlit = _rag_sv_literal(qvec)
+    if not qlit:
+        return []
+    where = ['vec_sv IS NOT NULL']
+    args = []
+    if sources:
+        where.append('source IN ('
+                     + ', '.join(['?'] * len(sources)) + ')')
+        args.extend(sources)
+    if village:
+        where.append('(village_id IS NULL OR village_id = ?)')
+        args.append(village)
+    sql = ('SELECT source, ref, title, room, '
+           "COALESCE(LEFT(text, 240), '') AS snippet, "
+           '1 - (vec_sv <=> ?::sparsevec) AS score '
+           f'FROM rag_index WHERE {" AND ".join(where)} '
+           'AND 1 - (vec_sv <=> ?::sparsevec) >= ? '
+           'ORDER BY vec_sv <=> ?::sparsevec LIMIT ?')
+    try:
+        with _db() as conn:
+            rows = conn.execute(sql, tuple([qlit] + args
+                                           + [qlit, min_score, qlit, k])
+                                ).fetchall()
+    except Exception:
+        return None
+    return [{'source': s, 'ref': r, 'title': t, 'room': ro,
+             'score': round(float(sc), 4), 'snippet': sn}
+            for s, r, t, ro, sn, sc in rows]
+
+
 def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
                 village=None):
     """Ranked semantic hits over the index: cosine similarity (the vectors
@@ -474,10 +520,17 @@ def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
     already scopes reads: docs stamped with another village are excluded;
     NULL-village docs (shared craft, legacy rows) stay visible to all.
     Empty index or empty query -> []. DB-only: no model calls, safe on
-    decision paths. Rows come from the in-process cache (_rag_search_rows_sync)."""
+    decision paths. Postgres with the native vector scores in-database
+    (_rag_search_sql); everything else scores the in-process cache."""
     qvec = _rag_embed(query, cap=200)
     if not qvec:
         return []
+    try:
+        sql_hits = _rag_search_sql(qvec, k, min_score, sources, village)
+    except Exception:
+        sql_hits = None
+    if sql_hits is not None:
+        return sql_hits
     try:
         rows = _rag_search_rows_sync()
     except Exception:

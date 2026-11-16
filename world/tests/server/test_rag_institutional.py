@@ -443,3 +443,20 @@ class NativeVectorBackfill(unittest.TestCase):
             ).fetchone()
         self.assertTrue(row[0])
         self.assertTrue(row[0].endswith('/1000000000'))
+
+    def test_sql_path_stands_down_without_postgres(self):
+        """The accelerator's contract: even with the pgvector flag forced
+        on, a non-Postgres backend (sqlite in tests) must stand the SQL
+        path down and score the legacy loop -- identical results, no
+        surprises."""
+        _wipe()
+        with open(os.path.join(serve.LIBRARY_DIR, 'guide.md'), 'w') as f:
+            f.write('Rate limit storms met exponential backoff retry.\n')
+        serve._rag_index_pass(budget=10)
+        self.assertIsNone(serve._rag_search_sql(
+            serve._rag_embed('rate limit storms'), 5,
+            serve._RAG_MIN_SCORE, None, None))
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True):
+            legacy = serve._rag_search('rate limit storms')
+            self.assertTrue(legacy)
+            self.assertTrue(all(h['source'] == 'library' for h in legacy))
