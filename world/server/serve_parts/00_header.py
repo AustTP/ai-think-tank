@@ -807,16 +807,39 @@ FAILURE_TYPE_LABELS = {
 DB_PATH = os.environ.get('THINK_TANK_DB') or os.path.join(THINK_TANK_DIR, 'think_tank.db')
 
 
+def _redact_dsn(dsn):
+    """scheme://user:secret@host... -> scheme://user:***@host...
+
+    The boot banner exists to say WHICH database a process will use; the
+    credential adds nothing to that and a raw DSN in stdout lands in
+    journald forever (and in every boot log anyone ever pastes). Keep the
+    user and host, mask everything after the first colon in the userinfo.
+    rpartition('@') because '@' can never appear in the userinfo but the
+    password could theoretically contain almost anything else."""
+    try:
+        head, sep, tail = dsn.partition('://')
+        if not sep:
+            return dsn
+        userinfo, at, host = tail.rpartition('@')
+        if not at:
+            return dsn
+        user = userinfo.partition(':')[0]
+        return f'{head}://{user}:***@{host}'
+    except Exception:
+        return dsn
+
+
 def _log_db_backend_banner():
     """Say WHICH database this process will use, once, at import. On
     2026-11-01 a test run silently talked to production Postgres (the repo
     .env DSN) while everyone believed it was on the isolated SQLite copy --
     the incident was only caught because /api/state served a test fixture.
-    A boot line removes the ambiguity for every process that follows."""
+    A boot line removes the ambiguity for every process that follows.
+    The DSN is redacted: the password must not live in journald."""
     try:
         import db_backend as _dbm
         if _dbm.is_postgres():
-            print(f'[db] backend: postgres ({_dbm._dsn()})')
+            print(f'[db] backend: postgres ({_redact_dsn(_dbm._dsn())})')
         else:
             print(f'[db] backend: sqlite {DB_PATH}')
     except Exception:
