@@ -215,8 +215,12 @@ def _rag_index_pass(budget=60):
         digest = hashlib.sha256(text.encode('utf-8', errors='replace')).hexdigest()
         entry = known.get(doc_id)
         if entry and entry[0] == digest:
-            if not entry[2]:
-                # Legacy row: stamp the village in place (no re-embed).
+            if entry[2] != village:
+                # Stamp the village in place (no re-embed): legacy rows that
+                # never had a village, AND rows whose derivation changed --
+                # a library file moved between villages (or out of one) must
+                # follow its new path, or the old village keeps surfacing
+                # knowledge that no longer lives there.
                 try:
                     with _db() as conn:
                         conn.execute('UPDATE rag_index SET village_id = ? '

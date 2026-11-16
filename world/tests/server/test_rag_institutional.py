@@ -370,3 +370,30 @@ class VillageScoping(unittest.TestCase):
             ).fetchone()
         self.assertEqual(row[0], 'village-b')
         self.assertGreaterEqual(out['indexed'], 1)
+
+    def test_drifted_village_stamp_restamps_without_reindex(self):
+        """The pass re-stamps whenever the stored village differs from the
+        derived one, not only when the stamp is missing. Same doc_id, drifted
+        derivation is real: downloads/<agent> rows derive their village from
+        the OWNING AGENT's current village, so an agent moving villages
+        re-attributes their rows -- and a stale stamp must never keep
+        surfacing village knowledge under the wrong flag."""
+        _wipe()
+        with open(os.path.join(serve.LIBRARY_DIR, 'runbook.md'), 'w') as f:
+            f.write('Observatory runbook for 429 storm triage.\n')
+        serve._rag_index_pass(budget=10)
+        # Simulate drift: the stored stamp no longer matches the derivation.
+        with serve._db() as conn:
+            conn.execute("UPDATE rag_index SET village_id = 'atlantis' "
+                         "WHERE doc_id = 'library:runbook.md'")
+        out = serve._rag_index_pass(budget=10)
+        self.assertGreaterEqual(out['indexed'], 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT village_id FROM rag_index WHERE doc_id = "
+                "'library:runbook.md'"
+            ).fetchone()
+        self.assertEqual(row[0], 'main')
+        self.assertTrue(serve._rag_search('429 storm triage', village='main'))
+        self.assertFalse(serve._rag_search('429 storm triage',
+                                           village='winter'))
