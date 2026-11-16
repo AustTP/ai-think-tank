@@ -1,5 +1,52 @@
 
 
+import json as _cjson
+import threading as _cthreading
+
+# ONE frozen whole-state copy per save revision, shared by every content job
+# dispatched while that revision is current. The old per-job
+# json.loads(json.dumps(state)) meant a worker burst held N whole-state copies
+# at once -- GBs of simultaneous transient churn that ratcheted the VM tank's
+# RSS into the cgroup kill every ~20 minutes (2026-11-16: flat tracemalloc,
+# giant allocator segments, invisible to every live-set probe). The base
+# rebuilds after each save (serve._STATE_SAVE_REV bumps per persisted save)
+# or whenever the live state object identity changes (tests hand a fresh dict
+# per case, so identity -- not id(), which is reusable after GC -- gates the
+# cache). Executors that mutate their snapshot get a per-job shell: own
+# top-level dict, own tasks mapping, and a private copy of THIS job's task,
+# so no worker ever writes into a snapshot another worker is reading.
+_CONTENT_SNAPSHOT_CACHE: dict = {'rev': None, 'src': None, 'base': None,
+                                 'lock': None}
+
+
+def _content_snapshot_base(state):
+    rev = None
+    try:
+        import serve
+        rev = serve._STATE_SAVE_REV[0]
+    except Exception:
+        rev = None
+    lock = _CONTENT_SNAPSHOT_CACHE['lock']
+    if lock is None:
+        lock = _cthreading.Lock()
+        _CONTENT_SNAPSHOT_CACHE['lock'] = lock
+    base = None
+    if rev is not None:
+        with lock:
+            if (_CONTENT_SNAPSHOT_CACHE['rev'] == rev
+                    and _CONTENT_SNAPSHOT_CACHE['src'] is state
+                    and _CONTENT_SNAPSHOT_CACHE['base'] is not None):
+                base = _CONTENT_SNAPSHOT_CACHE['base']
+    if base is None:
+        base = _cjson.loads(_cjson.dumps(state))
+        if rev is not None:
+            with lock:
+                _CONTENT_SNAPSHOT_CACHE['rev'] = rev
+                _CONTENT_SNAPSHOT_CACHE['src'] = state
+                _CONTENT_SNAPSHOT_CACHE['base'] = base
+    return base
+
+
 def _dispatch_content_work(executor, state, agent_id, task, now):
     """Fire the registered content executor on a background thread for this
     arriving agent's task, if one applies. Returns True if real content work was
@@ -40,7 +87,16 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
     # completion for a missing deliverable, and orphaned the real report).
     with _content_results_lock:
         _content_results.pop(task_id, None)
-    snapshot = json.loads(json.dumps(state))
+    snapshot = dict(_content_snapshot_base(state))
+    # Per-job shell over the shared base: an executor mutating its snapshot's
+    # task (e.g. shortening workUntil) must never write into a snapshot
+    # another worker is reading, and must never alias the LIVE task dict.
+    tasks = snapshot.get('tasks')
+    if isinstance(tasks, dict):
+        tasks = dict(tasks)
+        if task_id in tasks:
+            tasks[task_id] = _cjson.loads(_cjson.dumps(tasks[task_id]))
+        snapshot['tasks'] = tasks
     # Item 1: situational awareness. Build the perception block here, on the
     # main thread, from the FROZEN snapshot + the live task dict -- never inside
     # the worker thread, where a read of the still-mutating live `state` would
@@ -87,7 +143,13 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
             # Mark ok=False so the fail-closed quality gate treats it like a red
             # pipeline (card sent back / fix re-issued), and the worker-stuck
             # help signal can see it -- a crash must never complete as 'done'.
-            _store_content_result(task_id, {'ok': False, 'note': f'Content execution failed: {e}', 'seenUrls': (task.get('research') or {}).get('seenUrls') or []})
+            import traceback as _tb
+            _note = (f'Content execution failed: {e} | '
+                     f'{_tb.format_exc()[-500:]}')
+            _store_content_result(
+                task_id,
+                {'ok': False, 'note': _note,
+                 'seenUrls': (task.get('research') or {}).get('seenUrls') or []})
 
     threading.Thread(target=_run, daemon=True).start()
     return True
