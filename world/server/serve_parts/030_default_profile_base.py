@@ -797,6 +797,9 @@ def log_social_digest(state, people, decisions=None):
                 line += f' -- carry-away: **{dec.get("choice")}**{conf_s}'
             lines.append(line)
     try:
+        # Flat ON PURPOSE: the weekly social is a CROSS-TEAM commons event
+        # (attendees come from every village), so its digest stays in main's
+        # legacy tree, visible to all villages. Do NOT village-namespace it.
         os.makedirs(os.path.join(LIBRARY_DIR, 'social'), exist_ok=True)
         path = os.path.join(LIBRARY_DIR, 'social', f'social-{int(ts)}.md')
         with open(path, 'w') as f:
@@ -836,8 +839,16 @@ def log_refinement_digest(state, agents, groom):
             comp = comprehensions[request_id] or {}
             lines.append(f'- "{comp.get("title")}" ({comp.get("readiness")}): {comp.get("summary")}')
     try:
-        os.makedirs(os.path.join(LIBRARY_DIR, 'refinement'), exist_ok=True)
-        path = os.path.join(LIBRARY_DIR, 'refinement', f'refinement-{int(ts)}.md')
+        # Village-namespaced like every agent commons write: the ceremony
+        # belongs to the scrum master's village, so a winter scrum master's
+        # digest lands under villages/winter/refinement/ and never surfaces
+        # in another village's library search or RAG retrieval. Main and
+        # unknown owners keep the flat legacy path.
+        rel = _library_namespace_write(
+            (groom or {}).get('scrumMasterId') or '',
+            f'refinement/refinement-{int(ts)}.md', state)
+        path = os.path.join(LIBRARY_DIR, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
     except Exception:
@@ -866,8 +877,13 @@ def log_escalation_digest(state, pending, outcome):
              f'- Product: {product}', f'- Failed restore: "{title}"', f'- Why: {source}',
              f'- Filed as: {outcome}']
     try:
-        os.makedirs(os.path.join(LIBRARY_DIR, 'escalations'), exist_ok=True)
-        path = os.path.join(LIBRARY_DIR, 'escalations', f'escalation-{int(ts)}.md')
+        # Same village namespacing as the refinement digest: the escalation
+        # belongs to the scrum master's village.
+        rel = _library_namespace_write(
+            (pending.get('scrumMasterId') or '') if isinstance(pending, dict) else '',
+            f'escalations/escalation-{int(ts)}.md', state)
+        path = os.path.join(LIBRARY_DIR, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'w') as f:
             f.write('\n'.join(lines) + '\n')
     except Exception:
