@@ -406,14 +406,21 @@ def _rag_search_rows_sync():
             return _RAG_SEARCH_SNAPSHOT
         if not _RAG_SEARCH_SNAPSHOT:
             # First build after a restart: one full load, then deltas only.
+            # Keyed by doc_id (the primary key), NOT ref: refs are NOT
+            # unique -- hybrid docs reuse their task id as ref, so
+            # deliverable:task-N and hybrid:<agent>:task-N can both exist
+            # (2026-11-16: 626 duplicate refs on the live index). A ref
+            # key silently kept one arbitrary row per ref and DROPPED the
+            # rest from retrieval.
             with _db() as conn:
                 rows = conn.execute(
-                    'SELECT source, ref, title, room, village_id, text, '
-                    'vec, updated_at FROM rag_index').fetchall()
+                    'SELECT doc_id, source, ref, title, room, village_id, '
+                    'text, vec, updated_at FROM rag_index').fetchall()
             cache = _RAG_SEARCH_CACHE
             cache.clear()
             newest = 0.0
-            for source, ref, title, room, village_id, text, vec_raw, ts in rows:
+            for doc_id, source, ref, title, room, village_id, text, \
+                    vec_raw, ts in rows:
                 try:
                     dvec = {int(k): v
                             for k, v in json.loads(vec_raw).items()}
@@ -421,8 +428,8 @@ def _rag_search_rows_sync():
                     continue
                 if not dvec:
                     continue
-                cache[ref] = (source, ref, title, room, village_id,
-                              (text or '')[:240], dvec, ts)
+                cache[doc_id] = (source, ref, title, room, village_id,
+                                 (text or '')[:240], dvec, ts)
                 if ts > newest:
                     newest = ts
             state['count'] = count
@@ -430,26 +437,29 @@ def _rag_search_rows_sync():
             _RAG_SEARCH_SNAPSHOT = tuple(cache.values())
             return _RAG_SEARCH_SNAPSHOT
         # Delta pass: a shrank count (the index pass purging stale rows) or
-        # fresh rows both land here. The (ref, updated_at) projection is
+        # fresh rows both land here. The (doc_id, updated_at) projection is
         # ~1 MB for a 23k-row index -- never the blobs, never the vectors.
         with _db() as conn:
             live = dict(conn.execute(
-                'SELECT ref, updated_at FROM rag_index').fetchall())
-        stale = [ref for ref in _RAG_SEARCH_CACHE if ref not in live]
-        for ref in stale:
-            _RAG_SEARCH_CACHE.pop(ref, None)
-        fetch = [ref for ref, ts in live.items()
-                 if ref not in _RAG_SEARCH_CACHE
-                 or _RAG_SEARCH_CACHE[ref][7] != ts]
+                'SELECT doc_id, updated_at FROM rag_index').fetchall())
+        stale = [doc_id for doc_id in _RAG_SEARCH_CACHE
+                 if doc_id not in live]
+        for doc_id in stale:
+            _RAG_SEARCH_CACHE.pop(doc_id, None)
+        fetch = [doc_id for doc_id, ts in live.items()
+                 if doc_id not in _RAG_SEARCH_CACHE
+                 or _RAG_SEARCH_CACHE[doc_id][7] != ts]
         for i in range(0, len(fetch), 200):
             batch = fetch[i:i + 200]
             marks = ','.join('?' * len(batch))
             with _db() as conn:
                 rows = conn.execute(
-                    'SELECT source, ref, title, room, village_id, text, '
-                    f'vec, updated_at FROM rag_index WHERE ref IN ({marks})',
+                    'SELECT doc_id, source, ref, title, room, village_id, '
+                    'text, vec, updated_at FROM rag_index '
+                    f'WHERE doc_id IN ({marks})',
                     tuple(batch)).fetchall()  # nosec B608 -- '?' placeholders
-            for source, ref, title, room, village_id, text, vec_raw, ts in rows:
+            for doc_id, source, ref, title, room, village_id, text, \
+                    vec_raw, ts in rows:
                 try:
                     dvec = {int(k): v
                             for k, v in json.loads(vec_raw).items()}
@@ -457,9 +467,9 @@ def _rag_search_rows_sync():
                     continue
                 if not dvec:
                     continue
-                _RAG_SEARCH_CACHE[ref] = (source, ref, title, room,
-                                          village_id, (text or '')[:240],
-                                          dvec, ts)
+                _RAG_SEARCH_CACHE[doc_id] = (source, ref, title, room,
+                                             village_id, (text or '')[:240],
+                                             dvec, ts)
         state['count'] = count
         state['max_ts'] = max_ts
         _RAG_SEARCH_SNAPSHOT = tuple(_RAG_SEARCH_CACHE.values())
@@ -499,7 +509,7 @@ def _rag_search_sql(qvec, k, min_score, sources, village):
            '1 - (vec_sv <=> ?::sparsevec) AS score '
            f'FROM rag_index WHERE {" AND ".join(where)} '
            'AND 1 - (vec_sv <=> ?::sparsevec) >= ? '
-           'ORDER BY vec_sv <=> ?::sparsevec LIMIT ?')
+           'ORDER BY score DESC, ref ASC LIMIT ?')
     try:
         with _db() as conn:
             rows = conn.execute(sql, tuple([qlit] + args

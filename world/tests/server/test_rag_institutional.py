@@ -460,3 +460,40 @@ class NativeVectorBackfill(unittest.TestCase):
             legacy = serve._rag_search('rate limit storms')
             self.assertTrue(legacy)
             self.assertTrue(all(h['source'] == 'library' for h in legacy))
+
+
+class DuplicateRefs(unittest.TestCase):
+    """Refs are NOT unique: hybrid docs reuse their task id as ref, so
+    deliverable:task-N and hybrid:<agent>:task-N coexist (626 duplicate
+    refs on the live index). The search cache is keyed by doc_id (the
+    primary key) precisely so a ref collision can never drop a row from
+    retrieval -- the ref-keyed cache silently kept one arbitrary row per
+    ref and hid the rest."""
+
+    def test_both_rows_with_one_ref_stay_retrievable(self):
+        _wipe()
+        _seed_archive('task-dupX', 'observatory', 'Ledger backoff',
+                      'Exponential backoff carried the retry budget '
+                      'through the 429 storms.')
+        serve._rag_index_pass(budget=10)
+        # A hybrid doc arrives reusing the same task id as its ref.
+        vec = json.dumps(serve._rag_embed(
+            'hybrid sandbox ledger notes referencing backoff storms'))
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO rag_index (doc_id, source, ref, title, room, '
+                'village_id, text, vec, content_hash, updated_at) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ('hybrid:lydia:task-dupX', 'hybrid', 'task-dupX',
+                 'Hybrid ledger', '', None,
+                 'hybrid sandbox ledger notes referencing backoff storms',
+                 vec, 'hash-x', time.time()))
+        rows = serve._rag_search_rows_sync()
+        dup_rows = [r for r in rows if r[1] == 'task-dupX']
+        self.assertEqual({r[0] for r in dup_rows},
+                         {'deliverable', 'hybrid'})
+        # Both sides of the ref collision surface in retrieval.
+        hits = serve._rag_search('ledger backoff storms')
+        sources = {h['source'] for h in hits if h['ref'] == 'task-dupX'}
+        self.assertIn('deliverable', sources)
+        self.assertIn('hybrid', sources)
