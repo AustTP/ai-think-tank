@@ -404,5 +404,51 @@ class FreeSpikeWeekKeysSurviveRoundTrip(unittest.TestCase):
         self.assertNotIn(week - 2, state['freeSpikeRooms'])
 
 
+class NoneMergeReadCache(unittest.TestCase):
+    """Outside test mode a 'none' read returns ONE shared object keyed on
+    the save revision: the work pipeline's roster/sandbox remaps fire dozens
+    of whole-blob re-parses per save window, and that churn (never retained
+    Python objects -- libpq and allocator churn, invisible to tracemalloc)
+    was the VM tank's RSS sawtooth. The cache must hit between saves and be
+    dropped by a save."""
+
+    def test_none_reads_share_one_object_until_a_save(self):
+        calls = {'reads': 0}
+        blob = json.dumps({'agents': {'ada': {'villageId': 'north'}},
+                           'tasks': {}})
+        row = (blob,)
+
+        class _FakeConn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def execute(self, *a, **k):
+                calls['reads'] += 1
+                return unittest.mock.Mock(fetchone=lambda: row)
+
+        serve._NONE_READ_CACHE.update({'rev': -1, 'obj': None})
+        try:
+            with unittest.mock.patch.object(serve, '_state_io_test_mode',
+                                            return_value=False), \
+                 unittest.mock.patch.object(serve, '_db',
+                                            return_value=_FakeConn()), \
+                 unittest.mock.patch.object(serve,
+                                            '_merge_extracted_sections',
+                                            lambda data: None):
+                first = serve.get_state_from_db(archive_merge='none')
+                second = serve.get_state_from_db(archive_merge='none')
+                self.assertIs(first, second)
+                self.assertEqual(calls['reads'], 1)
+                serve._STATE_SAVE_REV[0] += 1  # a save persisted elsewhere
+                third = serve.get_state_from_db(archive_merge='none')
+                self.assertIsNot(second, third)
+                self.assertEqual(calls['reads'], 2)
+        finally:
+            serve._NONE_READ_CACHE.update({'rev': -1, 'obj': None})
+
+
 if __name__ == '__main__':
     unittest.main()

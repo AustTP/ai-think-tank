@@ -857,7 +857,11 @@ def get_state_from_db(archive_merge='copy'):
               needing only the roster -- the loop stalled behind every
               execute and HTTP health checks timed out. A 'none' reader that
               DOES touch tasks sees a truncated view: never use it where
-              task ids are resolved.
+              task ids are resolved. NOTE (2026-11-16): outside test mode a
+              'none' read returns a SHARED, cached object keyed on the save
+              revision -- read-only lookups only; a mutating caller must use
+              'copy' (mutating the shared object would corrupt every later
+              'none' read until the next save rebuilds it).
     """
     # Read cache (2026-11-05 batched saves): the merged state object is kept
     # in memory and served to every default-mode reader. Each uncached read
@@ -881,6 +885,12 @@ def get_state_from_db(archive_merge='copy'):
     if archive_merge == 'copy' and _STATE_READ_CACHE['obj'] is not None \
             and not _state_io_test_mode():
         return _STATE_READ_CACHE['obj']
+    none_rev = None
+    if archive_merge == 'none' and not _state_io_test_mode():
+        none_rev = _STATE_SAVE_REV[0]
+        cached = _NONE_READ_CACHE
+        if cached['rev'] == none_rev and cached['obj'] is not None:
+            return cached['obj']
     with _db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
         if not row:
@@ -891,6 +901,9 @@ def get_state_from_db(archive_merge='copy'):
         _merge_archived_tasks(data, mode=archive_merge)
     if archive_merge == 'copy' and not _state_io_test_mode():
         _STATE_READ_CACHE['obj'] = data
+    elif archive_merge == 'none' and not _state_io_test_mode():
+        _NONE_READ_CACHE['rev'] = none_rev
+        _NONE_READ_CACHE['obj'] = data
     return data
 
 
@@ -1315,6 +1328,16 @@ _SAVE_WORKER: list = []
 # saved blob (2026-11-07 zombie-retry fix).
 _SAVE_RETRY_COUNTS: dict = {}
 _STATE_READ_CACHE: dict = {'obj': None}
+# 'none'-merge readers (roster lookups, sandbox-id remaps, archive checks)
+# share ONE cached merged object keyed on the save revision. Before
+# 2026-11-16 every 'none' reader re-fetched the whole kv blob and re-ran
+# _merge_extracted_sections (with its defensive deepcopy) -- the work
+# pipeline fires dozens of these per save window (every screenshot poll
+# remaps its sandbox id), and that churn is what sawtoothed the VM tank's
+# RSS into the cgroup kill. Readers MUST NOT mutate the shared object;
+# a mutating caller needs 'copy'.
+_NONE_READ_CACHE: dict = {'rev': -1, 'obj': None}
+_STATE_SAVE_REV: list = [0]
 _SAVE_FLUSHED = threading.Event()
 
 
@@ -1474,6 +1497,9 @@ def save_state_to_db(data):
 
 
 def _save_state_to_db_sync(data):
+    # Any persisted save changes the persisted view: drop the shared
+    # 'none'-merge cache so the next 'none' reader rebuilds from the new blob.
+    _STATE_SAVE_REV[0] += 1
     # Pass 1 completion recovery: a stale whole-state save must not erase a
     # newer player recovery decision. Only tasks with newer intervention
     # history are protected; ordinary saves pass through unchanged.
