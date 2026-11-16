@@ -541,8 +541,14 @@ def _rag_search_sql(qvec, k, min_score, sources, village):
            'ORDER BY score DESC, ref ASC LIMIT ?')
     try:
         with _db() as conn:
+            # Placeholder pairing: SELECT score ?; sources ?s; village ?;
+            # WHERE score ?; >= ?; LIMIT ?. (An extra qlit here meant every
+            # live query failed with 'not all arguments converted' and --
+            # before the None-fallback fix above -- silently flipped the
+            # tank onto the 3.5 GB row cache. CI never saw it: sqlite stands
+            # the SQL path down, so the bug only fired on Postgres.)
             rows = conn.execute(sql, tuple([qlit] + args
-                                           + [qlit, min_score, qlit, k])
+                                           + [qlit, min_score, k])
                                 ).fetchall()
     except Exception as e:
         # Transient Postgres failure while the SQL scorer is the expected

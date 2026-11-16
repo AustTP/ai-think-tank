@@ -565,3 +565,79 @@ class SqlPathMemoryContract(unittest.TestCase):
         self.assertEqual(len(hits), 1)
         self.assertEqual(serve._RAG_SEARCH_CACHE, {})
         self.assertEqual(serve._RAG_SEARCH_SNAPSHOT, ())
+
+
+class SqlPlaceholderParity(unittest.TestCase):
+    """The SQL scorer's ? placeholders and its parameter tuple must match
+    exactly. A one-extra-param bug shipped live for a day, unseen by CI
+    (sqlite stands the SQL path down, so the mismatch only fired on the VM's
+    Postgres): every search failed, the None-fallback built the 3.5 GB row
+    cache, and nobody noticed because retrieval still returned hits."""
+
+    def test_placeholder_count_matches_param_count(self):
+        import unittest.mock
+        captured = {}
+
+        class FakeCur:
+            description = [('source',), ('ref',), ('title',), ('room',),
+                           ('snippet',), ('score',)]
+            def execute(self, sql, params=None):
+                captured['sql'] = sql
+                captured['params'] = params
+                return []
+            def fetchall(self):
+                return []
+
+        class FakeConn:
+            def execute(self, sql, params=None):
+                captured['sql'] = sql
+                captured['params'] = params
+                return FakeCur()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True), \
+                unittest.mock.patch('db_backend.is_postgres',
+                                    return_value=True), \
+                unittest.mock.patch.object(serve, '_db', FakeConn):
+            serve._rag_search_sql({5: 0.5, 9: 0.3}, 5, 0.1, ['library'], 'main')
+        n_placeholders = captured['sql'].count('?')
+        self.assertGreater(n_placeholders, 0)
+        self.assertEqual(len(captured['params']), n_placeholders,
+                         f"sql has {n_placeholders} '?' placeholders but "
+                         f"{len(captured['params'])} params were passed")
+
+    def test_village_and_sources_param_order(self):
+        import unittest.mock
+        captured = {}
+
+        class FakeCur:
+            description = [('source',), ('ref',), ('title',), ('room',),
+                           ('snippet',), ('score',)]
+            def fetchall(self):
+                return []
+
+        class FakeConn:
+            def execute(self, sql, params=None):
+                captured['params'] = params
+                return FakeCur()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True), \
+                unittest.mock.patch('db_backend.is_postgres',
+                                    return_value=True), \
+                unittest.mock.patch.object(serve, '_db', FakeConn):
+            serve._rag_search_sql({7: 0.4}, 3, 0.2, ['library', 'tasks'],
+                                  'main')
+        params = captured['params']
+        # qlit, source1, source2, village, qlit, min_score, limit
+        self.assertEqual(params[0], serve._rag_sv_literal({7: 0.4}))
+        self.assertEqual(params[1:3], ('library', 'tasks'))
+        self.assertEqual(params[3], 'main')
+        self.assertEqual(params[5], 0.2)
+        self.assertEqual(params[6], 3)
