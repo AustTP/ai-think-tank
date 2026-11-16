@@ -360,19 +360,34 @@ async def _ws_collector_loop(sid):
     live registry on every reconnect, resolves the credential (if any),
     subscribes, and ingests extracted frames into the service buffer. The stall
     watchdog forces a reconnect when a subscribed-but-silent connection sits
-    idle (observed live after rapid reconnects throttled the IP)."""
+    idle (observed live after rapid reconnects throttled the IP).
+
+    Reconnect backoff DOUBLES per failed cycle (a stall, a drop, a failed
+    handshake) up to 10 min, and resets to the spec base only when a real
+    frame is ingested. Fixed 15s reconnects are the exact failure mode the
+    2026-11-16 36h log review caught: the collector reconnected every ~2.5
+    min for days, which is what keeps AISStream's per-key/IP reconnect
+    throttle tripped (their side accepts the handshake and then sends zero
+    frames -- connect storm = permanent throttle), while Kraken silently
+    dropped and reconnected every ~1-2 min. A healthy feed gets data within
+    seconds and never leaves the base backoff."""
     import websockets
     import serve as _serve
+    base_backoff = None
+    wait_s = None
     while True:
         spec = _serve._WS_FEEDS.get(sid) or {}
         ws = spec.get('ws') or {}
         url = ws.get('url') or ''
         stall = float(ws.get('stall_timeout_s') or 90)
-        backoff = float(ws.get('reconnect_backoff_s') or 15)
+        base_backoff = float(ws.get('reconnect_backoff_s') or 15)
+        if wait_s is None:
+            wait_s = base_backoff
         open_timeout = float(ws.get('open_timeout_s') or 15)
         buf = _serve._WS_BUFFERS.setdefault(sid, {'latest': {}, 'history': [],
                                                   'status': {'connected': False, 'last_error': '',
                                                              'connected_at': 0, 'last_tick_at': 0}})
+        got_frame = False
         try:
             checkpoint = _serve.get_collector_checkpoint(sid)
             if checkpoint:
@@ -389,7 +404,8 @@ async def _ws_collector_loop(sid):
             if err:
                 buf['status'].update(connected=False, last_error=err)
                 print(f'[ws:{sid}] credential error: {err}', flush=True)
-                await asyncio.sleep(backoff)
+                await asyncio.sleep(wait_s)
+                wait_s = min(wait_s * 2, 600)
                 continue
             payload = _serve._ws_subscribe_payload(ws, token)
             async with websockets.connect(
@@ -404,7 +420,12 @@ async def _ws_collector_loop(sid):
                     except asyncio.TimeoutError:
                         print(f'[ws:{sid}] no data for {stall}s; reconnecting', flush=True)
                         break
-                    except Exception:  # noqa: BLE001 -- ConnectionClosed et al: reconnect
+                    except Exception as drop:  # noqa: BLE001 -- ConnectionClosed et al: reconnect
+                        # Named and logged: this break was silent for months,
+                        # which is why Kraken's ~2-min reconnect churn was
+                        # invisible in the 36h review until the connect-line
+                        # timestamps gave it away.
+                        print(f'[ws:{sid}] connection lost ({type(drop).__name__}); reconnecting', flush=True)
                         break
                     try:
                         data = json.loads(raw)
@@ -413,11 +434,20 @@ async def _ws_collector_loop(sid):
                     topic, fields, full = _serve._ws_extract_frame(ws, data)
                     if topic is None:
                         continue
+                    got_frame = True
                     await asyncio.to_thread(_serve._ws_ingest, sid, topic, fields, full)
         except Exception as e:  # noqa: BLE001 -- a drop/backoff and retry is the whole point
             buf['status'].update(connected=False, last_error=str(e)[:200])
             print(f'[ws:{sid}] collector error: {e}', flush=True)
-            await asyncio.sleep(backoff)
+            await asyncio.sleep(wait_s)
+            wait_s = min(wait_s * 2, 600)
+            continue
+        if got_frame:
+            wait_s = base_backoff
+        else:
+            print(f'[ws:{sid}] reconnecting in {int(wait_s)}s (no frames this cycle)', flush=True)
+        await asyncio.sleep(wait_s)
+        wait_s = base_backoff if got_frame else min(wait_s * 2, 600)
 
 
 async def _ws_supervisor_loop():
