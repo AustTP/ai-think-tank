@@ -624,14 +624,32 @@ async def _sim_loop():
             print(f'[sim] email drain error: {e!r}', flush=True)
 
 
+import threading as _drain_threading
+
+_DRAIN_GATE_LOCK = _drain_threading.Lock()
+_DRAIN_BUSY = False
+
+
 def _drain_emails_from_db():
     """Load state, drain its emailOutbox via the serve sender, save. Runs on its
     own thread (not the tick) so SMTP latency doesn't block the sim. Reads the
-    same authoritative DB row, so it sees whatever the tick last persisted."""
+    same authoritative DB row, so it sees whatever the tick last persisted.
+
+    One drain at a time (2026-11-15): when provider calls push a tick past the
+    watchdog threshold, the loop is recycled and every recycle used to leave an
+    orphaned drain queued on _STATE_LOCK -- five stacked drains, each one full
+    ~400 MB state parse behind a slow writer, sawtoothed the RSS into the
+    cgroup kill (boot 52709 stack dump). A skipped drain is harmless: the
+    outbox lives in the same DB row the next drain reads."""
+    global _DRAIN_BUSY
     try:
         import serve
     except Exception:
         return []
+    with _DRAIN_GATE_LOCK:
+        if _DRAIN_BUSY:
+            return []
+        _DRAIN_BUSY = True
     try:
         state = serve._state_begin()
         if not state:
@@ -650,6 +668,8 @@ def _drain_emails_from_db():
         return results
     finally:
         serve._state_abort()
+        with _DRAIN_GATE_LOCK:
+            _DRAIN_BUSY = False
 
 
 # ---------------------------------------------------------------------------

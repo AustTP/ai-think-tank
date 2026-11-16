@@ -327,6 +327,25 @@ class SmallHelpers(SimIsolation):
         self.assertEqual(state['emailOutbox'], [])
         save.assert_called_once()
 
+    def test_drain_emails_skips_when_one_is_already_pending(self):
+        # One drain at a time: when provider calls slow a tick past the
+        # watchdog threshold, the recycled loop used to stack orphaned drains
+        # on the state lock (each a full state parse) until the RSS hit the
+        # cgroup kill. A pending drain now makes every other drain a no-op.
+        with unittest.mock.patch.object(sim, '_DRAIN_BUSY', True), \
+             unittest.mock.patch('serve._state_begin') as begin, \
+             unittest.mock.patch('serve._state_abort') as abort:
+            self.assertEqual(sim._drain_emails_from_db(), [])
+            begin.assert_not_called()
+            abort.assert_not_called()
+
+    def test_drain_emails_releases_the_gate_after_completing(self):
+        state = {'emailOutbox': []}
+        with unittest.mock.patch('serve.get_state_from_db',
+                                 return_value=state):
+            self.assertEqual(sim._drain_emails_from_db(), [])
+        self.assertFalse(sim._DRAIN_BUSY)
+
     def test_drain_email_outbox_sync_send_raises(self):
         state = {'emailOutbox': [{'kind': 'x', 'subject': 's', 'body': 'b'}]}
         with unittest.mock.patch('serve.send_player_email_sync',
