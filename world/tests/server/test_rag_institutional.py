@@ -497,3 +497,71 @@ class DuplicateRefs(unittest.TestCase):
         sources = {h['source'] for h in hits if h['ref'] == 'task-dupX'}
         self.assertIn('deliverable', sources)
         self.assertIn('hybrid', sources)
+
+
+class SqlPathMemoryContract(unittest.TestCase):
+    """2026-11-16 tracemalloc profile on the VM: the in-process row cache
+    held ~3.5 GB (a parsed sparse vector per doc) because ONE transient
+    Postgres failure returned None from the SQL scorer and silently flipped
+    retrieval onto the full-table fallback, which retains the cache for the
+    life of the process. Contract: on a Postgres box the row cache is never
+    built (a DB blip scores no hits for that one query instead), and a
+    cache that exists anyway is released the moment the SQL scorer serves."""
+
+    def test_pg_query_failure_returns_empty_and_never_builds_cache(self):
+        import contextlib
+        import unittest.mock
+        _wipe()
+        with open(os.path.join(serve.LIBRARY_DIR, 'boom.md'), 'w') as f:
+            f.write('Backoff storms meet the retry budget.\n')
+        serve._rag_index_pass(budget=10)
+
+        @contextlib.contextmanager
+        def broken_db():
+            raise RuntimeError('db down')
+            yield
+
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True), \
+                unittest.mock.patch('db_backend.is_postgres',
+                                    return_value=True), \
+                unittest.mock.patch.object(serve, '_db', broken_db):
+            hits = serve._rag_search('backoff storms')
+        self.assertEqual(hits, [])
+        self.assertEqual(serve._RAG_SEARCH_CACHE, {})
+        self.assertEqual(serve._RAG_SEARCH_SNAPSHOT, ())
+
+    def test_rows_sync_refuses_to_build_on_sql_path(self):
+        import contextlib
+        import unittest.mock
+
+        @contextlib.contextmanager
+        def forbidden_db():
+            raise AssertionError('full-table load attempted on SQL path')
+            yield
+
+        serve._RAG_SEARCH_CACHE.clear()
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True), \
+                unittest.mock.patch('db_backend.is_postgres',
+                                    return_value=True), \
+                unittest.mock.patch.object(serve, '_db', forbidden_db):
+            rows = serve._rag_search_rows_sync()
+        self.assertEqual(rows, ())
+        self.assertEqual(serve._RAG_SEARCH_CACHE, {})
+
+    def test_sql_success_releases_a_prebuilt_cache(self):
+        import unittest.mock
+        serve._RAG_SEARCH_CACHE['stale-doc'] = ('library', 'x', 't', 'r',
+                                                None, 'snip', {1: 0.5}, 1.0)
+        with unittest.mock.patch.object(
+                serve, '_RAG_SEARCH_SNAPSHOT', (object(),)), \
+                unittest.mock.patch.object(serve, '_rag_embed',
+                                           return_value=[0.1, 0.2]), \
+                unittest.mock.patch.object(
+                    serve, '_rag_search_sql',
+                    return_value=[{'source': 'library', 'ref': 'x',
+                                   'title': 't', 'room': 'r', 'score': 0.9,
+                                   'snippet': 's'}]):
+            hits = serve._rag_search('anything')
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(serve._RAG_SEARCH_CACHE, {})
+        self.assertEqual(serve._RAG_SEARCH_SNAPSHOT, ())

@@ -375,6 +375,23 @@ _RAG_SEARCH_CACHE = {}            # ref -> cached (parsed) row tuple
 _RAG_SEARCH_SNAPSHOT = ()         # immutable reader-facing snapshot
 _RAG_SEARCH_STATE = {'count': -1, 'max_ts': 0.0}
 _RAG_SEARCH_LOCK = threading.Lock()
+_RAG_SQL_FAIL_LAST_LOG = 0.0
+
+
+def _rag_release_row_cache():
+    """Free the in-process parsed-index cache (the 2026-11-16 tracemalloc
+    profile measured it at ~3.5 GB retained on the VM: every doc's parsed
+    sparse vector plus its row tuple). Only the sqlite/fallback path needs
+    this cache; once the SQL scorer is serving queries, holding it is pure
+    waste. Cheap O(1) check per search; the actual clear runs once."""
+    if _RAG_SEARCH_CACHE or _RAG_SEARCH_SNAPSHOT:
+        with _RAG_SEARCH_LOCK:
+            _RAG_SEARCH_CACHE.clear()
+            globals()['_RAG_SEARCH_SNAPSHOT'] = ()
+            _RAG_SEARCH_STATE['count'] = -1
+            _RAG_SEARCH_STATE['max_ts'] = 0.0
+        print('[rag] released in-process row cache (SQL scorer is serving)',
+              flush=True)
 
 
 def _rag_search_rows_sync():
@@ -392,6 +409,18 @@ def _rag_search_rows_sync():
     chunks, refs gone from the table are dropped from the cache, and an
     unchanged index costs one COUNT/MAX probe per query."""
     global _RAG_SEARCH_SNAPSHOT
+    # Never build the giant in-process cache on a Postgres box where the SQL
+    # scorer is the engine: the cache holds a parsed sparse vector per doc
+    # (~3.5 GB at the VM's index size, measured 2026-11-16). It belongs to
+    # the sqlite/fallback path only.
+    try:
+        import db_backend as _dbm
+        if _RAG_PGVECTOR_OK and _dbm.is_postgres():
+            print('[rag] row cache requested on the SQL path -- refusing to '
+                  'build it (searches score in Postgres)', flush=True)
+            return ()
+    except Exception:
+        pass
     with _db() as conn:
         count, max_ts = conn.execute(
             'SELECT COUNT(*), COALESCE(MAX(updated_at), 0) FROM '
@@ -515,8 +544,21 @@ def _rag_search_sql(qvec, k, min_score, sources, village):
             rows = conn.execute(sql, tuple([qlit] + args
                                            + [qlit, min_score, qlit, k])
                                 ).fetchall()
-    except Exception:
-        return None
+    except Exception as e:
+        # Transient Postgres failure while the SQL scorer is the expected
+        # engine: return [] (this query scores nothing) rather than None,
+        # because None silently flips the caller onto the in-process row
+        # cache -- whose first build loads the whole rag_index and retains
+        # ~3.5 GB of parsed vectors for the life of the process (measured
+        # on the VM 2026-11-16). Retrieval misses one query during a DB
+        # blip; memory never balloons. Log rate-limited.
+        global _RAG_SQL_FAIL_LAST_LOG
+        now = time.time()
+        if now - _RAG_SQL_FAIL_LAST_LOG > 300:
+            _RAG_SQL_FAIL_LAST_LOG = now
+            print(f'[rag] sql scoring failed, returning no hits this query '
+                  f'(not falling back to the row cache): {e}', flush=True)
+        return []
     return [{'source': s, 'ref': r, 'title': t, 'room': ro,
              'score': round(float(sc), 4), 'snippet': sn}
             for s, r, t, ro, sn, sc in rows]
@@ -540,6 +582,9 @@ def _rag_search(query, k=5, min_score=_RAG_MIN_SCORE, sources=None,
     except Exception:
         sql_hits = None
     if sql_hits is not None:
+        # The SQL scorer just served a query: the sqlite-era row cache is
+        # dead weight -- release it if an earlier fallback ever built one.
+        _rag_release_row_cache()
         return sql_hits
     try:
         rows = _rag_search_rows_sync()
