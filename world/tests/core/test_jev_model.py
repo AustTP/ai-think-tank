@@ -27,6 +27,14 @@ class JevModelSetting(unittest.TestCase):
             serve,
             DB_PATH=os.path.join(self.tmp, 'test.db'),
             THINK_TANK_DIR=self.tmp,
+            # Hermetic resolver: an ambient OPENROUTER_API_KEY (local dev)
+            # lets an earlier test's lifespan watchdog latch the real-account
+            # credits pause into module state, which the spend-gate filter
+            # then honors. Pin all three gate inputs so these tests verify
+            # resolver precedence, never the environment's wallet.
+            _credits_remaining_cached=lambda: None,
+            credits_pause_active=lambda: False,
+            _lane_cap_exceeded=lambda band: False,
         )
         self._cm.start()
         serve.init_db()
@@ -79,6 +87,15 @@ class JevModelEndpoint(unittest.TestCase):
             # during shutdown. No live network, no real credentials.
             TELEGRAM_BOT_TOKEN=None,
             TELEGRAM_ALLOWED_CHAT_IDS=[],
+            # Same hermeticity as JevModelSetting: with an ambient
+            # OPENROUTER_API_KEY, the lifespan's credits watchdog fetches the
+            # REAL balance and latches the paid-floor pause into module state
+            # (in-process, surviving the temp-DB teardown), and the spend gate
+            # then filters the chain to []. Pin the gate inputs so endpoint
+            # tests test the endpoint, not the environment's wallet.
+            _credits_remaining_cached=lambda: None,
+            credits_pause_active=lambda: False,
+            _lane_cap_exceeded=lambda band: False,
         )
         self._cm.start()
         serve.init_db()
@@ -121,6 +138,83 @@ class JevModelEndpoint(unittest.TestCase):
             c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
             r = c.post('/api/jev/model', json={'model': '   '})
         self.assertEqual(r.status_code, 400)
+
+
+class JevModelSpendGateEmptyChain(unittest.TestCase):
+    """The 2026-11-16 VM outage: below the free-credit floor (or with spend
+    paused) the chain filter keeps only the Colab standby / freepool routes.
+    The VM runs neither, so the chain filtered to [] and both _jev_model()
+    ([0] on an empty list) and the /api/jev/model endpoint (chain[0]) raised
+    IndexError -- 14 crashes in the tier-refresh/failover loops and 43 ASGI
+    500s on the status poll. The gate is a 'nothing may serve' state, not a
+    crash: _jev_model returns '', the decision call fails closed (taped,
+    typed exception), the endpoint reports the empty chain."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='jev-model-gate-')
+        self._cm = unittest.mock.patch.multiple(
+            serve,
+            DB_PATH=os.path.join(self.tmp, 'test.db'),
+            THINK_TANK_DIR=self.tmp,
+        )
+        self._cm.start()
+        serve.init_db()
+
+    def tearDown(self):
+        self._cm.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _gate_empty(self):
+        # Force the real spend-gate branch: credits far below the floor,
+        # no Colab standby forward, no freepool route -- exactly the VM's
+        # shape, so the filter at _decision_model_chain leaves [].
+        return unittest.mock.patch.multiple(
+            serve,
+            _credits_remaining_cached=lambda: 0.0,
+            _credits_free_floor=lambda: 1e9,
+            _colab_standby_enabled=lambda: False,
+            _freepool_route_for_band=lambda band, force=False: None,
+        )
+
+    def test_resolver_returns_empty_string_not_indexerror(self):
+        serve._set_setting('jev_model', 'typesafe/jev-2.0')
+        with self._gate_empty():
+            self.assertEqual(serve._decision_model_chain(), [])
+            self.assertEqual(serve._jev_model(), '')
+
+    def test_decision_call_fails_closed_with_tape_row(self):
+        with self._gate_empty(), \
+             unittest.mock.patch.object(serve, '_think_tank_spend_cap_exceeded',
+                                        return_value=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                serve._call_openrouter_decision_sync('', {'x': 1}, ['q'])
+        self.assertIn('spend gate', str(ctx.exception))
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT model, ok, raw FROM decision_tape ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row, 'the lost decision must land on the tape')
+        self.assertEqual(row[1], 0)
+        self.assertIn('no decision model may serve', row[2])
+
+    def test_endpoint_reports_empty_chain_200(self):
+        from starlette.testclient import TestClient
+        with unittest.mock.patch.multiple(
+                serve,
+                TELEGRAM_BOT_TOKEN=None,
+                TELEGRAM_ALLOWED_CHAT_IDS=[],
+                verify_session=lambda *a, **k: True,
+                _decision_model_chain=lambda: [],
+                _jev_model=lambda: '',
+                _jev_judge_model=lambda: None,
+                _escalation_judge_drift_summary=lambda: {}):
+            with TestClient(serve.app) as c:
+                r = c.get('/api/jev/model')
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIsNone(body['primary'])
+        self.assertEqual(body['chain'], [])
+        self.assertEqual(body['slugs'], {})
 
 
 if __name__ == '__main__':

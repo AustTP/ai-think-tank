@@ -708,9 +708,29 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     criteria = criteria if criteria is not None else ''
     kind = explicit_kind or _decision_kind(prompt)
     chain = _decision_model_chain()
-    if model not in chain:
-        # An explicit model (tests, forwarders) leads the chain, fallbacks follow.
+    if model and model not in chain:
+        # An explicit model (tests, forwarders) leads the chain, fallbacks
+        # follow. An empty model (the spend-gated _jev_model) must NOT
+        # re-enter the chain here, or it would defeat the empty-chain
+        # fail-closed guard below and attempt a request with slug ''.
         chain = [model] + [m for m in chain if m != model]
+    if not chain:
+        # The spend gate emptied the chain (credits below the free floor, or
+        # spend paused/lane-capped) AND the caller had no explicit model:
+        # nothing may serve right now. Tape the loss and fail closed with a
+        # typed exception -- callers own the recovery (deterministic
+        # fallback), the same contract as every other decision failure.
+        # Before this guard the loop fell through to `raise last_error` with
+        # last_error None (or the misleading 'all calls failed'), and
+        # _jev_model() callers crashed upstream with IndexError instead.
+        _append_decision_tape(
+            kind, '', prompt, criteria,
+            None, None, None,
+            {'error': 'no decision model may serve: spend gate active and no standby/freepool route'},
+            False,
+            trace_id=trace_id, meta=tape_meta,
+        )
+        raise RuntimeError('no decision model available: spend gate active and no standby/freepool route')
     # An identical request answered before is served from the cache: no network,
     # no spend (so it also works past the spend cap), still taped as a cached
     # decision. The measured exact-repeat rate is what justified this. The
@@ -947,8 +967,15 @@ def _jev_model():
     fresh at call time like before: DB `settings` row (which may now be a
     comma-separated FAILOVER chain) > env/default constant. Returns the head
     of _decision_model_chain() so every existing call site keeps using the
-    primary slug unchanged while the chain handles failover internally."""
-    return _decision_model_chain()[0]
+    primary slug unchanged while the chain handles failover internally. The
+    spend gate can legitimately filter the chain to EMPTY (credits below the
+    free floor, or spend paused/lane-capped with no Colab standby and no
+    freepool route alive -- the VM runs neither). That is a "nothing may
+    serve right now" state, not a crash: returns '' and the decision call
+    fails closed (taped ok=0, typed exception, callers keep their own
+    recovery) instead of raising IndexError from [0] on an empty list."""
+    chain = _decision_model_chain()
+    return chain[0] if chain else ''
 
 
 def _jev_openrouter_slug():

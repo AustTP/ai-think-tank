@@ -9,13 +9,18 @@ async def jev_model_get():
     # the leader over to a fallback is the whole point of the failover --
     # visible here instead of silently degraded).
     chain = _decision_model_chain()
-    if len(chain) <= 1:
+    # The spend gate can leave the chain empty (credits below the free floor
+    # or paused with no Colab standby / freepool route alive): report the
+    # empty chain honestly instead of crashing the endpoint with IndexError.
+    if len(chain) == 1:
         states = {chain[0]: 'sole'}
-    else:
+    elif chain:
         states = {slug: ('broken' if is_model_circuit_broken(slug) else 'available')
                   for slug in chain}
+    else:
+        states = {}
     judge = _jev_judge_model()
-    return JSONResponse({'model': _jev_model(), 'primary': chain[0], 'chain': chain,
+    return JSONResponse({'model': _jev_model(), 'primary': chain[0] if chain else None, 'chain': chain,
                          'slugs': states, 'fallback': JEV_MODEL,
                          'judge_model': judge,
                          'judge_drift': _escalation_judge_drift_summary()})
