@@ -490,6 +490,7 @@ class RssPollLoopTest(unittest.TestCase):
         status = {'a': {'last_fetch_at': 0}, 'b': {'last_fetch_at': 1000}}
         with mock.patch.object(serve, '_RSS_FEEDS', feeds), \
              mock.patch.object(serve, '_RSS_STATUS', status), \
+             mock.patch.object(serve, '_load_rss_feeds', lambda: None), \
              mock.patch.object(serve, '_fetch_feed_sync',
                                side_effect=[['item'], RuntimeError('bad')]), \
              mock.patch.object(serve, '_rss_ingest', return_value=1), \

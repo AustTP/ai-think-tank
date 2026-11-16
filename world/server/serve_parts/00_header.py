@@ -217,6 +217,7 @@ from integrations.rss import (  # noqa: E402,F401
     _rss_recent,
     _seed_rss_feeds_if_empty,
     _validate_rss_feed_spec,
+    set_rss_feed_temp_window,
 )
 # The generic WebSocket feed collector (see DESIGN.md "WebSocket feeds").
 # Kraken and AISStream are registered data, not code; the descriptor language
@@ -246,6 +247,7 @@ from server.ws import (  # noqa: E402,F401
     _ws_substitute,
     _ws_subscribe_payload,
     _ws_supervisor_loop,
+    set_ws_feed_temp_window,
 )
 # Inbound webhook intake (see DESIGN.md "Inbound loom requests"). The channel
 # registry, goal formatter, self-activity gate, and consumer loop live in

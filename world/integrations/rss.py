@@ -216,13 +216,22 @@ def _rss_feed_spec_to_row(spec, status='active', proposed_by=None):
 def _rss_feed_row_to_spec(row):
     return {'id': row['id'], 'name': row['name'], 'url': row['url'],
             'interval_s': int(row['interval_s'] or 600), 'status': row['status'],
-            'proposed_by': row.get('proposed_by')}
+            'proposed_by': row.get('proposed_by'),
+            'temp_until_s': row.get('temp_until_s'),
+            'temp_granted_by': row.get('temp_granted_by')}
 
 
 def _load_rss_feeds():
     """Load the active rss_feeds rows into the live registry. Fail closed like
     _load_api_services: on any DB error the registry stays empty (the poll loop
-    then has nothing to fetch, never a crash)."""
+    then has nothing to fetch, never a crash).
+
+    A row also serves while it holds an unexpired TEMP window
+    (temp_until_s > now), whatever its permanent status -- the same bounded
+    agent-granted access the ws registry honors (<=24h, audited, see
+    set_rss_feed_temp_window). The poll loop reloads the registry each cycle
+    (<=30s), so a grant goes live and an expired window stops serving without
+    a restart."""
     import serve as _serve
     _serve._RSS_FEEDS = {}
     _serve._RSS_FEEDS_LOAD_ERROR = None
@@ -230,7 +239,10 @@ def _load_rss_feeds():
         with _serve._db() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, name, url, interval_s, status, proposed_by FROM rss_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
+                "SELECT id, name, url, interval_s, status, proposed_by, temp_until_s, temp_granted_by "
+                "FROM rss_feeds WHERE status = 'active' "
+                "OR (temp_until_s IS NOT NULL AND temp_until_s > ?)"  # nosec B608 -- fixed internal columns
+                " ORDER BY id", (time.time(),)
             ).fetchall()
     except Exception as e:
         _serve._RSS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
@@ -240,6 +252,42 @@ def _load_rss_feeds():
         spec = _serve._rss_feed_row_to_spec(dict(row))
         feeds[spec['id']] = spec
     _serve._RSS_FEEDS = feeds
+
+
+def set_rss_feed_temp_window(feed_id, hours, granted_by, purpose=''):
+    """Grant (hours > 0) or clear (hours == 0) a bounded TEMP access window on
+    one rss_feeds row. Mirrors set_ws_feed_temp_window in server/ws.py: the
+    permanent status is never touched, the update is a targeted column UPDATE
+    (never the whole-row upsert), and the live registry reloads immediately so
+    the poll loop picks the change up within one cycle (<=30s). Returns
+    (ok, message)."""
+    import serve as _serve
+    feed_id = str(feed_id or '').strip().lower()
+    if not feed_id:
+        return False, 'feedId is required'
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        return False, 'hours must be a number'
+    if hours < 0 or hours > 24:
+        return False, 'hours must be between 0 and 24 (0 clears the window)'
+    try:
+        with _serve._db() as conn:
+            row = conn.execute('SELECT id FROM rss_feeds WHERE id = ?', (feed_id,)).fetchone()
+            if row is None:
+                return False, f'no feed row "{feed_id}"'
+            until = (time.time() + hours * 3600.0) if hours > 0 else None
+            by = str(granted_by or '') if hours > 0 else None
+            conn.execute(
+                'UPDATE rss_feeds SET temp_until_s = ?, temp_granted_by = ?, updated_at = ? '
+                'WHERE id = ?', (until, by, time.time(), feed_id))
+    except Exception as e:  # noqa: BLE001 -- db hiccup is a result, not a crash
+        return False, f'db unavailable: {e}'
+    _serve._load_rss_feeds()
+    if hours > 0:
+        return True, (f'feed "{feed_id}" temporarily enabled for {hours:g}h '
+                      f'(until ~{time.strftime("%H:%M UTC", time.gmtime(until))})')
+    return True, f'temp window on feed "{feed_id}" cleared'
 
 
 def _seed_rss_feeds_if_empty():
@@ -335,6 +383,10 @@ async def _rss_poll_loop():
     import asyncio
     import serve as _serve
     while True:
+        try:
+            _serve._load_rss_feeds()
+        except Exception:  # noqa: BLE001 -- a reload hiccup keeps the old registry
+            pass
         feeds = dict(_serve._RSS_FEEDS)
         now = time.time()
         for feed_id, feed in feeds.items():

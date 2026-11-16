@@ -412,6 +412,31 @@ AGENT_ASK_TOOLS = [
     {
         'type': 'function',
         'function': {
+            'name': 'manage_feed_access',
+            'description': 'Temporarily enable or disable a registered data feed (websocket or RSS) '
+                           'for a bounded window of 1-24 hours, or end an active temp window early. '
+                           'Use this when a task needs live data the tank is not currently collecting '
+                           '(e.g. kraken quotes, aisstream ship positions, an RSS feed a director '
+                           'removed). The permanent registry status is never changed -- the feed '
+                           'automatically goes dark again when the window expires. Every grant is '
+                           'logged with your purpose, so state WHY you need it.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'kind': {'type': 'string', 'enum': ['ws', 'rss'],
+                             'description': 'ws for a websocket feed (kraken, aisstream), rss for an RSS feed.'},
+                    'feed_id': {'type': 'string', 'description': 'Feed id, e.g. kraken, aisstream, usgs_quakes.'},
+                    'hours': {'type': 'number',
+                              'description': 'Window length 1-24. Pass 0 to end a temp window early.'},
+                    'purpose': {'type': 'string', 'description': 'Why the feed is needed now (logged).'},
+                },
+                'required': ['kind', 'feed_id', 'hours'],
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'read_live_feed',
             'description': 'Read live buffered records from ANY registered real-time feed service '
                            '(operators add feeds at runtime; the registry is seeded with "kraken" '

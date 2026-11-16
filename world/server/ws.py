@@ -72,12 +72,65 @@ def _ws_feed_row_to_spec(row):
             'credential': {'type': row.get('credential_type') or 'none',
                            'key': row.get('credential_key'),
                            'key2': row.get('credential_key2')},
-            'ws': ws, 'status': row['status'], 'proposed_by': row.get('proposed_by')}
+            'ws': ws, 'status': row['status'], 'proposed_by': row.get('proposed_by'),
+            'temp_until_s': row.get('temp_until_s'),
+            'temp_granted_by': row.get('temp_granted_by')}
+
+
+def set_ws_feed_temp_window(feed_id, hours, granted_by, purpose=''):
+    """Grant (hours > 0) or clear (hours == 0) a bounded TEMP access window on
+    one ws_feeds row. The permanent status is never touched: a 'removed' feed
+    serves only while its window is unexpired, and an 'active' feed is
+    unaffected when the window lapses. Targeted column UPDATE -- deliberately
+    NOT _ws_feed_upsert, whose ON CONFLICT rewrites the whole row (the remove
+    flow deliberately clobbers ws_spec with an invalid stub; a temp grant must
+    preserve the original descriptor so the feed can come back intact).
+
+    Returns (ok, message): ok False with a caller-safe message when the feed
+    row does not exist. Reloads the live registry so the supervisor's next
+    10s reconciliation starts or stops the collector. Audit logging is the
+    caller's job (endpoint/tool) so HTTP and tool callers stamp the same
+    action names."""
+    import serve as _serve
+    feed_id = str(feed_id or '').strip().lower()
+    if not feed_id:
+        return False, 'feedId is required'
+    try:
+        hours = float(hours)
+    except (TypeError, ValueError):
+        return False, 'hours must be a number'
+    if hours < 0 or hours > 24:
+        return False, 'hours must be between 0 and 24 (0 clears the window)'
+    try:
+        with _serve._db() as conn:
+            row = conn.execute('SELECT id FROM ws_feeds WHERE id = ?', (feed_id,)).fetchone()
+            if row is None:
+                return False, f'no feed row "{feed_id}"'
+            until = (time.time() + hours * 3600.0) if hours > 0 else None
+            by = str(granted_by or '') if hours > 0 else None
+            conn.execute(
+                'UPDATE ws_feeds SET temp_until_s = ?, temp_granted_by = ?, updated_at = ? '
+                'WHERE id = ?', (until, by, time.time(), feed_id))
+    except Exception as e:  # noqa: BLE001 -- db hiccup is a result, not a crash
+        return False, f'db unavailable: {e}'
+    _serve._load_ws_feeds()
+    if hours > 0:
+        return True, (f'feed "{feed_id}" temporarily enabled for {hours:g}h '
+                      f'(until ~{time.strftime("%H:%M UTC", time.gmtime(until))})')
+    return True, f'temp window on feed "{feed_id}" cleared'
 
 
 def _load_ws_feeds():
     """Load the active ws_feeds rows into the live _WS_FEEDS registry. Fail
-    closed: on DB error the registry stays empty (no collectors start)."""
+    closed: on DB error the registry stays empty (no collectors start).
+
+    A row also serves while it holds an unexpired TEMP window
+    (temp_until_s > now), whatever its permanent status: agents grant
+    themselves bounded access (<=24h, audited via /api/feeds/access and the
+    manage_feed_access tool) without touching the permanent status a director
+    approved. The supervisor reloads this registry every cycle, so a grant
+    goes live within ~10s and an expired window stops serving within ~10s --
+    no restart."""
     import serve as _serve
     _serve._WS_FEEDS = {}
     _serve._WS_FEEDS_LOAD_ERROR = None
@@ -85,8 +138,11 @@ def _load_ws_feeds():
         with _serve._db() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT id, name, credential_type, credential_key, credential_key2, ws_spec, status, proposed_by "
-                "FROM ws_feeds WHERE status = 'active'"  # nosec B608 -- fixed internal columns
+                "SELECT id, name, credential_type, credential_key, credential_key2, ws_spec, "
+                "status, proposed_by, temp_until_s, temp_granted_by "
+                "FROM ws_feeds WHERE status = 'active' "
+                "OR (temp_until_s IS NOT NULL AND temp_until_s > ?)"  # nosec B608 -- fixed internal columns
+                " ORDER BY id", (time.time(),)
             ).fetchall()
     except Exception as e:
         _serve._WS_FEEDS_LOAD_ERROR = f'db unavailable: {e}'
@@ -454,9 +510,17 @@ async def _ws_supervisor_loop():
     """Reconcile running collector tasks with the live _WS_FEEDS registry every
     few seconds: spawn collectors for newly-active feeds, cancel collectors for
     removed/denied feeds, and restart a collector whose spec fingerprint changed
-    (an operator's edit goes live without a restart)."""
+    (an operator's edit goes live without a restart). The registry itself is
+    re-read from the DB each cycle: a temp access window granted via
+    /api/feeds/access goes live within ~10s, and an expired window stops its
+    collector within ~10s -- no restart, no extra loop. One tiny SELECT per
+    cycle against a registry-sized table."""
     import serve as _serve
     while True:
+        try:
+            _serve._load_ws_feeds()
+        except Exception:  # noqa: BLE001 -- a reload hiccup keeps the old registry
+            pass
         feeds = _serve._WS_FEEDS
         tasks = _serve._WS_TASKS
         for sid, spec in list(feeds.items()):

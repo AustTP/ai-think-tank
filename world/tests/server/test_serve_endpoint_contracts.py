@@ -630,6 +630,7 @@ class WsSupervisorLoopTest(unittest.TestCase):
             raise asyncio.CancelledError()
         with mock.patch.dict(serve.__dict__, {'_WS_FEEDS': {},
                                               '_WS_TASKS': tasks}), \
+             mock.patch.object(serve, '_load_ws_feeds', lambda: None), \
              mock.patch('asyncio.sleep', side_effect=fake_sleep):
             with self.assertRaises(asyncio.CancelledError):
                 asyncio.run(serve._ws_supervisor_loop())

@@ -1049,7 +1049,9 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'active',
             proposed_by TEXT,
             created_at REAL,
-            updated_at REAL
+            updated_at REAL,
+            temp_until_s REAL,
+            temp_granted_by TEXT
         )''')
 
         # WebSocket feed registry -- same operator-managed registry idea as
@@ -1067,8 +1069,25 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'active',
             proposed_by TEXT,
             created_at REAL,
-            updated_at REAL
+            updated_at REAL,
+            temp_until_s REAL,
+            temp_granted_by TEXT
         )''')
+
+        # Existing registries: add the temp-access columns (agent-granted
+        # bounded feed windows, see set_feed_temp_window / /api/feeds/access).
+        # CREATE TABLE above covers fresh installs; these cover databases born
+        # before the columns existed. SQLite has no ADD COLUMN IF NOT EXISTS,
+        # so each is attempted and a duplicate-column error is swallowed
+        # (same pattern as vote_service's migrations).
+        for _alter in ('ALTER TABLE rss_feeds ADD COLUMN temp_until_s REAL',
+                       'ALTER TABLE rss_feeds ADD COLUMN temp_granted_by TEXT',
+                       'ALTER TABLE ws_feeds ADD COLUMN temp_until_s REAL',
+                       'ALTER TABLE ws_feeds ADD COLUMN temp_granted_by TEXT'):
+            try:
+                conn.execute(_alter)
+            except Exception:  # noqa: BLE001 -- column already exists
+                pass
 
         # Benchmark data-source registry -- the URLs the model-tier refresh
         # fetches external evaluator data from (the Artificial Analysis

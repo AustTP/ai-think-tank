@@ -275,6 +275,37 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             wrapped, _nonce, _tag, instruction = wrap_external_content(
                 raw, 'live crypto market data from the Kraken public ticker')
             return f'{instruction}\n\n{wrapped}'
+        if name == 'manage_feed_access':
+            # Self-service bounded feed access (see /api/feeds/access): an
+            # agent switches a registered feed ON for <=24h (including feeds a
+            # director removed) or ends a temp window early. The permanent
+            # registry status is untouched and the window self-expires; the
+            # supervisor/poll loop applies the change within one cycle. Every
+            # grant lands in action_log with the agent's stated purpose.
+            kind = ((args or {}).get('kind') or '').strip().lower()
+            feed_id = ((args or {}).get('feed_id') or '').strip().lower()
+            hours = (args or {}).get('hours')
+            purpose = ((args or {}).get('purpose') or '').strip()
+            caller = agent_id or 'player'
+            if kind == 'ws':
+                ok, message = set_ws_feed_temp_window(feed_id, hours, caller, purpose)
+            elif kind == 'rss':
+                ok, message = set_rss_feed_temp_window(feed_id, hours, caller, purpose)
+            else:
+                ok, message = False, "kind must be 'ws' or 'rss'"
+            log_action(caller, 'feed_access_granted' if ok and hours not in (0, '0', 0.0) else 'feed_access_cleared' if ok else 'feed_access_denied',
+                       {'kind': kind, 'feedId': feed_id,
+                        'hours': hours if isinstance(hours, (int, float)) else str(hours)[:20],
+                        'purpose': purpose[:200], 'via': f'{kind}:{feed_id}'},
+                       authorized=True)
+            if not ok:
+                wrapped, _nonce, _tag, instruction = wrap_external_content(
+                    f'feed access denied: {message}', 'feed access management result')
+                return f'{instruction}\n\n{wrapped}'
+            raw = message
+            wrapped, _nonce, _tag, instruction = wrap_external_content(
+                raw, 'feed access management result')
+            return f'{instruction}\n\n{wrapped}'
         if name == 'read_live_feed':
             # Generic read of any registered real-time feed's buffer -- new
             # feeds added by operators via /api/ws/* become readable here with

@@ -602,7 +602,7 @@ async def rss_feeds_list(request: Request):
         with _db() as conn:
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(
-                'SELECT id, name, url, interval_s, status, proposed_by, updated_at '
+                'SELECT id, name, url, interval_s, status, proposed_by, temp_until_s, temp_granted_by, updated_at '
                 'FROM rss_feeds ORDER BY id')]
     except Exception as e:  # noqa: BLE001
         return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
@@ -713,7 +713,8 @@ async def ws_feeds_list(request: Request):
         with _db() as conn:
             conn.row_factory = sqlite3.Row
             rows = [dict(r) for r in conn.execute(
-                'SELECT id, name, credential_type, credential_key, ws_spec, status, proposed_by, updated_at '
+                'SELECT id, name, credential_type, credential_key, ws_spec, status, proposed_by, '
+                'temp_until_s, temp_granted_by, updated_at '
                 'FROM ws_feeds ORDER BY id')]
     except Exception as e:  # noqa: BLE001
         return JSONResponse({'error': f'db unavailable: {e}'}, status_code=503)
@@ -721,6 +722,49 @@ async def ws_feeds_list(request: Request):
         if r.get('credential_key'):
             r['credential_key'] = f'{r["credential_key"][:3]}...'
     return JSONResponse({'feeds': rows})
+
+
+@app.post('/api/feeds/access')
+async def feeds_access(request: Request):
+    """Self-service, bounded, audited feed access for the village: grant or
+    clear a TEMP window (<=24h) on a registered ws or rss feed. This is the
+    middle ground between the read tools (always available while a feed
+    serves) and the permanent registry flows (propose/approve/remove, which
+    stay director/admin/player-only): any authenticated agent can switch a
+    feed ON for a bounded window -- including a feed a director previously
+    removed -- and switch it OFF early, every grant logged with its purpose,
+    the permanent status never touched, and the window self-expires. The
+    supervisor/poll loop picks the change up within one reconciliation cycle
+    (~10s ws / ~30s rss); no restart."""
+    body = await request.json()
+    agent_id = (body.get('agentId') or 'player').strip() or 'player'
+    purpose = (body.get('purpose') or '').strip()
+    if not check_rate_limit(agent_id):
+        log_action(agent_id, 'rate_limited', {'endpoint': 'feeds-access'})
+        return JSONResponse({'error': f'Rate limit exceeded -- max {RATE_LIMIT_MAX_CALLS} calls per {RATE_LIMIT_WINDOW_S}s.'}, status_code=429)
+    if not (verify_agent_key(agent_id, request.headers.get('X-Agent-Key')) is True
+            or _require_player_session(request)
+            or _operator_gate(request)[0]):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    kind = (body.get('kind') or '').strip().lower()
+    feed_id = (body.get('feedId') or '').strip().lower()
+    hours = body.get('hours')
+    if kind not in ('ws', 'rss'):
+        return JSONResponse({'error': "kind must be 'ws' or 'rss'"}, status_code=400)
+    if kind == 'ws':
+        ok, message = set_ws_feed_temp_window(feed_id, hours, agent_id, purpose)
+    else:
+        ok, message = set_rss_feed_temp_window(feed_id, hours, agent_id, purpose)
+    if not ok:
+        return JSONResponse({'error': message}, status_code=400)
+    log_action(agent_id, 'feed_access_granted' if (hours or 0) not in (0, '0') else 'feed_access_cleared',
+               {'kind': kind, 'feedId': feed_id,
+                'hours': hours if isinstance(hours, (int, float)) else str(hours)[:20],
+                'purpose': purpose[:200], 'via': f'{kind}:{feed_id}'},
+               authorized=True)
+    status = _feed_registry_status('ws_feeds' if kind == 'ws' else 'rss_feeds', feed_id)
+    return JSONResponse({'ok': True, 'kind': kind, 'feedId': feed_id,
+                         'permanentStatus': status, 'message': message})
 
 
 @app.post('/api/api-call')
