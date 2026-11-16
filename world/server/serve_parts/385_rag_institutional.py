@@ -41,6 +41,28 @@ def _rag_stable_hash(token):
         'big')
 
 
+# pgvector sparsevec (2026-11-16): embeddings gain a native in-DB column
+# (vec_sv) alongside the JSON text, so scoring can move into Postgres and
+# the ~GB in-process parsed-vector cache can retire. sparsevec caps at 1e9
+# declared dimensions; the feature ids are uint32 (md5[:4]), so vectors map
+# into the 1e9 space with a deterministic remainder applied IDENTICALLY to
+# docs and queries -- scoring is unchanged, and with <=400 features per doc
+# the added collision probability is ~1e-4. The column is an accelerator,
+# never load-bearing: sqlite (tests) has no pgvector and simply stores the
+# literal as TEXT; if the extension is missing on Postgres everything
+# keeps working off the JSON column.
+_RAG_SV_DIMS = 1000000000
+
+
+def _rag_sv_literal(dvec):
+    """'{k:w,...}/<dims>' literal for the vec_sv sparsevec column."""
+    if not dvec:
+        return None
+    pairs = ','.join(f'{int(k) % _RAG_SV_DIMS}:{float(w):.8g}'
+                     for k, w in dvec.items())
+    return '{' + pairs + '}/' + str(_RAG_SV_DIMS)
+
+
 def _rag_tokens(text):
     """Lowercased word unigrams (len >= 2) plus character 3-grams, as a
     count vector over stable feature ids."""
@@ -85,6 +107,7 @@ def _rag_embed(text, cap=400):
 
 
 def _rag_ensure_table():
+    _rag_ensure_pgvector()
     with _db() as conn:
         conn.execute('''CREATE TABLE IF NOT EXISTS rag_index (
             doc_id TEXT PRIMARY KEY,
@@ -107,8 +130,36 @@ def _rag_ensure_table():
             'PRAGMA table_info(rag_index)')}
         if 'village_id' not in existing_cols:
             conn.execute('ALTER TABLE rag_index ADD COLUMN village_id TEXT')
+        if 'vec_sv' not in existing_cols:
+            conn.execute('ALTER TABLE rag_index ADD COLUMN vec_sv TEXT')
         conn.execute(
             'CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_index (source)')
+
+
+def _rag_ensure_pgvector():
+    """Ensure the vector extension and the vec_sv column on Postgres, in its
+    OWN transaction: a swallowed failure inside the main schema transaction
+    would poison it (the memory.py idiom). sqlite has no pgvector; anything
+    failing here leaves the JSON column authoritative and just skips the
+    accelerator. Returns True once the column is known present."""
+    global _RAG_PGVECTOR_OK
+    if _RAG_PGVECTOR_OK:
+        return True
+    try:
+        import db_backend as _dbm
+        if not _dbm.is_postgres():
+            return False
+        with _db() as conn:
+            conn.execute('CREATE EXTENSION IF NOT EXISTS vector')
+            conn.execute('ALTER TABLE rag_index ADD COLUMN IF NOT EXISTS '
+                         'vec_sv sparsevec(1000000000)')
+        _RAG_PGVECTOR_OK = True
+        return True
+    except Exception:
+        return False
+
+
+_RAG_PGVECTOR_OK = False
 
 
 def _rag_read_file_text(full):
@@ -197,9 +248,12 @@ def _rag_index_pass(budget=60):
     indexed = skipped = 0
     try:
         with _db() as conn:
-            known = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
-                'SELECT doc_id, content_hash, updated_at, village_id '
-                'FROM rag_index')}
+            if _RAG_PGVECTOR_OK:
+                cols = ('doc_id, content_hash, updated_at, village_id, vec_sv')
+            else:
+                cols = 'doc_id, content_hash, updated_at, village_id'
+            known = {r[0]: tuple(r[1:]) for r in conn.execute(
+                f'SELECT {cols} FROM rag_index')}
     except Exception:
         known = {}
     pending = []
@@ -228,6 +282,23 @@ def _rag_index_pass(budget=60):
                     indexed += 1
                 except Exception:
                     pass
+            if _RAG_PGVECTOR_OK and entry[3] is None:
+                # Backfill the native vector in place (no re-embed): parse
+                # the stored JSON once and store its sparsevec literal. The
+                # hash->1e9 mapping is the same one queries use, so scores
+                # are identical.
+                try:
+                    with _db() as conn:
+                        row = conn.execute(
+                            'SELECT vec FROM rag_index WHERE doc_id = ?',
+                            (doc_id,)).fetchone()
+                        if row and row[0]:
+                            conn.execute(
+                                'UPDATE rag_index SET vec_sv = ? '
+                                'WHERE doc_id = ?',
+                                (_rag_sv_literal(json.loads(row[0])), doc_id))
+                except Exception:
+                    pass
             if entry[1] < now - 7 * 86400:
                 pending.append((0.0, now, doc_id, source, ref, title, room,
                                 village, text, digest))
@@ -254,20 +325,22 @@ def _rag_index_pass(budget=60):
                 grade = None
             outcome = _rag_row_outcome(ref)
         vec = json.dumps(_rag_embed(text))
+        sv = _rag_sv_literal(json.loads(vec))
         with _db() as conn:
             conn.execute(
                 'INSERT INTO rag_index (doc_id, source, ref, title, room, '
-                'village_id, text, vec, grade, outcome, content_hash, '
+                'village_id, text, vec, vec_sv, grade, outcome, content_hash, '
                 'updated_at) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(doc_id) DO UPDATE SET source = excluded.source, '
                 'ref = excluded.ref, title = excluded.title, room = excluded.room, '
                 'village_id = excluded.village_id, '
-                'text = excluded.text, vec = excluded.vec, grade = excluded.grade, '
+                'text = excluded.text, vec = excluded.vec, '
+                'vec_sv = excluded.vec_sv, grade = excluded.grade, '
                 'outcome = excluded.outcome, content_hash = excluded.content_hash, '
                 'updated_at = excluded.updated_at',
-                (doc_id, source, ref, title, room, village, text, vec, grade,
-                 outcome, digest, now))
+                (doc_id, source, ref, title, room, village, text, vec, sv,
+                 grade, outcome, digest, now))
         done += 1
         indexed += 1
     return {'indexed': indexed, 'skipped': skipped,

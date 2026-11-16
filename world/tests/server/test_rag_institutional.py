@@ -397,3 +397,49 @@ class VillageScoping(unittest.TestCase):
         self.assertTrue(serve._rag_search('429 storm triage', village='main'))
         self.assertFalse(serve._rag_search('429 storm triage',
                                            village='winter'))
+
+
+class NativeVectorBackfill(unittest.TestCase):
+    """The pgvector accelerator: every row carries a native sparsevec
+    literal (vec_sv) alongside its JSON, so scoring can move into Postgres
+    and the in-process parsed-vector cache can retire. sqlite stores the
+    literal as plain TEXT -- same code path, no extension needed."""
+
+    def test_sv_literal_maps_and_never_lies(self):
+        self.assertIsNone(serve._rag_sv_literal({}))
+        out = serve._rag_sv_literal({0: 1.0, 1500000000: 0.5})
+        self.assertTrue(out.endswith('/1000000000'))
+        self.assertIn('0:1,', out)
+        self.assertIn('500000000:0.5', out)
+
+    def test_indexing_dual_writes_the_native_vector(self):
+        _wipe()
+        with open(os.path.join(serve.LIBRARY_DIR, 'guide.md'), 'w') as f:
+            f.write('The observatory watches rate limits and 429 storms.\n')
+        serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT vec, vec_sv FROM rag_index WHERE ref = 'guide.md'"
+            ).fetchone()
+        self.assertTrue(row[0])
+        self.assertTrue(row[1].endswith('/1000000000'))
+        # One sparsevec entry per JSON feature, both over the same ids.
+        self.assertEqual(row[1].count(':'),
+                         len(json.loads(row[0])))
+
+    def test_missing_vec_sv_backfilled_in_place(self):
+        _wipe()
+        with open(os.path.join(serve.LIBRARY_DIR, 'runbook.md'), 'w') as f:
+            f.write('Escalation runbook: restore the ledger, then triage.\n')
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', False):
+            serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            conn.execute('UPDATE rag_index SET vec_sv = NULL')
+        with unittest.mock.patch.object(serve, '_RAG_PGVECTOR_OK', True):
+            serve._rag_index_pass(budget=10)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT vec_sv FROM rag_index WHERE ref = 'runbook.md'"
+            ).fetchone()
+        self.assertTrue(row[0])
+        self.assertTrue(row[0].endswith('/1000000000'))
