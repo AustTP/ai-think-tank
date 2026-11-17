@@ -40,7 +40,7 @@ python3 -m pytest world/tests -q
 node world/tests/js_coverage.mjs
 ```
 
-`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 8,832 collected Python tests and a 90% JavaScript coverage floor.
+`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 9,648 collected Python tests and a 90% JavaScript coverage floor.
 
 For restart and recovery evidence, run the failure-injection soak harness:
 
@@ -61,7 +61,7 @@ TANK_AGENT_KEY=... python3 evals/run_evals.py
 
 Theo keeps the building honest. He cares about state, gates, and where the money goes.
 
-- **The database.** `think_tank.db` is SQLite. Every action gets logged. Agent history can be replayed. Nothing is lost on restart.
+- **The database.** SQLite (`think_tank.db`) by default; set `THINK_TANK_DB_URL` (see `.env.template`) and the store routes through `world/db_backend.py` to Postgres instead. Every action gets logged. Agent history can be replayed. Nothing is lost on restart.
 - **The server.** `world/serve.py` loads the parts in `world/server/serve_parts/`. The FastAPI app owns the simulation, model calls through OpenRouter, the shared Library, spend accounting, and session auth.
 - **The simulation.** `world/sim.py` loads the parts in `world/village/sim_parts/`. It moves agents, assigns tasks, runs ceremonies, enforces peer-review gates, and drives sprint lifecycles in one read-modify-write pass every 6 seconds. Wake-on-mail uses a durable queue with coalescing, claim recovery, and marker restore after a restart. Task dependencies are a small DAG: `dependsOn` takes one task id or a list, a gated card releases only when every predecessor has landed (join semantics), and self-edges plus closing edges are pruned where the durable task record is born, so a cycle is dropped rather than deadlocked.
 - **The executors.** `world/content.py` loads the parts in `world/agents/content_parts/`. It handles research crawls, code writing and review, weather, distillation, media digests, bank reviews, and time-boxed investigations called spikes.
@@ -75,6 +75,7 @@ Theo keeps the building honest. He cares about state, gates, and where the money
 - **URL reputation.** Before the JEV gate classifies a browser or `api_call` request to an external URL, the tank consults outside reputation: RDAP domain age, URLhaus, VirusTotal, and Google Safe Browsing. Verdicts are `trusted` / `checkable` / `untrusted`. A trusted URL's plain GET passes without JEV; an untrusted one is refused; writes never ride reputation -- they always see the JEV gate. Verdicts cache 24 hours per host; the keyed lookups are Bank-accounted, day-keyed quotas (`VIRUSTOTAL_DAILY_BUDGET` 400, `SAFEBROWSING_DAILY_BUDGET` 10,000, at least 15s between VirusTotal calls). Set `VIRUSTOTAL_API_KEY` and `SAFEBROWSING_API_KEY` in `.env` to arm the keyed sources; without them the score still runs on RDAP age and URLhaus.
 - **Outbound webhooks.** The tank received webhooks but could not notify anyone. `POST /api/webhooks` registers a subscribed URL with optional shared secret and event patterns; when an action-log kind matches, the tank POSTs the record with `X-Tank-Event` and, when a secret is set, `X-Tank-Signature: sha256=<hex hmac>` over the exact body. Delivery is one bounded POST, no retries; targets must resolve to public hosts (SSRF-checked at registration and at every delivery). Secrets are stored server-side and never listed back.
 - **Code grounding.** A read-only GitHub repo tool gives agents ephemeral workspaces over real repositories. MCP servers load from a two-layer registry: the shipped `mcp_servers.json` (REA, plus GitHub's official remote MCP server at `api.githubcopilot.com/mcp/` authenticated by `GITHUB_TOKEN` as a bearer credential), and an operator-local `mcp_servers.local.json` that overrides by id.- **The budgets.** Page requests are capped at 1,000 per month. The hard spend cap defaults to $50 per month and is set with `SPEND_CAP_USD`. The high tier has its own monthly budget, which defaults to $5. JEV respects both. Every priced model call also writes a durable usage receipt, replayed after an interrupted projection; unpriced usage holds that task's budget by default (`UNPRICED_USAGE_POLICY=block`). The URL-reputation lookups have their own day-keyed Bank-accounted quotas (see above), not the monthly dollar cap.
+- **Live feeds.** External data streams are operator-managed registries, not always-on costs: websocket feeds (`kraken`, `aisstream`) and RSS/Atom poll feeds live in `world/ws_feeds.json` and `world/rss_feeds.json`, seeded into the database at first boot. For short-lived needs an agent can grant itself a temporary window (1-24 h) through the `manage_feed_access` tool or `POST /api/feeds/access` (rate-limited, logged, owner visible); the collectors start and stop on the window without touching the feed's permanent status. Removing a feed is a registry status change; the ws API's remove endpoint overwrites the live spec with a stub, so operator removals are done at the registry, not the API. The `/n` Ops board reads team-first: cards group by team, with a `Group by: Team | Project` toggle keeping the old project view.
 - **Plain writing.** Prose replies at the model-call boundary carry a "write plainly, no filler" instruction and a word-ban list. The tank spends fewer tokens on the same information. It is on by default. You can opt out per request. JSON prompts are exempt.
 
 ## Nora's personnel floor
@@ -105,7 +106,7 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 | `world/integrations/web_helpers.py` | Pure HTML stripping, link extraction, HTTP-date parsing, SSRF host check |
 | `world/village/sim_helpers.py` | Pure priority normalization, room and team derivation, sprint and product ID generation, village and memory-clock helpers |
 | `world/index.html` + `world/js/*.js` | Browser renderer. The client is a viewport and never the state machine. |
-| `world/tests/` | Python and JavaScript test suites (8,832 collected Python tests plus the JS coverage harness) |
+| `world/tests/` | Python and JavaScript test suites (9,648 collected Python tests plus the JS coverage harness) |
 
 ## Repo layout
 

@@ -1,4 +1,4 @@
-"""Player-facing Ops page: pulse desk and project board."""
+"""Player-facing Ops page: pulse desk and team work board."""
 
 PULSE_HTML = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -48,7 +48,7 @@ pre{white-space:pre-wrap;background:#0c131b;border:1px solid var(--line);border-
 footer{color:var(--muted);font-size:11px;margin-top:18px}
 </style></head><body>
 <header>
-  <h1>TANK OPS</h1><span class="sub">pulse desk / project board</span>
+  <h1>TANK OPS</h1><span class="sub">pulse desk / team work board</span>
   <span class="spacer"></span>
   <button id="refresh">Refresh</button>
   <a class="btn" href="/">World</a>
