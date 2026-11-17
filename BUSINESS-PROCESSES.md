@@ -1,10 +1,10 @@
 # Think Tank Business Processes
 
-Status: review draft, code-checked 2026-11-02
+Status: review draft, code-checked 2026-11-16
 Date: 2026-10-25
 Freshness: per section. A "Last checked" date records the last review pass for
-THAT section; sections absent from the 2026-10-26..2026-11-02 change log were
-last checked 2026-10-25 and may lag the code.
+THAT section; sections absent from the 2026-10-26..2026-11-16 change log were
+last checked 2026-11-02 and may lag the code.
 Owner: operator (the player)
 Scope: the operating processes of the AI think tank as implemented in this repository
 
@@ -61,6 +61,23 @@ Three source documents were used:
 
 This is a dated change record. Git history carries commit detail; this section
 states only what changed in the operating model.
+
+**2026-11-16**
+
+- Live external feeds became an operator-managed registry with agent-granted
+  temporary access: websocket and RSS/Atom registries seed into the database,
+  and an agent can open a 1-24 h collection window on a disabled feed through
+  the `manage_feed_access` tool or `POST /api/feeds/access` (rate-limited,
+  logged, owner-visible) without touching the feed's permanent status. See
+  BP-77.
+- The Ops board at `/n` is team-first: cards group into team sections with
+  per-team counts, newest-activity-first, and a `Group by: Team | Project`
+  toggle keeps the old project view. Project is secondary metadata on every
+  card. See BP-78.
+- Institutional retrieval (RAG) gained a memory contract: a transient
+  Postgres failure returns an empty result set and never falls back to the
+  full-table row cache, and the SQL scorer's placeholder/parameter layout is
+  pinned by tests. Amends BP-40.
 
 **2026-11-02**
 
@@ -616,7 +633,11 @@ Owner request
 | BP-73 | Outbound webhooks | Matching action-log kind | Per event | Serve | Signed POST, delivery record |
 | BP-74 | Fast lanes | Continuous | Always on | Fast-lane process | Lane audit chain entries |
 | BP-75 | Draft desk | Operator Telegram command or nightly hook | Per draft | Operator, drafting executor | Pending/posted/skipped ledger |
-| BP-76 | Workflow templates | Breakdown match; weekly learning | Per goal, weekly | Scrum masters | Learned template set |## 4. Core delivery processes
+| BP-76 | Workflow templates | Breakdown match; weekly learning | Per goal, weekly | Scrum masters | Learned template set |
+| BP-77 | Live feed registries and temp access | Agent window grant or operator registry edit | Per window | Any authenticated agent (window), director/admin/player (registry) | Feed registry rows, `feed_access_granted`/`feed_access_cleared` log |
+| BP-78 | Team work board | Ops page request | On demand | Owner | Team-grouped card view |
+
+## 4. Core delivery processes
 
 ### BP-01 Player request intake and routing
 
@@ -1842,6 +1863,12 @@ distills typed work-learnings into the agent's long-term memory, redacted
 and cadence-bounded, recalled on the agent's next task; RAG indexes are
 village-scoped; and institutional retrieval merges semantic hits under the
 keyword matches for library search, escalation prompts, and grader anchors.
+
+**Verified 2026-11-16.** The institutional-retrieval SQL scoring path is
+placeholder/parameter parity-tested against a recording connection, and its
+Postgres failure contract is fail-open: a transient database error returns an
+empty result set and never builds the in-process full-table row cache, so the
+recall path cannot balloon process memory. The cache releases on SQL success.
 
 **Scope.** The Telegram bridge and the public `/api/intent/ask` lane. The public
 lane keys memory by agent (`player-ask:<agent>`) or by `player-ask:any` when no
@@ -3657,6 +3684,73 @@ director review unchanged, API-gated management.
 
 **Records.** The workflow-templates table, action log.
 
+### BP-77 Live feed registries and temp access
+
+**Last checked:** 2026-11-16
+
+**Purpose.** Keep external data streams available on demand without paying
+for always-on collection: disabled feeds stay in the registry, and a team
+that actually needs a stream can open a bounded window for itself.
+
+**Trigger.** An agent decides it needs a feed for its current task; or the
+operator edits the registry.
+
+**Steps.**
+
+1. The operator curates the websocket (`world/ws_feeds.json`) and RSS/Atom
+   (`world/rss_feeds.json`) registries; they seed into `ws_feeds` /
+   `rss_feeds` database rows at first boot. Removal is a status change.
+2. Any authenticated agent (agent key), the player session, or the operator
+   grants a temporary window (1-24 h) on a disabled feed through the
+   `manage_feed_access` tool or `POST /api/feeds/access`. Zero hours clears
+   the window early. The permanent registry flows (propose, approve, remove)
+   stay director/admin/player-only.
+3. The ws supervisor loop and the RSS poll loop reload the registries each
+   cycle, so a window opens within one cycle and closes at its expiry
+   without touching the feed's permanent status.
+4. The owner sees every grant and clear as `feed_access_granted` /
+   `feed_access_cleared` action-log records with the granting agent and the
+   stated purpose.
+
+**Controls.** Agent/player/operator gate on the access route, rate limit per
+caller, hard 1-24 h window bounds, purpose required, owner-visible log.
+
+**Failure path.** A refused grant changes nothing; a lapsed window simply
+stops its collector. Operator removal of a ws feed happens at the registry,
+not through `/api/ws/remove` (that endpoint overwrites the live spec with a
+stub).
+
+**Records.** `ws_feeds` / `rss_feeds` rows (`temp_until_s`,
+`temp_granted_by`), action log.
+
+### BP-78 Team work board
+
+**Last checked:** 2026-11-16
+
+**Purpose.** Give the owner one oversight view where work reads by team
+first, since the village does its work in teams; project is a label, not the
+axis.
+
+**Trigger.** An Ops page (`/n`) request.
+
+**Steps.**
+
+1. The board fetches `/api/project-board` (status=all) and groups cards into
+   team sections keyed on `teamId`; cards without a team land in an explicit
+   Unassigned section, sorted last.
+2. Each section shows open/done counts; sections sort by most recent
+   activity, cards within a section newest first.
+3. A `Group by: Team | Project` toggle switches to project grouping
+   (empty labels become "(no project)"); a team filter and the project
+   filter narrow the view in either mode.
+4. Cards keep owner/project/budget/spent/report meta in both modes.
+
+**Controls.** Player-session gate on the page and the endpoint; the
+endpoint's filter contract is unchanged (team and project query params).
+
+**Records.** The rendered view; underlying records are the task rows
+themselves.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -4206,7 +4300,11 @@ rather than gate-integrity questions.
 | BP-73 | `serve._outbound_webhook_emit`, `serve._deliver_webhook`, the webhook endpoints |
 | BP-74 | `world/server/fast_path.py`, `fast_lanes.json` |
 | BP-75 | `serve._draft_desk_create`, the draft-desk endpoints |
-| BP-76 | `world/village/sim_parts/135_workflow_templates.py`, `world/server/serve_parts/428_workflow_templates_api.py` |## 20. Appendix D: review checklist
+| BP-76 | `world/village/sim_parts/135_workflow_templates.py`, `world/server/serve_parts/428_workflow_templates_api.py` |
+| BP-77 | `world/server/ws.py`, `world/integrations/rss.py`, `world/server/serve_parts/350_api_channel_execute.py`, `world/server/serve_parts/240_make_web_tools_executor.py` |
+| BP-78 | `world/agents/pulse_ui.py`, `world/agents/content_parts/90_body_10.py`, `world/server/serve_parts/430_jev_model_get.py` |
+
+## 20. Appendix D: review checklist
 
 Use this list when reviewing the document and the process.
 
