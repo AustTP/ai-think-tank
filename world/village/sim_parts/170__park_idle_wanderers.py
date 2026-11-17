@@ -739,7 +739,22 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # Director-only card: wait for the named supervisor instead of leaking
         # it to an unrelated worker on the global round-robin.
         return _ASSIGN_WAIT
-    if pick.get('directedTo') and chosen_id is None:
+    # A directed card waits for its owner (2026-11-17 refinement): wait when
+    # directedTo NAMES an agent (non-empty string) or when the flag rides a
+    # real pin (assignedTo / facilitatorId / _reassignedTo present -- the
+    # mint convention, 165/166 always pair them). The one case that must
+    # NOT wait is a truthy flag with NO pin at all: that is the corrupt
+    # mint shape (the [PROG-1D] re-issue: assignedTo=None, directedTo=True)
+    # that returned _ASSIGN_WAIT on every pass for 19h and starved all
+    # dispatch. Raw pin-field presence, not the resolved `pinned` variable:
+    # a card whose owner is mid-walk or unreachable still names an owner,
+    # and directed cards keep waiting for her exactly as before.
+    _directed = pick.get('directedTo')
+    _directed_named = isinstance(_directed, str) and _directed
+    _directed_pinned = bool(pick.get('assignedTo') or pick.get('facilitatorId')
+                            or pick.get('_reassignedTo'))
+    if _directed and (_directed_named or _directed_pinned) \
+            and chosen_id is None:
         # The lead named this worker. Wait for them (and wake them when they
         # are dormant) rather than handing their card to someone else.
         return _ASSIGN_WAIT
@@ -749,7 +764,8 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
         # exist, fall through to the round-robin below -- the old unconditional
         # check stranded every unpinned issue card before assignment.
         return _ASSIGN_WAIT
-    if (pick.get('taskType') == 'report' and pick.get('directRoute')
+    if (pick.get('taskType') == 'report'
+            and pick.get('directRoute')
             and chosen_id is None):
         # A directly-routed report belongs to the named agent, not to whoever
         # is next in the round-robin. Wait for that agent to free up; a

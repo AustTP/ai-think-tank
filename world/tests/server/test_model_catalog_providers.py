@@ -325,5 +325,72 @@ class RefreshIntegratesProviders(unittest.TestCase):
                                 ('straitly', 'shared/x'), ('straitly', 'st/vision')})
 
 
+class TierProviderPin(unittest.TestCase):
+    """Operator pin (2026-11-17, item E): a `tier_provider` settings row
+    forces the band picks onto that provider's listing. Without it the pick
+    only understands monthly spend CAPS, so the default provider kept
+    winning while its balance sat under the pivot floor and every band call
+    remapped at dial time. An unknown pin is ignored; the registry-order
+    pick resumes."""
+
+    def setUp(self):
+        _clear()
+
+    def _run_refresh(self, catalogs):
+        # Bands pick only scored models (BAND_MIN_SCORE on intelligence_index),
+        # so both fixtures need a score to be eligible at all.
+        serve.set_model_benchmark_score('or/cheap', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('st/best', 'intelligence_index', 70.0, 'u')
+        # Pricing is per-token; the bucket math converts to per-million.
+        # $2/M lands both fixtures in the SAME 'mid' bucket (0.5-5 $/M), so
+        # the ONLY thing deciding the pick is the provider pin.
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
+             unittest.mock.patch.object(
+                 serve, '_fetch_openrouter_catalog_sync',
+                 return_value=[_model('or/cheap', 0.000002, 0.000002)]), \
+             unittest.mock.patch.object(
+                 serve, '_fetch_straitly_catalog_sync',
+                 return_value=[_model('st/best', 0.000002, 0.000002)]), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_mmmu_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            return asyncio.run(serve.refresh_model_tiers())
+
+    def test_pin_forces_pick_from_pinned_provider(self):
+        serve._set_setting('tier_provider', 'straitly')
+        chosen = self._run_refresh(
+            {'openrouter': '_fetch_openrouter_catalog_sync',
+             'straitly': '_fetch_straitly_catalog_sync'})
+        self.assertEqual(chosen['mid']['id'], 'st/best')
+        # The pin rides the tier row, so dialing resolves through straitly.
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT provider FROM model_tiers WHERE band='mid'").fetchone()
+        self.assertEqual(row[0], 'straitly')
+
+    def test_unknown_pin_is_ignored(self):
+        serve._set_setting('tier_provider', 'nosuchprovider')
+        chosen = self._run_refresh(
+            {'openrouter': '_fetch_openrouter_catalog_sync'})
+        self.assertEqual(chosen['mid']['id'], 'or/cheap')
+
+    def test_releasing_the_pin_restores_registry_order(self):
+        serve._set_setting('tier_provider', '')
+        chosen = self._run_refresh(
+            {'openrouter': '_fetch_openrouter_catalog_sync',
+             'straitly': '_fetch_straitly_catalog_sync'})
+        self.assertEqual(chosen['mid']['id'], 'or/cheap')
+
+
 if __name__ == '__main__':
     unittest.main()

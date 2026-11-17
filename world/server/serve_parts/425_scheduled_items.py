@@ -121,7 +121,18 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         'operator_veto_window_expired', 'task_auto_closed',
         'task_requeued_unreachable', 'task_parked_unreachable',
         'grade_artifact_mismatch', 'scheduled_item_skipped',
-        'operator_quality_blocks_cancelled')
+        'operator_quality_blocks_cancelled',
+        # 2026-11-17 gap fill: the overnight stall (replan-capped churn, free
+        # pool flaps, JEV model failovers, provider pivots, work drops, and
+        # the Telegram bridge going dark) produced ZERO digest alerts while it
+        # happened -- none of these actions were in this list.
+        'queued_card_replan_capped', 'failed_work_dropped',
+        'failed_work_sm_replan', 'aged_card_retired',
+        'capped_card_retired',
+        'free_pool_fallback', 'model_circuit_broken',
+        'jev_model_auto_failover', 'provider_pivot',
+        'work_item_abandoned', 'credits_pause_started',
+        'telegram_poll_failed', 'telegram_poll_recovered')
     internal_rows = []
     try:
         with _db() as conn:

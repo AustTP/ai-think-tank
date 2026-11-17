@@ -823,6 +823,27 @@ def _verify_decision_model_works_sync(model_id):
         # already handles them) so the daily loop never 'fixes' the chain by
         # dropping them.
         return True
+    if _cheaper_decision_slug(model_id):
+        # Cheaper Inference decisions slug ('@cheaperinference:jev-1.14.0'):
+        # probe its OWN typed transport -- the OpenRouter probe below would
+        # 400 on a foreign slug and wrongly call a healthy provider dead
+        # (2026-11-17), which would let the auto-failover clobber the chain.
+        for attempt in range(MODEL_VERIFY_ATTEMPTS):
+            try:
+                data = _call_cheaper_decision_sync(model_id, {'messages': [], 'signals': {}},
+                                                   {'choice': {'type': 'choice',
+                                                               'instructions': 'Reply with one of the given options.',
+                                                               'criteria': {'a': 'first option', 'b': 'second option'}}})
+                if data.get('answers', {}).get('choice', {}).get('choice'):
+                    # Same accrual rule as the other probes: a real API call,
+                    # so its cost belongs in the ledger -- never silently free.
+                    _accrue_spend('__model_verify__', ((data or {}).get('usage') or {}).get('cost', 0.0))
+                    return True
+            except Exception:
+                pass
+            if attempt + 1 < MODEL_VERIFY_ATTEMPTS:
+                time.sleep(1)
+        return False
     for attempt in range(MODEL_VERIFY_ATTEMPTS):
         try:
             req = _decision_request(model_id, {'messages': [], 'signals': {}},

@@ -22,8 +22,74 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import sim  # noqa: E402
+import serve  # noqa: E402
 
 _NOW_MS = 1_725_000_000_000  # 2026-09, matches _task_cycle(now=1_725_000_000.0)
+
+
+class ReplanCappedRetirement(unittest.TestCase):
+    """Operator fix C (2026-11-17): a queued card at the replan cap can never
+    re-issue, so its stranded record only ever fed the 30-min capped-log
+    churn (~15k rows/day for 249 such cards). Past a 7-day line it parks for
+    operator promotion (the DEV-109 aged-retirement idiom), at the same
+    10-per-pass budget as the aged line. Parking sets `lane`, not `status`,
+    so the open-twin dedup still sees the record."""
+
+    def _queued_capped(self, tid='task-cap', age_days=8, replans=2):
+        return {
+            'id': tid, 'title': f'Stale stranded card {tid}',
+            'status': 'queued', 'taskType': 'code', 'room': 'observatory',
+            'createdAt': _NOW_MS - int(age_days * 24 * 3600 * 1000),
+        }, replans
+
+    def _run_reconcile(self, state, now_ms=_NOW_MS):
+        with mock.patch.object(sim, '_open_twin_task', return_value=None), \
+                mock.patch.object(serve, 'log_action'):
+            return sim._reconcile_queued_cards(state, now_ms)
+
+    def test_capped_card_past_7_days_parks(self):
+        card, replans = self._queued_capped(age_days=8)
+        state = _state()
+        state['tasks'][card['id']] = card
+        state['_staleWorkReplans'] = {
+            repr((card['title'], card['room'])): replans}
+        n = self._run_reconcile(state)
+        self.assertEqual(n, 0)  # retired, NOT re-issued
+        self.assertEqual(card['lane'], 'parking-lot')
+        self.assertIn('replan-capped', card['parkedReason'])
+
+    def test_capped_card_younger_than_7_days_stays_queued(self):
+        card, replans = self._queued_capped(age_days=2)
+        state = _state()
+        state['tasks'][card['id']] = card
+        state['_staleWorkReplans'] = {
+            repr((card['title'], card['room'])): replans}
+        self._run_reconcile(state)
+        self.assertNotEqual(card.get('lane'), 'parking-lot')
+
+    def test_uncapped_card_still_reissues(self):
+        card, _ = self._queued_capped(age_days=8)
+        state = _state()
+        state['tasks'][card['id']] = card
+        state['_staleWorkReplans'] = {
+            repr((card['title'], card['room'])): 0}
+        n = self._run_reconcile(state)
+        self.assertEqual(n, 1)
+        self.assertNotEqual(card.get('lane'), 'parking-lot')
+
+    def test_retirement_respects_the_per_pass_budget(self):
+        state = _state()
+        state['_staleWorkReplans'] = {}
+        for i in range(12):
+            card, replans = self._queued_capped(tid=f'task-cap-{i}',
+                                                age_days=8, replans=2)
+            state['tasks'][card['id']] = card
+            state['_staleWorkReplans'][repr((card['title'],
+                                             card['room']))] = replans
+        self._run_reconcile(state)
+        parked = [t for t in state['tasks'].values()
+                  if t.get('lane') == 'parking-lot']
+        self.assertEqual(len(parked), 10)  # _AGED_CARD_RETIRE_PER_PASS
 
 
 def _agent(aid, **kw):

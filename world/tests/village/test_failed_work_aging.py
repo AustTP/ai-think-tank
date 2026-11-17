@@ -9,6 +9,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import sim  # noqa: E402
+import serve  # noqa: E402
 
 
 def _state(failed_task):
@@ -342,3 +343,77 @@ class AssignPerPassCap(unittest.TestCase):
         src = inspect.getsource(sim._task_cycle)
         self.assertIn('assigned_this_pass >= MAX_ASSIGN_PER_PASS', src)
         self.assertIn('assigned_this_pass += 1', src)
+
+
+class RequeuePinCarrying(unittest.TestCase):
+    """Operator fix B (2026-11-17): the stale/failed re-queues used to drop
+    assignedTo/facilitatorId, which turned every pin-required card (supervise,
+    review, directed) permanently unassignable -- _assign_due_item waits
+    forever for a pin it no longer has, and 13 such cards jammed the queue
+    head. Re-issues must carry the pin while the named agent still exists,
+    and drop a pin to a removed agent (a pin to nobody recreates the same
+    wedge)."""
+
+    def _stale_card(self):
+        return {
+            'id': 'task-pin', 'title': 'Supervise the sprint close',
+            'status': 'queued', 'taskType': 'supervise', 'room': 'workroom',
+            'assignedTo': 'ada', 'facilitatorId': 'ada',
+            'createdAt': 1_700_000_000_000,
+        }
+
+    def test_stale_reissue_carries_live_pin(self):
+        state = {
+            'agents': {'ada': {'id': 'ada'}},
+            'tasks': {'task-pin': self._stale_card()},
+            'workQueue': [], '_staleWorkReplans': {}, 'lastStaleWorkSweep': 0,
+        }
+        with mock.patch.object(sim, '_open_twin_task', return_value=None), \
+                mock.patch.object(serve, 'log_action'):
+            reissued = sim._reconcile_queued_cards(state, 1_700_000_000_000 + 60_000)
+        self.assertEqual(reissued, 1)
+        self.assertEqual(len(state['workQueue']), 1)
+        item = state['workQueue'][0]
+        self.assertEqual(item['assignedTo'], 'ada')
+        self.assertEqual(item['facilitatorId'], 'ada')
+
+    def test_stale_reissue_drops_pin_to_removed_agent(self):
+        state = {
+            'agents': {},  # ada no longer exists
+            'tasks': {'task-pin': self._stale_card()},
+            'workQueue': [], '_staleWorkReplans': {}, 'lastStaleWorkSweep': 0,
+        }
+        with mock.patch.object(sim, '_open_twin_task', return_value=None), \
+                mock.patch.object(serve, 'log_action'):
+            sim._reconcile_queued_cards(state, 1_700_000_000_000 + 60_000)
+        self.assertEqual(len(state['workQueue']), 1)
+        item = state['workQueue'][0]
+        self.assertIsNone(item['assignedTo'])
+        self.assertIsNone(item['facilitatorId'])
+
+
+class FailedRequeuePinCarrying(unittest.TestCase):
+    """Same pin-carrying rule for the FAILED-card re-issue path (2026-11-17)."""
+
+    def _run(self, state, now_ms=1_700_000_000_000 + 4 * 3600 * 1000):
+        return sim._stale_work_step(state, now_ms / 1000.0, now_ms)
+
+    def test_failed_reissue_carries_pin(self):
+        card = _failed_card()
+        card['assignedTo'] = 'ada'
+        state = _state(card)
+        state['agents'] = {'ada': {'id': 'ada'}}
+        with mock.patch.object(sim, '_log_governance'):
+            self._run(state)
+        self.assertEqual(len(state['workQueue']), 1)
+        self.assertEqual(state['workQueue'][0]['assignedTo'], 'ada')
+
+    def test_failed_reissue_drops_pin_to_removed_agent(self):
+        card = _failed_card()
+        card['assignedTo'] = 'ghost'
+        state = _state(card)
+        state['agents'] = {}
+        with mock.patch.object(sim, '_log_governance'):
+            self._run(state)
+        self.assertEqual(len(state['workQueue']), 1)
+        self.assertIsNone(state['workQueue'][0]['assignedTo'])

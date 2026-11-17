@@ -413,6 +413,31 @@ def test_directed_card_waits_for_its_named_worker():
     assert len(state['tasks']) == before
 
 
+def test_pinless_directed_flag_does_not_wedge_the_queue():
+    """2026-11-17 dispatch wedge: a program re-issue minted
+    assignedTo=None, directedTo=True -- a mint FLAG where a name belongs.
+    _assign_due_item returned _ASSIGN_WAIT forever for it, and with it the
+    only due card in the queue, EVERY dispatch pass starved for 19h. A
+    truthy directedTo flag without any pin must fall through to the
+    round-robin instead of waiting for an owner who does not exist."""
+    state = _state()
+    grid, doors = sim._load_outdoor_geometry()
+    door = doors['pressoffice']
+    state['agents']['ruth'].update({
+        'x': door['x'] + door['w'] / 2,
+        'y': door['y'] + door['h'] + 4,
+        'offDuty': False, 'busy': False, 'task': None})
+    item = {'title': 'Program piece', 'room': 'pressoffice',
+            'taskType': 'code', 'assignedTo': None, 'directedTo': True,
+            'instructions': 'Do the piece.'}
+    result = sim._assign_due_item(state, item, True, grid, doors, 1000,
+                                  task_id_holder={0: 0})
+    assert result is not sim._ASSIGN_WAIT
+    # The card actually assigned to the idle worker (no pin to honor, so
+    # the generic pick may take it).
+    assert result is not None
+
+
 def test_assign_task_carries_approved_commit_tools():
     state = _state()
     grid, doors = sim._load_outdoor_geometry()

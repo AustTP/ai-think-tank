@@ -178,6 +178,11 @@ class TelegramApiSync(unittest.TestCase):
         self.assertFalse(rows[0][2]['ok'])
 
     def test_polling_and_setup_never_log(self):
+        # A clean streak (no prior failures) must stay silent: a healthy poll
+        # and setMyCommands log nothing at all. (The streak state is module-
+        # level; reset it so failure-path tests elsewhere in this class do
+        # not leak a recovery row into this assertion.)
+        serve._TG_POLL_FAIL_STATE['consecutive'] = 0
         body = json.dumps({'ok': True, 'result': []})
         calls = []
         with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
@@ -188,6 +193,39 @@ class TelegramApiSync(unittest.TestCase):
             self.assertEqual(serve._telegram_api_sync('getUpdates', {}), [])
             serve._telegram_api_sync('setMyCommands', {'commands': []})
         self.assertEqual(calls, [])
+        self.assertEqual(serve._TG_POLL_FAIL_STATE['consecutive'], 0)
+
+    def test_poll_failure_streak_logs_transitions_only(self):
+        # Incident visibility (2026-11-17): a getUpdates failure streak logs
+        # telegram_poll_failed on the FIRST failure only, and exactly one
+        # telegram_poll_recovered when the streak ends. Every 10th failure
+        # also re-logs, so a long outage keeps a heartbeat without one row
+        # per poll. This is the contract the alert digest relies on
+        # (telegram_poll_failed / telegram_poll_recovered are in the
+        # internal-signal list).
+        serve._TG_POLL_FAIL_STATE['consecutive'] = 0
+        rows = []
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        side_effect=ConnectionError('no')), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append(a)):
+            self.assertIsNone(serve._telegram_api_sync('getUpdates', {}))
+            self.assertIsNone(serve._telegram_api_sync('getUpdates', {}))
+            self.assertEqual(len(rows), 1)  # first failure only
+            self.assertEqual(rows[0][1], 'telegram_poll_failed')
+            self.assertEqual(rows[0][2]['consecutive'], 1)
+        with unittest.mock.patch.object(serve, 'TELEGRAM_BOT_TOKEN', 'tok'), \
+             unittest.mock.patch.object(serve.urllib.request, 'urlopen',
+                                        return_value=_FakeResp(
+                                            json.dumps({'ok': True, 'result': []}))), \
+             unittest.mock.patch.object(serve, 'log_action',
+                                        lambda *a, **k: rows.append(a)):
+            self.assertEqual(serve._telegram_api_sync('getUpdates', {}), [])
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1][1], 'telegram_poll_recovered')
+        self.assertEqual(rows[1][2]['afterFailures'], 2)
+        self.assertEqual(serve._TG_POLL_FAIL_STATE['consecutive'], 0)
 
     def test_send_photo_logs_caption(self):
         body = json.dumps({'ok': True, 'result': {'message_id': 9}})

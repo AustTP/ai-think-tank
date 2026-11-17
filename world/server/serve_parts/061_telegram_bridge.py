@@ -54,15 +54,21 @@ def _telegram_api_sync(method, params=None, timeout=30):
             body = json.loads(resp.read().decode('utf-8', errors='replace'))
             ok = bool(body.get('ok'))
             _log_telegram_send(method, params, ok)
+            if method == 'getUpdates':
+                _telegram_poll_outcome(ok)
             return body.get('result') if ok else None
     except urllib.error.HTTPError as e:
         _log_telegram_send(method, params, False)
+        if method == 'getUpdates':
+            _telegram_poll_outcome(False, f'HTTP {e.code}')
         if e.code == 409:
             raise _TelegramConflictError(str(e))
         print(f'[telegram] {method} failed: {e}', flush=True)
         return None
     except Exception as e:
         _log_telegram_send(method, params, False)
+        if method == 'getUpdates':
+            _telegram_poll_outcome(False, e)
         print(f'[telegram] {method} failed: {e}', flush=True)
         return None
 
@@ -71,6 +77,36 @@ class _TelegramConflictError(Exception):
     """Raised on a Telegram 409 Conflict -- another poller already holds the
     long-poll on this bot token. Kept module-level so the poll loop can catch
     it specifically and back off rather than retrying a 409 in a tight loop."""
+
+
+# Inbound-bridge visibility (2026-11-17): getUpdates failures previously went
+# to stdout ONLY, so an overnight outage (7 failures during the Nov 17 05:01-
+# 09:46 incident) was invisible to action_log, the digests, and any alerting.
+# Transition logging: write telegram_poll_failed on the FIRST failure of a
+# streak and every 10th after that, and telegram_poll_recovered when a streak
+# ends -- one row per incident instead of one row per poll.
+_TG_POLL_FAIL_STATE = {'consecutive': 0}
+
+
+def _telegram_poll_outcome(ok, err=''):
+    """Record a getUpdates outcome. Never raises; logging failure must not
+    break the poll loop that calls it."""
+    try:
+        st = _TG_POLL_FAIL_STATE
+        if ok:
+            if st['consecutive']:
+                log_action('', 'telegram_poll_recovered',
+                           {'afterFailures': st['consecutive']},
+                           authorized=False)
+            st['consecutive'] = 0
+            return
+        st['consecutive'] += 1
+        if st['consecutive'] == 1 or st['consecutive'] % 10 == 0:
+            log_action('', 'telegram_poll_failed',
+                       {'consecutive': st['consecutive'], 'error': str(err)[:160]},
+                       authorized=False)
+    except Exception:
+        pass
 
 
 def _telegram_send_photo_sync(png_bytes, caption):

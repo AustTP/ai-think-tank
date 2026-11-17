@@ -94,6 +94,12 @@ def _reconcile_queued_cards(state, now_ms):
     # Bounded per pass so a backlog cleanup never flips mass state in one tick.
     _AGED_CARD_RETIRE_MS = 14 * 24 * 3600 * 1000
     _AGED_CARD_RETIRE_PER_PASS = 10
+    # Replan-capped line (operator, 2026-11-17): a card at the replan cap can
+    # never re-issue from this sweep, so its stranded record only ever feeds
+    # the 30-min capped-log churn (~15k rows/day for 249 such cards). After
+    # 7 days it is dead weight: park it for operator promotion like the aged
+    # line does, at the same per-pass budget.
+    _CAPPED_CARD_RETIRE_MS = 7 * 24 * 3600 * 1000
     tasks = state.get('tasks')
     if not isinstance(tasks, dict) or not tasks:
         return 0
@@ -137,13 +143,40 @@ def _reconcile_queued_cards(state, now_ms):
             continue
         if tid in issued_for or tid in held:
             continue
-        # An open twin means the work is already live under another card:
-        # re-issuing this stranded record forks the chain into parallel live
-        # cards. Leave the record for the stale-work sweep to clean up.
-        if _open_twin_task(state, task):
-            continue
+        # Replan-cap check BEFORE the open-twin scan (operator, 2026-11-17):
+        # a capped card can never re-issue, so paying the O(tasks) twin scan
+        # for it is pure waste -- with 250 of 280 queued cards capped, the
+        # scan ate ~73% of the sim thread (py-spy: card_dedup_key over
+        # 280x1054 pairs per pass) and starved the dispatch pick loop to
+        # under 1% of pass time. Same outcomes: capped cards log + continue
+        # exactly as below, only without the wasted scan.
         key = repr((task.get('title') or '', task.get('room') or ''))
         replans = replan_map.get(key, 0)
+        # Replan-capped retirement: past the 7-day line a capped card parks
+        # for operator promotion instead of logging forever. Shares the aged
+        # line's per-pass budget so a backlog cleanup never flips mass state
+        # in one tick. Parking sets `lane`, not `status`, so the open-twin
+        # dedup still sees the record (a live reissue of a similar title is
+        # still blocked exactly as before).
+        if replans >= STALE_WORK_MAX_REPLANS and created \
+                and now_ms - created >= _CAPPED_CARD_RETIRE_MS \
+                and retired_this_pass < _AGED_CARD_RETIRE_PER_PASS:
+            task['lane'] = 'parking-lot'
+            task['parkedAt'] = now_ms
+            task['parkedReason'] = 'replan-capped: parked for operator promotion'
+            retired_this_pass += 1
+            try:
+                from serve import log_action
+                log_action('system', 'capped_card_retired',
+                           {'taskId': tid,
+                            'title': (task.get('title') or '')[:120],
+                            'ageDays': round((now_ms - created) / 86400000.0, 1),
+                            'replans': replans,
+                            'note': 'parked for operator promotion'},
+                           authorized=True)
+            except Exception:
+                pass
+            continue
         if replans >= STALE_WORK_MAX_REPLANS:
             # Visible, not silent (2026-11-09): a capped card stranded between
             # this bound and the SM re-plan otherwise sits queued forever with
@@ -165,7 +198,18 @@ def _reconcile_queued_cards(state, now_ms):
                 except Exception:
                     pass
             continue
+        # An open twin means the work is already live under another card:
+        # re-issuing this stranded record forks the chain into parallel live
+        # cards. Leave the record for the stale-work sweep to clean up.
+        if _open_twin_task(state, task):
+            continue
         replan_map[key] = replans + 1
+        # Pin-carrying (2026-11-17, fix B): this append is its own reissue
+        # path with its own field whitelist -- the stale/failed re-queue
+        # functions below carry pins, and this path must too, or a pin-
+        # required card (supervise/review/directed) that lands HERE becomes
+        # permanently unassignable exactly as before. Same _carry_pin rule:
+        # a pin to a removed agent would recreate the wedge.
         queue.append({
             'reissueOf': tid,
             'title': task.get('title'),
@@ -178,6 +222,11 @@ def _reconcile_queued_cards(state, now_ms):
             'projectLabel': task.get('projectLabel'),
             'productId': task.get('productId'),
             'reviewOf': task.get('reviewOf'),
+            'incident': task.get('incident'),
+            'directedTo': task.get('directedTo'),
+            'facilitatorId': _carry_pin(state, task, 'facilitatorId'),
+            'assignedTo': (_carry_pin(state, task, 'assignedTo')
+                           or _carry_pin(state, task, '_reassignedTo')),
             'priority': task.get('priority') or 2,
             'notBefore': now_ms + 5000,
         })
@@ -335,11 +384,25 @@ def _stale_work_step(state, now, now_ms):
     return replanned
 
 
+def _carry_pin(state, task, field):
+    """The named pin value for `field`, but only while that agent still exists
+    in the roster (and is never 'player'). A pin to a removed agent recreates
+    the unassignable-card wedge that jammed the queue head on 2026-11-17."""
+    pin = task.get(field)
+    return pin if (pin and pin != 'player'
+                   and pin in (state.get('agents') or {})) else None
+
+
 def _requeue_stale_work(state, task):
     """Fast-path re-plan: put the swept card back on the work queue so a fresh
     assignment re-issues it, bumped to at least 'high' priority (it already
     waited long enough once) and marked so a future sweep can find it fast."""
     room = task.get('room') or _resolve_assignment_room(task)
+    # Carry the owner pin through the re-issue (2026-11-17): supervise/review
+    # cards REQUIRE their pin (assignedTo / facilitatorId / _reassignedTo) --
+    # _assign_due_item returns _ASSIGN_WAIT forever for an unpinned supervise
+    # card, so dropping the pin here made every re-planned supervise card
+    # permanently unassignable and jammed the whole queue head behind it.
     queue_work(state, [{
         'title': task.get('title'),
         # reissueOf marks this as the SAME work continuing, not a new card:
@@ -362,6 +425,16 @@ def _requeue_stale_work(state, task):
         'backlogItemId': task.get('backlogItemId'),
         'sprintId': task.get('sprintId'),
         'priority': WORK_PRIORITY['high'],
+        # Pin-required semantics survive the re-issue (supervise/incident/
+        # review/directedTo keep their wake and wait rules), and the pin
+        # fields ride along when the named owner is still in the roster.
+        'reviewOf': task.get('reviewOf'),
+        'incident': task.get('incident'),
+        'directedTo': task.get('directedTo'),
+        'facilitatorId': _carry_pin(state, task, 'facilitatorId'),
+        'assignedTo': (_carry_pin(state, task, 'assignedTo')
+                       or _carry_pin(state, task, '_reassignedTo')),
+        'lane': task.get('lane'),
     }])
 
 
@@ -371,6 +444,10 @@ def _requeue_failed_work(state, task):
     into the instructions so the retry knows why its predecessor died."""
     room = task.get('room') or _resolve_assignment_room(task)
     fail_note = (task.get('failNote') or 'unknown cause')[:240]
+    # Same pin-carrying rule as _requeue_stale_work (2026-11-17): a pin-
+    # required card (supervise/review/directedTo) re-issued without its pin
+    # becomes permanently unassignable, and a pin to a removed agent would
+    # wedge the queue head again.
     queue_work(state, [{
         'title': task.get('title'),
         'reissueOf': task.get('id'),
@@ -391,6 +468,13 @@ def _requeue_failed_work(state, task):
         'backlogItemId': task.get('backlogItemId'),
         'sprintId': task.get('sprintId'),
         'priority': WORK_PRIORITY['high'],
+        'reviewOf': task.get('reviewOf'),
+        'incident': task.get('incident'),
+        'directedTo': task.get('directedTo'),
+        'facilitatorId': _carry_pin(state, task, 'facilitatorId'),
+        'assignedTo': (_carry_pin(state, task, 'assignedTo')
+                       or _carry_pin(state, task, '_reassignedTo')),
+        'lane': task.get('lane'),
     }])
 
 

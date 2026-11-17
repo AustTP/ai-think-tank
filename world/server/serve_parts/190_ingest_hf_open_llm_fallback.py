@@ -451,6 +451,26 @@ async def refresh_model_tiers():
     # provider rides the tier rows, and the transport resolves base_url and
     # key from the dialing registry at call time.
     pick_provider = _pick_provider(per_provider)
+    # Operator pin (2026-11-17, item E): a `tier_provider` settings row forces
+    # the band picks onto that provider's listing -- the documented "other
+    # providers join the dialing layer through pins" mechanism. Without it the
+    # pick only knows monthly spend CAPS, not balance floors, so the default
+    # provider keeps winning while its balance sits under the pivot floor and
+    # every band call remaps at dial time (the 2026-11-17 morning state: tiers
+    # said openrouter, calls pivoted to straitly all day). An empty or
+    # unknown pin is ignored; the registry-order pick resumes. Delete the
+    # settings row (or set it to '') to release the pin.
+    try:
+        pin = (_get_setting('tier_provider') or '').strip()
+    except Exception:
+        pin = ''
+    if pin:
+        if per_provider.get(pin):
+            if pin != pick_provider:
+                print(f'[model-tiers] tier_provider pin active: picking from {pin}', flush=True)
+            pick_provider = pin
+        else:
+            print(f'[model-tiers] tier_provider pin {pin!r} has no listing this sweep; ignored', flush=True)
     pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
     buckets = _bucket_models_by_price(pick_models)
     all_benchmark_rows = get_model_benchmark_scores()

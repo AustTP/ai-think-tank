@@ -106,7 +106,11 @@ def _program_card_item(program, kind, instructions, now_ms):
         'taskType': 'report',
         'deliverable': 'report',
         'assignedTo': program.get('ownerAgentId'),
-        'directedTo': True,
+        # directedTo is the FLAG for "named owner, wait for her" only when a
+        # real agent id rides along. A bare True with assignedTo=None made
+        # _assign_due_item return _ASSIGN_WAIT forever (2026-11-17: the
+        # [PROG-1D] card jammed the whole queue head for 19h that way).
+        'directedTo': bool(program.get('ownerAgentId')),
         'priority': 'high',
         'feature': f"program:{program.get('id')}:{kind.lower()}",
     }
@@ -341,7 +345,10 @@ def _programs_pass(state, now_ms=None):
                     'taskType': piece.get('taskType') or 'code',
                     'deliverable': piece.get('deliverable') or 'code',
                     'assignedTo': directors.get(piece.get('teamId')),
-                    'directedTo': True,
+                    # Same rule as _program_card_item: the flag only when the
+                    # named owner resolved; a teamless piece must round-robin
+                    # instead of waiting forever on a null pin.
+                    'directedTo': bool(directors.get(piece.get('teamId'))),
                 })
             if items:
                 minted += queue_work(state, items)

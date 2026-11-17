@@ -109,14 +109,18 @@ if os.path.exists(_LIVE_DB):
         _dst.close()
         _src.close()
 else:
-    # No live DB (fresh checkout / CI): build the full schema so unpatched
-    # tests hit a valid empty-state database instead of "no such table".
-    # (The old behavior left a zero-byte file and relied on every test
-    # module initializing its own DB -- only true where a live DB existed
-    # to silently back them.)
+    # No live DB (fresh checkout / CI): start from an empty file instead of
+    # relying on every test module initializing its own DB.
     open(_TEST_DB, 'ab').close()
-    import serve  # THINK_TANK_DB is set above; serve reads it at import
-    serve.init_db()
+# The repo-root think_tank.db may be a LEGACY component DB that predates the
+# world schema entirely (2026-11-17: it held only mc_* tables -- the mc
+# bridge's own store -- so the copied test DB had no kv_state/action_log/
+# decision_tape at all, and every unpatched test that touched world state
+# died with "no such table"). init_db() is all CREATE TABLE IF NOT EXISTS,
+# so running it over the copy is idempotent and completes whichever parts of
+# the schema the source was missing.
+import serve  # THINK_TANK_DB is set above; serve reads it at import
+serve.init_db()
 
 
 @pytest.fixture(autouse=True)

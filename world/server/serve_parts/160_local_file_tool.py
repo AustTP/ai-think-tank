@@ -647,6 +647,86 @@ def decision_key_report(prefix):
         return {'calls': 0, 'distinct_keys': 0, 'repeat_calls': 0, 'repeat_pct': 0.0, 'top': []}
 
 
+# Cheaper Inference also sells the JEV typed decisions models (operator tip,
+# verified live 2026-11-17): slugs jev-1.13.0 / jev-1.14.0 under the chain
+# prefix '@cheaperinference:'. Same typed-decisions contract as OpenRouter's
+# /api/alpha/decisions, different wire shape: POST {model, input, questions[]
+# with choices[{value,label}]} to /v1/decisions, answers come back as an
+# ARRAY (OpenRouter returns an object keyed by question name). Normalized
+# here into the OpenRouter shape so _jev_choice, the decision tape, the
+# __jev__ spend accrual, and the per-slug breaker all work unchanged.
+# Spend note: the cost accrues into the __jev__ lane cap (the binding
+# constraint for decisions regardless of provider); Cheaper's own monthly
+# dialing cap is a separate ledger enforced at the band-dialing layer.
+_CHEAPER_DECISION_PREFIX = '@cheaperinference:'
+CHEAPERINFERENCE_DECISIONS_URL = 'https://api.cheaperinference.com/v1/decisions'
+
+
+def _cheaper_decision_slug(model_id):
+    """The provider-side model id for a '@cheaperinference:<id>' chain entry,
+    or None when the entry is not a Cheaper decisions slug."""
+    if isinstance(model_id, str) and model_id.startswith(_CHEAPER_DECISION_PREFIX):
+        return model_id[len(_CHEAPER_DECISION_PREFIX):].strip()
+    return None
+
+
+def _call_cheaper_decision_sync(slug, state, questions):
+    """One JEV decisions call against Cheaper Inference, normalized to the
+    OpenRouter {answers: {name: {...}}, usage: {cost}} shape. Raises on any
+    failure so the chain loop treats it exactly like a failed OpenRouter
+    slug (breaker bookkeeping included)."""
+    import urllib.error as _ue
+    model_id = _cheaper_decision_slug(slug)
+    if not model_id:
+        raise ValueError(f'not a Cheaper decisions slug: {slug!r}')
+    qs = _normalize_decision_questions(questions)
+    choice_q = (qs or {}).get('choice') or {}
+    criteria = choice_q.get('criteria') or {}
+    if isinstance(criteria, dict):
+        choices = [{'value': str(k), 'label': str(v or k)} for k, v in criteria.items()]
+    else:
+        choices = [{'value': str(c), 'label': str(c)} for c in criteria]
+    wire_questions = [{'name': 'choice', 'type': 'choice',
+                       'instructions': str(choice_q.get('instructions') or ''),
+                       'choices': choices}]
+    # Cheaper's `input` is the decision CONTEXT (string or user-message list).
+    # The tank's state shape is {messages: [...], signals: {}}; join message
+    # contents when present, else the empty string (the question's
+    # instructions + choices carry the actual decision).
+    messages = (state or {}).get('messages') or []
+    if isinstance(messages, list) and messages:
+        input_text = '\n'.join(
+            str((m or {}).get('content') or '') for m in messages
+            if isinstance(m, dict)).strip()
+    else:
+        input_text = str((state or {}).get('summary') or '')
+    payload = {'model': model_id, 'input': input_text, 'questions': wire_questions}
+    key = (_load_env().get('CHEAPER_INFERENCE_API_KEY') or '').strip()
+    if not key:
+        raise RuntimeError('CHEAPER_INFERENCE_API_KEY not set -- Cheaper decisions slug unusable')
+    req = urllib.request.Request(
+        CHEAPERINFERENCE_DECISIONS_URL,
+        data=json.dumps(payload).encode(),
+        headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+        method='POST')
+    with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 -- fixed provider host
+        data = json.loads(resp.read().decode('utf-8', errors='replace'))
+    # Normalize answers: array [{type, name, choice, confidence, ...}] ->
+    # {name: {...}} (the OpenRouter object shape _jev_choice reads).
+    answers = {}
+    for a in (data.get('answers') or []):
+        if isinstance(a, dict) and a.get('name'):
+            answers[a['name']] = {k: v for k, v in a.items() if k != 'name'}
+    billing = data.get('billing') or {}
+    try:
+        cost = float(billing.get('billed_cost_usd') or 0.0)
+    except (TypeError, ValueError):
+        cost = 0.0
+    return {'answers': answers,
+            'usage': {**(data.get('usage') or {}), 'cost': cost},
+            'model': data.get('model') or model_id}
+
+
 def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     # Jev (TypeSafe's System One decision model) via OpenRouter -- a
     # genuinely different endpoint from chat completions, confirmed only
@@ -759,9 +839,26 @@ def _call_openrouter_decision_sync(model, state, questions, village_id=None):
     attempted = []
     last_error = None
     for slug in chain:
+        cheaper_slug = _cheaper_decision_slug(slug)
         try:
-            data = json.loads(_urlopen_with_resilience(_decision_request(slug, state, questions), timeout=30))
-        except Exception:
+            if cheaper_slug:
+                # Cheaper Inference typed-decisions transport (different wire
+                # shape AND different account wallet than OpenRouter); the
+                # helper returns the normalized {answers, usage} dict.
+                data = _call_cheaper_decision_sync(slug, state, questions)
+            else:
+                data = json.loads(_urlopen_with_resilience(_decision_request(slug, state, questions), timeout=30))
+        except Exception as exc:
+            if cheaper_slug:
+                # The chat-completions fallback below is OpenRouter-only AND
+                # Cheaper's decision models 400 on chat by contract ("use the
+                # decision generation API instead"), so there is no second
+                # transport to try: record the failure and move on.
+                attempted.append(slug)
+                last_error = exc
+                if armed:
+                    record_model_result(slug, False)
+                continue
             # The typed endpoint failed for this slug. Before giving the slug
             # up entirely, try the same choice protocol over the STANDARD
             # chat-completions transport (see _decision_via_chat_completions
@@ -856,6 +953,69 @@ def _set_setting(key, value, conn=None):
     )
 
 
+# Measured-price ordering for the decisions chain (operator, 2026-11-17):
+# trailing per-call cost per slug from the decision tape, cached 5 minutes so
+# a frequent decision lane does not add a DB aggregate per call.
+_JEV_PRICE_CACHE = {'at': 0.0, 'prices': {}}
+_JEV_PRICE_TTL_S = 300.0
+_JEV_PRICE_MIN_SAMPLES = 3
+_JEV_PRICE_WINDOW_S = 7 * 24 * 3600
+
+
+def _jev_slug_prices():
+    """{chain slug: avg billed cost per call} over the trailing 7 days of
+    DECIDED (ok=1) tape rows, per slug; slugs with fewer than
+    _JEV_PRICE_MIN_SAMPLES decided calls are omitted (unknown price). The
+    tape's `model` column records the answering chain slug verbatim
+    ('typesafe/jev-1.14', '@cheaperinference:jev-1.14.0', ...), so no slug
+    mapping is needed. Never raises."""
+    now = time.time()
+    if now - _JEV_PRICE_CACHE['at'] < _JEV_PRICE_TTL_S:
+        return _JEV_PRICE_CACHE['prices']
+    prices = {}
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                'SELECT model, AVG(cost), COUNT(*) FROM decision_tape '
+                'WHERE ok = 1 AND cost IS NOT NULL AND ts >= ? GROUP BY model',
+                (now - _JEV_PRICE_WINDOW_S,)).fetchall()
+        for model, avg_cost, n in rows or []:
+            if model and n and n >= _JEV_PRICE_MIN_SAMPLES:
+                try:
+                    prices[str(model)] = float(avg_cost)
+                except (TypeError, ValueError):
+                    pass
+    except Exception:
+        pass
+    _JEV_PRICE_CACHE['at'] = now
+    _JEV_PRICE_CACHE['prices'] = prices
+    return prices
+
+
+def _price_order_decision_chain(chain):
+    """Stable-reorder the chain: paid slugs (OpenRouter slugs and
+    '@cheaperinference:' entries) sort by measured per-call price ascending,
+    unknown-priced paid slugs after known ones (operator order preserved
+    among unknowns and among equal prices); Laya ('://') and free-pool
+    ('@freepool:') entries keep their positions AFTER every paid slug."""
+    if not chain or len(chain) < 2:
+        return chain
+    try:
+        prices = _jev_slug_prices()
+    except Exception:
+        return chain
+    paid = [c for c in chain
+            if '://' not in c and not c.startswith('@freepool:')]
+    rest = [c for c in chain
+            if '://' in c or c.startswith('@freepool:')]
+    if len(paid) < 2:
+        return chain
+    paid_sorted = sorted(
+        paid,
+        key=lambda c: ((0, prices[c]) if c in prices else (1, 0.0)))
+    return paid_sorted + rest
+
+
 def _decision_model_chain():
     """Ordered Jev candidate slugs, primary first -- the failover chain
     Resolution order: a comma-separated `settings` row
@@ -904,6 +1064,18 @@ def _decision_model_chain():
             chain.insert(laya_at + 1, free_low)
         else:
             chain.append(free_low)
+    # Price-based ordering (operator, 2026-11-17): within the PAID slugs,
+    # cheapest measured per-call decision cost leads -- the same model sold
+    # by two providers (OpenRouter's typed jev slugs, Cheaper Inference's
+    # @cheaperinference: ones) serves from whoever is actually cheaper right
+    # now, and the other becomes the failover, instead of a hand-pinned
+    # order going stale as prices drift. Measured tape averages, not catalog
+    # quotes: both providers bill the same workload shape here, so trailing
+    # per-call cost is the comparable unit (Cheaper's catalog is per-million
+    # tokens; OpenRouter doesn't list the typed slugs at all). Unknown-priced
+    # slugs sort AFTER known ones inside the paid group; Laya and the free
+    # pool always stay after every paid slug, in their fixed roles.
+    chain = _price_order_decision_chain(chain)
     remaining = _credits_remaining_cached()
     if remaining is not None and remaining <= _credits_free_floor():
         # Below the free floor even free routes stop: JEV serves from the
@@ -914,8 +1086,17 @@ def _decision_model_chain():
         # lane has hit its OWN monthly cap (JEV_SPEND_CAP_USD): the paid
         # slugs drop, Laya then the free pool keep the decisions model
         # alive. Decisions never stop; only the paid spend does.
-        chain = [c for c in chain
-                 if '://' in c or c.startswith('@freepool:')]
+        # An OPENROUTER-ACCOUNT pause (credits_pause_active) does NOT drop
+        # the Cheaper Inference slug: that is a separate wallet with its own
+        # prepaid balance (2026-11-17). The __jev__ LANE cap gates every
+        # provider together, so a lane-cap hit still drops it.
+        if credits_pause_active() and not _lane_cap_exceeded('__jev__'):
+            chain = [c for c in chain
+                     if '://' in c or c.startswith('@freepool:')
+                     or _cheaper_decision_slug(c)]
+        else:
+            chain = [c for c in chain
+                     if '://' in c or c.startswith('@freepool:')]
     return chain
 
 

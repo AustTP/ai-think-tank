@@ -975,7 +975,10 @@ def _file_failure_bug(state, sprint_id, team_id, director_id, failure, finding, 
         'room': failure.get('room') or 'pressoffice',
         'taskType': 'bug',
         'assignedTo': assignee,
-        'directRoute': True,
+        # The flag only when the assignee resolved; a null-assignee directRoute
+        # flag must round-robin, never wait forever (2026-11-17 lesson from
+        # the [PROG-1D] directedTo wedge).
+        'directRoute': bool(assignee),
         'incident': True,
         'priority': 'high',
         'teamId': team_id,
