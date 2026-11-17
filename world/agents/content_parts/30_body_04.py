@@ -586,15 +586,27 @@ def _wiki_context_for_task(state, task, agent_id=None):
     task's agent's VILLAGE so a worker only ever sees their own village's wiki.
     Empty string when the wiki has nothing for this task's room -- the executor
     still runs, just with a blank knowledge context (the pre-existing
-    behavior)."""
+    behavior). The epistemic brief (core/epistemics.py) is appended so the
+    worker sees ESTABLISHED vs ASSERTED vs UNKNOWN vs CONFLICTED before it
+    writes: asserted context must never read as established fact."""
+    ctx = ''
     try:
         import sim as _sim
         if agent_id:
             village_id = _sim.village_of_agent(state, agent_id)
-            return _sim.inject_wiki_context(state, task, village_id=village_id)
-        return _sim.inject_wiki_context(state, task)
+            ctx = _sim.inject_wiki_context(state, task, village_id=village_id)
+        else:
+            ctx = _sim.inject_wiki_context(state, task)
     except Exception:
-        return ''
+        ctx = ''
+    try:
+        import core.epistemics as _epistemics
+        brief = _epistemics.epistemic_brief()
+        if brief:
+            ctx = f'{ctx}\n\n{brief}' if ctx else brief
+    except Exception:
+        pass
+    return ctx
 
 
 def _design_context_for_task(state, task, agent_id=None):

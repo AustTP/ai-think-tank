@@ -4,6 +4,7 @@
 
 ### Features
 
+- Epistemic ledger (`core/epistemics.py` + the `epistemics` ask tool + `GET/POST /api/epistemics`): the tank now distinguishes what it has ASSERTED from what it has ESTABLISHED. Propositions move unknown -> hypothesized -> evidenced -> validated -> superseded, with disputed/contradicted/blocked/unresolved states and computed staleness (a 30-day review window; stale records stay readable but lose trusted-current status). Evidence attaches through the existing evidence ledger and independence is computed per resolved source identity, so two agents repeating the same source count as one corroboration, never two. Validations make unknowns actionable (what to learn, what evidence resolves it, cost, blockers) and pass through the Bank before running; a completed result does not validate its item until a DIFFERENT agent approves the review. Contradictions stay open and visible until a written resolution names one of the recorded sides (or neither). Decisions are replayable artifacts with citations, resulting actions, and reconsideration triggers. The agent context brief and the synthetic prompt-injection benchmark (`core/epistemic_benchmark.py`, graded on the 13-category answer key, not prose) close the loop.
 - Docker-down fallback for `/api/execute`: when the local Docker sandbox
   cannot start (daemon down, binary missing), the same Jev-approved command
   reroutes to the player's Colab CPU runtime -- workspace shipped as a

@@ -3751,6 +3751,65 @@ endpoint's filter contract is unchanged (team and project query params).
 **Records.** The rendered view; underlying records are the task rows
 themselves.
 
+### BP-79 Epistemic ledger (asserted vs established)
+
+**Last checked:** 2026-11-17
+
+**Purpose.** Make the tank able to say, accurately, "I don't know this yet;
+here is my evidence and where it came from; these sources conflict; this
+information may be stale." Knowledge moves through an explicit lifecycle
+(unknown -> hypothesized -> evidenced -> validated -> superseded, plus
+disputed/contradicted/blocked/unresolved), so repeated talk never reads as
+established fact and contradictory evidence stays visible until a written
+resolution lands.
+
+**Trigger.** An agent's `epistemics` ask tool call, a player write to
+`POST /api/epistemics`, or an agent worker reading its task context (the
+epistemic brief is folded in next to the wiki context).
+
+**Steps.**
+
+1. A proposition enters the ledger (`core/epistemics.py`) as an unknown, a
+   hypothesis, or an unsupported assertion. Text-keyed, so a restatement
+   is the same record with a second asker, never a second fact.
+2. Evidence attaches only through the evidence ledger's claims
+   (`evidence.record_source_claim`); independence is computed per resolved
+   source identity, so two agents citing the same source count as ONE
+   source.
+3. Validations make unknowns actionable: what to learn, what evidence
+   would resolve it, how to get it, whether it is blocked, expected cost,
+   and whether resolution is worth the cost. Starting one consults the
+   Bank (shared spend cap plus the `epistemic` lane cap); an exhausted
+   budget parks the validation as blocked instead of running past the cap.
+4. A validation result becomes evidence but does NOT validate its item: a
+   DIFFERENT agent must approve the review gate first (reviewer
+   independence, applied to knowledge).
+5. Contradictions open on an item, flip it to disputed, and stay open
+   until `resolve` lands written text; the winner must be one of the two
+   recorded claims, never an invented third version. No winner means the
+   item drops to unresolved.
+6. Items carry a review window (30 days by default). An expired window
+   computes as stale at read time: the record stays readable but loses
+   trusted-current status until re-verified (`stale` refresh action).
+7. Decisions are replayable artifacts citing the items/claims/validations/
+   contradictions they rested on, with resulting actions and the
+   conditions that would force reconsideration; replay shows each cited
+   record's status NOW vs then.
+
+**Controls.** HTTP is player-session gated (operator console view); agents
+reach the same state through the ask tool as themselves, so reviewer
+independence holds on both surfaces. The audit trail lands in
+`evidence_audit` (append-only). Storage is the ledger's own row through
+`_db()`, so it rides the deployment backend (Postgres or SQLite) like the
+other ledgers.
+
+**Records.** The `epistemic_ledger` row (items, validations,
+contradictions, decisions), the shared `evidence_audit` trail, and the
+snapshot/brief views (`GET /api/epistemics`, `GET /api/epistemics/brief`).
+The synthetic benchmark (prompt-injection monitoring investigation) lives
+in `core/epistemic_benchmark.py` and grades the SNAPSHOT against an answer
+key across 13 categories -- calibrated knowledge, not prose.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |

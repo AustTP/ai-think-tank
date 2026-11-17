@@ -78,7 +78,13 @@ AUDIT_ACTIONS = frozenset({'claim_recorded', 'claim_observed', 'claim_reviewed',
                            'coverage_pending_review', 'coverage_covered',
                            'coverage_failed',
                            'question_recorded', 'question_answered',
-                           'question_contradicted'})
+                           'question_contradicted',
+                           'epistemic_recorded', 'epistemic_evidence',
+                           'epistemic_validated', 'epistemic_validation',
+                           'epistemic_contradiction',
+                           'epistemic_contradiction_resolved',
+                           'epistemic_superseded', 'epistemic_stale_refresh',
+                           'epistemic_decision', 'epistemic_action'})
 
 # Per-actor cap on COVERED flips within the window: a compromised Verifier
 # cannot silently flip the whole ledger to covered in one pass. When an agent

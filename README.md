@@ -99,6 +99,7 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 | `world/integrations/notify.py` | Escalation and player-notification email and Telegram senders |
 | `world/sim.py` + `world/village/sim_parts/` | Simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
 | `world/core/confirmations.py` | Durable two-phase confirmation proposals: target and argument binding, exact phrase, expiry, completion |
+| `world/core/epistemics.py` | The epistemic ledger: asserted vs established, evidence lineage, validations, contradictions, staleness, replayable decisions |
 | `world/server/confirmations_api.py` | Player and agent HTTP surface for proposing, confirming, listing, and cancelling actions |
 | `world/server/migrations.py` + `world/migrations/` | Versioned SQLite migrations with checksums |
 | `world/core/model_config.py` | Model-band validation and operator table |
