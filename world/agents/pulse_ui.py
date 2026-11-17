@@ -27,6 +27,12 @@ pre{white-space:pre-wrap;background:#0c131b;border:1px solid var(--line);border-
 .badge.done{color:var(--good);border-color:#2f5a35}
 .badge.bad{color:var(--bad);border-color:#5a2f2f}
 .meta{color:var(--muted);font-size:12px;margin-top:4px;display:flex;gap:12px;flex-wrap:wrap}
+.grouptoggle{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.grouptoggle button{padding:5px 9px;font-size:12px}
+.grouptoggle button.on{color:var(--accent);border-color:#2b5a58}
+.group{margin:0 0 16px}
+.group-h{display:flex;gap:10px;align-items:baseline;margin:0 0 8px}
+.group-h b{font-size:12px;letter-spacing:.12em;color:var(--muted);text-transform:uppercase}
 .event{border-left:2px solid var(--line);padding:4px 0 4px 8px;margin:0 0 6px;color:var(--muted);font-size:12px}
 .event b{color:var(--text)}
 .trace{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin:0 0 8px}
@@ -59,7 +65,16 @@ footer{color:var(--muted);font-size:11px;margin-top:18px}
       <div id="events" class="empty">Loading...</div>
     </section>
     <section>
-      <h2>Open cards</h2>
+      <h2>Work board</h2>
+      <div class="meta" style="margin-bottom:10px">
+        <span class="grouptoggle">Group by:
+          <button id="groupTeam" class="on" data-group="team">Team</button>
+          <button id="groupProject" data-group="project">Project</button>
+        </span>
+        <select id="boardTeam" style="min-width:140px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit"></select>
+        <input id="boardProject" placeholder="project" autocomplete="off"
+               style="flex:1;min-width:120px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit">
+      </div>
       <div id="board" class="empty">Loading...</div>
     </section>
     <section>
@@ -120,16 +135,81 @@ function renderPulse(data) {
     });
   }
 }
-function renderBoard(data) {
-  const b = $('board'); b.textContent = '';
-  if (!data.tasks || !data.tasks.length) { b.className='empty'; b.textContent='No open cards.'; return; }
-  b.className='';
-  data.tasks.forEach(t => {
-    const meta = [t.teamId && ('team '+t.teamId), t.assignedTo && ('owner '+t.assignedTo), t.projectLabel && ('project '+t.projectLabel), 'budget $'+(t.budgetUsd||0), 'spent $'+(t.spentUsd||0)].filter(Boolean).join(' / ');
-    const c = card(null, t.title, meta, t.status, t.status === 'done' ? 'done' : 'open');
-    if (t.reportPath) c.appendChild(el('div','meta', 'report '+t.reportPath+(t.artifactExists ? ' (on disk)' : ' (missing)')));
-    b.appendChild(c);
+let boardTasks = [];
+let boardMode = 'team';
+let boardTeam = '';
+let boardProject = '';
+function boardCard(t) {
+  const meta = [t.teamId && ('team '+t.teamId), t.assignedTo && ('owner '+t.assignedTo), t.projectLabel && ('project '+t.projectLabel), 'budget $'+(t.budgetUsd||0), 'spent $'+(t.spentUsd||0)].filter(Boolean).join(' / ');
+  const c = card(null, t.title, meta, t.status, t.status === 'done' ? 'done' : 'open');
+  if (t.reportPath) c.appendChild(el('div','meta', 'report '+t.reportPath+(t.artifactExists ? ' (on disk)' : ' (missing)')));
+  return c;
+}
+function boardGroups(tasks, mode, teamFilter, projectFilter) {
+  const proj = (projectFilter || '').trim().toLowerCase();
+  const rows = (tasks || []).filter(t => {
+    if (teamFilter && (t.teamId || '') !== teamFilter) return false;
+    if (proj) {
+      const label = (t.projectLabel || '').toLowerCase();
+      const title = (t.title || '').toLowerCase();
+      if (label.indexOf(proj) < 0 && title.indexOf(proj) < 0) return false;
+    }
+    return true;
   });
+  const order = [];
+  const byKey = {};
+  rows.forEach(t => {
+    const key = mode === 'team' ? (t.teamId || '') : (t.projectLabel || '');
+    if (!(key in byKey)) {
+      byKey[key] = {key: key, label: mode === 'team' ? (key || 'Unassigned') : (key || '(no project)'), open: 0, done: 0, latest: 0, tasks: []};
+      order.push(byKey[key]);
+    }
+    const g = byKey[key];
+    const st = t.status || '';
+    if (st === 'done') g.done += 1;
+    else if (st !== 'cancelled' && st !== 'abandoned') g.open += 1;
+    const ts = t.updatedAt || 0;
+    if (ts > g.latest) g.latest = ts;
+    g.tasks.push(t);
+  });
+  order.sort((a, b) => {
+    const au = mode === 'team' && a.key === '';
+    const bu = mode === 'team' && b.key === '';
+    if (au !== bu) return au ? 1 : -1;
+    return b.latest - a.latest;
+  });
+  return order;
+}
+function renderBoardSections() {
+  const b = $('board'); b.textContent = '';
+  if (!boardTasks.length) { b.className='empty'; b.textContent='No cards.'; return; }
+  const groups = boardGroups(boardTasks, boardMode, boardTeam, boardProject);
+  if (!groups.length) { b.className='empty'; b.textContent='No cards match the filters.'; return; }
+  b.className='';
+  groups.forEach(g => {
+    const sec = el('div', 'group');
+    sec.setAttribute('data-group', boardMode);
+    sec.setAttribute('data-key', g.key || (boardMode === 'team' ? 'unassigned' : 'none'));
+    const head = el('div', 'group-h');
+    head.appendChild(el('b', null, g.label));
+    head.appendChild(el('span', 'badge', g.open + ' open / ' + g.done + ' done'));
+    sec.appendChild(head);
+    g.tasks.forEach(t => sec.appendChild(boardCard(t)));
+    b.appendChild(sec);
+  });
+}
+function renderBoard(data) {
+  boardTasks = data.tasks || [];
+  const teams = [];
+  boardTasks.forEach(t => { const id = t.teamId || ''; if (id && teams.indexOf(id) < 0) teams.push(id); });
+  teams.sort();
+  const sel = $('boardTeam');
+  const keep = boardTeam;
+  sel.textContent = '';
+  const all = el('option', null, 'All teams'); all.value = ''; sel.appendChild(all);
+  teams.forEach(id => { const o = el('option', null, id); o.value = id; sel.appendChild(o); });
+  if (keep && teams.indexOf(keep) >= 0) sel.value = keep; else { sel.value = ''; boardTeam = ''; }
+  renderBoardSections();
 }
 async function getJSON(url) {
   const r = await fetch(url, {credentials:'same-origin'});
@@ -232,7 +312,7 @@ async function refresh() {
   try {
     const [p, b] = await Promise.all([
       getJSON('/api/pulse/overview'),
-      getJSON('/api/project-board?status=open&limit=40')
+      getJSON('/api/project-board?status=all&limit=60')
     ]);
     renderPulse(p); renderBoard(b);
     $('stamp').textContent = 'Updated '+new Date().toLocaleString();
@@ -249,6 +329,16 @@ $('sessStart').addEventListener('click', async () => {
     $('sessAgent').value=''; loadSessions();
   } catch (e) { alert(e.message); }
 });
+function setBoardMode(mode) {
+  boardMode = mode;
+  $('groupTeam').classList.toggle('on', mode === 'team');
+  $('groupProject').classList.toggle('on', mode === 'project');
+  renderBoardSections();
+}
+$('groupTeam').addEventListener('click', () => setBoardMode('team'));
+$('groupProject').addEventListener('click', () => setBoardMode('project'));
+$('boardTeam').addEventListener('change', () => { boardTeam = $('boardTeam').value; renderBoardSections(); });
+$('boardProject').addEventListener('input', () => { boardProject = $('boardProject').value; renderBoardSections(); });
 $('refresh').addEventListener('click', refresh);
 $('traceRefresh').addEventListener('click', loadTrace);
 $('traceAgent').addEventListener('change', loadTrace);
