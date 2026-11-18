@@ -162,4 +162,4 @@ async def api_session_search(request: Request, q: str = '', limit: int = 0,
         return JSONResponse({'error': 'query parameter q is required'},
                             status_code=400)
     return JSONResponse(await asyncio.to_thread(
-        _session_search, q, limit, days))
+        _ss_session_search, q, limit, days))

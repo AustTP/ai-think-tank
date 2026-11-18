@@ -259,6 +259,11 @@ class SearchFunction(unittest.TestCase):
         self.assertIn("'/api/session-search'", src465)
         self.assertIn('_require_player_or_admin(request)', src465,
                       'operator/admin only, like /api/replay and /api/failures')
+        # The endpoint dispatches the _ss_-prefixed searcher; an unprefixed
+        # call would NameError at request time (exec'd-namespace hazard the
+        # first deploy actually hit).
+        self.assertIn('to_thread(\n        _ss_session_search', src465)
+        self.assertNotIn('to_thread(\n        _session_search', src465)
 
 
 if __name__ == '__main__':
