@@ -57,6 +57,26 @@ STORED_STATUSES = frozenset({'unknown', 'hypothesized', 'evidenced', 'validated'
                              'superseded', 'disputed', 'contradicted', 'blocked',
                              'unresolved'})
 
+# Evidence relations (2026-11-18, coherence review Priority 2): how an
+# attachment relates to its proposition. Legacy entries carry no 'relation'
+# and mean 'supports' -- _entry_corroborates treats a missing relation as
+# supporting, so no existing record changes meaning.
+EVIDENCE_RELATIONS = frozenset({'supports', 'partially_supports',
+                                'context_only', 'duplicate'})
+
+# Evidence strength scale (same review): how good the evidence is, from a
+# bare claim to a reproducible runtime validation. Stored per attachment
+# when the caller knows it; None means unspecified (the common case for
+# desk-research claims) and never gates anything by itself.
+EVIDENCE_STRENGTH = {
+    0: 'E0 assertion only',
+    1: 'E1 secondary reference',
+    2: 'E2 authoritative design or implementation evidence',
+    3: 'E3 direct runtime observation',
+    4: 'E4 reproducible runtime validation with independently reviewable '
+       'artifacts',
+}
+
 # Item kinds: how the record entered the ledger. An assertion is something
 # someone SAID without source-backed evidence -- asserted, never established.
 ITEM_KINDS = frozenset({'unknown', 'hypothesis', 'assertion'})
@@ -413,7 +433,8 @@ def effective_status(item, now_ms=None):
     return status
 
 
-def _attach(item, entry, *, supports, actor, review_after_ms):
+def _attach(item, entry, *, supports, actor, review_after_ms,
+            relation=None, strength=None):
     """Append one evidence attachment with identity-level independence.
     Two attachments sharing a resolved identity are ONE source -- the
     anti-false-corroboration rule -- so the second only records the repeat."""
@@ -421,6 +442,10 @@ def _attach(item, entry, *, supports, actor, review_after_ms):
     entry = dict(entry)
     entry['independent'] = entry.get('identity') not in prior_identities
     entry['supports'] = bool(supports)
+    if relation:
+        entry['relation'] = relation
+    if strength is not None:
+        entry['strength'] = int(strength)
     entry['ts'] = time.time()
     entry.setdefault('actor', (actor or 'unknown')[:64])
     item.setdefault('evidence', []).append(entry)
@@ -448,25 +473,55 @@ def _advance_on_evidence(item, actor, review_after_ms):
     return 'evidenced'
 
 
+def _entry_corroborates(entry):
+    """The full-corroboration test behind source counting: supports=True
+    AND relation is absent-or-'supports'. partially_supports / context_only
+    / duplicate attachments stay VISIBLE on the item but never count as
+    independent corroboration -- a proposition is not evidenced by its own
+    footnotes."""
+    return bool(entry.get('supports')) \
+        and entry.get('relation') in (None, 'supports')
+
+
 def _independent_sources(item):
-    """Distinct resolved source identities among supporting attachments.
+    """Distinct resolved source identities among corroborating attachments.
     THE corroboration rule: same identity repeated N times is 1 source."""
     return {e.get('identity') for e in (item.get('evidence') or [])
-            if e.get('supports') and e.get('identity')}
+            if _entry_corroborates(e) and e.get('identity')}
 
 
 def independent_source_count(item):
     return len(_independent_sources(item))
 
 
+def _validate_relation_strength(relation, strength):
+    """Return (relation, strength, error). relation None/'' means the
+    default 'supports'; strength must be an int 0-4 or None."""
+    if relation in (None, '', 'supports'):
+        relation = None
+    elif relation not in EVIDENCE_RELATIONS:
+        return None, None, f'relation must be one of {sorted(EVIDENCE_RELATIONS)}'
+    if strength is not None:
+        try:
+            strength = int(strength)
+        except (TypeError, ValueError):
+            return None, None, 'strength must be an integer 0-4 or None'
+        if strength not in EVIDENCE_STRENGTH:
+            return None, None, 'strength must be an integer 0-4'
+    return relation, strength, None
+
+
 @_serialized
-def attach_evidence(item_id, claim_id, *, supports=True, actor=None,
-                    review_after_ms=None):
+def attach_evidence(item_id, claim_id, *, supports=True, relation=None,
+                    strength=None, actor=None, review_after_ms=None):
     """Attach an evidence-ledger claim to a proposition. The claim must
     exist in the evidence ledger -- an attachment without a recorded claim
     is not evidence, it is the same unsupported assertion with better
-    handwriting. Returns {'attached': True, 'id', 'corroborated',
-    'independentSources', 'status'}."""
+    handwriting. relation: supports (default) / partially_supports /
+    context_only / duplicate -- only 'supports' counts toward independent
+    corroboration. strength: E0-E4 (see EVIDENCE_STRENGTH), recorded for
+    measurement, never a gate by itself. Returns {'attached': True, 'id',
+    'corroborated', 'independentSources', 'status'}."""
     ledger = _ensure_shape(_ledger_read())
     item = ledger['items'].get(item_id)
     if item is None:
@@ -479,6 +534,10 @@ def attach_evidence(item_id, claim_id, *, supports=True, actor=None,
         supports = _validate_bool(supports, 'supports')
     except ValueError as e:
         return {'attached': False, 'reason': 'invalid', 'error': str(e)}
+    relation, strength, rel_err = _validate_relation_strength(relation,
+                                                              strength)
+    if rel_err:
+        return {'attached': False, 'reason': 'invalid', 'error': rel_err}
     import core.evidence as evidence
     claim = evidence.get_claim(claim_id)
     if claim is None:
@@ -489,9 +548,10 @@ def attach_evidence(item_id, claim_id, *, supports=True, actor=None,
     entry = _attach(item, {'claimId': claim_id, 'identity': claim.get('identity'),
                            'sourceHost': claim.get('source_host'),
                            'actor': actor}, supports=supports, actor=actor,
-                    review_after_ms=review_after_ms)
+                    review_after_ms=review_after_ms, relation=relation,
+                    strength=strength)
     new_status = None
-    if supports:
+    if _entry_corroborates(entry):
         new_status = _advance_on_evidence(item, actor, review_after_ms)
         if new_status:
             entry['advancedTo'] = new_status
@@ -499,7 +559,9 @@ def attach_evidence(item_id, claim_id, *, supports=True, actor=None,
     _ledger_write(ledger)
     _audit(actor, 'epistemic_evidence', subject_id=item_id,
            detail={'claimId': claim_id, 'identity': claim.get('identity'),
-                   'independent': entry['independent'], 'supports': supports})
+                   'independent': entry['independent'], 'supports': supports,
+                   'relation': entry.get('relation') or 'supports',
+                   'strength': entry.get('strength')})
     return {'attached': True, 'id': item_id,
             'corroborated': not entry['independent'],
             'independentSources': independent_source_count(item),
@@ -508,7 +570,8 @@ def attach_evidence(item_id, claim_id, *, supports=True, actor=None,
 
 @_serialized
 def attach_evidence_from_source(item_id, source_url, claim_text, *,
-                                resolved_url=None, supports=True, actor=None,
+                                resolved_url=None, supports=True,
+                                relation=None, strength=None, actor=None,
                                 review_after_ms=None):
     """Record a claim in the evidence ledger from a raw source, then attach
     it. Convenience for an agent that has a source in hand and no claim id
@@ -523,7 +586,8 @@ def attach_evidence_from_source(item_id, source_url, claim_text, *,
         return {'attached': False, 'reason': 'claim_not_recorded',
                 'detail': result}
     out = attach_evidence(item_id, result['id'], supports=supports,
-                          actor=actor, review_after_ms=review_after_ms)
+                          relation=relation, strength=strength, actor=actor,
+                          review_after_ms=review_after_ms)
     out['claim'] = result
     return out
 
@@ -1112,8 +1176,11 @@ def replay_decision(decision_id):
 def _item_view(item, now_ms, contradictions):
     sources = [{'identity': e.get('identity'), 'claimId': e.get('claimId'),
                 'independent': e.get('independent'),
+                'relation': e.get('relation') or 'supports',
+                'strength': e.get('strength'),
                 'host': e.get('sourceHost')}
-               for e in (item.get('evidence') or []) if e.get('supports')]
+               for e in (item.get('evidence') or [])
+               if _entry_corroborates(e)]
     open_cx = [c for c in (item.get('contradictionIds') or [])
                if (contradictions.get(c) or {}).get('status') == 'open']
     status = effective_status(item, now_ms)
