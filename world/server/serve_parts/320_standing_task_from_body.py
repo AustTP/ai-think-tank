@@ -415,6 +415,14 @@ async def supervisor_meeting(request: Request):
 
 @app.get('/api/budget/story')
 async def budget_overview(request: Request):
+    # Operator-gated (route_auth_audit finding, 2026-11-18): this sat in the
+    # middleware's '/api/budget' public prefix with no in-handler gate, so
+    # the story-budget ledger (spend lines, overrun alerts, reviews) was
+    # anonymous-readable. Spend data is operator data.
+    authed, _actor = _operator_gate(request)
+    if not authed:
+        return JSONResponse({'error': 'Unauthorized -- operator only'},
+                            status_code=401)
     state = get_state_from_db() or {}
     ledger = story_budget.BudgetLedger.from_state(state.get('budgetLedger'))
     if ledger is None:

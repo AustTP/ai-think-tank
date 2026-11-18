@@ -90,6 +90,19 @@ jobs:
         working-directory: world
         run: python -m bandit --ini setup.cfg -q serve.py sim.py content.py selfedit.py
 
+      # Release gate (2026-11-18, from the coherence review): every HTTP
+      # route must reach an explicit authorization decision -- the
+      # deny-by-default middleware, an in-handler gate, or the reviewed
+      # allowlist in tools/route_auth_audit.py. A new endpoint that ships
+      # without one fails the build here. The dynamic half of the gate
+      # (exactly-once external writes, dependency gating, restart
+      # durability, review/contradiction knowledge gates) lives in
+      # tests/server/test_release_invariants.py, part of the tests/server
+      # sweep below.
+      - name: Route auth reachability (release gate)
+        working-directory: world
+        run: python tools/route_auth_audit.py
+
       - name: Git identity for sandbox tests
         run: |
           git config --global user.email "ci@aithinktank.local"
