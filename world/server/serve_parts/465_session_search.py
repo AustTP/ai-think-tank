@@ -24,6 +24,12 @@ from fastapi.responses import JSONResponse
 _SS_LIMIT = 40
 _SS_PREFILTER = 4000
 _SS_SNIPPET = 220
+# Building-era window bound (operator decision 2026-11-18): the tank is only
+# ~61 days old and most of that is build/troubleshoot churn, so search
+# surfaces the last 14 days for now. Raise this to 90+ once there is that
+# much steady-state history worth recalling -- it is the ONLY knob: it clamps
+# the endpoint's days parameter and bounds the mail scan together.
+_SS_WINDOW_DAYS = 14
 
 
 def _ss_tokens(q):
@@ -89,7 +95,7 @@ def _ss_mail_hits(state, toks, now_ms):
     (MAILBOX_KEEP_COUNT / MAILBOX_ARCHIVE_KEEP_COUNT) already bounds the
     scan; entries older than the window drop out. Mail stamps are epoch-ms
     under createdAt or ts -- both appear in the wild, so read both."""
-    window = 90 * 24 * 3600 * 1000
+    window = _SS_WINDOW_DAYS * 24 * 3600 * 1000
     min_ms = now_ms - window
     out = []
     for agent_id, agent in (state.get('agents') or {}).items():
@@ -133,7 +139,8 @@ def _ss_session_search(q, limit, days):
     if not toks:
         return {'error': 'empty query'}
     now_ms = int(time.time() * 1000)
-    since_ts = time.time() - max(1, min(int(days or 7), 90)) * 24 * 3600
+    since_ts = time.time() - max(1, min(int(days or 7), _SS_WINDOW_DAYS)) \
+        * 24 * 3600
     state = get_state_from_db('none') or {}
     with _db() as conn:
         log_hits = _ss_log_rows(conn, toks, since_ts)
@@ -154,7 +161,7 @@ def _ss_session_search(q, limit, days):
 
 @app.get('/api/session-search')
 async def api_session_search(request: Request, q: str = '', limit: int = 0,
-                             days: int = 7):
+                             days: int = 14):
     if not _require_player_or_admin(request):
         return JSONResponse({'error': 'Unauthorized -- operator only'},
                             status_code=401)
@@ -163,3 +170,101 @@ async def api_session_search(request: Request, q: str = '', limit: int = 0,
                             status_code=400)
     return JSONResponse(await asyncio.to_thread(
         _ss_session_search, q, limit, days))
+
+
+_SS_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'session_search',
+        'description': 'Search your own recorded history before re-doing '
+                       'work or re-hitting a failure: your action_log rows '
+                       '(every action you took) and your mailbox (live + '
+                       'archive). Self-scoped: you see only your own rows; '
+                       'the operator-wide search is GET /api/session-search '
+                       '(operator only). Query tokens are ANDed, window is '
+                       'the last N days (default 7, max 14).',
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'q': {'type': 'string',
+                      'description': 'Space-separated tokens, ANDed.'},
+                'days': {'type': 'integer',
+                         'description': 'Look-back window in days '
+                                        '(default 7, max 14).'},
+                'limit': {'type': 'integer',
+                          'description': 'Max results (default 20, cap 40).'},
+            },
+            'required': ['q'],
+        },
+    },
+}
+
+
+def _ss_agent_search(agent_id, args):
+    """Dispatch a `session_search` tool call. Self-scope rule, same shape as
+    the replay/investigate tools: an agent sees only its own action rows and
+    its own mailbox (live + archive); never other agents' mail and never the
+    player inbox. Read-only by construction."""
+    args = args or {}
+    toks = _ss_tokens(args.get('q'))
+    if not toks:
+        return 'session_search: q is required (space-separated tokens)'
+    now_ms = int(time.time() * 1000)
+    days = max(1, min(int(args.get('days') or 7), _SS_WINDOW_DAYS))
+    since_ts = time.time() - days * 24 * 3600
+    limit = max(1, min(int(args.get('limit') or 20), _SS_LIMIT))
+    with _db() as conn:
+        try:
+            rows = conn.execute(
+                'SELECT ts, action, details FROM action_log '
+                'WHERE agent_id = ? AND ts >= ? '
+                'AND LOWER(details) LIKE ? ORDER BY ts DESC LIMIT ?',
+                (agent_id, since_ts, '%' + toks[0] + '%', _SS_PREFILTER),
+            ).fetchall()
+        except Exception:
+            rows = []
+    hits = []
+    for ts, action, details in rows:
+        try:
+            parsed = json.loads(details) if details else {}
+        except Exception:
+            parsed = {'raw': str(details)[:300]}
+        searchable = ' '.join([action, details or '', str(parsed)])
+        if not _ss_matches_all(searchable, toks):
+            continue
+        hits.append({'source': 'log', 'atMs': int(ts * 1000),
+                     'action': action,
+                     'taskId': parsed.get('taskId'),
+                     'snippet': _ss_snippet(searchable, toks)})
+    agent = (get_state_from_db('none') or {}).get('agents', {}).get(agent_id)
+    if isinstance(agent, dict):
+        pool = list(agent.get('mailbox') or []) + \
+            list(agent.get('mailboxArchive') or [])
+        min_ms = now_ms - _SS_WINDOW_DAYS * 24 * 3600 * 1000
+        for m in pool:
+            if not isinstance(m, dict):
+                continue
+            text = ' '.join([m.get('kind') or '', m.get('about') or '',
+                             m.get('title') or '', m.get('text') or ''])
+            if not _ss_matches_all(text, toks):
+                continue
+            stamp = int(m.get('createdAt') or m.get('ts') or 0)
+            if stamp < min_ms:
+                continue
+            hits.append({'source': 'mail', 'atMs': stamp,
+                         'kind': m.get('kind'),
+                         'snippet': _ss_snippet(text, toks)})
+    hits.sort(key=lambda h: h.get('atMs') or 0, reverse=True)
+    if not hits:
+        return (f"No hits for {' '.join(toks)} in your last {days} days of "
+                'actions and mail.')
+    lines = [f"{len(hits)} hit(s) in your last {days} days "
+             f"(self-scoped; the operator-wide search is "
+             f"GET /api/session-search):"]
+    for h in hits[:limit]:
+        when = time.strftime('%m-%d %H:%M', time.gmtime(h['atMs'] / 1000))
+        label = h.get('action') or h.get('kind') or '?'
+        tid = f" [{h['taskId']}]" if h.get('taskId') else ''
+        lines.append(f"- {when} {h['source']}:{label}{tid} "
+                     f"{h.get('snippet', '')[:160]}")
+    return '\n'.join(lines)

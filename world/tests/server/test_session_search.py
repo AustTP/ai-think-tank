@@ -219,9 +219,9 @@ class SearchFunction(unittest.TestCase):
         self.assertEqual([m['atMs'] for m in out['matches']],
                          [9_000, 7_000, 5_000], 'newest first across sources')
         self.assertFalse(out['truncated'])
-        # days=500 clamps to the 90-day ceiling
+        # days=500 clamps to the building-era window (14 days)
         self.assertAlmostEqual(captured['since_ts'],
-                               1800.0 - 90 * 24 * 3600)
+                               1800.0 - ss._SS_WINDOW_DAYS * 24 * 3600)
 
     def test_limit_applied_with_truncation_flag(self):
         import serve as ss
@@ -264,6 +264,110 @@ class SearchFunction(unittest.TestCase):
         # first deploy actually hit).
         self.assertIn('to_thread(\n        _ss_session_search', src465)
         self.assertNotIn('to_thread(\n        _session_search', src465)
+        self.assertIn('_SS_WINDOW_DAYS = 14', src465,
+                      'building-era window bound is one explicit knob')
+
+
+class AgentAskTool(unittest.TestCase):
+    """The self-scoped session_search ask-tool: an agent sees only its own
+    action rows and its own mailbox/archive; never other agents' mail and
+    never the player inbox."""
+
+    NOW_MS = 1_800_000_000_000
+
+    def _state(self):
+        return {'agents': {
+            'ada': {'mailbox': [{'kind': 'chief_directive',
+                                 'about': 'DEV-153',
+                                 'title': 'write gate directive',
+                                 'text': 'filed for your team',
+                                 'createdAt': self.NOW_MS - 1000}]},
+            'ben': {'mailbox': [{'kind': 'supervisor_brief',
+                                 'title': 'ben-only secret plan',
+                                 'text': 'pipeline theta-9',
+                                 'createdAt': self.NOW_MS - 1000}]}},
+            'playerInbox': [{'question': 'player note about theta-9',
+                             'answer': 'operator eyes only',
+                             'ts': self.NOW_MS - 1000}]}
+
+    def _run(self, agent_id):
+        import serve as ss
+
+        class FakeConn:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def execute(self, sql, params):
+                self.sql, self.params = sql, params
+                return self
+
+            def fetchall(self):
+                assert "agent_id = ?" in self.sql, \
+                    'agent tool must filter the log to its own rows'
+                assert self.params[0] == agent_id
+                return self._rows
+
+        rows = [(1800.0, 'selfedit_applied',
+                 json.dumps({'taskId': 'task-1',
+                             'title': 'write gate patch'}))]
+        with mock.patch.object(ss, '_db',
+                               return_value=type('ND', (), {
+                                   '__enter__': lambda s: FakeConn(rows),
+                                   '__exit__': lambda s, *a: False})()), \
+             mock.patch.object(ss, 'get_state_from_db',
+                               return_value=self._state()):
+            return ss._ss_agent_search(agent_id, {'q': 'theta-9 write'})
+
+    def test_self_scoped_log_and_mail(self):
+        import serve as ss
+        out_theta = self._run('ada')  # tokens: theta-9 (ben's mail only)
+
+        class FakeConn:
+            def __init__(self, rows):
+                self._rows = rows
+
+            def execute(self, sql, params):
+                self.sql, self.params = sql, params
+                return self
+
+            def fetchall(self):
+                assert "agent_id = ?" in self.sql
+                return self._rows
+
+        rows = [(1800.0, 'selfedit_applied',
+                 json.dumps({'taskId': 'task-1',
+                             'title': 'write gate patch'}))]
+        with mock.patch.object(ss, '_db',
+                               return_value=type('ND', (), {
+                                   '__enter__': lambda s: FakeConn(rows),
+                                   '__exit__': lambda s, *a: False})()), \
+             mock.patch.object(ss, 'get_state_from_db',
+                               return_value=self._state()):
+            out_write = ss._ss_agent_search('ada', {'q': 'write'})
+        self.assertIn('write gate patch', out_write)
+        self.assertIn('chief_directive', out_write)
+        self.assertIn('No hits', out_theta,
+                      'theta-9 exists only outside ada\'s scope')
+        self.assertNotIn('operator eyes only', out_write,
+                         'player inbox is invisible')
+
+    def test_ben_cannot_see_ada_rows(self):
+        out = self._run('ben')
+        self.assertIn('theta-9', out, 'ben hits his own mail')
+        self.assertNotIn('write gate patch', out,
+                         "ada's action rows are invisible to ben")
+
+    def test_dispatch_wired_into_ask_core(self):
+        src250 = open(_parts_path('250_ask_core.py'), encoding='utf-8').read()
+        self.assertIn("name == 'session_search'", src250)
+        self.assertIn('_ss_agent_search(pick, args)', src250)
+        self.assertIn('_SS_TOOL', src250)
+
+    def test_tool_registered_in_source(self):
+        src465 = open(_parts_path('465_session_search.py'),
+                      encoding='utf-8').read()
+        self.assertIn("'name': 'session_search'", src465)
+        self.assertIn('def _ss_agent_search(', src465)
 
 
 if __name__ == '__main__':
