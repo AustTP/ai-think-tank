@@ -17,13 +17,14 @@ def _brief_beliefs(now_ms):
     """What we now believe + what is still open, from the ledger."""
     try:
         import core.epistemics as epistemics
-        established = epistemics.query_items(status='validated') or []
-        disputed = [i for i in (epistemics.query_items() or [])
+        items = (epistemics.query_items(limit=500) or {}).get('items') or []
+        established = [i for i in items if i.get('status') == 'validated']
+        disputed = [i for i in items
                     if i.get('status') in ('disputed', 'contradicted')]
-        open_items = [i for i in (epistemics.query_items() or [])
+        open_items = [i for i in items
                       if i.get('status') in ('unknown', 'hypothesized',
                                              'evidenced')]
-        stale = [i for i in (epistemics.query_items() or [])
+        stale = [i for i in items
                  if epistemics.effective_status(i, now_ms) == 'stale']
         brief = {
             'establishedCount': len(established),
@@ -105,7 +106,7 @@ def _brief_spend():
     """Spend posture from the story-budget ledger in state."""
     try:
         state = get_state_from_db() or {}
-        import story_budget
+        import agents.story_budget as story_budget
         ledger = story_budget.BudgetLedger.from_state(
             state.get('budgetLedger'))
         if ledger is None:
