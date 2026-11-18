@@ -79,10 +79,19 @@ async def _route_player_request(state, text, session_id=None,
     lane = await asyncio.to_thread(_lane_decider, state, text) or 'unclear'
     actor_id = (key.agent_id if key is not None
                 else requester_id) or 'player'
+    # Second-opinion context (foundry pilot 1): when Jev REJECTS single-lane
+    # fit ('unclear') or a policy denial follows, the tiny net's top-2 read
+    # is logged beside the decision so the reviewing human gets context, not
+    # a bare refusal. Logged only -- never injected into a director's
+    # conversation, never used to decide anything. None (shadow off) adds no
+    # field at all.
+    net_read = _route_net_read(text)
+    classified_details = {'lane': lane, 'text': text[:200],
+                          'requester': actor_id}
+    if lane == 'unclear' and net_read:
+        classified_details['netSecondOpinion'] = net_read
     log_action('player', 'route_classified',
-               {'lane': lane, 'text': text[:200],
-                'requester': actor_id},
-               authorized=True)
+               classified_details, authorized=True)
     # Shadow pilot (foundry 1): the tiny net re-answers the same message in
     # parallel; its lane is logged, never used. Logging is inside
     # _route_shadow_classified's own try, so the live route is untouched.
@@ -107,7 +116,8 @@ async def _route_player_request(state, text, session_id=None,
                              % decision.approval_id}
         log_action(actor, 'theo_denied',
                    {'lane': lane, 'action': action,
-                    'reason': decision.reason},
+                    'reason': decision.reason,
+                    **({'netSecondOpinion': net_read} if net_read else {})},
                    authorized=False)
         return {'reply': "I can't do that: %s." % decision.reason}
     handler = _ROUTING_HANDLERS.get(lane, _route_lane_unclear)
