@@ -360,6 +360,11 @@ class RunBrowserActSync(unittest.TestCase):
         # nothing in the mount can be swapped between Jev classifying the op
         # and the driver reading the action (TOCTOU). The temp dir is deleted
         # in the finally, so it never outlives the run.
+        # The FILE is bound directly (not the whole mkdtemp dir): the dir is
+        # 0700 owned by the server uid and the container runs --cap-drop ALL,
+        # so root has no DAC search override and could not traverse it
+        # (the driver then read an empty action and died with
+        # "unknown op None").
         fake_run = unittest.mock.Mock(returncode=0, stdout='', stderr='')
         seen_mounts = []
         action_host_paths = []
@@ -370,12 +375,12 @@ class RunBrowserActSync(unittest.TestCase):
             # Where the driver will read its action from, per the argv.
             action_arg = next(c for c in cmd if c.endswith('.json') and 'action-' in c)
             self.assertEqual(action_arg, '/browser-act/' + os.path.basename(action_arg))
-            # Resolve the read-only mount to its host-side source dir.
-            ro_mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == '-v' and ':/browser-act:ro' in cmd[i + 1]]
+            # Resolve the read-only mount to its host-side source FILE.
+            ro_mounts = [cmd[i + 1] for i, c in enumerate(cmd) if c == '-v' and cmd[i + 1].split(':')[1] == '/browser-act/' + os.path.basename(action_arg)]
             self.assertEqual(len(ro_mounts), 1)
-            host_dir = ro_mounts[0].split(':')[0]
-            seen_mounts.append(host_dir)
-            action_path = os.path.join(host_dir, os.path.basename(action_arg))
+            host_path = ro_mounts[0].split(':')[0]
+            seen_mounts.append(os.path.dirname(host_path))
+            action_path = host_path
             action_host_paths.append(action_path)
             # The action must NOT be inside the shared sandbox mount.
             self.assertFalse(os.path.abspath(action_path).startswith(os.path.abspath(self.sbx) + os.sep))

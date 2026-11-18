@@ -114,7 +114,12 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         # exec sandbox never sees /browser-act, so a concurrent shell cannot
         # read the (decrypted) action file, and nothing in the mount can be
         # swapped between the Jev classification and the driver reading it.
-        '-v', f'{action_dir}:/browser-act:ro',
+        # The FILE is bound directly, not the mkdtemp dir: the dir is 0700 and
+        # owned by the server uid, and this container runs with --cap-drop ALL,
+        # so root has no DAC search override and could not traverse the dir
+        # (surfaced as the driver silently reading an empty action:
+        # "unknown op None"). A single-file bind needs no traversal.
+        '-v', f'{action_path}:/browser-act/action-{run_id}.json:ro',
         '-v', f'{_browser_profile_dir(agent_id)}:/browser-profile',
         '-w', '/workspace',
         SANDBOX_IMAGE,

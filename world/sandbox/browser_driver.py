@@ -834,7 +834,7 @@ def main(argv):
             with open(argv[1], 'r') as f:
                 action = json.load(f)
         else:
-            action = json.load(sys.stdin.read())
+            action = json.loads(sys.stdin.read())
     except Exception:
         action = {}
     result = run(action or {})
