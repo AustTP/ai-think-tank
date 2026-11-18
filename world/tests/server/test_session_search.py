@@ -269,93 +269,137 @@ class SearchFunction(unittest.TestCase):
 
 
 class AgentAskTool(unittest.TestCase):
-    """The self-scoped session_search ask-tool: an agent sees only its own
-    action rows and its own mailbox/archive; never other agents' mail and
-    never the player inbox."""
+    """Hierarchical scope for the session_search ask-tool: a worker sees
+    only herself; a director sees her subtree; a village regional VP sees
+    her village; the admin sees everything. The player inbox stays
+    operator-only on the HTTP endpoint."""
 
     NOW_MS = 1_800_000_000_000
 
+    def _roster(self):
+        return [
+            {'id': 'ada', 'director': 'rex'},
+            {'id': 'ben', 'director': 'rex'},
+            {'id': 'rex', 'director': None},          # team director
+            {'id': 'zoe', 'director': 'pat'},         # other village worker
+            {'id': 'pat', 'director': None,
+             'villageChief': True, 'chiefOfVillage': 'west'},
+            {'id': 'ops', 'isAdmin': True},
+        ]
+
     def _state(self):
-        return {'agents': {
-            'ada': {'mailbox': [{'kind': 'chief_directive',
-                                 'about': 'DEV-153',
-                                 'title': 'write gate directive',
-                                 'text': 'filed for your team',
-                                 'createdAt': self.NOW_MS - 1000}]},
-            'ben': {'mailbox': [{'kind': 'supervisor_brief',
-                                 'title': 'ben-only secret plan',
-                                 'text': 'pipeline theta-9',
-                                 'createdAt': self.NOW_MS - 1000}]}},
+        return {
+            'agentRoster': self._roster(),
+            'agents': {
+                'ada': {'villageId': 'main',
+                        'mailbox': [{'kind': 'chief_directive',
+                                     'about': 'DEV-153',
+                                     'title': 'write gate directive',
+                                     'text': 'filed for your team',
+                                     'createdAt': self.NOW_MS - 1000}]},
+                'ben': {'villageId': 'main',
+                        'mailbox': [{'kind': 'supervisor_brief',
+                                     'title': 'ben-only secret plan',
+                                     'text': 'pipeline theta-9',
+                                     'createdAt': self.NOW_MS - 1000}]},
+                'zoe': {'villageId': 'west',
+                        'mailbox': [{'kind': 'supervisor_brief',
+                                     'title': 'zoe west village note',
+                                     'text': 'harbor repair',
+                                     'createdAt': self.NOW_MS - 1000}]},
+            },
             'playerInbox': [{'question': 'player note about theta-9',
                              'answer': 'operator eyes only',
                              'ts': self.NOW_MS - 1000}]}
 
-    def _run(self, agent_id):
+    def _log_rows_for(self, agent_id):
+        return [(1800.0, agent_id, 'selfedit_applied',
+                 json.dumps({'taskId': 'task-1',
+                             'title': f'{agent_id} logged the write gate'}))]
+
+    def _run(self, agent_id, q):
         import serve as ss
+        seen = {}
 
         class FakeConn:
-            def __init__(self, rows):
-                self._rows = rows
-
             def execute(self, sql, params):
                 self.sql, self.params = sql, params
                 return self
 
             def fetchall(self):
-                assert "agent_id = ?" in self.sql, \
-                    'agent tool must filter the log to its own rows'
-                assert self.params[0] == agent_id
-                return self._rows
+                seen['sql'] = self.sql
+                if 'agent_id IN' in self.sql:
+                    ids = self.params[:self.sql.count('?)')]
+                    out = []
+                    for a in ids:
+                        out.extend(self._rows_for(a))
+                    return out
+                return self._rows_for(self.params[0])
 
-        rows = [(1800.0, 'selfedit_applied',
-                 json.dumps({'taskId': 'task-1',
-                             'title': 'write gate patch'}))]
-        with mock.patch.object(ss, '_db',
-                               return_value=type('ND', (), {
-                                   '__enter__': lambda s: FakeConn(rows),
-                                   '__exit__': lambda s, *a: False})()), \
+            def _rows_for(self, a):
+                return [(1800.0, a, 'selfedit_applied',
+                         json.dumps({'taskId': 'task-1',
+                                     'title': f'{a} logged the write gate'}))]
+
+        class ND:
+            def __enter__(self):
+                return FakeConn()
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(ss, '_db', return_value=ND()), \
              mock.patch.object(ss, 'get_state_from_db',
                                return_value=self._state()):
-            return ss._ss_agent_search(agent_id, {'q': 'theta-9 write'})
+            return ss._ss_agent_search(agent_id, {'q': q})
 
-    def test_self_scoped_log_and_mail(self):
+    def test_worker_scope_is_self_only(self):
         import serve as ss
-        out_theta = self._run('ada')  # tokens: theta-9 (ben's mail only)
+        state = self._state()
+        self.assertEqual(ss._ss_scope_ids(state, 'ada'), {'ada'})
 
-        class FakeConn:
-            def __init__(self, rows):
-                self._rows = rows
+    def test_director_scope_covers_subtree_not_other_teams(self):
+        import serve as ss
+        state = self._state()
+        self.assertEqual(ss._ss_scope_ids(state, 'rex'),
+                         {'rex', 'ada', 'ben'})
 
-            def execute(self, sql, params):
-                self.sql, self.params = sql, params
-                return self
+    def test_village_chief_scope_covers_her_village(self):
+        import serve as ss
+        state = self._state()
+        got = ss._ss_scope_ids(state, 'pat')
+        self.assertIn('zoe', got)
+        self.assertNotIn('ada', got, 'another village is out of scope')
 
-            def fetchall(self):
-                assert "agent_id = ?" in self.sql
-                return self._rows
+    def test_admin_scope_is_unbounded(self):
+        import serve as ss
+        self.assertIsNone(ss._ss_scope_ids(self._state(), 'ops'))
 
-        rows = [(1800.0, 'selfedit_applied',
-                 json.dumps({'taskId': 'task-1',
-                             'title': 'write gate patch'}))]
-        with mock.patch.object(ss, '_db',
-                               return_value=type('ND', (), {
-                                   '__enter__': lambda s: FakeConn(rows),
-                                   '__exit__': lambda s, *a: False})()), \
-             mock.patch.object(ss, 'get_state_from_db',
-                               return_value=self._state()):
-            out_write = ss._ss_agent_search('ada', {'q': 'write'})
-        self.assertIn('write gate patch', out_write)
-        self.assertIn('chief_directive', out_write)
-        self.assertIn('No hits', out_theta,
-                      'theta-9 exists only outside ada\'s scope')
-        self.assertNotIn('operator eyes only', out_write,
-                         'player inbox is invisible')
+    def test_unknown_agent_falls_back_to_self(self):
+        import serve as ss
+        self.assertEqual(ss._ss_scope_ids(self._state(), 'ghost'),
+                         {'ghost'})
 
-    def test_ben_cannot_see_ada_rows(self):
-        out = self._run('ben')
-        self.assertIn('theta-9', out, 'ben hits his own mail')
-        self.assertNotIn('write gate patch', out,
-                         "ada's action rows are invisible to ben")
+    def test_director_sees_reports_log_and_mail(self):
+        out = self._run('rex', 'theta-9')
+        self.assertIn('theta-9', out, 'rex reads ben\'s mail as her manager')
+        self.assertIn('@ben', out)
+
+    def test_worker_cannot_reach_other_agent_rows(self):
+        out = self._run('ada', 'theta-9')
+        self.assertIn('No hits', out,
+                      'theta-9 is in ben\'s mail, outside ada\'s scope')
+
+    def test_village_chief_sees_village_rows(self):
+        out = self._run('pat', 'harbor')
+        self.assertIn('harbor repair', out)
+        self.assertIn('@zoe', out)
+
+    def test_admin_sees_everything_including_other_villages(self):
+        out_ben = self._run('ops', 'theta-9')
+        out_zoe = self._run('ops', 'harbor')
+        self.assertIn('@ben', out_ben)
+        self.assertIn('@zoe', out_zoe)
 
     def test_dispatch_wired_into_ask_core(self):
         src250 = open(_parts_path('250_ask_core.py'), encoding='utf-8').read()
@@ -368,6 +412,7 @@ class AgentAskTool(unittest.TestCase):
                       encoding='utf-8').read()
         self.assertIn("'name': 'session_search'", src465)
         self.assertIn('def _ss_agent_search(', src465)
+        self.assertIn('def _ss_scope_ids(', src465)
 
 
 if __name__ == '__main__':

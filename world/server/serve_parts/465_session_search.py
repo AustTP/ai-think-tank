@@ -176,13 +176,15 @@ _SS_TOOL = {
     'type': 'function',
     'function': {
         'name': 'session_search',
-        'description': 'Search your own recorded history before re-doing '
-                       'work or re-hitting a failure: your action_log rows '
-                       '(every action you took) and your mailbox (live + '
-                       'archive). Self-scoped: you see only your own rows; '
-                       'the operator-wide search is GET /api/session-search '
-                       '(operator only). Query tokens are ANDed, window is '
-                       'the last N days (default 7, max 14).',
+        'description': 'Search recorded history before re-doing work or '
+                       're-hitting a failure: action_log rows and agent '
+                       'mailboxes (live + archive). Scope follows the org '
+                       'chart: you always see your own rows; a director '
+                       'also sees everyone under her (direct or indirect '
+                       'reports); a village regional VP sees everyone in '
+                       'her village; the admin sees everything. Query '
+                       'tokens are ANDed, window is the last N days '
+                       '(default 7, max 14).',
         'parameters': {
             'type': 'object',
             'properties': {
@@ -200,11 +202,56 @@ _SS_TOOL = {
 }
 
 
+def _ss_scope_ids(state, agent_id):
+    """Who this agent may search. Hierarchy rule (operator direction
+    2026-11-18): a worker sees only herself; a director sees her whole
+    subtree (direct and indirect reports, walked through the roster's
+    `director` pointers); a village regional VP (`villageChief`) sees every
+    agent in her village; the admin (chief of staff) sees everything.
+    Returns a set of ids, or None for the admin's unbounded surface."""
+    roster = [r for r in (state.get('agentRoster') or [])
+              if isinstance(r, dict) and r.get('id')]
+    by_id = {r.get('id'): r for r in roster}
+    me = by_id.get(agent_id)
+    if me is None:
+        # Not on the roster: self only. Never the unbounded surface --
+        # unknown ids fall closed, not open.
+        return {agent_id}
+    if me.get('isAdmin'):
+        return None
+    allowed = {agent_id}
+    agents = state.get('agents') or {}
+
+    def village_of(rid):
+        return ((agents.get(rid) or {}).get('villageId') or 'main')
+
+    is_chief = bool(me.get('villageChief'))
+    chief_village = me.get('chiefOfVillage') or village_of(agent_id)
+    for r in roster:
+        rid = r.get('id')
+        # Director chain: walk this agent's `director` pointers upward; any
+        # path that reaches the searcher puts the agent in her subtree.
+        walker, seen = rid, set()
+        while walker and walker not in seen:
+            seen.add(walker)
+            nxt = (by_id.get(walker) or {}).get('director')
+            if nxt == agent_id:
+                allowed.add(rid)
+                break
+            walker = nxt
+        # Village scope: the regional VP sweeps her whole village, whatever
+        # the reporting tree underneath her looks like.
+        if is_chief and village_of(rid) == chief_village:
+            allowed.add(rid)
+    return allowed
+
+
 def _ss_agent_search(agent_id, args):
-    """Dispatch a `session_search` tool call. Self-scope rule, same shape as
-    the replay/investigate tools: an agent sees only its own action rows and
-    its own mailbox (live + archive); never other agents' mail and never the
-    player inbox. Read-only by construction."""
+    """Dispatch a `session_search` tool call. Self-scope rule plus manager
+    visibility: a worker searches only her own rows and mail; a director
+    adds her subtree; a village regional VP adds her whole village; the
+    admin gets the unbounded surface (same as GET /api/session-search).
+    The player inbox stays operator-only on the HTTP endpoint."""
     args = args or {}
     toks = _ss_tokens(args.get('q'))
     if not toks:
@@ -213,18 +260,30 @@ def _ss_agent_search(agent_id, args):
     days = max(1, min(int(args.get('days') or 7), _SS_WINDOW_DAYS))
     since_ts = time.time() - days * 24 * 3600
     limit = max(1, min(int(args.get('limit') or 20), _SS_LIMIT))
+    state = get_state_from_db('none') or {}
+    scope = _ss_scope_ids(state, agent_id)
     with _db() as conn:
         try:
-            rows = conn.execute(
-                'SELECT ts, action, details FROM action_log '
-                'WHERE agent_id = ? AND ts >= ? '
-                'AND LOWER(details) LIKE ? ORDER BY ts DESC LIMIT ?',
-                (agent_id, since_ts, '%' + toks[0] + '%', _SS_PREFILTER),
-            ).fetchall()
+            if scope is None:
+                rows = conn.execute(
+                    'SELECT ts, agent_id, action, details FROM action_log '
+                    'WHERE ts >= ? AND LOWER(details) LIKE ? '
+                    'ORDER BY ts DESC LIMIT ?',
+                    (since_ts, '%' + toks[0] + '%', _SS_PREFILTER),
+                ).fetchall()
+            else:
+                ids = sorted(scope)
+                marks = ','.join('?' for _ in ids)
+                rows = conn.execute(
+                    f'SELECT ts, agent_id, action, details FROM action_log '
+                    f'WHERE agent_id IN ({marks}) AND ts >= ? '
+                    f'AND LOWER(details) LIKE ? ORDER BY ts DESC LIMIT ?',
+                    (*ids, since_ts, '%' + toks[0] + '%', _SS_PREFILTER),
+                ).fetchall()
         except Exception:
             rows = []
     hits = []
-    for ts, action, details in rows:
+    for ts, row_agent, action, details in rows:
         try:
             parsed = json.loads(details) if details else {}
         except Exception:
@@ -233,14 +292,19 @@ def _ss_agent_search(agent_id, args):
         if not _ss_matches_all(searchable, toks):
             continue
         hits.append({'source': 'log', 'atMs': int(ts * 1000),
-                     'action': action,
+                     'agent': row_agent, 'action': action,
                      'taskId': parsed.get('taskId'),
                      'snippet': _ss_snippet(searchable, toks)})
-    agent = (get_state_from_db('none') or {}).get('agents', {}).get(agent_id)
-    if isinstance(agent, dict):
-        pool = list(agent.get('mailbox') or []) + \
-            list(agent.get('mailboxArchive') or [])
-        min_ms = now_ms - _SS_WINDOW_DAYS * 24 * 3600 * 1000
+    agents = state.get('agents') or {}
+    min_ms = now_ms - _SS_WINDOW_DAYS * 24 * 3600 * 1000
+    mail_pool = agents.keys() if scope is None else \
+        [a for a in (scope or set()) if a in agents]
+    for other_id in mail_pool:
+        other = agents.get(other_id)
+        if not isinstance(other, dict):
+            continue
+        pool = list(other.get('mailbox') or []) + \
+            list(other.get('mailboxArchive') or [])
         for m in pool:
             if not isinstance(m, dict):
                 continue
@@ -252,19 +316,21 @@ def _ss_agent_search(agent_id, args):
             if stamp < min_ms:
                 continue
             hits.append({'source': 'mail', 'atMs': stamp,
-                         'kind': m.get('kind'),
+                         'agent': other_id, 'kind': m.get('kind'),
                          'snippet': _ss_snippet(text, toks)})
     hits.sort(key=lambda h: h.get('atMs') or 0, reverse=True)
     if not hits:
-        return (f"No hits for {' '.join(toks)} in your last {days} days of "
-                'actions and mail.')
-    lines = [f"{len(hits)} hit(s) in your last {days} days "
-             f"(self-scoped; the operator-wide search is "
-             f"GET /api/session-search):"]
+        return (f"No hits for {' '.join(toks)} in the last {days} days of "
+                'in-scope actions and mail.')
+    lines = [f"{len(hits)} hit(s) in the last {days} days "
+             f"(scope: {'everything (admin)' if scope is None else f'{len(scope)} in-scope agent(s)'}; "
+             f"the operator-wide search is GET /api/session-search):"]
     for h in hits[:limit]:
         when = time.strftime('%m-%d %H:%M', time.gmtime(h['atMs'] / 1000))
         label = h.get('action') or h.get('kind') or '?'
+        who = h.get('agent') or ''
         tid = f" [{h['taskId']}]" if h.get('taskId') else ''
-        lines.append(f"- {when} {h['source']}:{label}{tid} "
+        who_bit = f" @{who}" if who and who != agent_id else ''
+        lines.append(f"- {when} {h['source']}:{label}{who_bit}{tid} "
                      f"{h.get('snippet', '')[:160]}")
     return '\n'.join(lines)
