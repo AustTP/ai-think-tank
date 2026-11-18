@@ -91,7 +91,11 @@ class Redact(unittest.TestCase):
         self.assertIn('google_api_key', kinds)
 
     def test_password_assignments_and_jwt(self):
-        clean, kinds = redact.scrub('password=hunter2secret token=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c')
+        # The fake JWT deliberately lacks the `eyJhbGciO` header prefix and
+        # the 27-char signature gitleaks' jwt rule requires (CI secret scan)
+        # while still matching core/redact.py's eyJ+8/segment pattern.
+        clean, kinds = redact.scrub('password=hunter2secret token='
+                                    'eyJtest12345.payloadsegment.sigsegment1')
         self.assertNotIn('hunter2secret', clean)
         self.assertIn('password', kinds)
         self.assertIn('jwt', kinds)
