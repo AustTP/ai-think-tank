@@ -415,6 +415,16 @@ def record_source_claim(record, actor=None):
         _validate_claim_record(record)
     except ValueError as e:
         return {'recorded': False, 'reason': 'invalid', 'error': str(e)}
+    # Edge scrub (Relay pattern, 2026-11-17): strip high-confidence secrets
+    # from the claim text BEFORE identity/id computation and storage, so a
+    # leaked credential never lands in the ledger, the audit trail, or the
+    # backups. The kinds found are recorded ON the claim (not the values).
+    import core.redact as redact
+    _scrubbed, _redaction_kinds = redact.scrub(record.get('claim') or '')
+    if _redaction_kinds:
+        record = dict(record)
+        record['claim'] = _scrubbed
+        record['redacted'] = _redaction_kinds
     source_url = (record.get('source_url') or '').strip()
     resolved_url = (record.get('resolved_url') or '').strip() or None
     identity, meta = source_identity(source_url, resolved_url)

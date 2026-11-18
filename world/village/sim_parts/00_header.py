@@ -1200,6 +1200,22 @@ def record_agent_failure(state, agent_id, now_ms=None, kind='quality'):
     kinds = entry.setdefault('kinds', {})
     kinds[kind] = kinds.get(kind, 0) + 1
     mem[agent_id] = entry
+    # Seer hook (2026-11-17): a real failure is worth a structured
+    # investigation, not just a fault score. Best-effort and rate-limited
+    # (min 300s per agent): the question registry dedupes by text, so the
+    # investigation converges instead of spamming. Must never raise into
+    # the reclaim path.
+    try:
+        if now_ms - (entry.get('seerAt') or 0) >= 300_000:
+            entry['seerAt'] = now_ms
+            import core.seer as _seer
+            task_id = entry.get('lastTaskId')
+            _seer.investigate_failure(
+                agent_id, kind, task_id=task_id,
+                failure_count=entry['count'],
+                team_name=None, actor='seer')
+    except Exception:
+        pass
 
 
 def _agent_failure_score(state, agent_id, now_ms):

@@ -100,6 +100,12 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 | `world/sim.py` + `world/village/sim_parts/` | Simulation engine: movement, task lifecycle, ceremonies, peer gates, sprint lifecycle, governance |
 | `world/core/confirmations.py` | Durable two-phase confirmation proposals: target and argument binding, exact phrase, expiry, completion |
 | `world/core/epistemics.py` | The epistemic ledger: asserted vs established, evidence lineage, validations, contradictions, staleness, replayable decisions |
+| `world/core/epistemic_benchmark.py` | The prompt-injection monitoring benchmark: seeded conflicting evidence, snapshot graded on a 13-category answer key |
+| `world/core/redact.py` | Edge secret-scrubbing applied before any ledger write (keys, bearers, JWTs, credential URLs) |
+| `world/core/agent_replay.py` | Agent-run replay: typed action_log frames, run stats, scrub-through text form |
+| `world/core/seer.py` | Failure investigations: symptom classification from the action_log tail, question-registry findings, remediation cards past threshold |
+| `world/core/issue_engine.py` | Failure clusters -> root cause -> deduped fix cards + epistemic validations |
+| `world/core/harness_optimizer.py` | Measure-first revision of the tank's own memory doctrine: failure clusters -> registry page hypothesis -> decision -> measured keep-or-supersede |
 | `world/server/confirmations_api.py` | Player and agent HTTP surface for proposing, confirming, listing, and cancelling actions |
 | `world/server/migrations.py` + `world/migrations/` | Versioned SQLite migrations with checksums |
 | `world/core/model_config.py` | Model-band validation and operator table |

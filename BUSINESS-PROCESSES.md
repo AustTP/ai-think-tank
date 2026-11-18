@@ -3810,6 +3810,106 @@ The synthetic benchmark (prompt-injection monitoring investigation) lives
 in `core/epistemic_benchmark.py` and grades the SNAPSHOT against an answer
 key across 13 categories -- calibrated knowledge, not prose.
 
+### BP-80 Steal-list surfaces (query, replay, Seer, Engine)
+
+**Last checked:** 2026-11-17
+
+**Purpose.** The four competitor-derived capabilities the tank adopted
+after the PostHog/Sentry/LangSmith research: dimension queries over the
+epistemic ledger, agent-run replay timelines, automatic failure
+investigations (Seer), and failure-cluster root-cause sweeps (Engine).
+The common lesson: the data was all already recorded; what was missing
+was the reified, queryable, replayable view of it.
+
+**Trigger.** Operator console reads, an agent's `epistemics` ask tool
+action (`query` / `replay` / `evaluate` / `investigate`), or a real
+work failure (the Seer hook in `sim.record_agent_failure`).
+
+**Steps.**
+
+1. Edge scrub: every claim, proposition, validation, and decision text
+   passes through `core/redact.py` BEFORE storage, so high-confidence
+   secrets (API keys, bearers, JWTs, embedded URL credentials) never
+   land in the ledger, the audit trail, or the backups. Emails and IPs
+   are deliberately not scrubbed -- they are usually the substance of a
+   research claim.
+2. Dimension query: ledger writes mirror item facts into the
+   `epistemic_index` SQL table; queries hit parameterized SQL (Postgres
+   in production, SQLite in dev) with a consistency gate (index count
+   must match the ledger blob) and fall back to a blob scan when they
+   disagree. Same answers, slower path.
+3. Agent replay: `core/agent_replay.py` turns action_log rows into a
+   typed frame timeline (browse / model / lifecycle / evidence / mail)
+   with a stats header and error-notable frames. Agents replay only
+   themselves; operators replay anyone (`GET /api/replay/agent/<id>`).
+4. Seer: on a real work failure, `core/seer.py` reads the agent's
+   action_log tail, classifies the symptom, records the finding as a
+   deduped question in the question registry, anchors the open root
+   cause as an epistemic unknown with a proposed validation, and (past
+   the two-failure threshold, with a known team) files one remediation
+   card with acceptance criteria. Rate-limited to one investigation per
+   agent per 300s; never raises into the reclaim path.
+5. Engine: `core/issue_engine.py` clusters failure-class action_log rows
+   by symptom signature, root-causes each cluster from the members'
+   preceding notable actions, proposes one deduped spike card per
+   cluster past the two-failure threshold, and anchors each cluster's
+   root cause as an epistemic validation ("did the fix shrink the
+   cluster?"). `fileCards=false` is the operator dry run.
+6. Evaluator: `core.epistemics.evaluate_item` scores items structurally
+   (independent sources, official-claim types, contradictions, staleness)
+   and can promote unresolved/blocked/hypothesized items to evidenced --
+   never validated. Established still requires the review gate.
+
+**Controls.** All four endpoints are operator-gated (`_operator_gate`);
+the ask tool actions are self-scoped for agents (replay/investigate
+cover only the calling agent). Engine card filing is deduped per cluster
+per 12h window. Storage rides the deployment backend via `_db()`.
+
+**Records.** `epistemic_index` rows, the existing `action_log`,
+question-registry entries, epistemic items/validations, and (past
+threshold) Seer/Engine cards in the shared issue pipeline.
+
+### BP-81 Harness optimizer (measure-first memory doctrine)
+
+**Last checked:** 2026-11-17
+
+**Purpose.** Let the tank revise its own memory doctrine the way the
+Meta FAIR study revised agent memory prompts: propose from measured
+failure clusters, adopt provisionally, measure, and keep only what
+scores better. 37 of 44 generated revisions in the reference study
+lost, so the discipline (not the generation) is the capability.
+
+**Trigger.** An operator call to `POST /api/harness/optimize`, or
+`POST /api/harness/measure` after a measurement window.
+
+**Steps.**
+
+1. The issue Engine's dry-run sweep diagnoses the window's failure
+   clusters; the top recurring symptom (two or more failures) becomes
+   one proposal, deduped by symptom key.
+2. The proposal is recorded as an epistemic hypothesis citing the sweep
+   evidence, never as a fact.
+3. On apply, the operator's authority writes an indexed symptom-to-fix
+   REGISTRY page into the `harness` wiki category through the standard
+   wiki seam (versioned; the same symptom edits the same page instead
+   of growing an append-only monologue, the study's diagnosed losing
+   shape). The page expires on the normal 30-day review window like
+   every wiki page.
+4. `mark_applied` records the provisional adoption as an epistemic
+   DECISION with the baseline cluster size and a measure validation.
+5. Measure: a fresh sweep completes the validation with the delta.
+   Improved recommendations keep (through the review gate); worse
+   recommends supersede. Code never auto-supersedes and nothing here
+   can set validated -- established stays behind review.
+
+**Controls.** Both endpoints operator-gated. No ask-tool surface on
+purpose: an agent rewriting its own harness without measurement is the
+failure mode this guards against. The registry page is think-tank-wide
+injected context, so a bad page is visible to every worker fast.
+
+**Records.** The epistemic hypothesis/decision/validation chain, the
+`harness` wiki page versions, and the sweep reports they cite.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |

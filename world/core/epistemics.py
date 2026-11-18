@@ -49,6 +49,8 @@ import re
 import threading
 import time
 
+import core.redact as redact
+
 # Stored lifecycle statuses. 'stale' is deliberately absent -- see the module
 # docstring; it is derived from reviewAfterMs at read time.
 STORED_STATUSES = frozenset({'unknown', 'hypothesized', 'evidenced', 'validated',
@@ -165,6 +167,14 @@ def _clean_text(text):
     return re.sub(r'\s+', ' ', (text or '').strip())[:MAX_TEXT_CHARS]
 
 
+def _clean_secret(text):
+    """Ledger-entry text cleaning WITH edge scrubbing: normalize whitespace,
+    cap length, and strip high-confidence secrets before they land in the
+    blob (core/redact.py -- scrub at write time, never at read time)."""
+    clean, _kinds = redact.scrub(_clean_text(text))
+    return clean
+
+
 def _text_key(text):
     """Dedup identity for item text: the same proposition restated with
     different case/spacing is one item, not two."""
@@ -264,7 +274,7 @@ def _base_item(text, kind, *, owner, source, actor, review_after_ms):
 
 def _record_item(text, kind, *, owner=None, source=None, actor=None,
                  review_after_ms=None):
-    text = _clean_text(text)
+    text = _clean_secret(text)
     if not text:
         return {'recorded': False, 'reason': 'invalid',
                 'error': f'{kind} text is required'}
@@ -323,6 +333,65 @@ def record_assertion(text, *, source=None, owner=None, actor=None,
     as established by virtue of being repeated."""
     return _record_item(text, 'assertion', source=source, owner=owner,
                         actor=actor, review_after_ms=review_after_ms)
+
+
+@_serialized
+def annotate_item(item_id, fields, *, actor=None):
+    """Whitelisted metadata annotations on a ledger item. Status is NOT
+    annotatable -- transitions go through set_status (or the proper
+    action functions) so history stays truthful. Used by the harness
+    optimizer for sourceKey/measureBaseline/pageId bookkeeping."""
+    allowed = {'sourceKey', 'measureBaseline', 'pageId', 'authoritativeOwner'}
+    ledger = _ensure_shape(_ledger_read())
+    item = ledger['items'].get(item_id)
+    if item is None:
+        return {'annotated': False, 'reason': 'unknown_item'}
+    changed = []
+    for key, value in (fields or {}).items():
+        if key in allowed:
+            item[key] = value
+            changed.append(key)
+    if changed:
+        item['updated_ts'] = _now_ms()
+        _ledger_write(ledger)
+    return {'annotated': bool(changed), 'id': item_id,
+            'fields': changed}
+
+
+@_serialized
+def set_status(item_id, to_status, *, actor=None, note=None):
+    """One explicit, guarded status transition for callers that advance a
+    record outside the action functions (e.g. the harness optimizer's
+    hypothesis -> evidenced once the registry page exists). Enforces the
+    same TRANSITIONS map and records history."""
+    ledger = _ensure_shape(_ledger_read())
+    item = ledger['items'].get(item_id)
+    if item is None:
+        return {'advanced': False, 'reason': 'unknown_item'}
+    if to_status not in STORED_STATUSES:
+        return {'advanced': False, 'reason': 'invalid_status'}
+    if to_status in ('validated', 'superseded'):
+        # Gated transitions: 'validated' only through review_validation
+        # (reviewer independence), 'superseded' only through supersede_item
+        # (cross-link integrity). A generic status setter must not shortcut
+        # the invariants the whole ledger rests on.
+        return {'advanced': False, 'reason': 'gated_transition',
+                'to': to_status}
+    if to_status == item['status']:
+        return {'advanced': False, 'reason': 'no_change'}
+    allowed = _TRANSITIONS.get(item['status']) or set()
+    if to_status not in allowed:
+        return {'advanced': False, 'reason': 'invalid_transition',
+                'from': item['status'], 'to': to_status}
+    frm = item['status']
+    item['status'] = to_status
+    if to_status == 'evidenced':
+        item['reviewAfterMs'] = _now_ms() + DEFAULT_REVIEW_MS
+    _append_history(item, actor=actor, from_status=frm, to_status=to_status,
+                    note=note)
+    ledger['items'][item_id] = item
+    _ledger_write(ledger)
+    return {'advanced': True, 'id': item_id, 'from': frm, 'to': to_status}
 
 
 def get_item(item_id):
@@ -487,7 +556,7 @@ def propose_validation(item_id, procedure, *, needed_evidence=None,
     item = ledger['items'].get(item_id)
     if item is None:
         return {'proposed': False, 'reason': 'unknown_item', 'id': item_id}
-    procedure = _clean_text(procedure)
+    procedure = _clean_secret(procedure)
     if not procedure:
         return {'proposed': False, 'reason': 'invalid',
                 'error': 'procedure text is required'}
@@ -503,8 +572,8 @@ def propose_validation(item_id, procedure, *, needed_evidence=None,
         'id': vid,
         'itemId': item_id,
         'procedure': procedure,
-        'neededEvidence': _clean_text(needed_evidence) or None,
-        'obtainment': _clean_text(obtainment) or None,
+        'neededEvidence': _clean_secret(needed_evidence) or None,
+        'obtainment': _clean_secret(obtainment) or None,
         'blocked': bool(blocked),
         'blockedReason': _clean_text(blocked_reason) or None,
         'estimatedCostUsd': cost,
@@ -589,7 +658,7 @@ def complete_validation(validation_id, result_text, *, claim_id=None,
     only marks the validation completed-and-awaiting-review. A different
     agent must review it before the parent proposition becomes validated
     (peer review, applied to knowledge)."""
-    result_text = _clean_text(result_text)
+    result_text = _clean_secret(result_text)
     if not result_text:
         return {'completed': False, 'reason': 'invalid',
                 'error': 'result text is required'}
@@ -730,7 +799,7 @@ def record_contradiction(item_id, claim_id_a, claim_id_b, *, note=None,
         'itemId': item_id,
         'claimIdA': claim_id_a,
         'claimIdB': claim_id_b,
-        'note': _clean_text(note) or None,
+        'note': _clean_secret(note) or None,
         'status': 'open',
         'openedBy': (actor or 'unknown')[:64],
         'openedAt': time.time(),
@@ -763,7 +832,7 @@ def resolve_contradiction(contradiction_id, resolution_text, *,
     the resolution text is required and lands in history. winner=None
     means "neither side is trusted" and the item drops to 'unresolved'.
     A validation_id records which validation justified the resolution."""
-    resolution_text = _clean_text(resolution_text)
+    resolution_text = _clean_secret(resolution_text)
     if not resolution_text:
         return {'resolved': False, 'reason': 'invalid',
                 'error': 'resolution text is required'}
@@ -833,7 +902,7 @@ def supersede_item(item_id, replacement_text, *, actor=None, owner=None):
     fresh item that must earn its own status from the bottom (evidence,
     validation, review) -- supersession is never a free pass to
     'validated'."""
-    replacement_text = _clean_text(replacement_text)
+    replacement_text = _clean_secret(replacement_text)
     if not replacement_text:
         return {'superseded': False, 'reason': 'invalid',
                 'error': 'replacement text is required'}
@@ -908,6 +977,7 @@ def record_decision(text, *, rationale=None, item_ids=None, claim_ids=None,
     against the ledger -- a decision citing unknown records is noise.
     Actions (resulting work) start 'open'."""
     text = _clean_text(text)
+    text = _clean_secret(text)
     if not text:
         return {'recorded': False, 'reason': 'invalid',
                 'error': 'decision text is required'}
@@ -938,11 +1008,11 @@ def record_decision(text, *, rationale=None, item_ids=None, claim_ids=None,
     decision = {
         'id': did,
         'text': text,
-        'rationale': _clean_text(rationale) or None,
+        'rationale': _clean_secret(rationale) or None,
         'citations': {'itemIds': item_ids, 'claimIds': claim_ids,
                       'validationIds': validation_ids,
                       'contradictionIds': contradiction_ids},
-        'reconsiderWhen': _clean_text(reconsider_when) or None,
+        'reconsiderWhen': _clean_secret(reconsider_when) or None,
         'reconsiderTriggers': triggers,
         'actions': [],
         'createdBy': (actor or 'unknown')[:64],
@@ -958,7 +1028,10 @@ def record_decision(text, *, rationale=None, item_ids=None, claim_ids=None,
     _ledger_write(ledger)
     _audit(actor, 'epistemic_decision', subject_id=did,
            detail={'items': item_ids})
-    for action_text in (actions or []):
+    for action_spec in (actions or []):
+        # Accept plain strings or {'text': ...} dicts (structured callers).
+        action_text = action_spec if isinstance(action_spec, str) \
+            else (action_spec or {}).get('text')
         out = record_action(did, action_text, actor=actor)
         if not out.get('recorded'):
             break
@@ -972,7 +1045,7 @@ def record_action(decision_id, text, *, actor=None):
     """One resulting action from a decision: recommended next work, kept
     open until explicitly completed. Unknowns that generated validations
     are covered there; this is for the DECISION's follow-through."""
-    text = _clean_text(text)
+    text = _clean_secret(text)
     if not text:
         return {'recorded': False, 'reason': 'invalid',
                 'error': 'action text is required'}
@@ -1068,7 +1141,13 @@ def _item_view(item, now_ms, contradictions):
         'reviewAfterMs': item.get('reviewAfterMs'),
         'openContradictions': open_cx,
         'validationIds': item.get('validationIds') or [],
+        'decisionIds': item.get('decisionIds') or [],
         'supersededBy': item.get('supersededBy'),
+        # Optimizer bookkeeping (see annotate_item) surfaced so views can
+        # dedupe and measure without re-reading raw records.
+        'sourceKey': item.get('sourceKey'),
+        'measureBaseline': item.get('measureBaseline'),
+        'pageId': item.get('pageId'),
     }
 
 
@@ -1170,6 +1249,259 @@ def classify_item(item, now_ms=None):
                                                      'blocked'):
         return 'Unsupported Assumption'
     return 'Unknown'
+
+
+# --- dimension query (the ClickHouse lesson, on the deployment's own SQL) ---
+
+_INDEX_DDL = '''CREATE TABLE IF NOT EXISTS epistemic_index (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    owner TEXT,
+    independent_sources INTEGER DEFAULT 0,
+    open_contradictions INTEGER DEFAULT 0,
+    validation_count INTEGER DEFAULT 0,
+    created_ts REAL,
+    updated_ts REAL,
+    review_after_ms REAL
+)'''
+
+
+def _index_sync(ledger):
+    """Mirror item facts into the epistemic_index SQL table so dimension
+    queries hit parameterized SQL (Postgres in production, SQLite in dev)
+    instead of scanning the blob. Best-effort: an index failure never
+    fails the write -- query_items falls back to a blob scan, which is
+    correct, just slower. Called from _ledger_write after the blob lands."""
+    try:
+        import serve as _serve
+        with _serve._db() as conn:
+            conn.execute(_INDEX_DDL)
+            for item in (ledger.get('items') or {}).values():
+                conn.execute(
+                    'INSERT INTO epistemic_index '
+                    '(id, kind, status, owner, independent_sources, '
+                    ' open_contradictions, validation_count, created_ts, '
+                    ' updated_ts, review_after_ms) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) '
+                    'ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, '
+                    'status = excluded.status, owner = excluded.owner, '
+                    'independent_sources = excluded.independent_sources, '
+                    'open_contradictions = excluded.open_contradictions, '
+                    'validation_count = excluded.validation_count, '
+                    'created_ts = excluded.created_ts, '
+                    'updated_ts = excluded.updated_ts, '
+                    'review_after_ms = excluded.review_after_ms',
+                    (item['id'], item.get('kind'), item.get('status'),
+                     item.get('owner'), independent_source_count(item),
+                     len([c for c in (item.get('contradictionIds') or [])]),
+                     len(item.get('validationIds') or []),
+                     item.get('created_ts'), item.get('updated_ts'),
+                     item.get('reviewAfterMs')))
+    except Exception:
+        pass
+
+
+def _ledger_write(ledger):
+    import serve as _serve
+    with _serve._db() as conn:
+        conn.execute(
+            'INSERT INTO epistemic_ledger (id, blob, updated_at) '
+            'VALUES (1, ?, ?) '
+            'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, '
+            'updated_at = excluded.updated_at',
+            (json.dumps(ledger), time.time()),
+        )
+    _index_sync(ledger)
+
+
+def query_items(*, status=None, kind=None, owner=None, min_sources=None,
+                has_open_contradiction=None, created_after=None,
+                created_before=None, order='newest', limit=50):
+    """Dimension query over the ledger: filter items by status, kind,
+    owner, independent-source count, open contradictions, and creation
+    window. Tries the SQL index first (millisecond slices on Postgres);
+    falls back to a blob scan when the index is unavailable -- same
+    answers, slower path, and hermetic tests need no DB at all. Returns
+    full item views plus which path served the query."""
+    criteria = dict(status=status, kind=kind, owner=owner,
+                    min_sources=min_sources,
+                    has_open_contradiction=has_open_contradiction,
+                    created_after=created_after, created_before=created_before)
+    try:
+        ids, source = _index_query(criteria, order, limit)
+    except Exception:
+        ids, source = None, 'scan'
+    ledger = _ensure_shape(_ledger_read())
+    items = ledger['items']
+    if ids is None:
+        matches = [it for it in items.values()
+                   if _matches_criteria(it, criteria, _now_ms())]
+        matches.sort(key=lambda it: -(it.get('created_ts') or 0)
+                     if order == 'newest' else (it.get('created_ts') or 0))
+        if order == 'sources':
+            matches.sort(key=lambda it: -independent_source_count(it))
+        chosen = matches[:max(1, int(limit or 50))]
+        contradictions = ledger['contradictions']
+        return {'items': [_item_view(it, _now_ms(), contradictions)
+                          for it in chosen],
+                'source': 'scan', 'total': len(matches)}
+    contradictions = ledger['contradictions']
+    out = []
+    for iid in ids:
+        it = items.get(iid)
+        if it:
+            out.append(_item_view(it, _now_ms(), contradictions))
+    return {'items': out, 'source': source, 'total': len(ids)}
+
+
+def _index_query(criteria, order, limit):
+    import serve as _serve
+    with _serve._db() as conn:
+        conn.execute(_INDEX_DDL)
+        # Consistency gate: the index must cover the SAME generation of
+        # items as the blob seam, or the answer is silently wrong (an
+        # empty/stale index answering "nothing matches"). A count mismatch
+        # falls back to the blob scan -- correct, just slower.
+        count = conn.execute('SELECT COUNT(*) FROM epistemic_index').fetchone()[0]
+        if int(count) != len((_ledger_read() or {}).get('items') or {}):
+            raise RuntimeError('epistemic_index out of sync with ledger blob')
+        where, params = [], []
+        if criteria.get('status'):
+            where.append('status = ?')
+            params.append(criteria['status'])
+        if criteria.get('kind'):
+            where.append('kind = ?')
+            params.append(criteria['kind'])
+        if criteria.get('owner'):
+            where.append('owner = ?')
+            params.append(criteria['owner'])
+        if criteria.get('min_sources') is not None:
+            where.append('independent_sources >= ?')
+            params.append(int(criteria['min_sources']))
+        if criteria.get('has_open_contradiction'):
+            where.append('open_contradictions > 0')
+        if criteria.get('created_after') is not None:
+            where.append('created_ts >= ?')
+            params.append(float(criteria['created_after']))
+        if criteria.get('created_before') is not None:
+            where.append('created_ts <= ?')
+            params.append(float(criteria['created_before']))
+        sql = 'SELECT id FROM epistemic_index'
+        if where:
+            sql += ' WHERE ' + ' AND '.join(where)
+        sql += {'newest': ' ORDER BY created_ts DESC',
+                'oldest': ' ORDER BY created_ts ASC',
+                'sources': ' ORDER BY independent_sources DESC',
+                }.get(order, ' ORDER BY created_ts DESC')
+        sql += ' LIMIT ?'
+        params.append(max(1, int(limit or 50)))
+        rows = conn.execute(sql, params).fetchall()
+        return [r[0] for r in rows], 'index'
+
+
+def _matches_criteria(item, criteria, now_ms):
+    if criteria.get('status') and item.get('status') != criteria['status'] \
+            and effective_status(item, now_ms) != criteria['status']:
+        return False
+    if criteria.get('kind') and item.get('kind') != criteria['kind']:
+        return False
+    if criteria.get('owner') and item.get('owner') != criteria['owner']:
+        return False
+    if criteria.get('min_sources') is not None \
+            and independent_source_count(item) < int(criteria['min_sources']):
+        return False
+    if criteria.get('has_open_contradiction') \
+            and not (item.get('contradictionIds') or []):
+        return False
+    if criteria.get('created_after') is not None \
+            and (item.get('created_ts') or 0) < float(criteria['created_after']):
+        return False
+    if criteria.get('created_before') is not None \
+            and (item.get('created_ts') or 0) > float(criteria['created_before']):
+        return False
+    return True
+
+
+# --- structural evaluator (the online-evaluator lesson, without the LLM) ----
+
+def evaluate_item(item_id, *, apply=False, actor=None):
+    """Score a proposition's epistemic standing from STRUCTURAL signals --
+    independent-source count, source claim types, open contradictions,
+    staleness -- and optionally apply the promotion. This is the tank's
+    version of an online evaluator: it scores every item the same way on
+    arrival and on demand, without a model call (the expensive judgment
+    stays where the tank already puts it: the review gate).
+
+    Promotion is deliberately modest: a strong item moves
+    unknown/hypothesized/blocked/unresolved -> evidenced and gets a
+    proposed validation if it has none. 'validated' (established) is
+    NEVER granted by the evaluator -- that stays behind the peer-review
+    gate, which is the whole point of asserted-vs-established."""
+    ledger = _ensure_shape(_ledger_read())
+    item = ledger['items'].get(item_id)
+    if item is None:
+        return {'evaluated': False, 'reason': 'unknown_item'}
+    now_ms = _now_ms()
+    score = 0.0
+    reasons = []
+    sources = independent_source_count(item)
+    if sources >= 1:
+        score += 0.35
+        reasons.append(f'{sources} independent source(s)')
+    if sources >= 2:
+        score += 0.35
+        reasons.append('multi-source corroboration')
+    import core.evidence as evidence
+    official = 0
+    for e in item.get('evidence') or []:
+        claim = evidence.get_claim(e.get('claimId')) or {}
+        if claim.get('claim_type') == 'official_announcement':
+            official += 1
+    if official:
+        score += min(0.16, 0.08 * official)
+        reasons.append(f'{official} official-announcement claim(s)')
+    open_cx = [c for c in (item.get('contradictionIds') or [])
+               if (ledger['contradictions'].get(c) or {}).get('status') == 'open']
+    if open_cx:
+        score = min(score, 0.2)
+        reasons.append('contradiction open -- score capped')
+    if effective_status(item, now_ms) == 'stale':
+        score -= 0.2
+        reasons.append('review window expired')
+    if item.get('kind') == 'assertion' and sources == 0:
+        score = min(score, 0.2)
+        reasons.append('unsupported assertion')
+    score = max(0.0, min(1.0, round(score, 2)))
+    status = effective_status(item, now_ms)
+    has_validation = bool(item.get('validationIds'))
+    if open_cx:
+        recommendation = 'resolve_contradiction'
+    elif score >= 0.7 and status in ('unknown', 'hypothesized', 'blocked',
+                                     'unresolved'):
+        recommendation = 'promote'
+    elif score >= 0.5 and status in ('evidenced',) and not has_validation:
+        recommendation = 'propose_validation'
+    elif score <= 0.3:
+        recommendation = 'flag_unsupported'
+    else:
+        recommendation = 'none'
+    applied = False
+    if apply and recommendation == 'promote':
+        item = dict(item)
+        frm = item['status']
+        item['status'] = 'evidenced'
+        item['reviewAfterMs'] = now_ms + DEFAULT_REVIEW_MS
+        _append_history(item, actor=actor or 'evaluator', from_status=frm,
+                        to_status='evidenced',
+                        note=f'evaluator promotion (score {score})')
+        ledger['items'][item_id] = item
+        _ledger_write(ledger)
+        applied = True
+        status = 'evidenced'
+    return {'evaluated': True, 'id': item_id, 'score': score,
+            'reasons': reasons, 'recommendation': recommendation,
+            'applied': applied, 'status': status}
 
 
 def epistemic_brief(now_ms=None, max_lines=16):
