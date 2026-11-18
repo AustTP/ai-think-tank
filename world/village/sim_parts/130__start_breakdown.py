@@ -266,6 +266,15 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             filed_by = filed_by.get('id')
         author = agents.get(filed_by) or {}
         pc = req.get('playerConstraints') or {}
+        # Workforce pins (2026-11-18, the ideabrowser live miss): the player
+        # may pin how many workers the ask needs and how to divide it. These
+        # are breakdown-SHAPING, not just context -- a plan that is one card
+        # contradicts a workforce pin outright.
+        workers_pin = pc.get('workers')
+        if not (isinstance(workers_pin, int)
+                and not isinstance(workers_pin, bool) and workers_pin >= 2):
+            workers_pin = None
+        split_pin = pc.get('split') or []
         # Player pins are CONTEXT for the scrum master's judgment, not
         # mechanical overrides. They're woven into the instructions the same
         # way the goal itself is -- the model weighs them like any other signal.
@@ -276,12 +285,23 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                             "-- larger/riskier cards may deserve more, trivial ones less. "
                             "Set each card's \"budgetUsd\" field to its allocated share "
                             "(a positive number).")
+        if workers_pin:
+            pin_bits.append(f"The player pinned the WORKFORCE: at least {workers_pin} "
+                            "worker agents. Split the heavy work across at least that many "
+                            "SEPARATE worker cards (one per worker), never one card for the "
+                            "whole ask. Name batches/slices in the titles so assignment can "
+                            "map one card to one worker.")
+        if split_pin:
+            pin_bits.append('The player pinned how the work should be split: '
+                            + '; '.join(str(s) for s in split_pin) + '.')
         if pc.get('constraints'):
             pin_bits.append('The player listed these hard prohibitions the team must respect: '
                             + '; '.join(pc['constraints']) + '.')
         if pc.get('roles'):
             pin_bits.append('The player prefers cards suited to these roles/skills: '
-                            + '; '.join(pc['roles']) + '.')
+                            + '; '.join(pc['roles']) + '.'
+                            + (' Staff the cards with workers whose skills/job titles '
+                               'match these.' if workers_pin else ''))
         if pc.get('order'):
             pin_bits.append('The player wants this rough sequencing (earlier items '
                             'should be planned before later ones): '
@@ -340,12 +360,24 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                             {'request': req.get('id'), 'templateId': template.get('id'),
                              'ownerTeam': template.get('ownerTeamId'),
                              'usingTeam': team_id, 'steps': len(items)})
-        elif _single_deliverable_goal(goal):
+        elif _single_deliverable_goal(goal) and not (workers_pin or split_pin):
             items = [_single_deliverable_item(goal, pc)]
             _log_governance(state, scrum_master_id, 'breakdown_single_deliverable',
                             {'request': req.get('id'), 'goal': goal[:120],
                              'type': items[0]['type']})
         else:
+            if (workers_pin or split_pin) and _single_deliverable_goal(goal):
+                # A workforce/split pin and a one-card plan contradict each
+                # other: the pin wins (2026-11-18: the ideabrowser sweep,
+                # thousands of ideas, collapsed to one report card because the
+                # goal text tripped the single-deliverable heuristic). The
+                # decider plans the split; log the override so the pattern is
+                # visible in governance.
+                _log_governance(state, scrum_master_id,
+                                'breakdown_workers_pin_override',
+                                {'request': req.get('id'),
+                                 'workers': workers_pin, 'split': split_pin,
+                                 'goal': goal[:120]})
             data = decider(state, instructions, goal)
             items = []
             if isinstance(data, dict):

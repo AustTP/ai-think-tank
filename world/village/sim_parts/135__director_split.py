@@ -199,6 +199,15 @@ def _split_instructions(state, req, org, director_name, founding_mode='immediate
     if pc.get('budgetUsd'):
         pin_bits.append(f"The player named a total budget of ${pc['budgetUsd']:.2f} "
                         "for the whole ask; allocate it across pieces with judgment.")
+    workers_pin = pc.get('workers')
+    if isinstance(workers_pin, int) and not isinstance(workers_pin, bool) \
+            and workers_pin >= 2:
+        pin_bits.append(
+            f"The player pinned a workforce of {workers_pin} workers for the whole ask. "
+            "Create pieces so the workforce divides EVENLY across them -- roughly the "
+            "same number of workers per piece -- and say the intended share in each "
+            "piece's notes; each subteam's breakdown ceremony will then plan its share "
+            "as separate worker cards.")
     for key, lead in (('constraints', 'hard prohibitions'),
                       ('roles', 'preferred skills/roles'),
                       ('order', 'sequencing hints'),
@@ -423,6 +432,22 @@ def _resolve_split(state, pending, now_ms, decider=None):
             raw_subs = [s for s in (data.get('newSubdirectors') or [])
                         if isinstance(s, dict)]
             new_subs = raw_subs[:3]  # a review proposes/founds a capacity step, not a hiring spree
+        # Workforce math (2026-11-18): a workers pin on the parent ask is
+        # divided EVENLY across the pieces the director plans -- each child
+        # breakdown receives its share as its own workers pin, so the
+        # subteams' scrum masters plan batches that add up to the player's
+        # number. Ceil keeps the total >= the pin (an uneven org never
+        # under-delivers the workforce); a share < 2 is no pin at all.
+        pc_parent = req.get('playerConstraints') or {}
+        workers_pin = pc_parent.get('workers')
+        piece_share = None
+        if (isinstance(workers_pin, int) and not isinstance(workers_pin, bool)
+                and workers_pin >= 2 and raw_pieces):
+            piece_share = max(2, -(-workers_pin // len(raw_pieces)))
+        if piece_share:
+            _log_governance(state, director_id, 'large_request_workers_share',
+                            {'request': req.get('id'), 'workers': workers_pin,
+                             'pieces': len(raw_pieces), 'share': piece_share})
         founded_ids, held_proposals = [], []
         if mode == 'immediate':
             for spec in new_subs:
@@ -477,9 +502,12 @@ def _resolve_split(state, pending, now_ms, decider=None):
             else:
                 child_team = own_team_id  # fail open: a bad team name keeps the work home
             priority = p.get('priority')
+            child_constraints = req.get('playerConstraints')
+            if piece_share and isinstance(pc_parent, dict):
+                child_constraints = dict(pc_parent, workers=piece_share)
             child = _file_piece(state, director_id, own_team_id,
                                 (p.get('ask') or '').strip(), child_team,
-                                now_ms, constraints=req.get('playerConstraints'),
+                                now_ms, constraints=child_constraints,
                                 priority=priority,
                                 owner_product_id=owned_product_id,
                                 shared_scope=scope_for_child)
@@ -506,6 +534,8 @@ def _resolve_split(state, pending, now_ms, decider=None):
             _log_governance(state, director_id, 'large_request_split',
                             {'request': req['id'], 'goal': goal[:120],
                              'pieces': len(pieces),
+                             'workersPin': workers_pin,
+                             'workersShare': piece_share,
                              'shared': sum(1 for x in pieces if x['team'] == 'shared'),
                              'founded': founded_ids})
         else:

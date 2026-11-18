@@ -93,6 +93,19 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
                                for the whole ask. Passed to the breakdown as
                                CONTEXT so the scrum master allocates it across
                                cards with judgment, not a mechanical split.
+      workers (int 2-200)   -- how many worker agents the player wants on this
+                               ask. BREAKDOWN-SHAPING: the ceremony must plan
+                               at least this many separate worker cards (the
+                               single-deliverable shortcut is bypassed -- a
+                               workforce pin and a one-card plan contradict
+                               each other), with the heavy phase split across
+                               the workers. Still staffed with judgment; the
+                               number is a floor on card count, not a roster
+                               order.
+      split (list/str)      -- how the player wants the work divided (e.g.
+                               "batches of 150 ideas, one worker per batch").
+                               Also breakdown-shaping: names a multi-card
+                               shape, so it bypasses single-deliverable too.
       constraints (list)    -- hard "never" rules, as context for the team.
       roles (list)          -- preferred skills/roles, as context.
       order (list)          -- sequencing hints, as context.
@@ -149,6 +162,17 @@ def file_large_request(state, authority_id, goal, team_id, now_ms=None, constrai
         budget = constraints.get('budgetUsd')
         if isinstance(budget, (int, float)) and budget > 0:
             pinned['budgetUsd'] = float(budget)
+        workers = constraints.get('workers')
+        if isinstance(workers, int) and not isinstance(workers, bool) \
+                and 2 <= workers <= 200:
+            pinned['workers'] = workers
+        split = constraints.get('split')
+        if isinstance(split, str) and split.strip():
+            pinned['split'] = [split.strip()[:200]]
+        elif isinstance(split, (list, tuple)):
+            cleaned = [str(v).strip()[:200] for v in split if str(v).strip()]
+            if cleaned:
+                pinned['split'] = cleaned[:20]
         for key in ('constraints', 'roles', 'order', 'mustInclude'):
             val = constraints.get(key)
             if isinstance(val, (list, tuple)):
