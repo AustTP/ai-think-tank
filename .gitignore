@@ -183,3 +183,9 @@ library/hybrid-design-note.md
 think-tank-db-backups/*.dump
 think-tank-db-backups/*.dump.sha256
 think-tank-db-backups/*.log
+
+# X scrape pool state: the seeded marker must NOT ship -- a fresh clone
+# with a marker but no accounts.db bricks the lane (server refuses to
+# reseed while the marker exists). The server recreates both on first use.
+x_scrape/seeded
+x_scrape/accounts.db
