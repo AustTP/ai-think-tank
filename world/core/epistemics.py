@@ -129,18 +129,6 @@ def _ledger_read():
         return {}
 
 
-def _ledger_write(ledger):
-    import serve as _serve
-    with _serve._db() as conn:
-        conn.execute(
-            'INSERT INTO epistemic_ledger (id, blob, updated_at) '
-            'VALUES (1, ?, ?) '
-            'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, '
-            'updated_at = excluded.updated_at',
-            (json.dumps(ledger), time.time()),
-        )
-
-
 def _ensure_shape(ledger):
     ledger.setdefault('items', {})
     ledger.setdefault('validations', {})

@@ -128,7 +128,6 @@ def _epistemics_tool_extended(agent_id, args):
     (the HTTP endpoint stays operator-gated for the full surface)."""
     args = args or {}
     action = (args.get('action') or '').strip()
-    state = get_state_from_db() or {}
     if action == 'query':
         out = epistemics.query_items(
             status=args.get('status') or None, kind=args.get('kind') or None,

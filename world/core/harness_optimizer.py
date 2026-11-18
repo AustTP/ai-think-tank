@@ -32,7 +32,6 @@ The epistemic rules carry the discipline: nothing here can set 'validated'
 revision is traceable to the failure rows that motivated it.
 """
 
-import json
 import time
 
 _MIN_CLUSTER_SIZE = 2
@@ -205,7 +204,6 @@ def measure(conn=None, *, actor='harness-optimizer', window_s=None):
 def _measure(conn, *, actor, window_s):
     import core.epistemics as epistemics
     import core.issue_engine as issue_engine
-    now = time.time()
     if conn is None:
         import serve as _serve
         with _serve._db() as conn:

@@ -285,13 +285,9 @@ async def epistemics_write_endpoint(request: Request):
     action = (body.get('action') or '').strip()
     if not action:
         return JSONResponse({'error': 'action is required'}, status_code=400)
-    # The ledger owns its own row; the state read is only the Bank's
-    # product-cap lookup, and an unreadable state must not 503 a write the
-    # ledger itself can complete.
-    try:
-        state = get_state_from_db() or {}
-    except Exception:
-        state = {}
+    # The ledger owns its own row and _epistemics_tool reads state itself
+    # for the Bank's product-cap lookup, so a wedged state read must not
+    # 503 a write the ledger itself can complete.
     out = _epistemics_tool(actor or 'player', body)
     log_action(actor or 'player', 'epistemics_write',
                {'action': action}, authorized=True)
