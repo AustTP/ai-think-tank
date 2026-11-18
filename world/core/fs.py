@@ -74,13 +74,25 @@ def _require_cap(grant, cap):
         raise PermissionError(f'grant does not allow {cap}')
 
 
+def _no_grant_error(state, scope):
+    """Denial for an unmatched scope. The granted scope paths are named in the
+    message: agents guess at scopes more often than they mistype anything
+    else, and a denial that names the real scope turns three failed retries
+    into one correct call. Paths only -- never cap flags or labels."""
+    scopes = sorted({os.path.realpath(os.path.expanduser(g.get('scope') or ''))
+                     for g in (state.get('fileGrants') or []) if g.get('scope')})
+    return PermissionError(
+        f'no grant for this scope (scope must match one exactly): '
+        f'{", ".join(scopes) or "none"}')
+
+
 def list_scope(scope, rel_path=''):
     """List a directory inside the granted scope (default: the scope root).
     Returns [{name, type, size}]."""
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'read')
     p = _resolve(grant, rel_path)
     if not os.path.isdir(p):
@@ -100,7 +112,7 @@ def read_file(scope, rel_path, max_bytes=200000):
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'read')
     p = _resolve(grant, rel_path)
     if not os.path.isfile(p):
@@ -114,7 +126,7 @@ def write_file(scope, rel_path, content):
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'write')
     p = _resolve(grant, rel_path)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -128,7 +140,7 @@ def move_file(scope, src_rel, dst_rel):
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'write')
     src = _resolve(grant, src_rel)
     dst = _resolve(grant, dst_rel)
@@ -143,7 +155,7 @@ def delete_to_trash(scope, rel_path):
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'delete')
     p = _resolve(grant, rel_path)
     if not os.path.exists(p):
@@ -277,7 +289,7 @@ def read_store(scope, rel_path, query, gzip_columns=None, proto_columns=None, ma
     state = _state()
     grant = _grant_for(state, scope)
     if not grant:
-        raise PermissionError('no grant for this scope')
+        raise _no_grant_error(state, scope)
     _require_cap(grant, 'read')
     p = _resolve(grant, rel_path)
     if not os.path.isfile(p):
