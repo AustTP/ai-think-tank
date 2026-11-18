@@ -2,7 +2,7 @@
 .youtube-cookies.txt
 .secret_keys
 mcp_servers.local.json
-trusted_repos.json
+trusted_codebase.json
 VPS-MIGRATION.md
 library/theo-keys.json
 library/archive
