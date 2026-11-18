@@ -582,8 +582,14 @@ def _run_coding_content(snapshot, agent_id, task, base_ctx=None):
     # re-mint (2026-11-09: 100 of 184 fix cards pointed at reaped workspaces;
     # the refusal storm burned dispatch slots and Telegram alerts for hours).
     if task.get('reviewOf'):
-        root_id = story_tracking.root(snapshot, task)
-        root = (snapshot.get('tasks') or {}).get(root_id or '') or {}
+        # story_tracking.root() returns the root TASK DICT (see stamp() and
+        # every other caller), never an id. The 2026-11-18 ideabrowser story
+        # crashed here with `unhashable type: 'dict'` on every fix card:
+        # the dict was passed straight into snapshot['tasks'].get() as a key,
+        # so each doomed fix card died in the executor instead of refusing.
+        root_id = (story_tracking.root(snapshot, task) or {}).get('id') \
+            or task.get('reviewOf')
+        root = (snapshot.get('tasks') or {}).get(root_id) or {}
         if (str(root.get('status') or '') in ('done', 'cancelled', 'failed',
                                               'blocked', 'abandoned', '')
                 and not os.path.isdir(os.path.join(

@@ -92,3 +92,20 @@ class UnworkableFixShortCircuit(unittest.TestCase):
 
     def test_contract(self):
         self._exec_source_has_short_circuit()
+
+    def test_root_lookup_uses_id_not_dict(self):
+        # 2026-11-18: the reviewOf branch passed story_tracking.root()'s
+        # return (the root TASK DICT) straight into snapshot['tasks'].get()
+        # as a dict key -> TypeError: unhashable type: 'dict' on EVERY fix
+        # card whose parent story still existed, crashing the executor
+        # instead of refusing. The call site must extract .get('id') first.
+        import agents.story_tracking as story_tracking
+        snap = self._snapshot('working')
+        parent = story_tracking.root(snap, {'id': 'task-fix',
+                                            'reviewOf': 'task-root'})
+        self.assertIsInstance(parent, dict,
+                              'story_tracking.root returns the task dict')
+        self.assertEqual(parent.get('id'), 'task-root')
+        root_id = (parent or {}).get('id') or 'task-fix'
+        root = (snap.get('tasks') or {}).get(root_id) or {}
+        self.assertEqual(root.get('id'), 'task-root')
