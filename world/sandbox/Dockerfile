@@ -32,8 +32,13 @@ RUN python -m pip install --no-cache-dir \
 # in. The driver is a fixed script the endpoint invokes with ONE op per run --
 # it is the only browser entry point an agent has, deliberately (no free-form
 # JS, no arbitrary playwright scripts passed through).
+# Browsers install under /opt/ms-playwright (world-readable), NOT the default
+# /root/.cache: the runner starts the container as the HOST user (see
+# _run_browser_act_sync --user), which cannot traverse root's 0700 home.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN python -m pip install --no-cache-dir playwright==1.60.0
-RUN python -m playwright install --with-deps chromium
+RUN python -m playwright install --with-deps chromium \
+    && chmod -R a+rX /opt/ms-playwright
 COPY browser_driver.py /opt/browser_driver.py
 COPY browser_cf.py /opt/browser_cf.py
 

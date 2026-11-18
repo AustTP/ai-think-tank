@@ -732,6 +732,11 @@ def _run_in_sandbox_sync(sandbox_dir, command, limits=None, purpose=None,
         '--memory', f"{int(limits.get('memoryMb') or 512)}m",
         '--cpus', str(limits.get('cpus') or 1),
         '--pids-limit', str(int(limits.get('pidsLimit') or 128)),
+        # Run as the host user: with --cap-drop ALL the container's root has
+        # no DAC override and could not write into the server-owned workspace
+        # mount (every agent write failed with EACCES, silently). Same owner
+        # as the workspace means ordinary reads/writes just work.
+        '--user', f'{os.getuid()}:{os.getgid()}',
         '-v', f'{sandbox_dir}:/workspace',
         '-w', '/workspace',
         SANDBOX_IMAGE,

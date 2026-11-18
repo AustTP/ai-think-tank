@@ -134,12 +134,18 @@ def _public(session):
 def _build_run_command(name, password, profile_dir, sandbox_dir, proxy_url,
                        cpus, memory):
     """Browser container: internal network only, no published port."""
+    import os as _os
     cmd = [
         'run', '-d', '--rm', '--name', name,
         '--network', SESSION_NETWORK,
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
         '--memory', memory, '--cpus', cpus,
         '--pids-limit', '256', '--shm-size', '512m',
+        # Host uid: with --cap-drop ALL root has no DAC override and could
+        # not write the server-owned profile/workspace mounts (Chromium died
+        # with "Failed to create a ProcessSingleton").
+        '--user', f'{_os.getuid()}:{_os.getgid()}',
+        '-e', 'HOME=/browser-profile',
         '-e', f'VNC_PASS={password}',
     ]
     if proxy_url:

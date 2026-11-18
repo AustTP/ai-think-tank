@@ -109,6 +109,14 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         '--cpus', '1',
         '--pids-limit', '128',
         '--shm-size', '256m',
+        # Run as the host user: with --cap-drop ALL root has no DAC override,
+        # so it could not write the per-agent profile (server-owned 0700 dir)
+        # and Chromium died with "Failed to create a ProcessSingleton". Same
+        # owner as the profile/workspace mounts makes writes ordinary.
+        '--user', f'{os.getuid()}:{os.getgid()}',
+        # Chromium and the driver need a WRITABLE home (crashpad, caches);
+        # /root is root-owned 0700 and unreadable for this uid.
+        '-e', 'HOME=/browser-profile',
         '-v', f'{sandbox_dir}:/workspace',
         # Read-only, and mounted into THIS browser container only: the agent
         # exec sandbox never sees /browser-act, so a concurrent shell cannot
