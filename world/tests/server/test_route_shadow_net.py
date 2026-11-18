@@ -35,7 +35,7 @@ class NetArtifact(unittest.TestCase):
 
     def test_artifact_is_well_formed(self):
         net = json.load(open(_NET_PATH))
-        self.assertEqual(net['version'], 1)
+        self.assertEqual(net['version'], 2)
         self.assertEqual(net['lanes'],
                          ['ask', 'schedule', 'schedule_once', 'spike',
                           'story', 'incident', 'unclear'])
@@ -44,9 +44,38 @@ class NetArtifact(unittest.TestCase):
                             for row in net['weights']))
         self.assertEqual(len(net['bias']), len(net['lanes']))
         self.assertIn('md5', net['spec'])
-        self.assertEqual(net['meta']['role'],
+        self.assertIn('200 chars', net['spec'])
+        meta = net['meta']
+        self.assertEqual(meta['role'],
                          'shadow only -- never decides routing '
                          '(476_route_shadow_net.py)')
+        self.assertEqual(meta['cvMode'],
+                         'group-aware (duplicate texts never split across '
+                         'folds)')
+        self.assertEqual(meta['unseenLanes'],
+                         ['schedule', 'schedule_once', 'incident'])
+        self.assertEqual(meta['uniqueTexts'], 45)
+
+    def test_inference_truncation_parity(self):
+        # Spec: the shadow only ever sees the same 200-char prefix the
+        # action log stores. Tokens past the cap must not change the
+        # prediction (they would be weightless but still inflate the L2
+        # norm on the live path).
+        import serve
+        _fresh_net_state()
+        serve._route_net_cache = json.load(open(_NET_PATH))
+        head = 'We researched PostHog, Sentry, LangSmith. Compare each ' \
+               'against OUR think tank. PostHog: events via Kafka into ' \
+               'ClickHouse queried with HogQL.'
+        long_text = head + (' tail detail ' * 60)
+        self.assertGreater(len(long_text), 200)
+        self.assertEqual(serve._route_net_predict(long_text),
+                         serve._route_net_predict(long_text[:200]))
+        self.assertEqual(serve._route_net_features(long_text),
+                         serve._route_net_features(long_text[:200]))
+        # Sanity: the truncation actually binds (a head-only prediction is
+        # allowed to differ; only full-vs-prefix must agree).
+        self.assertLess(len(head), 200)
 
     def test_serve_side_predict_reproduces_every_training_label(self):
         # The artifact fit the dataset perfectly (fullFitAccuracy 1.0), so the

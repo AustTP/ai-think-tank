@@ -22,9 +22,12 @@ _route_net_loaded_at = 0.0       # last time we tried (or managed) to load
 
 def _route_net_features(text):
     """Hashed feature indices for one message. Spec identical to
-    train.py: [a-z0-9]+ tokens kept at len>=2, unigrams + adjacent bigrams,
-    md5 -> first 8 hex -> mod buckets."""
-    toks = [t for t in re.findall('[a-z0-9]+', (text or '').lower())
+    train.py: the message is truncated to the same 200 chars the action log
+    stores (the net only ever votes on evidence it was trained on -- tokens
+    past the cap would be weightless but would inflate the L2 norm and
+    shrink the trained features' influence), [a-z0-9]+ tokens kept at
+    len>=2, unigrams + adjacent bigrams, md5 -> first 8 hex -> mod buckets."""
+    toks = [t for t in re.findall('[a-z0-9]+', (text or '').lower()[:200])
             if len(t) >= 2]
     grams = toks + [a + ' ' + b for a, b in zip(toks, toks[1:])]
     buckets = int(_route_net_cache.get('buckets') or 256) if _route_net_cache else 256
