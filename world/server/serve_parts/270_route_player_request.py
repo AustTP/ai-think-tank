@@ -83,6 +83,10 @@ async def _route_player_request(state, text, session_id=None,
                {'lane': lane, 'text': text[:200],
                 'requester': actor_id},
                authorized=True)
+    # Shadow pilot (foundry 1): the tiny net re-answers the same message in
+    # parallel; its lane is logged, never used. Logging is inside
+    # _route_shadow_classified's own try, so the live route is untouched.
+    _route_shadow_classified(text, lane)
     action = _LANE_ACTIONS.get(lane, 'converse')
     if key is not None:
         decision = _theo_policy.evaluate_key(
