@@ -177,7 +177,7 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         grant_host = ''
     if grant_host and not _is_allowlisted_host(grant_host):
         _grant_egress_host(grant_host)
-    proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    proxy_url = _proxy_url_for_sandbox()
     docker_cmd = [
         'docker', 'run', '--rm',
         '--network', SANDBOX_NETWORK,

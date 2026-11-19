@@ -148,6 +148,18 @@ def _build_run_command(name, password, profile_dir, sandbox_dir, proxy_url,
         '-e', 'HOME=/browser-profile',
         '-e', f'VNC_PASS={password}',
     ]
+    # SANDBOX_RUNTIME (2026-11-19): alternate OCI runtime (runsc/gVisor) for
+    # the live browser session too. This module runs in the server process
+    # and .env is the operator's config surface; os.environ is not used here
+    # because the unit also runs in tests without env plumbing.
+    _runtime = ''
+    try:
+        import serve as _serve_mod
+        _runtime = (_serve_mod._load_env().get('SANDBOX_RUNTIME') or '').strip()
+    except Exception:
+        _runtime = (os.environ.get('SANDBOX_RUNTIME') or '').strip()
+    if _runtime:
+        cmd = cmd[:2] + ['--runtime', _runtime] + cmd[2:]
     if proxy_url:
         for key in ('http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY'):
             cmd += ['-e', f'{key}={proxy_url}']

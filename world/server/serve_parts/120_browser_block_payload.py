@@ -671,7 +671,12 @@ def _run_docker_sandbox(docker_cmd, timeout_s):
             pass
         # --cidfile is a `docker run` option and must precede the image name.
         idx = docker_cmd.index(SANDBOX_IMAGE)
-        cmd = docker_cmd[:idx] + ['--cidfile', cid_path] + docker_cmd[idx:]
+        # SANDBOX_RUNTIME (2026-11-19): an alternate OCI runtime for every
+        # sandbox lane -- runsc (gVisor) gives agent code a user-space kernel
+        # boundary instead of the host kernel. Empty = docker's default.
+        _rt = (_load_env().get('SANDBOX_RUNTIME') or '').strip()
+        cmd = docker_cmd[:2] + (['--runtime', _rt] if _rt else []) + docker_cmd[2:]
+        cmd = cmd[:idx] + ['--cidfile', cid_path] + cmd[idx:]
         try:
             return subprocess.run(cmd, capture_output=True, text=True,
                                   timeout=timeout_s)
@@ -690,6 +695,41 @@ def _run_docker_sandbox(docker_cmd, timeout_s):
             os.remove(cid_path)
         except OSError:
             pass
+
+
+def _proxy_url_for_sandbox():
+    """Proxy URL for sandbox containers, IP-pinned under runsc (2026-11-19).
+
+    Docker's embedded DNS resolves container names only inside a runc
+    container; gVisor's netstack forwards DNS to the HOST resolver
+    (ExtServers host(127.0.0.53)), which knows nothing about bridge-network
+    names -- so under SANDBOX_RUNTIME=runsc the proxy hostname never resolves
+    and every lane fails with ERR_PROXY_CONNECTION_FAILED / NameResolution
+    errors. The proxy container's IP on the sandbox network is stable for
+    the container's lifetime, so resolve it once and reuse; fall back to the
+    hostname when inspection fails (default runc path)."""
+    global _PROXY_URL_CACHE
+    cached = globals().get('_PROXY_URL_CACHE')
+    if cached:
+        return cached
+    import subprocess as _sp
+    try:
+        # Ask for the SANDBOX_NETWORK address specifically: the proxy is on
+        # TWO networks (egress + sandbox), and the first listed IP is often
+        # the egress-net one -- unreachable from sandbox containers.
+        result = _sp.run(['docker', 'inspect', '-f',
+                          '{{index (index .NetworkSettings.Networks "'
+                          + SANDBOX_NETWORK + '") "IPAddress"}}',
+                          PROXY_CONTAINER], capture_output=True, text=True,
+                         timeout=8)
+        ip = (result.stdout or '').strip()
+        if ip:
+            url = f'http://{ip}:{PROXY_PORT}'
+            globals()['_PROXY_URL_CACHE'] = url
+            return url
+    except Exception:
+        pass
+    return f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
 
 
 def _run_in_sandbox_sync(sandbox_dir, command, limits=None, purpose=None,
@@ -720,7 +760,7 @@ def _run_in_sandbox_sync(sandbox_dir, command, limits=None, purpose=None,
     # is mounted, so nothing outside /workspace is reachable even from
     # inside the container -- confirmed (an `ls /Users` from inside
     # an identical container found nothing there at all).
-    proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    proxy_url = _proxy_url_for_sandbox()
     limits = limits or resources.limits_for('light')
     docker_cmd = [
         'docker', 'run', '--rm',
@@ -789,7 +829,7 @@ def run_cron_script_sandboxed(script_relpath, timeout_s, env):
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     library = os.path.join(repo_root, 'library')
     os.makedirs(library, exist_ok=True)
-    proxy_url = f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    proxy_url = _proxy_url_for_sandbox()
     docker_cmd = [
         'docker', 'run', '--rm',
         '--network', SANDBOX_NETWORK,

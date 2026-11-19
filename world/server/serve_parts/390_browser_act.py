@@ -354,7 +354,7 @@ def _browser_session_sandbox_id(agent_id, sandbox_id):
 
 
 def _browser_session_proxy_url():
-    return f'http://{PROXY_CONTAINER}:{PROXY_PORT}'
+    return _proxy_url_for_sandbox()
 
 
 @app.get('/api/browser-session/list')
