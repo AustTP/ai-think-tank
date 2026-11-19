@@ -15,11 +15,13 @@ working and serve.py re-imports these names unchanged.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -61,6 +63,14 @@ _API_SERVICE_COLUMNS = (
 _OAUTH2_TOKEN_CACHE: dict = {}
 _OAUTH2_TOKEN_LOCK = threading.Lock()
 OAUTH2_REFRESH_MARGIN_S = 30
+
+# Refresh-token grant (2026-11-19): the PLAYER's long-lived OAuth refresh
+# token lives in the encrypted vault; the server exchanges it for a
+# short-lived access token (Google: ~1h) and caches that in-process only.
+# The cache is keyed by the refresh token's DIGEST, never the secret itself.
+_OAUTH2_REFRESH_CACHE: dict = {}
+OAUTH2_REFRESH_MARGIN_S = 60
+GOOGLE_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
 
 _MULLVAD_TOKEN_CACHE: dict = {}
 _MULLVAD_TOKEN_LOCK = threading.Lock()
@@ -340,9 +350,9 @@ def _validate_api_service_spec(spec):
     auth = spec.get('auth') or {}
     auth_type = auth.get('type')
     if auth_type not in ('none', 'header_bearer', 'header_key', 'body_field', 'mullvad',
-                         'oauth2_client_credentials', 'query_param'):
+                         'oauth2_client_credentials', 'oauth2_refresh_token', 'query_param'):
         return None, None, ('auth.type must be none, header_bearer, header_key, body_field, '
-                            'mullvad, oauth2_client_credentials, or query_param')
+                            'mullvad, oauth2_client_credentials, oauth2_refresh_token, or query_param')
     if auth_type == 'query_param':
         # Key-in-URL services (TomTom's ?key=... pattern). The credential is
         # appended to the URL query under auth.field (default 'key') at
@@ -376,6 +386,24 @@ def _validate_api_service_spec(spec):
             return None, None, 'oauth2_client_credentials requires a two-part env credential (key = client id, key2 = client secret)'
         auth = dict(auth)
         auth['token_url'] = token_url
+    if auth_type == 'oauth2_refresh_token':
+        # The player's long-lived OAuth REFRESH token lives in the encrypted
+        # vault (a 'token'-kind vault row); at request time the server
+        # exchanges it for a short-lived access token and injects only that.
+        # The client id/secret are APP credentials (they identify the tank's
+        # OAuth client, not a user) and come from .env keys, so rotating the
+        # refresh token never touches code and revoking the vault row kills
+        # the flow at the chokepoint. token_url defaults to Google's.
+        token_url = str(auth.get('token_url') or GOOGLE_OAUTH_TOKEN_URL).strip().rstrip('/')
+        parsed_tok = urllib.parse.urlparse(token_url)
+        if parsed_tok.scheme != 'https' or not parsed_tok.hostname or not _serve._is_safe_public_host(parsed_tok.hostname):
+            return None, None, 'oauth2_refresh_token requires a public https auth.token_url'
+        if cred.get('type') != 'vault' or not (cred.get('name') or '').strip():
+            return None, None, 'oauth2_refresh_token requires a vault credential (name = the vault row holding the refresh token)'
+        auth = dict(auth)
+        auth['token_url'] = token_url
+        auth['clientIdEnv'] = str(auth.get('clientIdEnv') or 'GOOGLE_OAUTH_CLIENT_ID').strip()
+        auth['clientSecretEnv'] = str(auth.get('clientSecretEnv') or 'GOOGLE_OAUTH_CLIENT_SECRET').strip()
     methods = spec.get('methods') or []
     if not methods or not all(m in _serve.CURL_METHODS for m in methods):
         return None, None, 'methods must be a non-empty subset of GET/POST/PUT/PATCH/DELETE/HEAD'
@@ -555,6 +583,17 @@ def _api_apply_auth(spec, token, token2, method, url, headers, body):
             raise ValueError('oauth2_client_credentials requires auth.token_url')
         bearer = _serve._oauth2_access_token(token_url, token, token2)
         headers['Authorization'] = f'Bearer {bearer}'
+    elif atype == 'oauth2_refresh_token':
+        # OAuth2 refresh-token grant (Google-style): the registry's credential
+        # is the PLAYER's refresh token from the encrypted vault (resolved by
+        # _api_credential_value); the client id/secret are app credentials
+        # from .env. Only the minted short-lived access token ever rides on
+        # the request -- the refresh token stays in the vault.
+        token_url = (auth.get('token_url') or GOOGLE_OAUTH_TOKEN_URL).strip()
+        client_id = _serve._load_env().get(auth.get('clientIdEnv') or 'GOOGLE_OAUTH_CLIENT_ID') or ''
+        client_secret = _serve._load_env().get(auth.get('clientSecretEnv') or 'GOOGLE_OAUTH_CLIENT_SECRET') or ''
+        bearer = _serve._oauth2_refresh_access_token(token_url, token, client_id, client_secret)
+        headers['Authorization'] = f'Bearer {bearer}'
     return url, headers, body
 
 
@@ -621,6 +660,88 @@ def _oauth2_access_token(token_url, client_id, client_secret):
         except (ValueError, TypeError):
             expires_in = 3600.0
         _serve._OAUTH2_TOKEN_CACHE[cache_key] = {'token': token, 'expires_at': time.time() + expires_in}
+        return token
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 refresh-token mint + cache (2026-11-19). The refresh token is the
+# PLAYER's long-lived grant, stored encrypted in the vault; the server
+# exchanges it (grant_type=refresh_token) for a SHORT-LIVED access token
+# (Google: ~1h) and caches that in-process keyed by
+# (token_url, client_id, refresh-token DIGEST) -- never the secret itself.
+# The minted bearer is the only credential that rides on the request; the
+# refresh token never leaves the vault, is never logged, persisted, or
+# returned to an agent. Exchange errors surface the token endpoint's own
+# error code (e.g. invalid_grant) so a revoked/expired refresh token is
+# diagnosable without echoing any secret.
+# ---------------------------------------------------------------------------
+def _oauth2_refresh_token_request_sync(token_url, refresh_token, client_id, client_secret):
+    """POST the refresh-token grant to the token endpoint and return the raw
+    response body. Form-encoded body (OAuth2's content type), SSRF-pinned
+    like every other outbound call, redirect-final-host re-checked. Raises on
+    a non-2xx response or a redirect to a disallowed host. Error text carries
+    status codes and the endpoint's error code only -- never any secret."""
+    import serve as _serve
+    if not refresh_token:
+        raise ValueError('oauth2 refresh token is not configured (vault row empty)')
+    if not client_id or not client_secret:
+        raise ValueError('oauth2 client id/secret env keys are not set')
+    body = urllib.parse.urlencode({
+        'grant_type': 'refresh_token',
+        'refresh_token': refresh_token,
+        'client_id': client_id,
+        'client_secret': client_secret,
+    }).encode()
+    headers = {'Content-Type': 'application/x-www-form-urlencoded',
+               'Accept': 'application/json', 'User-Agent': 'AIThinkTankAgent/1.0'}
+    req = urllib.request.Request(token_url, data=body, headers=headers, method='POST')
+    try:
+        with _serve._safe_urlopen(req, timeout=_serve.API_CALL_TIMEOUT_S) as resp:  # token URL is public-https validated at registration; _safe_urlopen pins each resolved IP so DNS cannot rebind to an internal address
+            final_url = resp.geturl()
+            final_host = urllib.parse.urlparse(final_url).hostname
+            if not _serve._is_safe_public_host(final_host):
+                raise ValueError('oauth2 token endpoint redirected to a disallowed host')
+            raw = resp.read(_serve.API_CALL_MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        detail = ''
+        try:
+            detail = (json.loads(e.read().decode(errors='replace')) or {}).get('error') or ''
+        except Exception:
+            detail = ''
+        raise ValueError(f'oauth2 token endpoint returned HTTP {e.code}'
+                         + (f' ({detail})' if detail else '')) from None
+    if resp.status >= 400:
+        raise ValueError(f'oauth2 token endpoint returned HTTP {resp.status}')
+    return raw.decode(errors='replace')[:_serve.API_CALL_MAX_BODY_BYTES]
+
+
+def _oauth2_refresh_access_token(token_url, refresh_token, client_id, client_secret):
+    """Return a valid access token for the given refresh token, minting and
+    caching one when the cache is empty or near expiry. Raises when the mint
+    fails so the caller (the auth-injection path) fails the request cleanly."""
+    import serve as _serve
+    parsed = urllib.parse.urlparse(token_url)
+    if parsed.scheme != 'https' or not parsed.hostname or not _serve._is_safe_public_host(parsed.hostname):
+        raise ValueError('oauth2 token_url must be a public https URL')
+    digest = hashlib.sha256((refresh_token or '').encode()).hexdigest()[:16]
+    cache_key = (token_url, client_id, digest)
+    with _serve._OAUTH2_TOKEN_LOCK:
+        cached = _serve._OAUTH2_REFRESH_CACHE.get(cache_key)
+        if cached and time.time() + _serve.OAUTH2_REFRESH_MARGIN_S < cached['expires_at']:
+            return cached['token']
+        raw = _serve._oauth2_refresh_token_request_sync(token_url, refresh_token, client_id, client_secret)
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            raise ValueError('oauth2 token endpoint returned non-JSON')
+        token = (data or {}).get('access_token')
+        if not token:
+            raise ValueError('oauth2 token endpoint returned no access_token')
+        try:
+            expires_in = float(data.get('expires_in') or 3600)
+        except (ValueError, TypeError):
+            expires_in = 3600.0
+        _serve._OAUTH2_REFRESH_CACHE[cache_key] = {'token': token, 'expires_at': time.time() + expires_in}
         return token
 
 

@@ -317,6 +317,43 @@ def ensure_village_chiefs(state):
     until an agent eligible for the seat exists. Returns the ids that were
     appointed."""
     appointed = []
+    live = {v.get('id') for v in (state.get('villages') or [])
+            if isinstance(v, dict) and v.get('id')}
+    admin_id = next((r.get('id') for r in (state.get('agentRoster') or [])
+                     if isinstance(r, dict) and r.get('isAdmin')), None)
+    stripped = []
+    for r in (state.get('agentRoster') or []):
+        if not isinstance(r, dict) or not r.get('villageChief'):
+            continue
+        if (r.get('chiefOfVillage') or None) in live:
+            continue
+        # Stale chief of a village that no longer exists (e.g. a merged-away
+        # second region): the RVP seat died with the village, so strip the
+        # chief flags and the RVP role, and re-parent under the surviving
+        # chief (or the admin when none). Without this, a second regional_vp
+        # lingers after a village merge and keeps RVP-grade authority.
+        r.pop('villageChief', None)
+        r.pop('chiefOfVillage', None)
+        if r.get('role') == 'regional_vp':
+            r['role'] = 'Supervisor'
+            r['isDirector'] = False
+            r.pop('elevatedAccess', None)
+            chief = next((c.get('id') for c in (state.get('agentRoster') or [])
+                          if isinstance(c, dict) and c.get('villageChief')
+                          and (c.get('chiefOfVillage') or None) in live
+                          and c.get('id') != r.get('id')), None)
+            if chief:
+                r['director'] = chief
+            elif admin_id and r.get('id') != admin_id:
+                r['director'] = admin_id
+        stripped.append(r.get('id'))
+    if stripped:
+        try:
+            import serve as _serve_log
+            _serve_log.log_action('sweep', 'stale_village_chief_stripped',
+                                  {'agents': stripped}, authorized=True)
+        except Exception:
+            pass
     have = {r.get('chiefOfVillage') for r in (state.get('agentRoster') or [])
             if isinstance(r, dict) and r.get('villageChief')}
     for v in (state.get('villages') or []):

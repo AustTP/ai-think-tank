@@ -172,3 +172,44 @@ def test_chiefs_never_report_to_themselves_and_admin_is_stable():
     assert chief == 'theo'
     entry = next(r for r in s['agentRoster'] if r['id'] == 'theo')
     assert entry.get('director') is None  # the admin reports to nobody
+
+
+def test_ensure_strips_a_chief_of_a_vanished_village():
+    # One village exists; a second RVP still carries chief flags for a
+    # village that was merged away. The invariant sweep strips the stale
+    # seat: no villageChief/role RVP/isDirector flags remain, the agent
+    # re-parents under the surviving chief, and the live village's chief
+    # is untouched.
+    s = _state()
+    h.appoint_village_chief(s, 'main', 'd1')
+    stale = {'id': 'd2', 'role': 'regional_vp', 'isDirector': True,
+             'villageChief': True, 'chiefOfVillage': 'winter',
+             'director': 'theo', 'elevatedAccess': True}
+    s['agentRoster'].append(stale)
+    appointed = h.ensure_village_chiefs(s)
+    assert appointed == []  # main already has its chief
+    by_id = {r['id']: r for r in s['agentRoster']}
+    assert by_id['d2'].get('villageChief') is None
+    assert by_id['d2'].get('chiefOfVillage') is None
+    assert by_id['d2']['role'] == 'Supervisor'
+    assert by_id['d2'].get('isDirector') is False
+    assert by_id['d2'].get('elevatedAccess') is None
+    assert by_id['d2']['director'] == 'd1'  # re-parented under the live chief
+    assert by_id['d1']['role'] == 'regional_vp'  # the real chief is untouched
+
+
+def test_ensure_strips_stale_chief_without_a_live_chief():
+    # No live chief anywhere: the demoted agent re-parents to the admin.
+    s = _state()
+    stale = {'id': 'd2', 'role': 'regional_vp', 'isDirector': True,
+             'villageChief': True, 'chiefOfVillage': 'winter',
+             'director': 'theo'}
+    s['agentRoster'].append(stale)
+    h.ensure_village_chiefs(s)
+    by_id = {r['id']: r for r in s['agentRoster']}
+    assert by_id['d2']['role'] == 'Supervisor'
+    # The strip re-parents to the admin, then the same pass's backfill seats
+    # a live chief for main and re-parents village directors under it.
+    assert by_id['d2']['director'] == 'd1'
+    assert any(r.get('villageChief') and r.get('chiefOfVillage') == 'main'
+               for r in s['agentRoster'])
