@@ -40,7 +40,7 @@ from browser_cf import (  # noqa: E402,F401
 
 
 OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit',
-       'screenshot', 'captcha_act')
+       'screenshot', 'captcha_act', 'flow')
 MAX_TEXT = int(os.environ.get('BROWSER_ACT_MAX_TEXT', '16000'))
 MAX_FIELDS = 40
 MAX_LINKS = 40
@@ -778,6 +778,40 @@ def run(action):
                     _settle(page, 2500)
                     state = _state(page, action)
                     return {'ok': True, 'op': op, 'screenshot': _maybe_shot(ctx, page, action), **state}
+                if op == 'flow':
+                    # Federated OAuth dances (2026-11-19): a bounded sequence
+                    # of selector clicks inside ONE browser session, because
+                    # an act is one browser run and a redirect dance cannot
+                    # survive between acts. Each step waits for the network
+                    # to settle; `optional` steps skip instead of failing
+                    # (the consent screen may or may not appear). Gated
+                    # server-side: only ever reachable with a session grant.
+                    steps = action.get('flow') or []
+                    if not isinstance(steps, list) or not (1 <= len(steps) <= 5):
+                        return {'ok': False, 'op': op,
+                                'error': 'flow requires 1..5 steps of {selector, optional?}'}
+                    visited = []
+                    for idx, step in enumerate(steps):
+                        if not isinstance(step, dict) or not str(step.get('selector') or '').strip():
+                            return {'ok': False, 'op': op,
+                                    'error': f'flow step {idx} needs a selector'}
+                        sel = str(step.get('selector'))
+                        optional = bool(step.get('optional'))
+                        try:
+                            page.click(sel, timeout=timeout_ms if not optional else 6000)
+                            _settle(page, 2500)
+                            visited.append({'step': idx, 'clicked': True,
+                                            'url': page.url[:400]})
+                        except Exception as exc:
+                            if optional:
+                                visited.append({'step': idx, 'clicked': False,
+                                                'skipped': str(exc)[:120]})
+                                continue
+                            return {'ok': False, 'op': op, 'error': f'flow step {idx} failed: {exc}'[:300],
+                                    'visited': visited}
+                    state = _state(page, action)
+                    return {'ok': True, 'op': op, 'visited': visited,
+                            'screenshot': _maybe_shot(ctx, page, action), **state}
                 if op == 'submit':
                     selector = action.get('selector') or ''
                     try:

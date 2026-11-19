@@ -884,7 +884,7 @@ async def execute(request: Request):
 # Jev-classified action runs where every other agent action runs. A persistent
 # profile dir under the sandbox makes the session survive across calls, so an
 # agent can go -> fill -> submit -> read like a real user.
-BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
+BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot', 'flow')
 
 # Signed-in operator sessions vaulted per service (2026-11-19): the login
 # tool deposits a browser profile here; agents get a short-lived, task-bound

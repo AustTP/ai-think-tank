@@ -231,7 +231,7 @@ async def browser_act(request: Request):
                        authorized=authorized)
             return JSONResponse({'error': 'session grant invalid, expired, or out of scope for this host'}, status_code=403)
         if op not in ('goto', 'read', 'screenshot', 'click', 'fill', 'fill_many',
-                      'submit', 'login'):
+                      'submit', 'login', 'flow'):
             return JSONResponse({'error': 'op not supported with a session grant'}, status_code=400)
     action = {'op': op, 'url': url, 'pageUrl': scope_url,
               'selector': selector, 'value': value if value is not None else '',
@@ -243,6 +243,23 @@ async def browser_act(request: Request):
         action['sessionHandle'] = _sess_handle_in
         action['sessionService'] = _sess_service
         action['sessionProfile'] = (body.get('sessionProfile') or '').strip() or None
+        # The flow op (2026-11-19) exists ONLY for federated OAuth dances:
+        # a redirect chain cannot survive between acts (each act is a fresh
+        # browser on a fresh profile copy), so the dance must complete in one
+        # run. It is a click sequence, nothing more -- no fill, no JS, capped
+        # at 5 steps -- and it is refused without a live session grant.
+        _flow_steps = body.get('flow')
+        if op == 'flow':
+            if not isinstance(_flow_steps, list) or not (1 <= len(_flow_steps) <= 5):
+                return JSONResponse({'error': 'flow requires 1..5 steps of {selector, optional?}'}, status_code=400)
+            for _fs in _flow_steps:
+                if not isinstance(_fs, dict) or not str(_fs.get('selector') or '').strip():
+                    return JSONResponse({'error': 'each flow step needs a selector'}, status_code=400)
+            action['flow'] = [{'selector': str(s.get('selector')).strip(),
+                               'optional': bool(s.get('optional'))}
+                              for s in _flow_steps]
+    elif op == 'flow':
+        return JSONResponse({'error': 'flow is a federated-auth op and requires a session grant (sessionHandle + sessionService)'}, status_code=403)
     # Automatic solving is opt-in twice: the global switch AND this host's
     # policy must both say yes. A relay-only host never gets a driver solve.
     _auto_mode = (_load_env().get('CAPTCHA_AUTO_SOLVE') or 'off').strip().lower()
