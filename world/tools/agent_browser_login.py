@@ -29,6 +29,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 # (serve's ROOT is world/, not the repo root). Mount the SAME tree or the
 # operator's login lands in an orphaned profile the lane never reads.
 PROFILE_ROOT = os.path.join(ROOT, 'world', '.browser-profiles', 'social')
+# Session vault (2026-11-19): operator-deposited per-service browser
+# sessions. --service mounts here instead of an agent profile; agents get a
+# fresh COPY only while holding a live session grant, so a sign-in here is
+# need-based access, never standing access.
+SESSION_ROOT = os.path.join(ROOT, 'world', '.browser-sessions')
 IMAGE = 'ai-think-tank-work-sandbox:latest'
 CONTAINER_PREFIX = 'btank-login-'
 DEFAULT_URL = 'https://accounts.google.com'
@@ -63,10 +68,11 @@ def _bind_ip(explicit):
 
 
 def start(args):
-    slug = _slug(args.agent)
+    slug = _slug(args.service or args.agent)
     name = CONTAINER_PREFIX + slug
     subprocess.run(['docker', 'rm', '-f', name], capture_output=True)
-    profile = os.path.join(PROFILE_ROOT, slug)
+    profile = (os.path.join(SESSION_ROOT, _slug(args.service)) if args.service
+               else os.path.join(PROFILE_ROOT, slug))
     os.makedirs(profile, mode=0o700, exist_ok=True)
     os.chmod(profile, 0o700)
     bind = _bind_ip(args.bind)
@@ -98,14 +104,19 @@ def start(args):
     if cid.returncode != 0:
         print('docker run failed:', cid.stderr.strip(), file=sys.stderr)
         return 1
+    what = f'service session {args.service}' if args.service else f'agent {args.agent} (profile {profile})'
     url = f'http://{bind}:{args.port}/vnc.html?autoconnect=1'
-    print(f'login session for agent {args.agent} (profile {profile})')
+    print(f'login session for {what}')
     print(f'  open:  {url}')
     print(f'  vnc password: {password}')
     print(f'  start page: {args.url}')
     print(f'  container: {name} (auto-removed; stops after {args.max_minutes} min)')
-    print('  when the login is done: agent_browser_login.py stop --agent '
-          + args.agent)
+    if args.service:
+        print(f'  when done: agent_browser_login.py stop --service {args.service}')
+        print(f'  agents then request access: request_credential_access(service={args.service!r})')
+    else:
+        print('  when the login is done: agent_browser_login.py stop --agent '
+              + args.agent)
     return 0
 
 
@@ -120,7 +131,8 @@ def status(_args):
 
 
 def stop(args):
-    name = CONTAINER_PREFIX + _slug(args.agent)
+    target = args.service or args.agent
+    name = CONTAINER_PREFIX + _slug(target)
     r = subprocess.run(['docker', 'rm', '-f', name], capture_output=True,
                        text=True)
     print('stopped' if r.returncode == 0 else f'not running: {name}')
@@ -131,7 +143,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest='cmd', required=True)
     p_start = sub.add_parser('start')
-    p_start.add_argument('--agent', required=True)
+    p_start.add_argument('--agent', help='log into this AGENT\'s standing profile (standing access)')
+    p_start.add_argument('--service', help='log into a vaulted SERVICE session (need-based access)')
     p_start.add_argument('--url', default=DEFAULT_URL)
     p_start.add_argument('--port', type=int, default=6080)
     p_start.add_argument('--bind', default=None)
@@ -140,9 +153,16 @@ def main():
     p_status = sub.add_parser('status')
     p_status.set_defaults(fn=status)
     p_stop = sub.add_parser('stop')
-    p_stop.add_argument('--agent', required=True)
+    p_stop.add_argument('--agent')
+    p_stop.add_argument('--service')
     p_stop.set_defaults(fn=stop)
     args = ap.parse_args()
+    if args.cmd == 'start' and not args.agent and not args.service:
+        ap.error('start requires --agent <id> or --service <name>')
+    if args.cmd == 'stop' and not args.agent and not args.service:
+        ap.error('stop requires --agent <id> or --service <name>')
+    if args.cmd == 'start' and args.agent and args.service:
+        ap.error('choose ONE of --agent or --service')
     return args.fn(args)
 
 

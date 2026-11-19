@@ -78,12 +78,33 @@ def _library_provenance_audit(now, window_s):
             ).fetchone()[0]
     except Exception:
         churn = {'refusals': [], 'repair_count': 0}
+    # Session-access churn (2026-11-19): the need-based session vault is the
+    # second rule measured by the same discipline. granted = demand signal;
+    # refused = an agent asked wrongly (task not assigned / needle miss /
+    # no stored session); mount_denied = an agent TRIED to use a session
+    # without a grant. A refused+denied rate that climbs while granted stays
+    # flat means the acquisition path is too tight (the browser_act
+    # tunnel-allowed-but-unreachable failure mode of the same morning).
+    session_churn = {'granted': 0, 'refused': 0, 'mount_denied': 0}
+    try:
+        with _db() as conn:
+            for action, key in (('session_access_granted', 'granted'),
+                                ('session_access_refused', 'refused'),
+                                ('session_mount_denied', 'mount_denied')):
+                session_churn[key] = conn.execute(
+                    'SELECT COUNT(*) FROM action_log WHERE action = ? '
+                    'AND ts > ? AND ts <= ?',
+                    (action, now - window_s, now),
+                ).fetchone()[0]
+    except Exception:
+        session_churn = {'granted': 0, 'refused': 0, 'mount_denied': 0}
     return {
         'writes': len(rows),
         'by_source': {k: by_source[k] for k in sorted(by_source)},
         'external_in_trusted': sorted(set(external_in_trusted)),
         'unvetted_pending': unvetted,
         'refusal_churn': churn,
+        'session_churn': session_churn,
     }
 
 
@@ -205,6 +226,7 @@ def _build_weekly_review(now=None):
             'count': provenance['refusal_churn']['repair_count'],
             'refusals': provenance['refusal_churn']['refusals'][:20],
         },
+        'session_churn': provenance['session_churn'],
         'judge_economics': _grade_outcome_spend(since),
     }
 
@@ -276,6 +298,18 @@ def _build_weekly_review(now=None):
                          f'{r.get("reason") or "?"} -- {r.get("detail") or "?"}')
         lines.append('- If refusals keep climbing, demote the gate: '
                      'flag-and-annotate instead of fail-closed.')
+    # Session-access churn: the need-based session vault's own ladenness
+    # signal (granted vs refused vs tried-without-a-grant).
+    sc = provenance.get('session_churn') or {}
+    if any(sc.get(k) for k in ('granted', 'refused', 'mount_denied')):
+        lines += ['', '## Session access (need-based)', '']
+        lines.append(f'- Grants: **{sc.get("granted", 0)}**, refused requests: '
+                     f'**{sc.get("refused", 0)}**, acts tried without a grant '
+                     f'(denied at mount): **{sc.get("mount_denied", 0)}**')
+        if sc.get('refused', 0) + sc.get('mount_denied', 0) > 2 * max(1, sc.get('granted', 0)):
+            lines.append('- Refusals outnumber grants 2:1 -- the acquisition '
+                         'path is likely too tight; check task-needle wording '
+                         'and the hosts list before adding more rules.')
     # Judge economics: what the grading spend bought this window. Rework
     # spend is the price of judgments the work then failed anyway -- the
     # number that decides how much grading is worth at all.

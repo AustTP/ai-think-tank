@@ -157,6 +157,15 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                                     'purpose': purpose,
                                 }, agent_key, timeout=30)
             if isinstance(result, dict) and result.get('ok'):
+                if result.get('session'):
+                    return (f"Granted {result.get('service')} SIGNED-IN session access "
+                            f"for this task. handle={result.get('handle')} "
+                            f"hosts={', '.join(result.get('hosts') or [])} "
+                            f"expiresInSec={result.get('expiresInSec')}. Pass "
+                            f"sessionHandle={result.get('handle')} and "
+                            f"sessionService={result.get('service')} with your "
+                            "browser_act calls; the vaulted sign-in profile is "
+                            "mounted for those runs only.")
                 return (f"Granted read-only {result.get('service')} access for this task. "
                         f"handle={result.get('handle')} hosts={', '.join(result.get('hosts') or [])} "
                         f"expiresInSec={result.get('expiresInSec')}. Use it with browser_act "

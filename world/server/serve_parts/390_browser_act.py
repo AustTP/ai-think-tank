@@ -212,12 +212,37 @@ async def browser_act(request: Request):
         value = injected  # only reaches the sandbox action file; never logged or returned
 
     sandbox_dir = _sandbox_dir_for(sandbox_id)
+    # Need-based session grant (2026-11-19): a live capability handle of the
+    # session:* family routes this act through a fresh COPY of the vaulted
+    # operator session instead of the agent's standing profile. Scope is
+    # verified HERE (agent, expiry, host) before anything mounts; the lane
+    # re-checks expiry and copies from the vault.
+    _sess_service = ''
+    _sess_handle_in = (body.get('sessionHandle') or '').strip()
+    if _sess_handle_in:
+        _sess_service = (body.get('sessionService') or '').strip().lower()
+        if not _sess_service:
+            return JSONResponse({'error': 'sessionService is required with sessionHandle'}, status_code=400)
+        _sess_scope = verify_session_handle_scope(agent_id, _sess_handle_in, _sess_service, scope_url or url)
+        if _sess_scope is None:
+            log_action(agent_id, 'browser_act', {'sandboxId': sandbox_id, 'op': op,
+                                                 'url': scope_url or url, 'decision': 'blocked',
+                                                 'reason': 'session grant invalid/expired/out of scope'},
+                       authorized=authorized)
+            return JSONResponse({'error': 'session grant invalid, expired, or out of scope for this host'}, status_code=403)
+        if op not in ('goto', 'read', 'screenshot', 'click', 'fill', 'fill_many',
+                      'submit', 'login'):
+            return JSONResponse({'error': 'op not supported with a session grant'}, status_code=400)
     action = {'op': op, 'url': url, 'pageUrl': scope_url,
               'selector': selector, 'value': value if value is not None else '',
              'timeoutMs': 30000, 'maxText': max_text,
              # Optional toggle/tab open before a login fill (see driver):
              # sites that hide the password form behind a click.
              'preClickSelector': (body.get('preClickSelector') or '').strip()}
+    if _sess_handle_in:
+        action['sessionHandle'] = _sess_handle_in
+        action['sessionService'] = _sess_service
+        action['sessionProfile'] = (body.get('sessionProfile') or '').strip() or None
     # Automatic solving is opt-in twice: the global switch AND this host's
     # policy must both say yes. A relay-only host never gets a driver solve.
     _auto_mode = (_load_env().get('CAPTCHA_AUTO_SOLVE') or 'off').strip().lower()

@@ -1,5 +1,78 @@
 
 
+def _session_vault_profile_dir():
+    """Vault dir of operator-deposited, per-service browser sessions (the
+    need-based alternative to standing per-agent profiles)."""
+    import serve as _serve_mod
+    return getattr(_serve_mod, 'SESSION_VAULT_DIR', None) or os.path.join(
+        _serve_mod.ROOT, '.browser-sessions')
+
+
+def _session_handle_row(agent_id, service, handle):
+    """The live capability handle for this agent+service+nonce, or None.
+    A session handle is valid only while unexpired."""
+    import serve as _serve_mod
+    try:
+        with _serve_mod._db() as conn:
+            row = conn.execute(
+                'SELECT allowed_hosts, expires_at FROM capability_handles '
+                'WHERE handle = ? AND agent_id = ? AND credential_name = ? '
+                'AND expires_at > ?', (handle, agent_id, 'session:' + service,
+                                       time.time())).fetchone()
+        return row
+    except Exception:
+        return None
+
+
+def _mount_session_profile(action, agent_id, sandbox_dir):
+    """Need-based session mount (2026-11-19): when the action carries
+    sessionHandle + sessionService, swap the action's profile to a fresh COPY
+    of the vaulted operator session for that service. The standing per-agent
+    profile is never touched -- an agent without a handle sees no session.
+    Returns an error string on refusal, None to proceed."""
+    handle = str(action.pop('sessionHandle', '') or '').strip()
+    service = str(action.pop('sessionService', '') or '').strip().lower()
+    if not handle and not service:
+        return None
+    if not handle or not service:
+        return 'session access requires both sessionHandle and sessionService'
+    row = _session_handle_row(agent_id, service, handle)
+    if not row:
+        # The churn signal for the weekly review: the agent TRIED to use a
+        # session it has no (or an expired) grant for. The run itself still
+        # proceeds anonymously -- this is never a refusal gate.
+        log_action(agent_id or 'unknown', 'session_mount_denied',
+                   {'service': service, 'reason': 'no live session grant'},
+                   authorized=True)
+        return ('no valid session grant for this agent/service: request one '
+                'via request_credential_access for your active task')
+    try:
+        _run_host = urllib.parse.urlparse(
+            action.get('url') or action.get('pageUrl') or '').hostname or ''
+    except ValueError:
+        _run_host = ''
+    allowed_hosts = json.loads(row[0] or '[]')
+    from serve import _host_matches as _hm
+    if _run_host and allowed_hosts and not _hm(_run_host, allowed_hosts):
+        return (f'session grant for {service} does not cover host {_run_host}')
+    vault_dir = _session_vault_profile_dir()
+    vault_profile = os.path.join(vault_dir,
+                                 str(action.pop('sessionProfile', '') or service))
+    if not os.path.isdir(os.path.join(vault_profile, 'Default')):
+        return ('no stored operator session for ' + service
+                + '; the operator must sign in via the browser-login tool')
+    work_dir = os.path.join(sandbox_dir, '.browser-act')
+    os.makedirs(work_dir, exist_ok=True)
+    import secrets as _secrets2
+    copy_id = _secrets2.token_hex(6)
+    copy_dir = os.path.join(work_dir, f'session-{copy_id}')
+    shutil.copytree(vault_profile, copy_dir, symlinks=True)
+    os.chmod(copy_dir, 0o700)
+    action['profileDir'] = '/browser-profile'
+    action['sessionProfileCopyHostPath'] = copy_dir
+    return None
+
+
 def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     """Run ONE already-classified browser_act op in the sandbox and return the
     parsed result dict from the driver's result file (falling back to parsing
@@ -39,6 +112,14 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     # by the agentic nested call to disable re-solving) wins.
     action.setdefault('autoSolve',
                       (_load_env().get('CAPTCHA_AUTO_SOLVE') or 'off').strip().lower())
+    # Need-based session mount (2026-11-19): an agent holding a live session
+    # grant may run this op against a fresh COPY of the vaulted operator
+    # session instead of its standing profile. Without a grant there is no
+    # session anywhere on the path -- the mount simply never happens.
+    _session_err = _mount_session_profile(action, agent_id, sandbox_dir)
+    if _session_err:
+        return None, _session_err
+    _session_copy = action.get('sessionProfileCopyHostPath')
     # A live session for this agent owns the browser: run the op against it so
     # the player can watch and step in. Only this falls through to launching a
     # new one-shot Chromium.
@@ -128,7 +209,7 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         # (surfaced as the driver silently reading an empty action:
         # "unknown op None"). A single-file bind needs no traversal.
         '-v', f'{action_path}:/browser-act/action-{run_id}.json:ro',
-        '-v', f'{_browser_profile_dir(agent_id)}:/browser-profile',
+        '-v', f'{_session_copy or _browser_profile_dir(agent_id)}:/browser-profile',
         '-w', '/workspace',
         SANDBOX_IMAGE,
         # Headful Chromium under a private Xvfb. Do NOT use xvfb-run here:
@@ -146,7 +227,7 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         try:
             # One Chromium profile at a time: a persistent user-data dir cannot
             # be opened by two browsers concurrently.
-            profile_dir = _browser_profile_dir(agent_id)
+            profile_dir = _session_copy or _browser_profile_dir(agent_id)
             os.makedirs(profile_dir, mode=0o700, exist_ok=True)
             try:
                 os.chmod(profile_dir, 0o700)
@@ -161,6 +242,11 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         if grant_host and not _is_allowlisted_host(grant_host):
             _revoke_egress_host(grant_host)
         shutil.rmtree(action_dir, ignore_errors=True)
+        # The session copy is per-run: cookies written during the run are
+        # discarded (the vault copy stays canonical), and nothing session-
+        # bearing survives the act outside the vault.
+        if _session_copy:
+            shutil.rmtree(_session_copy, ignore_errors=True)
 
 
 # How long real JS/AJAX content gets to finish loading before the text is

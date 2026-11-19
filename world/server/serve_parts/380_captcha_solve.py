@@ -129,9 +129,74 @@ async def request_credential_access(request: Request):
     text = _task_need_text(task)
     needles = [service] + [h.lower() for h in (spec.get('hosts') or [])]
     if not any(n and n in text for n in needles):
+        if spec.get('session'):
+            log_action(agent_id, 'session_access_refused',
+                       {'service': service, 'taskId': task_id,
+                        'reason': 'task does not reference the service'},
+                       authorized=True)
         return JSONResponse({'error': 'the assigned task does not reference this '
                                       'service; request access only for work that '
                                       'actually needs it'}, status_code=403)
+    # Session-backed services (2026-11-19): the signed-in identity lives in a
+    # vault browser profile (.browser-sessions/<service>), NOT in any agent's
+    # standing profile. A request mints a short-lived handle; the browser lane
+    # mounts a fresh copy of the vault profile only for runs that hold one.
+    # Same need-based shape as credential handles: task-bound, host-scoped,
+    # TTL, idempotent per task.
+    if spec.get('session'):
+        session_profile = os.path.join(
+            SESSION_VAULT_DIR, str(spec.get('sessionProfile') or service))
+        if not os.path.isfile(os.path.join(
+                session_profile, 'Default', 'Cookies')):
+            log_action(agent_id, 'session_access_refused',
+                       {'service': service, 'taskId': task_id,
+                        'reason': 'no stored operator session'}, authorized=True)
+            return JSONResponse({'error': 'no stored operator session for this '
+                                          'service; ask the operator to sign in '
+                                          'via the browser-login tool'},
+                                status_code=404)
+        credential = 'session:' + service
+        purpose_tag = f'task:{task_id} '
+        handle = None
+        with _db() as conn:
+            existing = conn.execute(
+                'SELECT handle FROM capability_handles WHERE agent_id = ? '
+                'AND credential_name = ? AND purpose LIKE ? AND expires_at > ? '
+                'ORDER BY created_at DESC LIMIT 1',
+                (agent_id, credential, purpose_tag + '%', time.time())).fetchone()
+            if existing:
+                handle = existing[0]
+            else:
+                conn.execute('DELETE FROM capability_handles WHERE agent_id = ? '
+                             'AND credential_name = ?', (agent_id, credential))
+        if handle is None:
+            # Direct insert: mint_capability_handle gates on a vault
+            # credential row, which a session-backed service intentionally
+            # does not have -- the vault profile on disk IS the secret.
+            handle = secrets.token_hex(32)
+            with _db() as conn:
+                conn.execute(
+                    'INSERT INTO capability_handles (handle, agent_id, '
+                    'credential_name, purpose, allowed_hosts, allowed_methods, '
+                    'granted_by, expires_at, created_at) '
+                    'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (handle, agent_id, credential, purpose_tag + purpose,
+                     json.dumps(list(spec.get('hosts') or [])),
+                     json.dumps(list(spec.get('methods') or ['GET', 'POST'])),
+                     'need-based-session', time.time() + int(spec.get('ttlSec') or 3600),
+                     time.time()))
+        log_action(agent_id, 'session_access_granted',
+                   {'service': service, 'taskId': task_id,
+                    'hosts': spec.get('hosts'), 'ttlSec': spec.get('ttlSec')},
+                   authorized=True)
+        _append_passport_decision('session_access_granted', agent_id, {
+            'service': service, 'taskId': task_id, 'hosts': spec.get('hosts'),
+            'scope': 'need-based-session'})
+        return JSONResponse({'ok': True, 'handle': handle, 'service': service,
+                             'session': True, 'hosts': spec.get('hosts'),
+                             'methods': spec.get('methods'),
+                             'expiresInSec': int(spec.get('ttlSec') or 3600),
+                             'readOnly': False})
     credential = spec.get('credential') or service
     purpose_tag = f'task:{task_id} '
     handle = None
@@ -820,6 +885,52 @@ async def execute(request: Request):
 # profile dir under the sandbox makes the session survive across calls, so an
 # agent can go -> fill -> submit -> read like a real user.
 BROWSER_ACT_OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit', 'screenshot')
+
+# Signed-in operator sessions vaulted per service (2026-11-19): the login
+# tool deposits a browser profile here; agents get a short-lived, task-bound
+# handle and the lane mounts a COPY for approved runs only. A session in an
+# agent's standing profile is usable forever; a vaulted one is need-based.
+SESSION_VAULT_DIR = os.environ.get('BROWSER_SESSION_VAULT_DIR') or os.path.join(
+    ROOT, '.browser-sessions')
+
+
+def verify_session_handle_scope(agent_id, handle, service, url):
+    """Scope check for a session:* capability handle (agent, expiry, host,
+    method) without touching the vault profile. verify_capability_handle_scope
+    cannot be reused: it resolves the handle against external_credentials,
+    which a session-backed service intentionally is not. Returns the grant
+    row or None."""
+    if not agent_id or not handle or not service:
+        return None
+    try:
+        with _db() as conn:
+            row = conn.execute(
+                'SELECT purpose, allowed_hosts, allowed_methods, expires_at '
+                'FROM capability_handles WHERE handle = ? AND agent_id = ? '
+                'AND credential_name = ?',
+                (handle, agent_id, 'session:' + service)).fetchone()
+            if not row:
+                return None
+            purpose, allowed_hosts, allowed_methods, expires_at = row
+            if time.time() > expires_at:
+                conn.execute('DELETE FROM capability_handles WHERE handle = ?',
+                             (handle,))
+                return None
+            host = urllib.parse.urlparse(url or '').hostname or ''
+            if not host:
+                return None
+            try:
+                hosts = json.loads(allowed_hosts) if isinstance(allowed_hosts, str) else allowed_hosts
+                methods = json.loads(allowed_methods) if isinstance(allowed_methods, str) else allowed_methods
+            except Exception:
+                return None
+            if hosts != '*' and host not in (hosts or []):
+                return None
+            if methods != '*' and 'GET' not in (methods or []):
+                return None
+        return {'purpose': purpose, 'hosts': hosts, 'methods': methods}
+    except Exception:
+        return None
 
 
 def _credential_access_cfg():
