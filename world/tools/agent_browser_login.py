@@ -25,7 +25,10 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PROFILE_ROOT = os.path.join(ROOT, '.browser-profiles', 'social')
+# The browser lane's BROWSER_PROFILE_DIR default is ROOT(world)/.browser-profiles/social
+# (serve's ROOT is world/, not the repo root). Mount the SAME tree or the
+# operator's login lands in an orphaned profile the lane never reads.
+PROFILE_ROOT = os.path.join(ROOT, 'world', '.browser-profiles', 'social')
 IMAGE = 'ai-think-tank-work-sandbox:latest'
 CONTAINER_PREFIX = 'btank-login-'
 DEFAULT_URL = 'https://accounts.google.com'
