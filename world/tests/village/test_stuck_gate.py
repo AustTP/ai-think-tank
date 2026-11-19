@@ -247,11 +247,15 @@ class StuckGateSweep(unittest.TestCase):
         # Positive control: a story carrying a real report artifact + note
         # closes as before (the refusal only fires on the hollow case). Same
         # contract shape as the dankornas card: deliverable='report'.
+        # Provenance (2026-11-19) is a separate layered check -- scoped out
+        # here so this test keeps testing the completion-contract shape.
         state = _state()
         _gated_task(state, taskType='task', deliverable='report',
                     reportPath='archive/report.md',
                     note='Submitted the change request report.')
-        with unittest.mock.patch.object(serve, 'log_action'), \
+        with unittest.mock.patch.object(sim, '_research_provenance_gap',
+                                        return_value=None), \
+                unittest.mock.patch.object(serve, 'log_action'), \
                 unittest.mock.patch.object(sim, '_deliver_card_report'):
             ok = sim._close_gated_story(state, state['tasks']['task-1'])
         self.assertTrue(ok)

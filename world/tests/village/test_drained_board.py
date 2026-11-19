@@ -101,9 +101,13 @@ class CompletionEvidence(unittest.TestCase):
     def test_bug_card_with_report_deliverable_accepts_a_saved_report(self):
         # A bug whose remedy is a report is minted with deliverable='report';
         # the gate follows the explicit contract, not the type or title.
-        self.assertTrue(sim._completion_has_evidence({}, {
-            'taskType': 'bug', 'deliverable': 'report',
-            'reportPath': 'archive/report.md', 'note': 'Saved the report.'}))
+        # Provenance (2026-11-19) is a separate check layered on the same
+        # contract -- scoped out here so this test keeps testing the shape.
+        with mock.patch.object(sim, '_research_provenance_gap',
+                               return_value=None):
+            self.assertTrue(sim._completion_has_evidence({}, {
+                'taskType': 'bug', 'deliverable': 'report',
+                'reportPath': 'archive/report.md', 'note': 'Saved the report.'}))
         self.assertFalse(sim._completion_has_evidence({}, {
             'taskType': 'bug', 'deliverable': 'report',
             'reportPath': 'archive/report.md'}))

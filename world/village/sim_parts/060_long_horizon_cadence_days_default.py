@@ -493,7 +493,13 @@ def _check_schedules(state, now, now_ms):
                 'room': 'observatory',
                 'instructions': ('Merge the findings archived since the last distillation into the '
                                  'think tank wiki, removing redundancy and extracting what the think tank '
-                                 'now knows as a body.'),
+                                 'now knows as a body. '
+                                 'Preserve ANSWERS, not summaries: for every claim, keep the specific '
+                                 'fact, number, path, or verdict an agent would need when acting -- and '
+                                 'record which question it answers and which Library file it came from. '
+                                 'A reader must be able to act on your merge WITHOUT opening the source '
+                                 'artifacts again; if the source held a decision, cite it in one line '
+                                 'rather than dropping it.'),
                 'distill': True,
                 'distillSince': previous_distill_at,
                 'kbClass': 'changes_how_we_work',

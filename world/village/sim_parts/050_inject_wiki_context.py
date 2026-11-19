@@ -974,6 +974,10 @@ _PROVENANCE_FETCH_ACTIONS = ('browse', 'search_web', 'api-call')
 _PROVENANCE_INABILITY_MARKERS = (
     'refused', 'not active', 'credential', 'unavailable', 'resource_exhausted',
     'rate limit', '[budget]', 'policy_refusal',
+    # Transport-failure phrases (observed live 2026-11: sweep cards archived
+    # "model call failed" notes -- honest infra inability, not fabrication).
+    'model call failed', 'circuit breaker', 'no provider', 'transport error',
+    'transport degraded', 'timeout',
 )
 
 
@@ -1104,6 +1108,8 @@ def _completion_has_evidence(state, task):
                       or task.get('restoreCheck') or task.get('codePublished'))
         if not ok:
             return False
+        if deliverable == 'report' and _research_provenance_gap(task):
+            return False
         grade = task.get('grade')
         if isinstance(grade, (int, float)) and grade <= 0:
             return False
@@ -1144,6 +1150,14 @@ def _completion_has_evidence(state, task):
         artifact = task.get('libraryPath') or task.get('reportPath')
         if not artifact or not str(task.get('note') or '').strip():
             return False
+        # Same provenance rule as plain research cards (2026-11-19): an
+        # investigation that concluded "impossible / premise rejected" with
+        # zero in-task fetch attempts is the spike lane's task-2208 class --
+        # the sweep batch evaluators archived exactly that and closed as done.
+        # Honest inability stays completable via the refusal markers.
+        gap = _research_provenance_gap(task)
+        if gap:
+            return False
     elif ttype in _DELIVERABLE_TASK_TYPES or task.get('_peerGate'):
         # A published code change is itself the deliverable. The Library
         # record is documentation; a failed Library write must not turn a
@@ -1174,6 +1188,13 @@ def _completion_evidence_gap(task):
         return gap or 'the task note is empty'
     deliverable = str(task.get('deliverable') or '').strip().lower()
     if deliverable == 'report':
+        if not (task.get('libraryPath') or task.get('reportPath')):
+            return 'no reportPath or task note'
+        if not str(task.get('note') or '').strip():
+            return 'no reportPath or task note'
+        gap = _research_provenance_gap(task)
+        if gap:
+            return gap
         return 'no reportPath or task note'
     if deliverable == 'note':
         return 'the task note is empty'
@@ -1184,6 +1205,12 @@ def _completion_evidence_gap(task):
         return ('no published change, written .py file, restore check, '
                 'or Library artifact')
     if ttype in ('spike', 'report'):
+        artifact = task.get('libraryPath') or task.get('reportPath')
+        if not artifact or not str(task.get('note') or '').strip():
+            return 'no reportPath or task note'
+        gap = _research_provenance_gap(task)
+        if gap:
+            return gap
         return 'no reportPath or task note'
     return 'no saved Library artifact'
 

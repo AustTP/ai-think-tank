@@ -24,7 +24,9 @@ FREE_SPIKE_PREMISE_GUIDANCE = (
     'often that the frame was wrong. '
     'A finding is not a finding until you can name what would prove it wrong: state '
     'the strongest objection or the concrete observation that would overturn it. If '
-    'you cannot, you have not yet separated a real signal from a comfortable assumption.'
+    'you cannot, you have not yet separated a real signal from a comfortable assumption. '
+    'Provenance contract: cite any sources you actually consulted, or state plainly '
+    'that the investigation was local reasoning over things you already know.'
 )
 # Hard cap of filed-but-not-yet-groomed requests in a single ceremony, so a
 # churny think tank can't convene a backlog-refinement meeting over a runaway list.

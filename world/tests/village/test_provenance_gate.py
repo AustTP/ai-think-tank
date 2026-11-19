@@ -150,5 +150,82 @@ class TestProvenanceGate(ProvenanceGateBase):
         self.assertTrue(sim._completion_has_evidence({}, task))
 
 
+def _spike_task(**over):
+    task = {
+        'id': 'task-9102',
+        'title': 'spike card',
+        'taskType': 'spike',
+        'assignedTo': 'tester',
+        'createdAt': int(time.time() * 1000) - 120000,
+        'note': 'Spiked "spike card": see the Library entry.',
+        'status': 'working',
+    }
+    task.update(over)
+    return task
+
+
+class TestSpikeReportProvenance(ProvenanceGateBase):
+    """The spike/report lane inherits the research-lane provenance rule
+    (2026-11-19): the sweep's batch evaluators closed as done with
+    "premise rejected" reports written from search snippets while the real
+    index sat unread. An artifact that claims the work is impossible must
+    show in-task fetch attempts or record the concrete refusal."""
+
+    def test_spike_with_fetched_citation_passes(self):
+        rel = self.write_artifact(
+            'spikes/eval.md',
+            '# Evaluation\nVerdict: feasible. Source https://example.test/source '
+            'shows the protocol is public.\n')
+        self.log_fetch('browse', 'https://example.test/source')
+        task = _spike_task(libraryPath=rel)
+        self.assertTrue(sim._completion_has_evidence({}, task))
+
+    def test_spike_premise_rejection_without_any_fetch_refused(self):
+        rel = self.write_artifact(
+            'spikes/eval.md',
+            '# Evaluation\nVerdict: impossible to evaluate. The premise '
+            'is rejected; the data is not public.\n')
+        task = _spike_task(libraryPath=rel)
+        self.assertFalse(sim._completion_has_evidence({}, task))
+        gap = sim._completion_evidence_gap(task)
+        self.assertIn('no fetch evidence', gap)
+
+    def test_spike_premise_rejection_with_unfetched_citation_refused(self):
+        rel = self.write_artifact(
+            'spikes/eval.md',
+            '# Evaluation\nVerdict: impossible to evaluate (' 
+            'https://not-fetched.example.test would be the source).\n')
+        self.log_fetch('search_web', 'https://example.test/source')
+        task = _spike_task(libraryPath=rel)
+        self.assertFalse(sim._completion_has_evidence({}, task))
+        gap = sim._completion_evidence_gap(task)
+        self.assertIn('cites no source', gap)
+
+    def test_spike_honest_refusal_still_passes(self):
+        rel = self.write_artifact(
+            'spikes/eval.md',
+            '# Evaluation\nVerdict: blocked. model call failed: no provider '
+            'available after circuit breaker. Will retry when the pool '
+            'recovers.\n')
+        task = _spike_task(libraryPath=rel)
+        self.assertTrue(sim._completion_has_evidence({}, task))
+
+    def test_spike_finding_report_with_fetched_citation_passes(self):
+        rel = self.write_artifact(
+            'spikes/finding.md',
+            '# Finding\nConclusion: the connector supports batch export '
+            '(https://example.test/source, fetched in-task).\n')
+        self.log_fetch('browse', 'https://example.test/source')
+        task = _spike_task(libraryPath=rel)
+        self.assertTrue(sim._completion_has_evidence({}, task))
+
+    def test_report_lane_uses_report_path_and_gate(self):
+        rel = self.write_artifact(
+            'reports/memo.md',
+            '# Memo\nVerdict: the evaluation is infeasible without data.\n')
+        task = _spike_task(taskType='report', reportPath=rel)
+        self.assertFalse(sim._completion_has_evidence({}, task))
+
+
 if __name__ == '__main__':
     unittest.main()
