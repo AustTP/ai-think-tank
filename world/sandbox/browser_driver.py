@@ -664,6 +664,19 @@ def run(action):
                 if op == 'login':
                     fields = action.get('fields', [])
                     filled_lengths = []
+                    # Some sites keep the password form behind a toggle/tab
+                    # (ideabrowser.com: "Sign in with Password" opens the
+                    # email+password inputs; the default tab is a magic-link
+                    # form whose email input stays hidden). One op per run
+                    # means the login op itself must open that form first,
+                    # else the first field never becomes visible.
+                    pre_click = str(action.get('preClickSelector') or '').strip()
+                    if pre_click:
+                        try:
+                            page.click(pre_click, timeout=timeout_ms)
+                            _settle(page, 1200)
+                        except Exception:
+                            pass
                     # Small, human-looking pointer and scroll activity before
                     # touching the form. A cold programmatic fill at 0ms is a
                     # strong automation signal even in a headful browser.

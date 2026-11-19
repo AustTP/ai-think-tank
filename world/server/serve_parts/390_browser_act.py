@@ -214,7 +214,10 @@ async def browser_act(request: Request):
     sandbox_dir = _sandbox_dir_for(sandbox_id)
     action = {'op': op, 'url': url, 'pageUrl': scope_url,
               'selector': selector, 'value': value if value is not None else '',
-             'timeoutMs': 30000, 'maxText': max_text}
+             'timeoutMs': 30000, 'maxText': max_text,
+             # Optional toggle/tab open before a login fill (see driver):
+             # sites that hide the password form behind a click.
+             'preClickSelector': (body.get('preClickSelector') or '').strip()}
     # Automatic solving is opt-in twice: the global switch AND this host's
     # policy must both say yes. A relay-only host never gets a driver solve.
     _auto_mode = (_load_env().get('CAPTCHA_AUTO_SOLVE') or 'off').strip().lower()
