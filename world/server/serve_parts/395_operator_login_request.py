@@ -137,7 +137,9 @@ async def request_operator_login(request: Request):
     service = (body.get('service') or '').strip().lower()
     task_id = (body.get('taskId') or '').strip()
     start_url = (body.get('url') or '').strip()
-    if not verify_agent_key(agent_id, request.headers.get('X-Agent-Key')):
+    # Same gate as every other agent endpoint: a player session may act as
+    # any agent; an agent key may act only as the agent it belongs to.
+    if not _actor_is_authorized(request, agent_id):
         return JSONResponse({'error': 'Unauthorized'}, status_code=401)
     if not check_rate_limit(agent_id):
         return JSONResponse({'error': 'Rate limit exceeded'}, status_code=429)

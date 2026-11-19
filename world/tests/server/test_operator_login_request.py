@@ -60,7 +60,7 @@ class _EscalationCase(unittest.TestCase):
         body = {'agentId': agent_id, 'service': service, 'taskId': 'task-e-1',
                 'reason': 'federated sign-in needs the human device prompt'}
         body.update(extra)
-        with unittest.mock.patch.object(serve, 'verify_agent_key',
+        with unittest.mock.patch.object(serve, '_actor_is_authorized',
                                         return_value=True), \
                 unittest.mock.patch.object(serve, 'check_rate_limit',
                                            return_value=True), \
