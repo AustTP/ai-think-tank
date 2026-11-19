@@ -735,6 +735,11 @@ def _backfill_teams_in_db():
     # it from the leadership set so it never gets (or keeps) a phantom team.
     admin_ids = _admin_ids()
     director_ids -= set(admin_ids or ())
+    # Same rule for village chiefs (regional VPs, operator direction
+    # 2026-11-19): the RVP runs a region, not a delivery roster. A team row
+    # under an RVP is a phantom the next retire sweep has to clean up.
+    director_ids -= {d.get('id') for d in roster
+                     if d.get('villageChief')}
 
     changed = False
     fresh = []
