@@ -42,7 +42,8 @@ _COMMIT_TOOLS = frozenset({
     'send_sms', 'send_telegram', 'publish_skill', 'send_mail', 'api_call',
     'self_edit', 'schedule_dormant_apply', 'selfedit_fix', 'policy_edit',
     'mcp_call', 'write_object_store', 'run_cli',
-    'request_credential_access', 'start_live_coverage', 'stop_live_coverage',
+    'request_credential_access', 'request_operator_login',
+    'start_live_coverage', 'stop_live_coverage',
 })
 
 

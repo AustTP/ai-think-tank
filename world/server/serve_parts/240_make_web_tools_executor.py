@@ -174,6 +174,34 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             err = (result.get('error') if isinstance(result, dict) else None) or result
             return (f'Credential access refused: {err} [do not retry unchanged; use a '
                     'different source or explain the task need]')
+        if name == 'request_operator_login':
+            # Auth walls only a human can pass (federated sign-in with a
+            # device-prompt 2FA, email magic link): start the operator's
+            # login browser on the service vault and page the player.
+            service = ((args or {}).get('service') or '').strip().lower()
+            login_url = ((args or {}).get('url') or '').strip()
+            requested_task = ((args or {}).get('taskId') or '').strip() or (task_id or '')
+            esc_reason = ((args or {}).get('reason') or purpose or '').strip()
+            if not service:
+                return ('request_operator_login needs the service name (e.g. google). '
+                        'Call it when a page demands a human sign-in you cannot pass.')
+            result = _http_json('POST', SELF_BASE_URL,
+                                '/api/browser-auth/request-login', {
+                                    'agentId': agent_id,
+                                    'service': service,
+                                    'url': login_url,
+                                    'taskId': requested_task,
+                                    'reason': esc_reason,
+                                }, agent_key, timeout=120)
+            if isinstance(result, dict) and result.get('ok'):
+                return (f"Operator sign-in requested for {result.get('service')}. "
+                        f"The player has been paged (Telegram + inbox) with the "
+                        f"login browser URL for {result.get('vncUrl')}. Do NOT retry "
+                        "the sign-in for at least 15 minutes -- continue the task "
+                        "anonymously where pages are public, then retry signed-in.")
+            err = (result.get('error') if isinstance(result, dict) else None) or result
+            return (f'Operator sign-in escalation refused: {err} [continue anonymously '
+                    'or use a different source; do not loop this call]')
         if name in ('grant_allowlist', 'revoke_allowlist'):
             # Director/admin-only allowlist mutation. The ENDPOINT enforces the
             # role gate via _operator_gate (session or a director/admin agent

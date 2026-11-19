@@ -289,7 +289,7 @@ def _seed_test_root(root):
                 # Live Chromium state (Singleton* lock files vanish under a
                 # running server's browser, failing the copy outright), and
                 # the same class of ephemeral runtime artifacts.
-                '.browser-profiles', 'think-tank-db-backups'))
+                '.browser-profiles', '.browser-sessions', 'think-tank-db-backups'))
     for name in ('escalations.json', 'webhooks.jsonl', 'failures.json',
                  'rule_proposals.json', 'successes.json',
                  'success_proposals.json', 'browse_trail.json',

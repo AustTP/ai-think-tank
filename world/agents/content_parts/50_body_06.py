@@ -54,6 +54,19 @@ def _make_browser_act_executor(agent_id, agent_key, sandbox_id, struck_tools=Non
             body['credentialHandle'] = cred_handle
             body['credentialField'] = (args or {}).get('credentialField') or ''
             body['pageUrl'] = (args or {}).get('pageUrl') or (args or {}).get('url') or ''
+        # Need-based session mount (2026-11-19): a request_credential_access
+        # grant for a session-backed service (e.g. google) arrives as
+        # sessionHandle + sessionService; a federated sign-in dance is one
+        # op=flow call with a bounded step list. Both pass straight through;
+        # the endpoint verifies the grant scope before anything mounts.
+        sess_handle = (args or {}).get('sessionHandle') or ''
+        if sess_handle:
+            body['sessionHandle'] = sess_handle
+            body['sessionService'] = (args or {}).get('sessionService') or ''
+            if (args or {}).get('sessionProfile'):
+                body['sessionProfile'] = (args or {}).get('sessionProfile')
+        if op == 'flow' and isinstance((args or {}).get('flow'), list):
+            body['flow'] = (args or {}).get('flow')
         result = _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/browser-act', body, agent_key, timeout=200)
         if not isinstance(result, dict):
             return 'Could not run that browser action (unexpected response).'
