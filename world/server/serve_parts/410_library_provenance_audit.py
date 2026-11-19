@@ -44,11 +44,46 @@ def _library_provenance_audit(now, window_s):
     except Exception:
         pass
     unvetted.sort()
+    # Rule-ladenness metric (2026-11-19): every completion refusal is not
+    # free -- finish_task fail-closes the card, queues a repair child, and
+    # burns a review cycle. A gate whose refusal rate climbs is miscalibrated
+    # and should degrade from refuse to flag-and-annotate. Ground truth is the
+    # refusal log; the spike/report provenance extension is the first rule
+    # this measures.
+    churn = {'refusals': [], 'repair_count': 0}
+    try:
+        with _db() as conn:
+            refuse_rows = conn.execute(
+                'SELECT details FROM action_log WHERE action = ? '
+                'AND ts > ? AND ts <= ? ORDER BY ts DESC',
+                ('task_completion_refused', now - window_s, now),
+            ).fetchall()
+            for (details,) in refuse_rows:
+                d = {}
+                if details:
+                    try:
+                        d = json.loads(details)
+                    except Exception:
+                        d = {}
+                churn['refusals'].append({
+                    'taskId': d.get('taskId'),
+                    'title': d.get('title'),
+                    'reason': (d.get('reason') or '')[:80],
+                    'detail': (d.get('detail') or '')[:80],
+                })
+            churn['repair_count'] = conn.execute(
+                'SELECT COUNT(*) FROM action_log WHERE action = ? '
+                'AND ts > ? AND ts <= ?',
+                ('task_completion_refused', now - window_s, now),
+            ).fetchone()[0]
+    except Exception:
+        churn = {'refusals': [], 'repair_count': 0}
     return {
         'writes': len(rows),
         'by_source': {k: by_source[k] for k in sorted(by_source)},
         'external_in_trusted': sorted(set(external_in_trusted)),
         'unvetted_pending': unvetted,
+        'refusal_churn': churn,
     }
 
 
@@ -166,6 +201,10 @@ def _build_weekly_review(now=None):
             'unvetted_pending_n': len(provenance['unvetted_pending']),
             'unvetted_pending': provenance['unvetted_pending'][:20],
         },
+        'refusal_churn': {
+            'count': provenance['refusal_churn']['repair_count'],
+            'refusals': provenance['refusal_churn']['refusals'][:20],
+        },
         'judge_economics': _grade_outcome_spend(since),
     }
 
@@ -222,6 +261,21 @@ def _build_weekly_review(now=None):
                          f'({len(provenance["unvetted_pending"])} file(s)):')
             for p in provenance['unvetted_pending'][:20]:
                 lines.append(f'  - `{p}`')
+    # Refusal churn: every completion refusal costs a repair card and a
+    # review cycle. A climb here means a gate (the spike/report provenance
+    # rule is the first candidate) is miscalibrated and should degrade from
+    # refuse to flag-and-annotate.
+    churn = provenance.get('refusal_churn') or {}
+    if churn.get('repair_count'):
+        lines += ['', '## Refusal churn (rule-ladenness)', '']
+        lines.append(f'- Completion refusals this window: '
+                     f'**{churn["repair_count"]}** (each one spawned a repair '
+                     f'card + review cycle)')
+        for r in churn.get('refusals', [])[:10]:
+            lines.append(f'  - task `{r.get("taskId")}`: '
+                         f'{r.get("reason") or "?"} -- {r.get("detail") or "?"}')
+        lines.append('- If refusals keep climbing, demote the gate: '
+                     'flag-and-annotate instead of fail-closed.')
     # Judge economics: what the grading spend bought this window. Rework
     # spend is the price of judgments the work then failed anyway -- the
     # number that decides how much grading is worth at all.
