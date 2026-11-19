@@ -305,6 +305,15 @@ def _load_credential_access(path):
                 'hosts': clean_hosts,
                 'methods': clean_methods or ['POST'],
                 'ttlSec': ttl,
+                # Session-backed services (2026-11-19): the secret IS the
+                # vaulted operator browser session, not a vault credential
+                # row. Preserve the flags -- the loader previously stripped
+                # unknown keys, which silently broke the live session grant
+                # path (tests passed because they patch the loader).
+                **({'session': True,
+                    'sessionProfile': str(spec.get('sessionProfile') or '').strip()
+                    or name}
+                   if spec.get('session') else {}),
             }
     if not out['readOnlyHosts']:
         out['readOnlyHosts'] = list(CREDENTIAL_ACCESS_DEFAULT['readOnlyHosts'])
