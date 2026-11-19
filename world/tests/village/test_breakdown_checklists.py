@@ -9,7 +9,8 @@ mechanically checkable ('code') and review-verifiable ('jev') requirements,
 sanitized into the exact shape the review grader consumes.
 
 Invariants pinned here:
-- the breakdown prompt teaches the checklist contract;
+- the per-card detail prompt teaches the checklist contract (2026-11-19
+  split composer: prose fields moved out of the skeleton call);
 - a card's checklist survives the item builder sanitized (capped at 4,
   types coerced to code/jev, lengths bounded, malformed entries dropped);
 - a 'report' card loses its 'code' entries (the quality pipeline is skipped
@@ -20,9 +21,11 @@ Invariants pinned here:
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import serve  # noqa: E402
 import sim  # noqa: E402
 
 
@@ -99,11 +102,22 @@ class Sanitize(unittest.TestCase):
 
 class BreakdownEmitsChecklists(unittest.TestCase):
     def test_prompt_teaches_the_checklist_contract(self):
-        state = _state()
-        log = []
-        _run_breakdown(state, [{'title': 'a', 'type': 'story'}],
-                       instructions_log=log)
-        prompt = log[0]
+        captured = {}
+
+        def fake_call(_model, messages, **_kw):
+            captured['system'] = messages[0]['content']
+            return {'usage': {'cost': 0.0},
+                    'choices': [{'message': {'content':
+                                '{"acceptanceCriteria": "AC"}'}}]}
+
+        with unittest.mock.patch.object(serve, '_resolve_model_tier',
+                                        return_value='m'), \
+                unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                           side_effect=fake_call):
+            sim._card_detail_decider_default(
+                {}, {'title': 'a', 'type': 'story', 'sizeEstimate': 'S'},
+                'Build the export feature')
+        prompt = captured['system']
         self.assertIn('"checklist"', prompt)
         self.assertIn('"code"', prompt)
         self.assertIn('"jev"', prompt)

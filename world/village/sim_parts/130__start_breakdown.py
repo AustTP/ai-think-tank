@@ -134,6 +134,86 @@ def _breakdown_decider_default(state, instructions, goal):
 _breakdown_decider = _breakdown_decider_default
 
 
+# Per-card detail resolution (2026-11-19): the skeleton plan and the per-card
+# prose (acceptance criteria, never-list, checklist, hypothesis) are SEPARATE
+# model calls, so a transport failure on one card degrades that card alone to
+# defaults instead of voiding the whole plan. The skeleton prompt is also much
+# smaller (title/type/phase/size only) -- the all-or-nothing composer was the
+# single largest completion in the sim and died wholesale on the degraded
+# free-pool transport.
+def _card_detail_decider_default(state, card, goal):
+    """One low-cost call per skeleton card: fill acceptanceCriteria, never,
+    checklist, and (for investigation cards) the pre-registered hypothesis.
+    Returns the enriched dict, or the input card unchanged on ANY failure --
+    a detail outage must never cost the plan."""
+    try:
+        import serve
+    except Exception:
+        return card
+    try:
+        model = serve._resolve_model_tier(
+            f'Card detail for breakdown: {goal[:120]}', allow_high=False)
+        if not model:
+            return card
+        ctype = (card.get('type') or 'story').strip().lower()
+        hypo_line = (' Also write a one-line "hypothesis": the specific claim this '
+                     'investigation will confirm or reject, stated BEFORE the work '
+                     'starts, plus what a "cannot answer" outcome must record '
+                     '(what was attempted, what blocked it).'
+                     if ctype in ('spike', 'research', 'report') else '')
+        prompt = (
+            f'Card from a breakdown of the request "{goal[:400]}". Card: '
+            f'title "{(card.get("title") or "")[:120]}", type {ctype}, '
+            f'size {(card.get("sizeEstimate") or "M")}.{hypo_line} '
+            'Write: "acceptanceCriteria" (one line), "never" (list of 0-2 hard '
+            'prohibitions, omit if none), "checklist" (1-3 entries, each '
+            '{"section":"short area","question":"one checkable requirement",'
+            '"type":"code" or "jev"}; type "code" means mechanically checkable '
+            '(tests, lint, CI green) -- give every story/spike/research card at '
+            'least one "code" entry; "jev" means a specific acceptance check a '
+            'reviewer verifies by reading the deliverable; omit the checklist on '
+            'report cards). '
+            'Respond with ONLY valid JSON, no other text: '
+            '{"acceptanceCriteria":"one line or omitted","never":["..."],"checklist":[{"section":"...","question":"...","type":"code"}],"hypothesis":"one line or omitted"}'
+        )
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': prompt},
+             {'role': 'user', 'content': f'Card: {(card.get("title") or "")[:200]}'}],
+            max_tokens=600)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__breakdowns__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        start = reply.find('{')
+        end = reply.rfind('}')
+        if start == -1 or end <= start:
+            return card
+        parsed = json.loads(reply[start:end + 1])
+        if not isinstance(parsed, dict):
+            return card
+        out = dict(card)
+        ac = (parsed.get('acceptanceCriteria') or '').strip()
+        if ac:
+            out['acceptanceCriteria'] = ac
+        nevers = parsed.get('never')
+        if isinstance(nevers, list) and nevers:
+            out['never'] = [str(x).strip()[:200] for x in nevers
+                            if str(x).strip()][:2]
+        chk = _sanitize_checklist(parsed.get('checklist'), ctype)
+        if chk:
+            out['checklist'] = chk
+        hyp = (parsed.get('hypothesis') or '').strip()
+        if hyp and ctype in ('spike', 'research', 'report'):
+            out['hypothesis'] = hyp[:300]
+        return out
+    except Exception:
+        return card
+
+
+_card_detail_decider = _card_detail_decider_default
+
+
 _SINGLE_DELIVERABLE_ARTIFACTS = (
     'brief', 'memo', 'report', 'write-up', 'writeup', 'one-page', 'one page',
     'summary', 'recommendation',
@@ -240,7 +320,8 @@ def _single_deliverable_item(goal, constraints):
     }
 
 
-def _resolve_breakdown(state, pending, now_ms, decider=None):
+def _resolve_breakdown(state, pending, now_ms, decider=None,
+                       card_detail_decider=None):
     """When the breakdown window elapses, the scrum master cards each pending
     large-request into concrete stories/spikes via the injectable decider; the
     pieces are queued as REAL work tagged with the receiving team + the goal
@@ -326,9 +407,7 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "document studies, competitive teardown, desk research), or "
             "\"report\" (a written deliverable, analysis, or recommendation that does NOT change the repo -- use "
             "this instead of story for a memo, review write-up, or recommendation), "
-            "a one-line \"acceptanceCriteria\" when the story has a clear test of done, a \"never\" list "
-            "ONLY when the card has hard prohibitions the worker must never do (omit otherwise), and a "
-            "\"sizeEstimate\" of S/M/L. "
+            "and a \"sizeEstimate\" of S/M/L. "
             "Never use story for a prose report or recommendation; use report. "
             "Plan the work in PHASES when the ask has a preparation stage the build depends on "
             "(spec definition, research, copywriting, UI research before implementation): tag every "
@@ -337,22 +416,8 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
             "share a phase run in parallel. Cards that must not run at the same time (gather before "
             "write, write before save) belong in DIFFERENT phases; only same-phase cards may overlap. "
             "A single-stage ask uses one phase (or omits phase entirely). "
-            "Give every card a short \"checklist\" of 1-3 verifiable requirements a reviewer "
-            "can check from the deliverable alone, "
-            "and for every spike/research/report card also write a one-line \"hypothesis\": the "
-            "specific claim the investigation will confirm or reject, stated BEFORE the work "
-            "starts, plus how a \"cannot answer\" outcome must be evidenced (what was attempted, "
-            "what blocked it). A card that pre-declares its question can never quietly become a "
-            "premise-rejection written from memory. "
-            "can check one by one. Each entry is {\"section\": \"short area\", \"question\": "
-            "\"one specific checkable requirement\", \"type\": \"code\" or \"jev\"}. Type \"code\" "
-            "means the claim is mechanically checkable by the quality pipeline (builds, tests, "
-            "lint, CI green) -- every story/spike/research card gets at least one such gate "
-            "(for example: the quality pipeline is green). Type \"jev\" means a specific "
-            "acceptance check the reviewer verifies by reading the deliverable (a requirement, "
-            "a named artifact, a stated finding). Omit the checklist on report cards. "
             "Respond with ONLY valid JSON, no other text, no markdown fences, in exactly this shape: "
-            '{"items":[{"title":"short title","type":"story|spike|research|report","phase":"short phase name or omitted","acceptanceCriteria":"one line or omitted","never":["one hard constraint or omit"],"sizeEstimate":"S|M|L","checklist":[{"section":"short area","question":"one checkable requirement","type":"code"}],' + budget_field + '}]}'
+            '{"items":[{"title":"short title","type":"story|spike|research|report","phase":"short phase name or omitted","sizeEstimate":"S|M|L"' + budget_field + '}]}'
         )
         template = _workflow_match_template(state, goal, team_id)
         if template:
@@ -393,6 +458,17 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 # Outage / unusable plan: never drop the ask -- queue a single card
                 # titled the goal so it stays in the pipeline for a worker to pick up.
                 items = [{'title': goal[:120], 'type': 'story'}]
+            # Per-card detail pass: each skeleton card gets its own small call
+            # (acceptance criteria, never-list, checklist, hypothesis). One
+            # card's transport failure degrades that card to defaults instead
+            # of voiding the plan (the 2026-11-19 all-or-nothing composer was
+            # the biggest single completion in the sim).
+            detail = card_detail_decider or _card_detail_decider
+            for _i, _s in enumerate(items):
+                try:
+                    items[_i] = detail(state, _s, goal)
+                except Exception:
+                    pass  # a degraded card keeps its skeleton fields
         # Phase plan (2026-11-01): when the scrum master's plan names more
         # than one phase, the request runs PHASED -- cards of one phase share
         # a sprint's workers in parallel, and every later-phase card waits at
@@ -442,11 +518,11 @@ def _resolve_breakdown(state, pending, now_ms, decider=None):
                 instructions_text += f"\n\nAcceptance criteria:\n{ac}"
             if never:
                 instructions_text += f"\n\nNEVER:\n{never}"
-            # Budget: when the player named a total, the scrum master was told
-            # to allocate it across cards with judgment (see the prompt). Pick
-            # up whatever share it assigned; a missing/invalid share means the
-            # model chose not to allocate this card, so leave it unbudgeted
-            # (type default applies) rather than forcing an even split.
+            hyp = (s.get('hypothesis') or '').strip()
+            if hyp:
+                instructions_text += (
+                    f"\n\nPre-registered hypothesis (state this BEFORE gathering any "
+                    f"data, and record it in your report header): {hyp}")
             card_budget = None
             raw_budget = s.get('budgetUsd')
             if isinstance(raw_budget, (int, float)) and raw_budget > 0:
