@@ -966,7 +966,13 @@ def emit_signals(state, subject, data):
 _DELIVERABLE_TASK_TYPES = frozenset({'code', 'bug', 'research', 'spike', 'report'})
 
 
-_PROVENANCE_FETCH_ACTIONS = ('browse', 'search_web', 'api-call')
+# The sandbox lane logs its navigations as browser_act (op goto/read over
+# per-task sandboxes) -- 2026-11-19: BEN-152 spike workers fetched dozens of
+# ideabrowser pages through it and the gate still refused them because only
+# the legacy 'browse' kind was counted (22 false refusals in one morning,
+# ten repair loops churned to a stop). x_search is the X/Twitter fetch.
+_PROVENANCE_FETCH_ACTIONS = ('browse', 'browser_act', 'search_web',
+                             'api-call', 'x_search')
 # An artifact that records WHY nothing could be fetched (the vault refusal,
 # a budget stop, a rate limit) is honest inability, not fabrication -- the
 # provenance gate accepts it (task-2193's honest refusal report must keep
@@ -1003,7 +1009,8 @@ def _research_fetch_urls(task):
         with serve._db() as conn:
             rows = conn.execute(
                 'SELECT details FROM action_log WHERE agent_id = ? AND ts >= ? '
-                'AND action IN (?,?,?)',
+                'AND action IN (%s)' % ','.join('?' for _ in
+                                                _PROVENANCE_FETCH_ACTIONS),
                 (agent, int(started / 1000),
                  *_PROVENANCE_FETCH_ACTIONS)).fetchall()
     except Exception:
@@ -1055,8 +1062,9 @@ def _research_provenance_gap(task):
         return None
     if not fetched:
         return ('no fetch evidence in the action log for this task: do the '
-                'research (search_web or browse) before completing, then '
-                'cite the URLs you actually retrieved')
+                'research (browse, search_web, or the browser sandbox) '
+                'before completing, then cite the URLs you actually '
+                'retrieved')
     return ('the report cites no source that was fetched in-task: add the '
             'retrieved URLs, or record the exact refusal that stopped the '
             'fetches')

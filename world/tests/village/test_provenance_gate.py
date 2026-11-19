@@ -130,6 +130,26 @@ class TestProvenanceGate(ProvenanceGateBase):
         task = _research_task(libraryPath=rel)
         self.assertTrue(sim._completion_has_evidence({}, task))
 
+    def test_browser_act_counts_as_fetch(self):
+        # 2026-11-19: the sandbox lane logs navigations as browser_act, not
+        # browse -- ben fetched dozens of ideabrowser pages for BEN-152 and
+        # the gate still refused the completion because only the legacy
+        # 'browse' kind was counted.
+        rel = self.write_artifact(
+            'reports/survey.md',
+            '# Survey\nPer https://example.test/source the corridor opens in 2027.\n')
+        self.log_fetch('browser_act', 'https://example.test/source')
+        task = _research_task(libraryPath=rel)
+        self.assertTrue(sim._completion_has_evidence({}, task))
+
+    def test_x_search_counts_as_fetch(self):
+        rel = self.write_artifact(
+            'reports/survey.md',
+            '# Survey\nPer https://example.test/source the corridor opens in 2027.\n')
+        self.log_fetch('x_search', 'https://example.test/source')
+        task = _research_task(libraryPath=rel)
+        self.assertTrue(sim._completion_has_evidence({}, task))
+
     def test_gate_env_disable(self):
         rel = self.write_artifact('reports/whatever.md', 'claims without sources')
         task = _research_task()
