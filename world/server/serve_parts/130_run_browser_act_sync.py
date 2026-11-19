@@ -120,6 +120,7 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
     if _session_err:
         return None, _session_err
     _session_copy = action.get('sessionProfileCopyHostPath')
+    _session_service = (action.get('sessionService') or '').strip().lower()
     # A live session for this agent owns the browser: run the op against it so
     # the player can watch and step in. Only this falls through to launching a
     # new one-shot Chromium.
@@ -242,10 +243,30 @@ def _run_browser_act_sync(sandbox_dir, action, agent_id=None):
         if grant_host and not _is_allowlisted_host(grant_host):
             _revoke_egress_host(grant_host)
         shutil.rmtree(action_dir, ignore_errors=True)
-        # The session copy is per-run: cookies written during the run are
-        # discarded (the vault copy stays canonical), and nothing session-
-        # bearing survives the act outside the vault.
+        # Write-back (2026-11-19): an auth success inside a session copy
+        # (an ideabrowser "sign in with Google" dance) must survive the run,
+        # or every act re-authenticates from zero. Copy the run's profile
+        # over the vault canonical for THAT service, then discard the copy.
+        # Service-scoped: this NEVER merges into any agent's standing
+        # profile, and only session runs touch the vault.
         if _session_copy:
+            try:
+                _svc = str(_session_service or '').strip().lower()
+                if _svc:
+                    import serve as _serve_mod
+                    _vault = getattr(_serve_mod, 'SESSION_VAULT_DIR', None)
+                    if _vault:
+                        _dst = os.path.join(_vault, _svc)
+                        shutil.rmtree(_dst, ignore_errors=True)
+                        shutil.copytree(_session_copy, _dst, symlinks=True)
+                        try:
+                            os.chmod(_dst, 0o700)
+                        except OSError:
+                            pass
+                        log_action(_session_service, 'session_vault_writeback',
+                                   {'service': _svc}, authorized=True)
+            except Exception:
+                pass  # a failed writeback keeps this run's result intact
             shutil.rmtree(_session_copy, ignore_errors=True)
 
 
