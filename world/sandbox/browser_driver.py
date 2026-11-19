@@ -674,7 +674,7 @@ def run(action):
                     if pre_click:
                         try:
                             page.click(pre_click, timeout=timeout_ms)
-                            _settle(page, 1200)
+                            _settle(page, 2500)
                         except Exception:
                             pass
                     # Small, human-looking pointer and scroll activity before
@@ -687,7 +687,15 @@ def run(action):
                     page.wait_for_timeout(300 + random.randint(0, 450))
                     for f in fields:
                         loc = page.locator(f['selector']).first
-                        loc.wait_for(state='visible', timeout=timeout_ms)
+                        try:
+                            loc.wait_for(state='visible', timeout=min(timeout_ms, 8000))
+                        except Exception:
+                            # Duplicate markup: the same placeholder often
+                            # exists in a hidden alt form (ideabrowser keeps
+                            # a magic-link twin of the email input). Prefer
+                            # the visible instance before giving up.
+                            loc = page.locator(f['selector']).locator('visible=true').first
+                            loc.wait_for(state='visible', timeout=timeout_ms)
                         # Type real key events, not just set .value: Facebook's
                         # login form is React-controlled and its submit control
                         # stays inert when the synthetic input event is skipped.
