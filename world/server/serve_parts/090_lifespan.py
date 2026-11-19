@@ -738,8 +738,8 @@ def _backfill_teams_in_db():
     # Same rule for village chiefs (regional VPs, operator direction
     # 2026-11-19): the RVP runs a region, not a delivery roster. A team row
     # under an RVP is a phantom the next retire sweep has to clean up.
-    director_ids -= {d.get('id') for d in roster
-                     if d.get('villageChief')}
+    chief_ids = {d.get('id') for d in roster if d.get('villageChief')}
+    director_ids -= chief_ids
 
     changed = False
     fresh = []
@@ -766,6 +766,26 @@ def _backfill_teams_in_db():
             'createdAt': time.time(),
         })
         changed = True
+
+    # Members pointing at a chief re-point into a real supervisor team
+    # (roster-order round-robin, like retire-team's redistribution): a
+    # worker under the teamless RVP derives to no team otherwise.
+    if chief_ids and fresh:
+        receivers = [(t.get('id'), t.get('directorId') or t.get('id'))
+                     for t in fresh]
+        reports = {}
+        for d in roster:
+            reports[d.get('director')] = reports.get(d.get('director'), 0) + 1
+        moved = 0
+        for d in roster:
+            aid = d.get('id')
+            if d.get('isDirector') or reports.get(aid, 0) > 0:
+                continue  # a director: chiefs re-point only pure workers
+            if d.get('director') in chief_ids:
+                _tid, tdir = receivers[moved % len(receivers)]
+                d['director'] = tdir
+                moved += 1
+                changed = True
 
     # Drop teams whose director no longer has reports and isn't a director.
     new_teams = []

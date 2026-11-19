@@ -198,6 +198,47 @@ class FlatOrgChart(unittest.TestCase):
         self.assertEqual(len(saved), 1)
 
 
+
+
+
+
+    def test_team_backfill_gives_chiefs_no_team_and_repairs_their_workers(self):
+        # Operator org rule (2026-11-19): the village chief (RVP) holds no
+        # delivery roster. The backfill must not mint a team row for her,
+        # must drop a stale one, and must re-point pure workers who report
+        # to her into a real supervisor team (roster-order round-robin).
+        self._install_state([
+            {'id': 'theo', 'isAdmin': True, 'isDirector': True, 'director': None},
+            {'id': 'nora', 'role': 'regional_vp', 'isDirector': True,
+             'villageChief': True, 'chiefOfVillage': 'main', 'director': None},
+            {'id': 'ben', 'role': 'Supervisor', 'isDirector': True, 'director': None},
+            {'id': 'june', 'role': 'Supervisor', 'isDirector': True, 'director': None},
+            # aria points at the chief (left over from a dissolved team).
+            {'id': 'aria', 'director': 'nora'},
+            # briar already sits in a supervisor team.
+            {'id': 'briar', 'director': 'june'},
+        ])
+        # One state blob carries the stale team row under the chief; the
+        # backfill drops it when the chief leaves the leadership set.
+        state = serve.get_state_from_db()
+        state['teams'] = [
+            {'id': 'nora', 'name': "regional_vp's Team", 'directorId': 'nora',
+             'members': ['aria']},
+            {'id': 'ben', 'name': "Ben's Team", 'directorId': 'ben', 'members': []},
+            {'id': 'june', 'name': "June's Team", 'directorId': 'june', 'members': []},
+        ]
+        serve.save_state_to_db(state)
+        serve._backfill_teams_in_db()
+        state = serve.get_state_from_db()
+        team_ids = [t['id'] for t in state.get('teams') or []]
+        self.assertNotIn('nora', team_ids, 'the RVP must hold no delivery team')
+        by_id = {d['id']: d for d in state['agentRoster']}
+        self.assertEqual(by_id['aria']['director'], 'ben',
+                         'a worker under the chief is re-pointed round-robin')
+        self.assertEqual(by_id['briar']['director'], 'june',
+                         'already-placed workers are untouched')
+
+
 class DirectorOwnedTemplates(unittest.TestCase):
     # Directors + admin may author the role-template library; rank-and-file may
     # not. Director-ness is structural (has direct reports, or is admin), not
