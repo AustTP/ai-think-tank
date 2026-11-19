@@ -30,9 +30,15 @@ def test_unpinned_issue_card_uses_round_robin(monkeypatch):
 
 
 def test_report_path_satisfies_completion_evidence():
-    assert sim._completion_has_evidence({}, {
-        'taskType': 'report', 'reportPath': 'x-articles/REVIEWED.md',
-        'note': 'Wrote the report.'})
+    # reportPath+note satisfies the completion-contract shape; the provenance
+    # layer (2026-11-19) is a separate check that needs the artifact on disk
+    # with fetched citations, so it is scoped out here.
+    import unittest.mock
+    with unittest.mock.patch.object(sim, '_research_provenance_gap',
+                                    return_value=None):
+        assert sim._completion_has_evidence({}, {
+            'taskType': 'report', 'reportPath': 'x-articles/REVIEWED.md',
+            'note': 'Wrote the report.'})
     assert not sim._completion_has_evidence({}, {
         'taskType': 'report', 'note': 'Wrote the report.'})
 

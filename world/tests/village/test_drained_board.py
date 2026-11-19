@@ -150,10 +150,15 @@ class CompletionEvidence(unittest.TestCase):
         self.assertFalse(sim._completion_has_evidence({}, {
             'taskType': 'spike', 'reviewOf': 'task-1',
             'note': 'NOT COMPLETED. No briefing was produced.'}))
-        self.assertTrue(sim._completion_has_evidence({}, {
-            'taskType': 'spike', 'reviewOf': 'task-1',
-            'reportPath': 'x-articles/ACTION-BRIEFING.md',
-            'note': 'Saved the briefing.'}))
+        # Provenance (2026-11-19) is a second layered check -- the artifact
+        # must exist in the trusted Library with fetched citations -- scoped
+        # out here so this test keeps testing the completion-contract shape.
+        with mock.patch.object(sim, '_research_provenance_gap',
+                               return_value=None):
+            self.assertTrue(sim._completion_has_evidence({}, {
+                'taskType': 'spike', 'reviewOf': 'task-1',
+                'reportPath': 'x-articles/ACTION-BRIEFING.md',
+                'note': 'Saved the briefing.'}))
 
     def test_finish_task_refuses_empty_deliverable(self):
         st = {
