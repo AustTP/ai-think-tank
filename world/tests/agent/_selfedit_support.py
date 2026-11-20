@@ -37,11 +37,13 @@ def _approve(monkeypatch, decision='approve', confidence=0.9, cost=0.01):
     monkeypatch.setattr(serve, '_jev_quorum_choice_sync', fake)
     return seen
 
-def _window_slot_time(days_ahead=2, hour_et=10, minute_et=30):
+def _window_slot_time(days_ahead=2, hour_et=18, minute_et=0):
     """The UTC date/HH:MM for a fixed Eastern clock time `days_ahead` out,
-    rolled forward to the next weekday so the slot passes the owner's
-    business-hours gate (2026-11-20). Roll-forward is capped small enough
-    that the default (2 days) never approaches the 7-day cap."""
+    rolled forward to the next weekday so the slot sits OUTSIDE the owner's
+    business-hours gate (owner rule 2026-11-20: 18:00 ET is after the close
+    in both EDT and EST, and never crosses midnight UTC). Roll-forward is
+    capped small enough that the default (2 days) never approaches the 7-day
+    cap."""
     import datetime
     from zoneinfo import ZoneInfo
     et = ZoneInfo('America/New_York')

@@ -134,10 +134,10 @@ def test_trading_mode_requires_safe_state_and_blackouts(fake_repo,
         **fields)
     assert ok is False
     assert 'blackoutWindows' in payload['error']
-    # A blackout covering the business-hours slot (14:00-16:00 UTC covers
-    # 10:30 ET in both EDT and EST) still refuses the request.
+    # A blackout covering the evening slot (21:00-23:59 UTC covers
+    # 18:00 ET in both EDT and EST) still refuses the request.
     fields['blackout_windows'] = [
-        {'start': '14:00', 'end': '16:00', 'label': 'US market open'}]
+        {'start': '21:00', 'end': '23:59', 'label': 'US market open'}]
     ok, payload = selfedit.request_window(
         'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'trading change', 'reviewer',
         **fields)

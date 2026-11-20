@@ -85,7 +85,7 @@ def test_schedule_window_refused_by_conflicts(fake_repo, monkeypatch):
     state = serve.get_state_from_db() or {}
     state['standingTasks'] = [{
         'taskId': 'st-eng-ritual', 'name': 'Engineering ritual block',
-        'mode': 'window', 'startTime': '14:00', 'endTime': '16:05'}]
+        'mode': 'window', 'startTime': '21:00', 'endTime': '23:59'}]
     serve.save_state_to_db(state)
     ok, payload = selfedit.request_window(
         'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance')
