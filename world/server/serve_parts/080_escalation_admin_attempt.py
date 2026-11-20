@@ -783,6 +783,15 @@ def _peer_review_pass(state, now):
             'id': aid, 'name': d.get('name', aid), 'role': d.get('role', ''),
             'actions': total, 'real': real, 'last': rows[0][2] if rows else None,
             'already': aid in existing_signals, 'director': d.get('director'),
+            # 2026-11-20 audit (26.5h window): 91 of the quiet signals hit
+            # workers who were HOLDING a live task -- the pass counts only
+            # terminal/execute actions, so a worker deep in a long
+            # investigation (browsing, waiting on a sandbox run) reads as
+            # "quiet" and the director's channel drowned in check-ins about
+            # people who were actively working. A held task is recorded
+            # here so the quiet gate below can exempt them; the overloaded
+            # direction is untouched (a busy standout still deserves help).
+            'task_held': bool((live.get(aid) or {}).get('task')),
         })
     if not candidates:
         return 0
@@ -809,9 +818,13 @@ def _peer_review_pass(state, now):
     # same" worker is NOT a signal: group_activity >= 2 is already guaranteed
     # by the village gate above, so this reduces to: the target is genuinely
     # behind (real < 2) or genuinely ahead (real >= 5, the group max).
+    # The quiet direction additionally requires NO held task (2026-11-20):
+    # a worker assigned to a live card is working by definition; flagging
+    # them was the 91-false-positive spam the audit measured.
     report_worthy = [
         c for c in cand_pool
-        if c['real'] < 2 or (c['real'] >= 5 and c['real'] >= group_activity)
+        if (c['real'] < 2 and not c['task_held'])
+        or (c['real'] >= 5 and c['real'] >= group_activity)
     ]
     if not report_worthy:
         return 0

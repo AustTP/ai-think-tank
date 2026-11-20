@@ -483,8 +483,13 @@ def _maybe_notify_failure(agent_id, action, details):
     if spec is None:
         return
     label, severity = spec
-    cooldown = {'critical': 300, 'high': 300, 'medium': 900, 'low': 3600}.get(
-        severity, 900)
+    # 2026-11-20 audit (26.5h window): 77 of 78 pushes were medium-severity
+    # failure alerts -- each label's 900s batching floor let ~8 labels x 4/h
+    # still flood the operator's chat. Medium now shares the 1/hour floor low
+    # already used; the suppressed-count digest carries the volume. Critical
+    # and high keep their 5-minute per-key path so real incidents page fast.
+    cooldown = {'critical': 300, 'high': 300, 'medium': 3600, 'low': 3600}.get(
+        severity, 3600)
     now = time.time()
     key = _failure_notice_key(action, details)
     if severity in ('low', 'medium'):

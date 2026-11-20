@@ -356,6 +356,8 @@ def _stale_work_step(state, now, now_ms):
     for tid, task in list(tasks.items()):
         if not isinstance(task, dict) or task.get('status') != 'failed':
             continue
+        if task.get('lane') == 'parking-lot':
+            continue  # parked for operator promotion -- no longer live work
         if task.get('taskType') == 'bug' or task.get('incident') or task.get('shadow') \
                 or task.get('reviewOf'):
             continue
@@ -370,17 +372,43 @@ def _stale_work_step(state, now, now_ms):
             _log_governance(state, 'admin', 'failed_work_requeued',
                             {'task': tid, 'title': (task.get('title') or '')[:120],
                              'room': task.get('room'), 'replans': replans + 1})
+            del tasks[tid]
+            replanned += 1
+        elif _sm_replan_stale_work(state, task, now_ms):
+            _log_governance(state, 'admin', 'failed_work_sm_replan',
+                            {'task': tid, 'title': (task.get('title') or '')[:120],
+                             'room': task.get('room'), 'replans': replans + 1})
+            del tasks[tid]
+            replanned += 1
         else:
-            if _sm_replan_stale_work(state, task, now_ms):
-                _log_governance(state, 'admin', 'failed_work_sm_replan',
-                                {'task': tid, 'title': (task.get('title') or '')[:120],
-                                 'room': task.get('room'), 'replans': replans + 1})
-            else:
-                _log_governance(state, 'admin', 'failed_work_dropped',
-                                {'task': tid, 'title': (task.get('title') or '')[:120],
-                                 'room': task.get('room')})
-        del tasks[tid]
-        replanned += 1
+            # Terminal drop that keeps its record (2026-11-20 audit): the old
+            # `del` + one log row re-ran forever -- deleting the card never
+            # closes its issue, so the re-card machine minted a fresh failed
+            # card with the same (title, room) every hour and this sweep
+            # dropped it again (947 rows, 32 ancient tasks, 26.5h). The
+            # queued sweep's 2026-11-11 idiom applies unchanged: park the
+            # record for operator promotion. `lane` (not `status`) keeps the
+            # open-twin dedup blocking live re-issues of the same work, and
+            # the parked record makes the churn visible instead of silent.
+            # Logging is capped at one row per 30 min per card, matching the
+            # queued path's _replanCappedLoggedAt contract.
+            logged = state.setdefault('_failedWorkDroppedLoggedAt', {})
+            if now_ms - (logged.get(tid) or 0) >= 30 * 60 * 1000:
+                logged[tid] = now_ms
+                task['lane'] = 'parking-lot'
+                task['parkedAt'] = now_ms
+                task['parkedReason'] = 'replan-capped failed card: parked for operator promotion'
+                try:
+                    from serve import log_action
+                    log_action('system', 'failed_work_dropped',
+                               {'task': tid,
+                                'title': (task.get('title') or '')[:120],
+                                'room': task.get('room'),
+                                'replans': replans,
+                                'note': 'parked for operator promotion'},
+                               authorized=True)
+                except Exception:
+                    pass
     return replanned
 
 
