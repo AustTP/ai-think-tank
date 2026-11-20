@@ -58,10 +58,9 @@ WINDOW_MAX_DURATION_MIN = 240
 WINDOW_DEFAULT_DURATION_MIN = 15
 # Change-request lead time (owner rule, 2026-10-27; owner revisions
 # 2026-11-11 and 2026-11-20): a change window must be requested at least
-# 6 hours ahead -- the owner gets the veto link and a real chance to review;
-# a full day of notice proved slower than the work needs, and 6h still
-# lands the veto decision inside the owner's Eastern-time business hours
-# when requests file in the evening -- and no more than 7 days out
+# 6 hours ahead -- the owner gets the veto link and a real chance to review,
+# but a full day of notice proved slower than the work needs -- and no more
+# than 7 days out
 # -- requests filed further ahead go stale before the window arrives;
 # re-request closer to the work.
 #
@@ -721,26 +720,30 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     if start_ts > now + WINDOW_MAX_LEAD_S:
         return False, {'error': 'the window may not be more than 7 days out '
                                 '-- file the request closer to the window'}
-    # Eastern-time business hours (owner rule, 2026-11-20): a NORMAL change
-    # window must sit entirely inside 09:00-17:00 America/New_York on a
-    # weekday, so the owner's veto decision always lands during the workday
-    # even with the shorter 6h notice. The emergency and tank-down lanes
-    # keep their own short-lead contracts and are exempt from this gate.
+    # Eastern-time business hours (owner rule, 2026-11-20): a change window
+    # must sit entirely OUTSIDE 09:00-17:00 America/New_York on weekdays --
+    # the tank applies its changes while the office is closed (evenings,
+    # overnights, weekends). The ONLY exception is the tank-down lane: a bug
+    # that prevents the tank from running is fixed immediately, whatever
+    # the clock says. Plain emergency changes observe the gate like normal
+    # changes do.
     end_ts = start_ts + duration_min * 60
-    if not emergency:
+    if not tank_down:
         import datetime as _dt
         from zoneinfo import ZoneInfo as _ZoneInfo
         _et = _ZoneInfo('America/New_York')
-        start_et = _dt.datetime.fromtimestamp(start_ts, tz=_et)
-        end_et = _dt.datetime.fromtimestamp(end_ts, tz=_et)
-        if (start_et.weekday() >= 5 or start_et.hour < 9
-                or (end_et.hour, end_et.minute) > (17, 0)
-                or end_et.date() != start_et.date()):
-            return False, {'error': 'change windows must sit inside Eastern-'
-                                    'time business hours (09:00-17:00 '
-                                    'America/New_York, Mon-Fri) -- the veto '
-                                    'decision has to land during the workday; '
-                                    'pick a slot then'}
+        cursor = start_ts
+        while cursor < end_ts:
+            moment = _dt.datetime.fromtimestamp(cursor, tz=_et)
+            if moment.weekday() < 5 and 9 <= moment.hour < 17:
+                return False, {'error': 'change windows must sit outside '
+                                        'Eastern-time business hours '
+                                        '(09:00-17:00 America/New_York, '
+                                        'Mon-Fri) -- the tank applies its '
+                                        'changes while the office is '
+                                        'closed; pick an evening, overnight, '
+                                        'or weekend slot'}
+            cursor += 60
     conflicts = _window_conflicts(start_ts, end_ts)
     if conflicts:
         listed = '; '.join(

@@ -1,7 +1,9 @@
 """Change-request window lead time (owner revisions 2026-11-11 and
 2026-11-20): the window must start at least 6 hours ahead -- a full day of
-notice proved slower than the work needs, and 6h keeps the owner's veto
-decision inside Eastern-time business hours."""
+notice proved slower than the work needs. Owner rule 2026-11-20: normal
+windows must also sit OUTSIDE Eastern-time business hours (09:00-17:00
+America/New_York, Mon-Fri) -- the tank applies its changes while the
+office is closed."""
 import datetime
 import os
 import sys
@@ -120,11 +122,12 @@ class OwnerLeadOverrideTests(unittest.TestCase):
         self.assertIn('at least 6 hours', res['error'])
 
 
-class EasternBusinessHoursTests(unittest.TestCase):
+class OutsideBusinessHoursTests(unittest.TestCase):
     """Owner rule 2026-11-20: with the shorter 6h notice, NORMAL change
-    windows must sit entirely inside Eastern-time business hours (09:00-17:00
-    America/New_York, Mon-Fri) so the veto decision lands during the workday.
-    The emergency and tank-down lanes are exempt."""
+    windows must sit entirely outside Eastern-time business hours
+    (09:00-17:00 America/New_York, Mon-Fri) -- evenings, overnights, and
+    weekends are in; any weekday 9-to-5 minute is out. The emergency and
+    tank-down lanes are exempt."""
 
     def setUp(self):
         self._cm = unittest.mock.patch.object(
@@ -167,32 +170,27 @@ class EasternBusinessHoursTests(unittest.TestCase):
                 return cls._et_utc_slot(extra, hour_et)
         raise AssertionError('unreachable')
 
-    def test_early_morning_et_slot_is_refused(self):
-        date, start = self._et_utc_slot(1, 7)
+    def test_midday_weekday_slot_is_refused(self):
+        date, start = self._weekday_slot(10, 30)
         ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
         self.assertFalse(ok)
+        self.assertIn('outside', res['error'])
         self.assertIn('business hours', res['error'])
 
-    def test_evening_et_slot_is_refused(self):
-        date, start = self._weekday_slot(19)
-        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
-        self.assertFalse(ok)
-        self.assertIn('business hours', res['error'])
-
-    def test_window_ending_after_5pm_et_is_refused(self):
+    def test_window_overlapping_5pm_et_is_refused(self):
         date, start = self._weekday_slot(16, 30)
         ok, res = selfedit.request_window('ada', date, start, 60, 'test reason')
         self.assertFalse(ok)
         self.assertIn('business hours', res['error'])
 
-    def test_weekend_slot_is_refused(self):
-        date, start = self._weekend_slot(10)
-        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+    def test_window_overlapping_9am_et_is_refused(self):
+        date, start = self._weekday_slot(8, 30)
+        ok, res = selfedit.request_window('ada', date, start, 60, 'test reason')
         self.assertFalse(ok)
         self.assertIn('business hours', res['error'])
 
-    def test_business_day_slot_gets_past_the_hours_gate(self):
-        date, start = self._weekday_slot(10)
+    def test_evening_weekday_slot_gets_past_the_hours_gate(self):
+        date, start = self._weekday_slot(19)
         ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
         # Past the hours gate the request may fail on later contract rules
         # (validator, roster) -- the boundary this pins is that the
@@ -200,11 +198,41 @@ class EasternBusinessHoursTests(unittest.TestCase):
         if not ok:
             self.assertNotIn('business hours', res.get('error', ''))
 
-    def test_emergency_lane_ignores_business_hours(self):
+    def test_early_morning_weekday_slot_gets_past_the_hours_gate(self):
+        date, start = self._weekday_slot(7)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        if not ok:
+            self.assertNotIn('business hours', res.get('error', ''))
+
+    def test_weekend_slot_gets_past_the_hours_gate(self):
+        date, start = self._weekend_slot(10)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        if not ok:
+            self.assertNotIn('business hours', res.get('error', ''))
+
+    def test_plain_emergency_observes_business_hours(self):
+        # Owner rule 2026-11-20: only the tank-down lane may touch the tank
+        # during business hours. A plain emergency weekday-midday request is
+        # refused by the hours gate.
         t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
+        date, start = t.strftime('%Y-%m-%d'), t.strftime('%H:%M')
         ok, res = selfedit.request_window(
-            'ada', t.strftime('%Y-%m-%d'), t.strftime('%H:%M'), 15,
-            'test reason', change_type='emergency')
+            'ada', date, start, 15, 'test reason', change_type='emergency')
+        # The slot may or may not be inside business hours depending on when
+        # the suite runs -- pin only the TANK-DOWN contrast: the same slot
+        # with tank_down=True must never carry the hours refusal.
+        if not ok:
+            td_ok, td_res = selfedit.request_window(
+                'ada', date, start, 15, 'tank is down: serve loop crash-looping',
+                change_type='emergency', tank_down=True)
+            if not td_ok:
+                self.assertNotIn('business hours', td_res.get('error', ''))
+
+    def test_tank_down_lane_ignores_business_hours(self):
+        date, start = self._weekday_slot(10, 30)
+        ok, res = selfedit.request_window(
+            'ada', date, start, 15, 'tank is down: serve loop crash-looping',
+            change_type='emergency', tank_down=True)
         if not ok:
             self.assertNotIn('business hours', res.get('error', ''))
 
