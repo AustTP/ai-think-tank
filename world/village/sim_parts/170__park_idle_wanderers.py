@@ -1,3 +1,4 @@
+import os
 import time
 
 
@@ -549,6 +550,90 @@ _ASSIGN_WAIT = object()
 _TASK_CONTENT_MAX_CONCURRENT = max(
     1, int((os.environ.get('TANK_MAX_CONTENT_RUNS') or '24').strip() or '24'))
 
+# RSS watermark guard (2026-11-20 19.8GB near-kill): the concurrency cap sizes
+# steady-state, but individual runs are unbounded (each holds its own growing
+# tool-loop transcript with fetched page HTML, plus allocator fragmentation
+# trim cannot return). The cap alone still let RSS walk to ~20GB in 70 minutes
+# on the 23GB box (`systemctl show` MemoryMax=22G; an abrupt cgroup kill
+# mid-save risks the corrupt-state blob the 2026-11-16/18 restart churn
+# produced). The governor now ALSO checks the process's own RSS once per
+# sweep: at or above the watermark nothing new is dispatched, and a single
+# '[/rss-guard] stop dispatching' line is logged per crossing instead of one
+# per tick. Env-overridable; default is 70% of the cgroup limit when visible
+# (the 22GB limit -> ~15GB ceiling, well clear of the kill), else 16GB.
+def _rss_watermark_from_limit(limit):
+    """Watermark for a known cgroup byte limit: the configured share of it,
+    clamped to a sane 1GiB floor. An absurd (unlimited) limit falls back to
+    the 16GiB default so an unexpected cgroup layout still yields a cap."""
+    default = 16 * 1024**3
+    if not limit or limit <= 0 or limit > 10 * 1024**3 * 1000:
+        return default
+    share = int((os.environ.get('TANK_RSS_GUARD_FRACTION') or '70').strip() or '70')
+    share = min(max(share, 10), 95)
+    return max(1_073_741_824, limit * share // 100)
+
+
+def _rss_watermark_bytes():
+    # An explicit absolute ceiling (bytes) wins outright; set
+    # TANK_RSS_GUARD_BYTES in the unit's Environment= to pin it.
+    try:
+        explicit = int((os.environ.get('TANK_RSS_GUARD_BYTES') or '').strip() or '0')
+    except ValueError:
+        explicit = 0
+    if explicit > 0:
+        return explicit
+    limit = None
+    try:
+        with open('/sys/fs/cgroup/memory.max') as _fh:
+            raw = _fh.read().strip()
+        if raw != 'max':
+            limit = int(raw)
+    except Exception:
+        limit = None
+    return _rss_watermark_from_limit(limit)
+
+
+_RSS_GUARD_WATERMARK = _rss_watermark_bytes()
+_rss_guard_stopped = False
+
+
+def _read_rss_bytes():
+    """One RSS sample in bytes for THIS process; 0 when unavailable (no
+    serve, no /proc). A module-level seam so tests can patch the read."""
+    try:
+        import serve as _serve
+        return _serve._process_rss_bytes()
+    except Exception:
+        return 0
+
+
+def _rss_guard_blocks_dispatch():
+    """True while process RSS is at or above the watermark. Logging is
+    edge-triggered: one stop line per crossing, one resume line when RSS has
+    clearly fallen back below the watermark. Any failure to READ the RSS
+    (no serve, no /proc) fails OPEN -- guard inert -- because a guard that
+    blocks dispatch forever on a missing file would silently freeze the
+    tank, which is strictly worse than running unthrottled."""
+    rss = _read_rss_bytes()
+    if not rss:
+        return False
+    global _rss_guard_stopped
+    if rss >= _RSS_GUARD_WATERMARK:
+        if not _rss_guard_stopped:
+            _rss_guard_stopped = True
+            print(f'[rss-guard] stop dispatching: rss {rss // 1024**2}MiB '
+                  f'>= watermark {_RSS_GUARD_WATERMARK // 1024**2}MiB; '
+                  'new runs hold until memory clears', flush=True)
+        return True
+    if _rss_guard_stopped:
+        if rss >= _RSS_GUARD_WATERMARK - 1024**3:
+            # Stopped and still inside the 1GiB hysteresis band: hold.
+            return True
+        _rss_guard_stopped = False
+        print(f'[rss-guard] resume dispatching: rss {rss // 1024**2}MiB '
+              'back under watermark', flush=True)
+    return False
+
 
 def _active_content_runs(state):
     # Only a WORKING task's in-flight flag means a live thread. Flags on
@@ -567,6 +652,12 @@ def _assign_due_item(state, pick, can_wake_off_duty, grid, doors, now_ms, task_i
     fallback-to-first-eligible but replaces JEV with a deterministic pick."""
     # Governor: never dispatch a content run past the concurrency cap.
     if _active_content_runs(state) >= _TASK_CONTENT_MAX_CONCURRENT:
+        return _ASSIGN_WAIT
+    # Second governor: the RSS watermark. The cap bounds run COUNT, not run
+    # SIZE (transcripts grow with fetched pages; trim cannot return arenas
+    # mid-run). A due item that would push the process past the watermark
+    # waits for the next tick, like an over-cap item -- nothing is lost.
+    if _rss_guard_blocks_dispatch():
         return _ASSIGN_WAIT
     request_id = pick.get('requestId')
     sequence = pick.get('sequence')

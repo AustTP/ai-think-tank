@@ -217,6 +217,11 @@ class _ContentHeartbeatKeepalive:
     def _loop(self):
         while not self._stop.wait(self.interval_s):
             _bump_content_heartbeat(self.task_id)
+            # Feed the per-run memory accounting while the run is live; the
+            # keepalive fires on the run's own cadence, which is exactly the
+            # sampler cadence wanted (030 defines it; sim parts assemble it
+            # into one namespace before any keepalive thread starts).
+            _run_mem_sample(self.task_id)
 
     def __exit__(self, *exc):
         self._stop.set()

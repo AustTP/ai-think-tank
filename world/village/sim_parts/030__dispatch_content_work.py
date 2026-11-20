@@ -2,6 +2,97 @@
 
 import json as _cjson
 import threading as _cthreading
+import time as _ctime
+
+# Per-run memory accounting (2026-11-20): every content run's wall duration
+# and the main-process RSS movement observed across it, logged once at
+# finish. The RSS delta is allocator high-water churn, not the run's true
+# live set (arena fragmentation keeps pages trim cannot return), but it is
+# exactly the number that walks the process toward the cgroup kill, so it is
+# the number that sizes the stage-2 run-in-container limits. Opt-out with
+# TANK_RUN_MEM=0; sampled in the dispatcher at run start/periodic heartbeats
+# (cheap /proc/self/statm reads, both on either the sim tick thread or the
+# run's own thread -- no lock beyond the dict update).
+_RUN_MEM = {}  # task_id -> {'rss0': int, 't0': float, 'peak': int}
+_RUN_MEM_LOCK = _cthreading.Lock()
+
+_RUN_MEM_ENABLED = True
+try:
+    import os as _os_runmem
+    if _os_runmem.environ.get('TANK_RUN_MEM') == '0':
+        _RUN_MEM_ENABLED = False
+except Exception:
+    pass
+
+
+def _run_mem_note(task_id):
+    """Stub kept for compatibility when accounting is disabled."""
+    return None
+
+
+def _run_mem_start(task_id):
+    if not _RUN_MEM_ENABLED:
+        return
+    try:
+        import serve as _serve
+        rss0 = _serve._process_rss_bytes()
+    except Exception:
+        rss0 = 0
+    with _RUN_MEM_LOCK:
+        _RUN_MEM[task_id] = {'rss0': rss0, 't0': _ctime.time(), 'peak': rss0}
+
+
+def _run_mem_sample(task_id):
+    if not _RUN_MEM_ENABLED:
+        return
+    with _RUN_MEM_LOCK:
+        entry = _RUN_MEM.get(task_id)
+        if not entry:
+            return
+    try:
+        import serve as _serve
+        rss = _serve._process_rss_bytes()
+    except Exception:
+        return
+    with _RUN_MEM_LOCK:
+        entry = _RUN_MEM.get(task_id)
+        if entry and rss > entry.get('peak', 0):
+            entry['peak'] = rss
+
+
+def _run_mem_done(task_id, task=None):
+    """Log one memory line per finished content run: wall duration, main
+    process RSS delta across the run (allocator high-water churn, not the
+    run's true live set), and peak RSS while it ran. Sizes the stage-2
+    run-in-container limits with real numbers instead of guesses."""
+    with _RUN_MEM_LOCK:
+        entry = _RUN_MEM.pop(task_id, None)
+    if not entry or not _RUN_MEM_ENABLED:
+        return
+    rss_now = 0
+    log_action = None
+    try:
+        import serve as _serve
+        rss_now = _serve._process_rss_bytes()
+        log_action = _serve.log_action
+    except Exception:
+        pass
+    peak = entry.get('peak') or 0
+    dur = _ctime.time() - entry['t0']
+    delta = (rss_now - entry['rss0']) // 1024 // 1024
+    peak_mib = peak // 1024 // 1024
+    print(f"[run-mem] task={task_id} dur={dur:.0f}s rss-delta={delta:+d}MiB "
+          f"peak-process-rss={peak_mib}MiB", flush=True)
+    try:
+        if task is not None and peak_mib and log_action:
+            log_action('system', 'run_memory', {
+                'taskId': task_id,
+                'durationS': round(dur),
+                'rssDeltaMiB': delta,
+                'peakProcessRssMiB': peak_mib,
+            }, authorized=True)
+    except Exception:
+        pass
 
 # ONE frozen whole-state copy per save revision, shared by every content job
 # dispatched while that revision is current. The old per-job
@@ -124,14 +215,16 @@ def _dispatch_content_work(executor, state, agent_id, task, now):
             # one heartbeat-less, all during the 57-worker burst).
             task['_contentHeartbeat'] = time.time()
             _bump_content_heartbeat(task_id)
+            _run_mem_sample(task_id)
         except Exception:
             pass
         try:
+            _run_mem_start(task_id)
             executor(snapshot, agent_id, task, base_ctx=perception)
+            _run_mem_done(task_id, task)
         except Exception as e:  # never let a content failure strand the agent
+            _run_mem_done(task_id, task)
             if getattr(e, 'credits_paused', False):
-                # The work did not fail; the account is out of credits. Keep the
-                # card intact and requeue it, and hold the task cycle until the
                 # balance is restored.
                 _store_content_result(task_id, {
                     'creditsPaused': True,

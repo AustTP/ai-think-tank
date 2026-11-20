@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import sim  # noqa: E402
@@ -73,6 +74,90 @@ class DispatchGovernor(unittest.TestCase):
             value = max(1, int(
                 (os.environ.get('TANK_MAX_CONTENT_RUNS') or '24').strip() or '24'))
         self.assertEqual(value, 7)
+
+
+class RssWatermark(DispatchGovernor):
+    """The RSS watermark guard (2026-11-20: RSS 12.6 -> 19.8GB in 70 minutes
+    under the 24-run default cap on a 23GB box; MemoryBarrier=22G kill was
+    minutes away). The cap bounds run COUNT, not run SIZE, so the governor
+    now also holds new dispatches while the process is at/above a watermark,
+    failing OPEN when the RSS read is unavailable."""
+
+    def setUp(self):
+        self._old_stopped = sim._rss_guard_stopped
+        self._old_wm = sim._RSS_GUARD_WATERMARK
+        sim._rss_guard_stopped = False
+
+    def tearDown(self):
+        sim._rss_guard_stopped = self._old_stopped
+        sim._RSS_GUARD_WATERMARK = self._old_wm
+
+    def test_watermark_from_cgroup_limit(self):
+        # 22GiB cgroup limit at the 70% share -> ~15GiB watermark.
+        wm = sim._rss_watermark_from_limit(22 * 1024**3)
+        self.assertGreater(wm, 15 * 1024**3)
+        self.assertLess(wm, 16 * 1024**3)
+        # Absurd/absent limits fall back to the 16GiB default.
+        self.assertEqual(sim._rss_watermark_from_limit(None), 16 * 1024**3)
+        self.assertEqual(sim._rss_watermark_from_limit(0), 16 * 1024**3)
+        self.assertEqual(sim._rss_watermark_from_limit(10**15), 16 * 1024**3)
+        # The share clamps into [10, 95]; a tiny limit keeps a 1GiB floor.
+        with mock.patch.dict(os.environ, {'TANK_RSS_GUARD_FRACTION': '5'}):
+            self.assertEqual(sim._rss_watermark_from_limit(22 * 1024**3),
+                             (22 * 1024**3) * 10 // 100)
+        with mock.patch.dict(os.environ, {'TANK_RSS_GUARD_FRACTION': '99'}):
+            self.assertEqual(sim._rss_watermark_from_limit(2 * 1024**3),
+                             (2 * 1024**3) * 95 // 100)
+
+    def test_explicit_bytes_env_wins(self):
+        with mock.patch.dict(os.environ,
+                             {'TANK_RSS_GUARD_BYTES': str(3 * 1024**3)}):
+            self.assertEqual(sim._rss_watermark_bytes(), 3 * 1024**3)
+
+    def test_blocks_at_or_above_watermark_and_fails_open(self):
+        sim._RSS_GUARD_WATERMARK = 10 * 1024**3
+        with mock.patch.object(sim, '_read_rss_bytes',
+                               return_value=(10 * 1024**3) + 1):
+            self.assertTrue(sim._rss_guard_blocks_dispatch())
+        # After a stop, an unavailable RSS read fails OPEN (the guard never
+        # wedges dispatch on a missing file), but the stopped flag persists
+        # so the resume edge still works when reads return.
+        with mock.patch.object(sim, '_read_rss_bytes', return_value=0):
+            self.assertFalse(sim._rss_guard_blocks_dispatch())
+        self.assertTrue(sim._rss_guard_stopped)
+
+    def test_resumes_after_clearing_the_watermark(self):
+        sim._RSS_GUARD_WATERMARK = 10 * 1024**3
+        with mock.patch.object(sim, '_read_rss_bytes',
+                               return_value=20 * 1024**3):
+            self.assertTrue(sim._rss_guard_blocks_dispatch())
+        # Inside the 1GiB hysteresis band the tank stays held.
+        with mock.patch.object(sim, '_read_rss_bytes',
+                               return_value=(10 * 1024**3) - 1):
+            self.assertTrue(sim._rss_guard_blocks_dispatch())
+        # A full GiB below the watermark clears the stop.
+        with mock.patch.object(
+                sim, '_read_rss_bytes',
+                return_value=(10 * 1024**3) - 1024**3 - 1):
+            self.assertFalse(sim._rss_guard_blocks_dispatch())
+        self.assertFalse(sim._rss_guard_stopped)
+
+    def test_guard_blocks_assign_due_item(self):
+        sim._RSS_GUARD_WATERMARK = 1  # force the guard active
+        state = self._state(running=0)
+        with mock.patch.object(sim, '_read_rss_bytes',
+                               return_value=2 * 1024**3):
+            result = sim._assign_due_item(state, self._pick(), False,
+                                          None, None, time.time() * 1000)
+            self.assertIs(result, sim._ASSIGN_WAIT,
+                          'over the watermark no new run is dispatched')
+            self.assertTrue(sim._rss_guard_blocks_dispatch())
+        # Under the real watermark the guard itself passes; the same call
+        # shape without the guard assigns (covered by test_non_content...).
+        sim._RSS_GUARD_WATERMARK = self._old_wm
+        with mock.patch.object(sim, '_read_rss_bytes',
+                               return_value=1 * 1024**3):
+            self.assertFalse(sim._rss_guard_blocks_dispatch())
 
 
 class mock_env:

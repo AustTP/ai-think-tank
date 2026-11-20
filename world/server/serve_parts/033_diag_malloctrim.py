@@ -12,6 +12,23 @@ import os as _os
 import threading as _threading
 import time as _time
 
+_PAGE_SIZE = None
+
+
+def _process_rss_bytes():
+    """This process's current RSS in bytes, from /proc, or 0 when unavailable.
+    Read by the dispatch governor's RSS watermark guard and by per-run memory
+    accounting; called on the sim tick thread, so no lock, one small file read."""
+    global _PAGE_SIZE
+    try:
+        if _PAGE_SIZE is None:
+            _PAGE_SIZE = _os.sysconf('SC_PAGE_SIZE')
+        with open('/proc/self/statm') as _fh:
+            rss_pages = int(_fh.read().split()[1])
+    except Exception:
+        return 0
+    return rss_pages * _PAGE_SIZE
+
 _TRIM_S = int(_os.environ.get('THINK_TANK_MALLOC_TRIM_S') or 0)
 if _TRIM_S > 0:
     def _malloc_trim_loop():
