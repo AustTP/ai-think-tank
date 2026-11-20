@@ -36,9 +36,11 @@ OUT_DIR = os.path.join(REPO, 'library', 'analysis', 'ideabrowser-reviews')
 LOG = os.path.join(OUT_DIR, 'harvest-log.json')
 
 MIN_IDEAS = 40
-KNOWN_SOURCES = {'title-only', 'viewable', 'gated'}
+# The rubric's source labels (SCORING-RUBRIC.md): what the worker actually
+# had when scoring -- page fetched, listing line only, or title alone.
+KNOWN_SOURCES = {'title-only', 'page', 'listing'}
 SOURCE_RE = re.compile(
-    r'^\|\s*\d+\s*\|.*\|\s*(title-only|viewable|gated)\s*\|\s*(\S.*)?\s*\|$',
+    r'^\|\s*\d+\s*\|.*\|\s*(title-only|page|listing)\s*\|\s*(\S.*)?\s*\|$',
     re.IGNORECASE)
 BATCH_RE = re.compile(r'batch[- _]?0?(\d+)', re.IGNORECASE)
 
