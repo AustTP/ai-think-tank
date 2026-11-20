@@ -557,6 +557,22 @@ def _tier_watch_moves_sync():
         per_provider[provider] = globals()[fetch_name]() or []
     if wanted and not per_provider:
         raise RuntimeError(f'no catalog fetchable for the selected providers: {wanted}')
+    # Cross-provider price scan (operator, 2026-11-20): the watch must also
+    # see the OTHER dialing providers' listings, or a cheaper listing of a
+    # selected model (or a cheaper qualifier) on another provider stays
+    # invisible until the 2h sweep. Non-serving providers are fetched
+    # FAIL-OPEN like the refresh does (an outage contributes an empty slice
+    # instead of failing the cycle); only a failure of a SERVING provider
+    # fails the whole cycle, as before.
+    for provider in PROVIDER_CATALOGS:
+        if provider in wanted or provider in per_provider:
+            continue
+        try:
+            per_provider[provider] = globals()[PROVIDER_CATALOGS[provider]]() or []
+        except Exception as exc:
+            print(f'[model-tiers] watch: {provider} catalog fetch failed '
+                  f'(ignored): {exc}', flush=True)
+            per_provider[provider] = []
     catalog = {}
     for models in per_provider.values():
         for m in models:
@@ -568,13 +584,15 @@ def _tier_watch_moves_sync():
                 continue
             catalog[m['id']] = (p + c) * 1_000_000
     benchmark_rows = get_model_benchmark_scores()
-    # The pools a fresh pick would draw from: whatever _pick_provider
-    # selects among the catalogs this cycle fetched. A provider MIGRATION
-    # itself is the cap watch's job; this watch owns price, delisting and
-    # cheaper-qualifier moves within the serving provider.
+    # The pools a fresh pick would draw from: the serving provider's slice,
+    # re-priced and re-stamped through the SAME cross-provider dial
+    # annotation the refresh applies -- otherwise a cheaper listing on
+    # another provider is invisible to the watch and the value window waits
+    # for the next full refresh to be taken.
     pick_provider = _pick_provider(per_provider)
-    pools = _band_candidate_pools(
-        per_provider.get(pick_provider) or next(iter(per_provider.values()), []))
+    pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
+    pools = _band_candidate_pools(_annotate_cheapest_dialers(
+        pick_models, per_provider, pick_provider))
     moves = set()
     for band, meta in selected.items():
         if _provider_spec_for_band(band):

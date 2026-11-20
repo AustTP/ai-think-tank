@@ -356,6 +356,64 @@ def _pick_provider(per_provider):
     return fallback
 
 
+def _annotate_cheapest_dialers(pick_models, per_provider, pick_provider):
+    """Cross-provider price scan (operator, 2026-11-20): the band picks must
+    consider every DIALING provider's listing, not just the pick provider's
+    slice. For each candidate in the pick slice, look the SAME model id up in
+    the other providers' listings and rewrite the candidate's pricing and
+    `_dial_provider` to the cheapest listing the transports can serve --
+    a capped provider's cheaper listing is skipped (its gate refuses the
+    call), registry order breaks exact ties, and a model only the pick
+    provider sells comes back untouched. Returns fresh dicts; the fetched
+    slices are never mutated."""
+    listings = {}
+    for provider in per_provider:
+        if provider == pick_provider:
+            continue
+        for m in per_provider.get(provider) or []:
+            mid = m.get('id')
+            if not mid or mid in _PROVIDER_ROUTER_MODELS:
+                continue
+            try:
+                price = float(m['pricing']['prompt']) + float(m['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            listings.setdefault(mid, []).append((price, provider, m))
+    capped = {}
+
+    def _capped(provider):
+        if provider not in capped:
+            try:
+                capped[provider] = bool(_provider_cap_exceeded(provider))
+            except Exception:
+                capped[provider] = False
+        return capped[provider]
+
+    out = []
+    for m in pick_models:
+        mid = m.get('id')
+        if not mid or mid in _PROVIDER_ROUTER_MODELS:
+            continue
+        try:
+            own = float(m['pricing']['prompt']) + float(m['pricing']['completion'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        best = (own, None, None)
+        for price, provider, raw in listings.get(mid, []):
+            if _capped(provider):
+                continue
+            if price < best[0] - 1e-15:
+                best = (price, provider, raw)
+        if best[1] is None:
+            out.append(m)
+            continue
+        fresh = dict(m)
+        fresh['pricing'] = best[2]['pricing']
+        fresh['_dial_provider'] = best[1]
+        out.append(fresh)
+    return out
+
+
 # --- Cap-crossing watch -----------------------------------------------------
 # A provider's spend crossing its monthly cap is a re-pick EVENT, not
 # something the 30-min price watch or the 2h sweep should be first to notice
@@ -425,10 +483,12 @@ async def refresh_model_tiers():
     # persisted to model_provider_catalog, and the UNION drives the
     # canonical rows, the benchmark backfills (so a model only one provider
     # sells still gets scored), and the purge scope. The call-ability pools
-    # (price buckets, band pools, live-verify probes) stay on the OpenRouter
-    # listing alone: that is the transport the tier picks are dialed through
-    # today; other providers join the dialing layer through pins, not by
-    # leaking into these pools.
+    # (price buckets, band pools, live-verify probes) draw from the registry
+    # pick provider's listing, then every candidate is re-priced to the
+    # cheapest other dialing provider's listing of the same model id and
+    # stamped with that provider -- the tier row dials the cheapest vendor
+    # (operator, 2026-11-20). A `tier_provider` pin keeps the pinned
+    # provider's own listings untouched.
     per_provider = {}
     for provider, fetch_name in PROVIDER_CATALOGS.items():
         try:
@@ -464,14 +524,27 @@ async def refresh_model_tiers():
         pin = (_get_setting('tier_provider') or '').strip()
     except Exception:
         pin = ''
+    pin_applied = False
     if pin:
         if per_provider.get(pin):
             if pin != pick_provider:
                 print(f'[model-tiers] tier_provider pin active: picking from {pin}', flush=True)
             pick_provider = pin
+            pin_applied = True
         else:
             print(f'[model-tiers] tier_provider pin {pin!r} has no listing this sweep; ignored', flush=True)
+    else:
+        pin_applied = False
     pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
+    # Cross-provider price scan (operator, 2026-11-20): when no pin is in
+    # force, each candidate is re-priced and re-stamped to the cheapest other
+    # dialing provider's listing of the same model id, so buckets, floors and
+    # the tier rows all reflect the listing the transport will actually dial.
+    # An applied `tier_provider` pin keeps the pinned provider's own listings
+    # untouched -- that is the whole point of a pin.
+    if not pin_applied:
+        pick_models = _annotate_cheapest_dialers(pick_models, per_provider,
+                                                 pick_provider)
     buckets = _bucket_models_by_price(pick_models)
     all_benchmark_rows = get_model_benchmark_scores()
     pools = _band_candidate_pools(pick_models)
@@ -573,7 +646,8 @@ async def refresh_model_tiers():
                         min_score=wide_min_score),
                     band):
                 if await asyncio.to_thread(_verify_model_works_sync,
-                                           candidate['id'], pick_provider):
+                                           candidate['id'],
+                                           candidate.get('provider') or pick_provider):
                     picked = candidate
                     break
             if picked is None:
@@ -588,7 +662,8 @@ async def refresh_model_tiers():
             # have 60+ entries; a classifier call doesn't need all of them,
             # just enough real variety to make a genuine choice from.
             shortlist = pool[:25]
-            candidates = [{'id': m['id'], 'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
+            candidates = [{'id': m['id'], 'provider': m.get('provider'),
+                           'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
             try:
                 data = await asyncio.to_thread(
                     _call_openrouter_decision_sync, _jev_model(),
@@ -606,7 +681,8 @@ async def refresh_model_tiers():
             # actually needs to talk.
             for candidate in ranked[:3]:
                 if await asyncio.to_thread(_verify_model_works_sync,
-                                           candidate['id'], pick_provider):
+                                           candidate['id'],
+                                           candidate.get('provider') or pick_provider):
                     picked = candidate
                     break
         if picked is None:
@@ -641,7 +717,8 @@ async def refresh_model_tiers():
         # _best_value_pick takes over and the score-grounded policy is
         # restored.
         shortlist = sorted(vision_pool, key=lambda m: m['price'])[:25]
-        candidates = [{'id': m['id'], 'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
+        candidates = [{'id': m['id'], 'provider': m.get('provider'),
+                       'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
         try:
             data = await asyncio.to_thread(
                 _call_openrouter_decision_sync, _jev_model(),
@@ -654,7 +731,8 @@ async def refresh_model_tiers():
         ranked = [m for m in shortlist if m['id'] == pick_id] + [m for m in shortlist if m['id'] != pick_id]
         for candidate in ranked[:3]:
             if await asyncio.to_thread(_verify_model_works_sync,
-                                       candidate['id'], pick_provider):
+                                       candidate['id'],
+                                       candidate.get('provider') or pick_provider):
                 vision_pick = candidate
                 break
     if vision_pick:
@@ -667,17 +745,21 @@ async def refresh_model_tiers():
     with _db() as conn:
         _ensure_tier_fallbacks_table(conn)
         for band, m in chosen.items():
+            # The pick's own dial provider (cheapest cross-provider listing)
+            # when annotated; the registry pick provider otherwise.
+            row_provider = m.get('provider') or pick_provider
             conn.execute(
                 'INSERT INTO model_tiers (band, slug, name, price_per_m, provider, chosen_at) VALUES (?, ?, ?, ?, ?, ?) '
                 'ON CONFLICT(band) DO UPDATE SET slug=excluded.slug, name=excluded.name, price_per_m=excluded.price_per_m, provider=excluded.provider, chosen_at=excluded.chosen_at',
-                (band, m['id'], m['name'], m['price'], pick_provider, time.time()),
+                (band, m['id'], m['name'], m['price'], row_provider, time.time()),
             )
             conn.execute('DELETE FROM model_tier_fallbacks WHERE band = ?', (band,))
             for _rank, _fb in enumerate(fallbacks.get(band, []), 1):
                 conn.execute(
                     'INSERT INTO model_tier_fallbacks (band, rank, slug, name, price_per_m, provider, chosen_at) '
                     'VALUES (?, ?, ?, ?, ?, ?, ?)',
-                    (band, _rank, _fb['id'], _fb['name'], _fb['price'], pick_provider, time.time()),
+                    (band, _rank, _fb['id'], _fb['name'], _fb['price'],
+                     _fb.get('provider') or row_provider, time.time()),
                 )
             # Daily price/score log: look up the benchmark score the pick was
             # grounded on (first metric in the band's chain that has a score
@@ -712,7 +794,7 @@ async def refresh_model_tiers():
                 'logged_at=CASE WHEN tier_daily_log.slug = excluded.slug '
                 'THEN tier_daily_log.logged_at ELSE excluded.logged_at END',
                 (time.strftime('%Y-%m-%d', time.gmtime()), band, m['id'], m['name'], m['price'], _bench, _score,
-                 pick_provider, time.time(),
+                 row_provider, time.time(),
                  _lat_ms, _lat_n, int(bool(_speed))),
             )
     log_action(None, 'model_tiers_refreshed', {band: m['id'] for band, m in chosen.items()})

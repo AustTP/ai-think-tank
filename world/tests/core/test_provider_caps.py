@@ -542,7 +542,11 @@ class WatchReadsTheServingProviderCatalog(unittest.TestCase):
              unittest.mock.patch.object(serve, '_fetch_straitly_catalog_sync',
                                         side_effect=fake_straitly):
             self.assertEqual(serve._tier_watch_moves_sync(), set())
-        self.assertEqual(fetches, ['straitly'])
+        # The serving provider is fetched first; the non-serving provider's
+        # slice is fetched too (fail-open) so the cross-provider dial
+        # annotation can see it.
+        self.assertEqual(fetches[0], 'straitly')
+        self.assertIn('openrouter', fetches)
 
     def test_unknown_provider_stamp_fails_the_cycle(self):
         self._select('mid', 'x/pick', 0.5, 'ghost-vendor')
@@ -599,6 +603,199 @@ class BestValuePickProbesItsOwnProvider(unittest.TestCase):
             picked = serve.asyncio.run(serve._best_value_pick(cands, scores))
         self.assertEqual(picked['id'], 'or/a')
         self.assertEqual(seen, [('or/a', None)])
+
+    def test_candidate_provider_wins_over_the_pool_default(self):
+        # A candidate annotated with its own cross-provider dial listing is
+        # probed through THAT transport, not the pick provider's.
+        cands = [{'id': 'ci/m', 'name': 'ci/m', 'price': 0.25,
+                  'provider': 'cheaperinference'}]
+        scores = {'ci/m': 41.0}
+        seen = []
+
+        def probe(model_id, provider=None):
+            seen.append((model_id, provider))
+            return True
+
+        with unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        side_effect=probe):
+            picked = serve.asyncio.run(serve._best_value_pick(
+                cands, scores, provider='openrouter'))
+        self.assertEqual(picked['id'], 'ci/m')
+        self.assertEqual(seen, [('ci/m', 'cheaperinference')])
+
+
+class CheapestDialerAnnotation(unittest.TestCase):
+    """The refresh re-prices each pick-slice candidate to the cheapest OTHER
+    dialing provider's listing of the same model id, stamps that provider on
+    the candidate (verify probe + tier row dial through it), and skips a
+    capped provider's cheaper listing -- its transport gate refuses the call
+    (operator, 2026-11-20)."""
+
+    def _m(self, mid, per_token='0.0000005'):
+        return {'id': mid, 'name': mid,
+                'pricing': {'prompt': per_token, 'completion': per_token},
+                'architecture': {'input_modalities': ['text'],
+                                 'output_modalities': ['text']}}
+
+    def test_cheaper_listing_moves_price_and_provider(self):
+        pick = [self._m('x/m')]
+        per = {'openrouter': pick,
+               'cheaperinference': [self._m('x/m', '0.000000125')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._annotate_cheapest_dialers(pick, per, 'openrouter')
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['_dial_provider'], 'cheaperinference')
+        self.assertEqual(
+            float(out[0]['pricing']['prompt']) + float(out[0]['pricing']['completion']),
+            2.5e-7)
+
+    def test_capped_provider_cheaper_listing_skipped(self):
+        pick = [self._m('x/m')]
+        per = {'openrouter': pick,
+               'cheaperinference': [self._m('x/m', '0.000000125')]}
+
+        def capped(provider):
+            return provider == 'cheaperinference'
+
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        side_effect=capped):
+            out = serve._annotate_cheapest_dialers(pick, per, 'openrouter')
+        self.assertNotIn('_dial_provider', out[0])
+        self.assertEqual(float(out[0]['pricing']['prompt']), 5e-7)
+
+    def test_price_tie_keeps_the_pick_provider(self):
+        pick = [self._m('x/m')]
+        per = {'openrouter': pick, 'straitly': [self._m('x/m')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._annotate_cheapest_dialers(pick, per, 'openrouter')
+        self.assertNotIn('_dial_provider', out[0])
+
+    def test_model_only_the_pick_provider_lists_is_untouched(self):
+        pick = [self._m('x/m')]
+        per = {'openrouter': pick, 'straitly': []}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._annotate_cheapest_dialers(pick, per, 'openrouter')
+        self.assertIs(out[0], pick[0])
+
+    def test_unpriceable_other_listing_ignored(self):
+        pick = [self._m('x/m')]
+        per = {'openrouter': pick,
+               'straitly': [{'id': 'x/m', 'name': 'x/m', 'pricing': {}}]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._annotate_cheapest_dialers(pick, per, 'openrouter')
+        self.assertIs(out[0], pick[0])
+
+
+class RefreshStampsCheapestDialer(unittest.TestCase):
+    """End to end: a model listed cheaper on CheaperInference lands in
+    model_tiers stamped provider='cheaperinference' at CI's price, and the
+    verify probe dialed CheaperInference's transport."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            for table in ('model_tiers', 'model_tier_fallbacks',
+                          'tier_daily_log', 'model_provider_catalog',
+                          'model_catalog', 'model_benchmark_scores'):
+                conn.execute(f'DELETE FROM {table}')
+
+    def _m(self, mid, per_token):
+        return {'id': mid, 'name': mid,
+                'pricing': {'prompt': per_token, 'completion': per_token},
+                'architecture': {'input_modalities': ['text'],
+                                 'output_modalities': ['text']}}
+
+    def test_cheaper_ci_listing_wins_the_row(self):
+        catalogs = {'openrouter': '_fetch_openrouter_catalog_sync',
+                    'cheaperinference': '_fetch_cheaperinference_catalog_sync'}
+        probes = []
+
+        def probe(model_id, provider=None):
+            probes.append((model_id, provider))
+            return True
+
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=[self._m('x/m', '0.0000005')]), \
+             unittest.mock.patch.object(serve, '_fetch_cheaperinference_catalog_sync',
+                                        return_value=[self._m('x/m', '0.000000125')]), \
+             unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        side_effect=probe), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        side_effect=RuntimeError('no decision')), \
+             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_mmmu_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            serve.set_model_benchmark_score('x/m', 'intelligence_index', 41.0,
+                                            source_url='test://cheapest-dialer')
+            serve.asyncio.run(serve.refresh_model_tiers())
+        self.assertIn(('x/m', 'cheaperinference'), probes)
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT band, slug, price_per_m, provider FROM model_tiers '
+                'WHERE slug = ?', ('x/m',)).fetchall()
+        self.assertTrue(rows)
+        for _band, _slug, price, provider in rows:
+            self.assertAlmostEqual(price, 0.25, places=6)
+            self.assertEqual(provider, 'cheaperinference')
+
+    def test_tier_provider_pin_suppresses_the_annotation(self):
+        # A `tier_provider` pin is a deliberate operator choice: the pinned
+        # provider's own listings must NOT be re-priced to another
+        # provider's cheaper listing of the same id.
+        catalogs = {'straitly': '_fetch_straitly_catalog_sync',
+                    'cheaperinference': '_fetch_cheaperinference_catalog_sync'}
+        probes = []
+
+        def probe(model_id, provider=None):
+            probes.append((model_id, provider))
+            return True
+
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
+             unittest.mock.patch.object(serve, '_get_setting',
+                                        return_value='straitly'), \
+             unittest.mock.patch.object(serve, '_fetch_straitly_catalog_sync',
+                                        return_value=[self._m('x/m', '0.0000005')]), \
+             unittest.mock.patch.object(serve, '_fetch_cheaperinference_catalog_sync',
+                                        return_value=[self._m('x/m', '0.000000125')]), \
+             unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        side_effect=probe), \
+             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        side_effect=RuntimeError('no decision')), \
+             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_mmmu_leaderboard',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            serve.set_model_benchmark_score('x/m', 'intelligence_index', 41.0,
+                                            source_url='test://pin-suppression')
+            serve.asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(probes, [('x/m', 'straitly')])
+        with serve._db() as conn:
+            rows = conn.execute(
+                'SELECT band, slug, price_per_m, provider FROM model_tiers '
+                'WHERE slug = ?', ('x/m',)).fetchall()
+        self.assertTrue(rows)
+        for _band, _slug, price, provider in rows:
+            self.assertAlmostEqual(price, 1.0, places=6)
+            self.assertEqual(provider, 'straitly')
 
 
 class ModelRouterPool(unittest.TestCase):

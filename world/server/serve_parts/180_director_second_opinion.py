@@ -517,14 +517,14 @@ async def _best_value_pick(candidates, scores, floor_gap=None, band=None,
     # probes must dial THAT transport (its base_url/key), not the default --
     # otherwise a Straitly candidate is "verified" against OpenRouter, which
     # does not even list it, and every band falls through to the classifier
-    # fallback (fixed 2026-11-13). Returns None if nothing in `candidates`
-    # has a stored score yet, or nothing verified works -- callers fall back
-    # to Jev's classifier in that case.
+    # fallback (fixed 2026-11-13). A candidate may carry its OWN `provider`
+    # key (the refresh's cross-provider dial annotation): it wins over the
+    # pool-level default.
     for candidate in _speed_tie_order(
             _best_value_qualifiers_sync(candidates, scores, floor_gap,
                                         min_score=min_score), band):
         if await asyncio.to_thread(_verify_model_works_sync, candidate['id'],
-                                   provider):
+                                   candidate.get('provider') or provider):
             return candidate
     return None
 
@@ -749,7 +749,11 @@ def _bucket_models_by_price(models):
         price_per_m = (prompt_price + completion_price) * 1_000_000
         for band, (lo, hi) in MODEL_PRICE_BANDS.items():
             if lo <= price_per_m < hi:
-                buckets[band].append({'id': m['id'], 'name': m.get('name', m['id']), 'price': price_per_m})
+                # `provider` rides the candidate when the refresh annotated it
+                # with a cheaper cross-provider dial listing (None on legacy
+                # callers: the pick provider's own transport).
+                buckets[band].append({'id': m['id'], 'name': m.get('name', m['id']), 'price': price_per_m,
+                                      'provider': m.get('_dial_provider')})
                 break
     for band in buckets:
         buckets[band].sort(key=lambda x: x['price'])
@@ -913,7 +917,8 @@ def _band_candidate_pools(models):
             continue
         if p <= 0 or c <= 0:
             continue
-        vision.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000})
+        vision.append({'id': m['id'], 'name': m.get('name', m['id']), 'price': (p + c) * 1_000_000,
+                       'provider': m.get('_dial_provider')})
     pools['vision'] = _apply_band_price_ceiling('vision', vision)
     return pools
 
