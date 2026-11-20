@@ -245,10 +245,26 @@ def _scheduled_items_pass(state, now_ms=None):
         if item.get('digest') == 'telegram' or item.get('id') == 'sch-rvp-telegram-digest':
             try:
                 import serve
+                # `last` is the PRE-period stamp (read before we stamped
+                # lastRunAtMs above): the writer reads only alerts fired
+                # since the previous scan, so passing the just-now stamp
+                # would collapse the window to zero.
                 digest_path = serve.write_telegram_alert_digest(
-                    since_ts=(item.get('lastRunAtMs') or 0) / 1000.0 or None)
+                    since_ts=last / 1000.0 or None)
             except Exception:
                 digest_path = None
+            if not digest_path:
+                # Quiet window or a write failure: nothing to triage, so
+                # no card. The period still counts as scanned because
+                # lastRunAtMs is stamped above.
+                item['lastRunSkipped'] = 'digest-quiet'
+                _log_governance(state, None, 'scheduled_item_skipped',
+                                {'id': item.get('id'),
+                                 'reason': 'telegram digest window was '
+                                           'quiet (no alerts, no internal '
+                                           'signals, no integrity '
+                                           'anomalies)'})
+                continue
         instructions = item.get('instructions') or f"Pick whoever is best suited for: {item['title']}"
         if digest_path:
             instructions += (f"\n\nToday's digest file: library/{digest_path} "

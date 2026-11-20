@@ -20,6 +20,31 @@ Call/patch contract (must hold for every future edit of this file):
     reads its own globals, so a self-edit of this file takes effect when this
     module is reloaded -- the self_edit apply flow (re)imports jev and then
     refreshes serve's re-exports while the tank is dormant.
+
+Routing rule (owner direction 2026-11-20: JEV is for open-ended judgment,
+not for cases deterministic code already solves). Before routing a decision
+to the JEV/LLM lane, place it in the first lane that applies:
+
+  1. Deterministic code: closed-form rules with a correct answer -- auth and
+     session checks, path containment, redaction, budget/credit arithmetic,
+     schema validation. Exact rules are free, instant, and never
+     hallucinate; they beat a confident classifier on their own turf. If
+     `_classify_command` or a URL-trust check could be written as a finite
+     rule table, it belongs here, not in a model call.
+  2. Calibrated ML: closed label set AND enough labeled history to train
+     on AND a mistake that is cheap to undo (e.g. the dormant triage
+     cascade's Naive Bayes). Never for high-stakes gates.
+  3. JEV/LLM (this module): open-ended judgment -- ambiguous requests,
+     novel situations, natural-language review, anything lane 1 and 2
+     cannot decide. Confidence stays calibrated and safety gates keep
+     escalating below JEV_SAFETY_CONFIDENCE.
+  4. Operator: irreversible actions, out-of-sandbox effects, or a JEV
+     result at or below the floor. The quorum sampler below exists so lane
+     3 lands here on its own variance instead of guessing.
+
+The corollary the DreyX variance run taught: a JEV confidence number on a
+question a rule table could answer is noise, not signal. Check for lane 1
+before spending a model call.
 """
 
 import asyncio

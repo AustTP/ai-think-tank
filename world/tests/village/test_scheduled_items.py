@@ -177,6 +177,39 @@ class EnginePassTests(unittest.TestCase):
                          'an open same-title card suppresses the mint')
 
 
+    def test_quiet_digest_skips_the_mint_and_logs_the_skip(self):
+        st = _state()
+        st['_villageScanSeeded'] = True
+        with mock.patch.object(serve, 'write_telegram_alert_digest',
+                               return_value=None) as w, \
+                mock.patch.object(sim, 'queue_work', return_value=1) as qw, \
+                mock.patch.object(sim, '_log_governance') as logged:
+            sim._scheduled_items_pass(st, now_ms=10_000_000_000)
+        self.assertFalse(qw.called, 'a quiet digest mints no card')
+        item = st['scheduledItems'][0]
+        self.assertEqual(item.get('lastRunSkipped'), 'digest-quiet')
+        self.assertEqual(item['lastRunAtMs'], 10_000_000_000,
+                         'the quiet period still counts as scanned')
+        skips = [c[0][3] for c in logged.call_args_list
+                 if c[0][2] == 'scheduled_item_skipped']
+        self.assertTrue(skips and 'quiet' in skips[0].get('reason', ''))
+
+    def test_digest_since_ts_is_the_previous_scan_stamp(self):
+        # lastRunAtMs is stamped BEFORE the digest call, so the writer's
+        # since_ts must use the pre-period stamp -- otherwise the window
+        # collapses to zero and every scan looks quiet.
+        st = _state()
+        st['_villageScanSeeded'] = True
+        prev = 10_000_000_000 - 88_560_000  # 24.6h ago; the seed is daily
+        st['scheduledItems'] = [dict(sim._SCHEDULED_SEED_ITEM)]
+        st['scheduledItems'][0]['lastRunAtMs'] = prev
+        with mock.patch.object(serve, 'write_telegram_alert_digest',
+                               return_value='analysis/digest.md') as w, \
+                mock.patch.object(sim, 'queue_work', return_value=1):
+            sim._scheduled_items_pass(st, now_ms=10_000_000_000)
+        self.assertEqual(w.call_args[1]['since_ts'], prev / 1000.0)
+
+
 class VillageScanSeedTests(unittest.TestCase):
     """Operator direction 2026-11-20: the RVP runs an HOURLY proactive
     village scan (ops/failures + ops/cards) and routes village-level
@@ -395,6 +428,76 @@ class DigestTests(unittest.TestCase):
         self.assertIn('win-19e1a3a954', text)
         self.assertIn('NO escalation_id and NO validator', text)
         self.assertIn('2048 MB in 410 files', text)
+
+    def test_digest_quiet_window_writes_nothing(self):
+        # Owner direction 2026-11-20: a completely quiet window (no alerts,
+        # no internal signals, no integrity anomalies) skips the file and
+        # the card. Routine trend plumbing does not make a window noisy.
+        now = datetime.datetime(2026, 11, 20, 9, 0,
+                                tzinfo=datetime.timezone.utc).timestamp()
+
+        def fake_db():
+            conn = mock.MagicMock()
+            conn.execute.return_value.fetchall.return_value = []
+            return mock.MagicMock(__enter__=lambda s: conn,
+                                  __exit__=lambda s, *a: False)
+
+        with mock.patch.object(serve, '_db', fake_db), \
+                mock.patch.object(serve, 'log_action') as la, \
+                mock.patch.object(serve, '_staging_usage',
+                                  return_value=(0, 0)), \
+                mock.patch('builtins.open') as op:
+            path = serve.write_telegram_alert_digest(now=now)
+        self.assertIsNone(path, 'a quiet window returns None, not a path')
+        self.assertFalse(op.called, 'no digest file is written')
+        la.call_args  # the writer logged SOMETHING
+        self.assertEqual(la.call_args[0][1], 'telegram_digest_quiet')
+
+    def test_digest_integrity_anomaly_is_never_quiet(self):
+        # An unescalated approved/fired window is a real finding: the scan
+        # must surface it even when the alert + signal feeds are empty.
+        now = datetime.datetime(2026, 11, 20, 10, 0,
+                                tzinfo=datetime.timezone.utc).timestamp()
+        written = {}
+
+        class FakeFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def write(self, text):
+                written['text'] = text
+
+        def fake_db():
+            conn = mock.MagicMock()
+
+            def execute(sql, *params):
+                m = mock.MagicMock()
+                if 'dormancy_windows' in sql:
+                    m.fetchall.return_value = [
+                        ('win-quiet1', 'approved', now - 7200)]
+                else:
+                    m.fetchall.return_value = []
+                return m
+
+            conn.execute.side_effect = execute
+            return mock.MagicMock(__enter__=lambda s: conn,
+                                  __exit__=lambda s, *a: False)
+
+        with mock.patch.object(serve, '_db', fake_db), \
+                mock.patch.object(serve, '_safe_library_path',
+                                  return_value='/tmp/digest.md'), \
+                mock.patch.object(serve, 'log_action'), \
+                mock.patch('builtins.open', return_value=FakeFile()), \
+                mock.patch.object(serve, '_staging_usage',
+                                  return_value=(0, 0)), \
+                mock.patch.object(serve.os.path, 'dirname',
+                                  return_value='/tmp'):
+            path = serve.write_telegram_alert_digest(now=now)
+        self.assertIsNotNone(path)
+        self.assertIn('NO escalation_id and NO validator', written['text'])
 
     def test_digest_writes_a_unique_file_per_scan(self):
         # A 30-min scan must NOT overwrite the day's earlier digests (the

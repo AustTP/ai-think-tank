@@ -78,9 +78,12 @@ def _staging_usage():
 def write_telegram_alert_digest(now=None, since_ts=None):
     """Land the last 24h of outbound Telegram alerts into the Library so the
     regional VP's daily scan card can read them with read_library_file.
-    Returns the stored path, or None when nothing fired (an empty day is a
-    real result the digest still records -- write it anyway, cheap and it
-    proves the scan ran rather than silently skipping)."""
+    Returns the stored path, or None when the window was COMPLETELY quiet --
+    no Telegram alerts AND no internal tank signals (owner direction
+    2026-11-20: a 30-min cadence minted 28+ 'Total alerts: 0' digests a day
+    during quiet hours; a quiet digest is not a result, it is churn the VP
+    must open and discard. A quiet window skips the file and the mint --
+    the loop's own skip log line proves the scan ran)."""
     now = now or time.time()
     # Incremental scan window: a scheduled item stamps lastRunAtMs each
     # period, so a high-frequency scan (30min) reads only what fired SINCE
@@ -249,6 +252,16 @@ def write_telegram_alert_digest(now=None, since_ts=None):
             'failing)' % (stage_bytes / (1024 * 1024), stage_files))
     except Exception:
         integrity_lines = []
+    # Quiet-window skip (owner direction 2026-11-20): nothing to triage
+    # means no file and no card. The selfedit trend/invariant lines are
+    # routine plumbing, so they do NOT make a window noisy on their own --
+    # only an actual invariant finding does.
+    anomalies = [ln for ln in integrity_lines
+                 if 'INVARIANT BREACH' in ln or 'NO escalation_id' in ln]
+    if not rows and not internal_rows and not anomalies:
+        log_action('system', 'telegram_digest_quiet',
+                   {'cutoff': cutoff, 'windowH': window_h}, authorized=True)
+        return None
     if integrity_lines:
         lines.append('## Selfedit integrity (7d trend + invariants)')
         lines.append('')
