@@ -120,6 +120,95 @@ class OwnerLeadOverrideTests(unittest.TestCase):
         self.assertIn('at least 6 hours', res['error'])
 
 
+class EasternBusinessHoursTests(unittest.TestCase):
+    """Owner rule 2026-11-20: with the shorter 6h notice, NORMAL change
+    windows must sit entirely inside Eastern-time business hours (09:00-17:00
+    America/New_York, Mon-Fri) so the veto decision lands during the workday.
+    The emergency and tank-down lanes are exempt."""
+
+    def setUp(self):
+        self._cm = unittest.mock.patch.object(
+            selfedit, '_window_conflicts', return_value=[])
+        self._cm.start()
+
+    def tearDown(self):
+        self._cm.stop()
+
+    @staticmethod
+    def _et_utc_slot(day_offset, hour_et, minute_et=0):
+        """Build (date, start) strings for `day_offset` days from now at a
+        fixed Eastern clock time, converted to UTC for the API."""
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo('America/New_York')
+        target = (datetime.datetime.now(et)
+                  + datetime.timedelta(days=day_offset)).replace(
+            hour=hour_et, minute=minute_et, second=0, microsecond=0)
+        utc = target.astimezone(datetime.timezone.utc)
+        return utc.strftime('%Y-%m-%d'), utc.strftime('%H:%M')
+
+    @classmethod
+    def _weekday_slot(cls, hour_et, minute_et=0):
+        """A slot 2-4 days out that lands on a Mon-Fri day (at least one of
+        today+2..today+4 is always a business day), so the lead check passes
+        and only the business-hours rules decide."""
+        for extra in (2, 3, 4):
+            wd = (datetime.datetime.now(
+                datetime.timezone.utc).weekday() + extra) % 7
+            if wd < 5:
+                return cls._et_utc_slot(extra, hour_et, minute_et)
+        raise AssertionError('unreachable')
+
+    @classmethod
+    def _weekend_slot(cls, hour_et):
+        for extra in range(1, 7):
+            wd = (datetime.datetime.now(
+                datetime.timezone.utc).weekday() + extra) % 7
+            if wd >= 5:
+                return cls._et_utc_slot(extra, hour_et)
+        raise AssertionError('unreachable')
+
+    def test_early_morning_et_slot_is_refused(self):
+        date, start = self._et_utc_slot(1, 7)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        self.assertFalse(ok)
+        self.assertIn('business hours', res['error'])
+
+    def test_evening_et_slot_is_refused(self):
+        date, start = self._weekday_slot(19)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        self.assertFalse(ok)
+        self.assertIn('business hours', res['error'])
+
+    def test_window_ending_after_5pm_et_is_refused(self):
+        date, start = self._weekday_slot(16, 30)
+        ok, res = selfedit.request_window('ada', date, start, 60, 'test reason')
+        self.assertFalse(ok)
+        self.assertIn('business hours', res['error'])
+
+    def test_weekend_slot_is_refused(self):
+        date, start = self._weekend_slot(10)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        self.assertFalse(ok)
+        self.assertIn('business hours', res['error'])
+
+    def test_business_day_slot_gets_past_the_hours_gate(self):
+        date, start = self._weekday_slot(10)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        # Past the hours gate the request may fail on later contract rules
+        # (validator, roster) -- the boundary this pins is that the
+        # business-hours error is gone.
+        if not ok:
+            self.assertNotIn('business hours', res.get('error', ''))
+
+    def test_emergency_lane_ignores_business_hours(self):
+        t = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=2)
+        ok, res = selfedit.request_window(
+            'ada', t.strftime('%Y-%m-%d'), t.strftime('%H:%M'), 15,
+            'test reason', change_type='emergency')
+        if not ok:
+            self.assertNotIn('business hours', res.get('error', ''))
+
+
 class TankDownLaneTests(unittest.TestCase):
     """Owner direction 2026-11-11: a bug that prevents the think tank from
     running may file an emergency change request with tankDown=True and no

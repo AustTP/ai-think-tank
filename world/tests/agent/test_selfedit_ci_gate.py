@@ -18,7 +18,8 @@ import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402,F1
     fake_repo, _approve, _patch_player_approval, _patch_roster, _arm_edit,
-    _notify_log, _fake_test_gate, _window_slot)
+    _notify_log, _fake_test_gate, _window_slot,
+    _window_slot_time)
 
 
 def _fire_requested_window(window_id):
@@ -39,7 +40,8 @@ def _pushed_window(monkeypatch, fake_repo, implementer='worker',
     _patch_roster(monkeypatch)
     edit_id = _arm_edit(monkeypatch, world, agent=implementer)
     ok, payload = selfedit.request_window(
-        implementer, _window_slot(), '03:10', 15, 'ship the tuning change',
+        implementer, _window_slot_time()[0], _window_slot_time()[1], 15,
+        'ship the tuning change',
         validator)
     assert ok is True, payload
     window_id = payload['id']

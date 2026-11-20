@@ -37,6 +37,23 @@ def _approve(monkeypatch, decision='approve', confidence=0.9, cost=0.01):
     monkeypatch.setattr(serve, '_jev_quorum_choice_sync', fake)
     return seen
 
+def _window_slot_time(days_ahead=2, hour_et=10, minute_et=30):
+    """The UTC date/HH:MM for a fixed Eastern clock time `days_ahead` out,
+    rolled forward to the next weekday so the slot passes the owner's
+    business-hours gate (2026-11-20). Roll-forward is capped small enough
+    that the default (2 days) never approaches the 7-day cap."""
+    import datetime
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo('America/New_York')
+    target = (datetime.datetime.now(et)
+              + datetime.timedelta(days=days_ahead)).replace(
+        hour=hour_et, minute=minute_et, second=0, microsecond=0)
+    while target.weekday() >= 5:
+        target += datetime.timedelta(days=1)
+    utc = target.astimezone(datetime.timezone.utc)
+    return utc.strftime('%Y-%m-%d'), utc.strftime('%H:%M')
+
+
 def _window_slot(days_ahead=2):
     # 2 days out: safely inside the 24h..7d lead-time rule at any run time
     # (1 day ahead can be <24h away when the suite runs after the slot time).

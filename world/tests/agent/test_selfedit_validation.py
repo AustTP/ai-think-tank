@@ -11,7 +11,7 @@ import selfedit  # noqa: E402
 import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402
-    fake_repo, _approve, _window_slot, _patch_player_approval, _patch_roster, _arm_edit
+    fake_repo, _approve, _window_slot, _window_slot_time, _patch_player_approval, _patch_roster, _arm_edit
 )
 
 def test_oversight_signature_flow(fake_repo, monkeypatch):
@@ -221,7 +221,7 @@ def _book_and_apply(monkeypatch, world, post_tests=(True, 'ALL GREEN'),
     if arm_twice:
         _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)
@@ -317,7 +317,7 @@ def test_apply_pass_with_all_reserved_edits_failed_marks_window_unsuccessful(
     _patch_roster(monkeypatch)
     _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)
@@ -564,7 +564,7 @@ def test_standing_conflicts_skip_bad_declarations(fake_repo, monkeypatch):
          'startTime': '10:00', 'endTime': '11:00'}]
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: roster_state)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
 
@@ -579,9 +579,9 @@ def test_request_window_rejects_bad_start_and_coerces_duration(
     # glibc mktime accepts year 1000 and the lead-time check (ad47809)
     # rejects it; macOS mktime raises out-of-range and the generic
     # window-start error fires. Both are correct refusals.
-    assert ok is False and ('12 hours from now' in payload['error'] or
+    assert ok is False and ('6 hours from now' in payload['error'] or
                             'invalid window start' in payload['error'])
-    ok, payload = selfedit.request_window('worker', _window_slot(), '03:10',
+    ok, payload = selfedit.request_window('worker', _window_slot_time()[0], _window_slot_time()[1],
                                           'garbage', 'why', 'reviewer')
     assert ok is False and 'invalid window start' not in payload['error']
 
@@ -594,7 +594,7 @@ def test_resolve_window_escalation_unknown_and_denial(fake_repo, monkeypatch):
     edit_id = _arm_edit(monkeypatch, world)
     assert selfedit.resolve_window_escalation('esc-nosuch', True) is False
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'],
@@ -617,7 +617,7 @@ def test_hold_for_validator_ignores_not_fired_window(fake_repo, monkeypatch):
     _patch_roster(monkeypatch)
     _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)
@@ -683,7 +683,7 @@ def test_validate_window_unknown_and_not_holding(fake_repo, monkeypatch):
     assert ok is False and payload['error'] == 'unknown window id'
     _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)

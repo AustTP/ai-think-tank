@@ -10,7 +10,8 @@ import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402,F401
     fake_repo, _approve, _patch_player_approval, _patch_roster,
-    _window_slot, _fake_test_gate)
+    _window_slot, _fake_test_gate,
+    _window_slot_time,)
 
 
 def _arm_window_only(monkeypatch, world, agent='worker', path='gear.py'):
@@ -46,14 +47,14 @@ def test_high_risk_requires_detail_and_manifest(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     _arm_window_only(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'risky change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'risky change', 'reviewer',
         risk_level='high', service_mode='batch')
     assert ok is False
     assert 'fileManifest' in payload['error']
     fields = _high_risk_fields()
     fields['file_manifest'] = ['world/other.py']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'risky change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'risky change', 'reviewer',
         **fields)
     assert ok is False
     assert 'does not match the reserved edits' in payload['error']
@@ -70,7 +71,7 @@ def test_high_risk_requires_window_only_edits(fake_repo, monkeypatch):
     assert ok is True, payload
     _pass_pre_apply(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'risky change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'risky change', 'reviewer',
         **_high_risk_fields())
     assert ok is False
     assert 'window-only edits' in payload['error']
@@ -84,7 +85,7 @@ def test_high_risk_pre_apply_gate_and_stored_fields(fake_repo, monkeypatch):
     _pass_pre_apply(monkeypatch)
     fields = _high_risk_fields()
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'risky change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'risky change', 'reviewer',
         **fields)
     assert ok is True, payload
     assert payload['preApplyResult'] == 'pass'
@@ -105,7 +106,7 @@ def test_high_risk_pre_apply_failure_refuses(fake_repo, monkeypatch):
     monkeypatch.setattr(selfedit, '_run_pre_apply_tests',
                         lambda rows: (False, 'FAIL: test_engine'))
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'risky change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'risky change', 'reviewer',
         **_high_risk_fields())
     assert ok is False
     assert 'pre-apply repo gate failed' in payload['error']
@@ -122,28 +123,32 @@ def test_trading_mode_requires_safe_state_and_blackouts(fake_repo,
     fields = _high_risk_fields()
     fields.update(risk_level='critical', service_mode='always_on_trading')
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'trading change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'trading change', 'reviewer',
         **fields)
     assert ok is False
     assert 'safeStatePlan' in payload['error']
     fields.update(safe_state_plan='Cancel resting orders and flatten exposure',
                   restore_plan='Reconcile positions and resume quoting')
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'trading change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'trading change', 'reviewer',
         **fields)
     assert ok is False
     assert 'blackoutWindows' in payload['error']
+    # A blackout covering the business-hours slot (14:00-16:00 UTC covers
+    # 10:30 ET in both EDT and EST) still refuses the request.
     fields['blackout_windows'] = [
-        {'start': '03:00', 'end': '04:00', 'label': 'US market open'}]
+        {'start': '14:00', 'end': '16:00', 'label': 'US market open'}]
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'trading change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'trading change', 'reviewer',
         **fields)
     assert ok is False
     assert 'blackout window' in payload['error']
+    # A blackout outside the slot passes, and the always_on_trading clamp
+    # caps the 15-minute window at MAX_TRADING_WINDOW_MIN (5).
     fields['blackout_windows'] = [
-        {'start': '05:00', 'end': '06:00', 'label': 'outside session'}]
+        {'start': '01:00', 'end': '02:00', 'label': 'quiet hours'}]
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'trading change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'trading change', 'reviewer',
         **fields)
     assert ok is True, payload
     assert payload['durationMin'] == 5
@@ -176,7 +181,7 @@ def test_fire_time_conflict_defers_and_releases(fake_repo, monkeypatch):
     fields = _high_risk_fields()
     fields['risk_level'] = 'medium'
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'normal change', 'reviewer',
         **fields)
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)
@@ -236,7 +241,7 @@ def test_invalid_risk_level_cannot_fall_back_to_low(fake_repo, monkeypatch):
     _patch_roster(monkeypatch)
     _patch_player_approval(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'typo risk', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'typo risk', 'reviewer',
         risk_level='hgih')
     assert ok is False
     assert 'riskLevel' in payload['error']
@@ -255,7 +260,7 @@ def test_veto_before_fire_releases_reservations(fake_repo, monkeypatch):
     fields = _high_risk_fields()
     fields['risk_level'] = 'medium'
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'normal change', 'reviewer',
         **fields)
     assert ok is True, payload
     ok, result = selfedit.veto_window(payload['id'], 'player', 'not now')
@@ -289,7 +294,7 @@ def test_veto_after_fire_rolls_back(fake_repo, monkeypatch):
     fields = _high_risk_fields()
     fields['risk_level'] = 'medium'
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'normal change', 'reviewer',
         **fields)
     assert ok is True, payload
     assert selfedit.resolve_window_escalation(payload['escalationId'], True)
@@ -354,7 +359,7 @@ def test_creation_telegram_has_details_and_veto_link(fake_repo, monkeypatch):
     fields = _high_risk_fields()
     fields['risk_level'] = 'medium'
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'normal change', 'reviewer',
         notify_created=True, **fields)
     assert ok is True, payload
     assert sent['subject'] == '[AI Think Tank] Change request created'
@@ -376,7 +381,7 @@ def test_veto_link_rejects_bad_token_and_accepts_real_one(fake_repo, monkeypatch
     fields = _high_risk_fields()
     fields['risk_level'] = 'medium'
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'normal change', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'normal change', 'reviewer',
         **fields)
     assert ok is True, payload
     ok, result = selfedit.veto_window_by_link(payload['id'], 'wrong-token')

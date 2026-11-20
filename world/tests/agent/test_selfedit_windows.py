@@ -11,7 +11,7 @@ import selfedit  # noqa: E402
 import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402
-    fake_repo, _approve, _window_slot, _patch_player_approval, _patch_roster, _arm_edit
+    fake_repo, _approve, _window_slot, _window_slot_time, _patch_player_approval, _patch_roster, _arm_edit
 )
 
 def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
@@ -20,7 +20,7 @@ def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance',
         'reviewer')
     assert ok is True, payload
     assert payload['status'] == 'pending'
@@ -36,8 +36,8 @@ def test_schedule_window_happy_path_pends_escalation(fake_repo, monkeypatch):
     assert len(rows) == 1
     row = rows[0]
     assert row['agent'] == 'worker'
-    assert row['date'] == _window_slot()
-    assert row['start'] == '03:10'
+    assert row['date'] == _window_slot_time()[0]
+    assert row['start'] == _window_slot_time()[1]
     assert row['durationMin'] == 15
     assert row['status'] == 'pending'
     assert row['escalationId'] == payload['escalationId']
@@ -59,7 +59,7 @@ def test_window_row_precedes_escalation_and_is_findable_by_note(fake_repo, monke
     monkeypatch.setattr(serve, 'send_player_telegram_sync',
                         lambda *a, **k: False)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '05:10', 15, 'nightly maintenance unique-%s' % os.getpid(),
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance unique-%s' % os.getpid(),
         'reviewer')
     assert ok is True, payload
     esc_id = payload['escalationId']
@@ -85,22 +85,23 @@ def test_schedule_window_refused_by_conflicts(fake_repo, monkeypatch):
     state = serve.get_state_from_db() or {}
     state['standingTasks'] = [{
         'taskId': 'st-eng-ritual', 'name': 'Engineering ritual block',
-        'mode': 'window', 'startTime': '03:00', 'endTime': '04:05'}]
+        'mode': 'window', 'startTime': '14:00', 'endTime': '16:05'}]
     serve.save_state_to_db(state)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance')
     assert ok is False
     assert 'collides with already scheduled items' in payload['error']
     assert any(c.get('name') == 'Engineering ritual block'
                for c in payload['conflicts'])
     # another dormancy window also blocks the same slot
     start_ts = selfedit.time.mktime(
-        selfedit.time.strptime(f"{_window_slot()} 03:12", '%Y-%m-%d %H:%M'))
+        selfedit.time.strptime(f"{_window_slot_time()[0]} {_window_slot_time()[1]}",
+                               '%Y-%m-%d %H:%M'))
     selfedit._window_record('win-pending', selfedit.time.time(), 'other',
-                            _window_slot(), '03:12', start_ts,
+                            _window_slot_time()[0], _window_slot_time()[1], start_ts,
                             start_ts + 15 * 60, 15, 'their reason', 'pending')
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:20', 15, 'nightly maintenance 2')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance 2')
     assert ok is False
     assert any(c.get('kind') == 'dormancy window'
                for c in payload['conflicts'])
@@ -177,7 +178,7 @@ def test_schedule_window_supervisor_refusal(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'vague pause please',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'vague pause please',
         'reviewer')
     assert ok is False and payload['status'] == 'refused'
     assert 'supervisor review said' in payload['error']
@@ -191,7 +192,7 @@ def test_resolve_and_cancel_lifecycle(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance',
         'reviewer')
     window_id, esc_id = payload['id'], payload['escalationId']
     assert selfedit.resolve_window_escalation(esc_id, True) is True
@@ -222,21 +223,21 @@ def test_request_window_two_agent_contract(fake_repo, monkeypatch):
     _patch_roster(monkeypatch)
     edit_id = _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance')
     assert ok is False and 'a validator is required' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance',
         'worker')
     assert ok is False and 'different agent' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance',
         'ghost')
     assert ok is False and 'not a known agent' in payload['error']
     # a rostered validator with no armed edits of the implementer's
     monkeypatch.setattr(serve, 'get_state_from_db',
                         lambda: {'agents': {'idle': {}, 'reviewer': {}}})
     ok, payload = selfedit.request_window(
-        'idle', _window_slot(), '03:10', 15, 'nightly maintenance',
+        'idle', _window_slot_time()[0], _window_slot_time()[1], 15, 'nightly maintenance',
         'reviewer')
     assert ok is False and 'no armed edits' in payload['error']
     assert selfedit.windows_snapshot(limit=10) == []
@@ -253,10 +254,10 @@ def test_window_tick_fires_forces_dormancy_and_marks_missed(
     _patch_player_approval(monkeypatch)
     now = selfedit.time.time()
     # due now: start passed, end still in the future
-    selfedit._window_record('win-due', now, 'worker', _window_slot(), '03:10',
+    selfedit._window_record('win-due', now, 'worker', _window_slot_time()[0], _window_slot_time()[1],
                             now - 60, now + 600, 15, 'reason', 'approved')
     # gone: both edges already passed while the server was down
-    selfedit._window_record('win-gone', now, 'worker', _window_slot(), '03:10',
+    selfedit._window_record('win-gone', now, 'worker', _window_slot_time()[0], _window_slot_time()[1],
                             now - 6000, now - 5000, 15, 'reason', 'approved')
     dormancy = []
 

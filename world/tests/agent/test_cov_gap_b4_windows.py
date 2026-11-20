@@ -11,7 +11,8 @@ import selfedit  # noqa: E402
 import serve  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402
-    fake_repo, _window_slot, _patch_player_approval, _approve
+    fake_repo, _window_slot, _window_slot_time, _patch_player_approval,
+    _approve
 )
 
 NORMAL_STATE = {'agents': {'worker': {}, 'reviewer': {}}}
@@ -169,30 +170,30 @@ def test_cov_revert_kernel_schedules_restart(fake_repo, monkeypatch):
 def test_cov_request_window_choice_and_manifest_guards(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         change_type='nope')
     assert ok is False and 'changeType' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         service_mode='nope')
     assert ok is False and 'serviceMode' in payload['error']
 
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: NORMAL_STATE)
     _arm_row()
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         file_manifest='not-a-list')
     assert ok is False and 'fileManifest must be a list' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         acknowledgements='nope')
     assert ok is False and 'acknowledgements must be a list' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         blackout_windows=[3])
     assert ok is False and 'must be an object' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         acknowledgements=['ghost'])
     assert ok is False and 'unknown acknowledgement' in payload['error']
 
@@ -201,7 +202,7 @@ def test_cov_request_window_event_duration_cap(fake_repo, monkeypatch):
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: NORMAL_STATE)
     _patch_player_approval(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 120, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 120, 'why', 'reviewer',
         service_mode='event_driven')
     assert ok is False
 
@@ -212,15 +213,15 @@ def test_cov_request_window_admin_validator_guards(fake_repo, monkeypatch):
     _arm_row()
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: ADMIN_STATE)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'peer')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'peer')
     assert ok is False and 'must be a supervisor' in payload['error']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'boss')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'boss')
     assert ok is False and 'other than the admin' in payload['error']
     # A regional VP (villageChief, no direct reports needed) is a valid
     # validator tier -- the appointed authority layer, not a peer worker.
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'chief')
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'chief')
     assert ok is True
 
 
@@ -229,7 +230,7 @@ def test_cov_request_window_high_risk_detail_guards(fake_repo, monkeypatch):
     _arm_row(policy='window_only')
     monkeypatch.setattr(serve, 'get_state_from_db', lambda: NORMAL_STATE)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer',
         risk_level='high', service_mode='batch',
         file_manifest=['world/gear.py'])
     assert ok is False and 'high-risk change requests require' in payload['error']
@@ -237,7 +238,7 @@ def test_cov_request_window_high_risk_detail_guards(fake_repo, monkeypatch):
     fields = _high_risk_fields()
     del fields['acknowledgements']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'why', 'reviewer', **fields)
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'why', 'reviewer', **fields)
     assert ok is False and 'at least one acknowledgement' in payload['error']
 
 

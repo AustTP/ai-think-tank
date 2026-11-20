@@ -29,7 +29,8 @@ import sqlite3  # noqa: E402
 
 from _selfedit_support import (  # noqa: E402,F401
     fake_repo, _approve, _patch_player_approval, _patch_roster, _arm_edit,
-    _notify_log, _fake_test_gate, _MARK, _window_slot)
+    _notify_log, _fake_test_gate, _MARK, _window_slot,
+    _window_slot_time)
 
 
 def _fire_requested_window(window_id):
@@ -75,7 +76,7 @@ def _book_window(monkeypatch, fake_repo, implementer='worker',
     _patch_roster(monkeypatch)
     edit_id = _arm_edit(monkeypatch, world, agent=implementer)
     ok, payload = selfedit.request_window(
-        implementer, _window_slot(), '03:10', 15, 'ship the tuning change',
+        implementer, _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         validator)
     assert ok is True, payload
     window_id = payload['id']
@@ -96,7 +97,7 @@ def test_window_applies_only_reserved_edits(fake_repo, monkeypatch):
     assert ok is True, payload
     other_edit = payload['id']
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert payload['reservedEdits'] == [worker_edit]
@@ -414,7 +415,7 @@ def test_unarmed_request_refused_and_nothing_reserved(fake_repo, monkeypatch):
     _patch_player_approval(monkeypatch)
     _patch_roster(monkeypatch)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'nothing armed yet',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'nothing armed yet',
         'reviewer')
     assert ok is False and 'no armed edits' in payload['error']
     assert selfedit.windows_snapshot(limit=10) == []
@@ -714,7 +715,7 @@ def _book_admin_window(monkeypatch, fake_repo):
     monkeypatch.setattr(serve, 'get_state_from_db', _admin_state)
     _arm_edit(monkeypatch, world)
     ok, payload = selfedit.request_window(
-        'worker', _window_slot(), '03:10', 15, 'ship the tuning change',
+        'worker', _window_slot_time()[0], _window_slot_time()[1], 15, 'ship the tuning change',
         'reviewer')
     assert ok is True, payload
     assert payload['status'] == 'approved', payload

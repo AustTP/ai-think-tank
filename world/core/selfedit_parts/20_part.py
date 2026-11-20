@@ -721,7 +721,26 @@ def request_window(agent_id, date, start, duration_min, reason, validator=None,
     if start_ts > now + WINDOW_MAX_LEAD_S:
         return False, {'error': 'the window may not be more than 7 days out '
                                 '-- file the request closer to the window'}
+    # Eastern-time business hours (owner rule, 2026-11-20): a NORMAL change
+    # window must sit entirely inside 09:00-17:00 America/New_York on a
+    # weekday, so the owner's veto decision always lands during the workday
+    # even with the shorter 6h notice. The emergency and tank-down lanes
+    # keep their own short-lead contracts and are exempt from this gate.
     end_ts = start_ts + duration_min * 60
+    if not emergency:
+        import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZoneInfo
+        _et = _ZoneInfo('America/New_York')
+        start_et = _dt.datetime.fromtimestamp(start_ts, tz=_et)
+        end_et = _dt.datetime.fromtimestamp(end_ts, tz=_et)
+        if (start_et.weekday() >= 5 or start_et.hour < 9
+                or (end_et.hour, end_et.minute) > (17, 0)
+                or end_et.date() != start_et.date()):
+            return False, {'error': 'change windows must sit inside Eastern-'
+                                    'time business hours (09:00-17:00 '
+                                    'America/New_York, Mon-Fri) -- the veto '
+                                    'decision has to land during the workday; '
+                                    'pick a slot then'}
     conflicts = _window_conflicts(start_ts, end_ts)
     if conflicts:
         listed = '; '.join(
