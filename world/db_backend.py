@@ -952,6 +952,18 @@ def _PG_CONNECT_KWARGS():
         'keepalives_idle': 30,
         'keepalives_interval': 10,
         'keepalives_count': 3,
+        # 2026-11-20 wedge (95-minute tank freeze): a result-read stalled
+        # mid-stream inside get_state_from_db()'s multi-MB blob transfer.
+        # statement_timeout cannot fire (the statement finished server-side;
+        # only the result stream stalled), and keepalives pass through the
+        # relay while the path is dead for real data -- the OS retransmission
+        # self-heal this module's 2026-11-04 note relied on never fired, so
+        # one email-drainer thread held _STATE_LOCK until operator restart.
+        # libpq >=12 tcp_user_timeout bounds ANY window with unacked in-flight
+        # data: an ACK-less stretch longer than 45s kills the connection with
+        # a fast, retryable error instead of a hung socket. Requires libpq
+        # >=12 (this host ships 17; verified 2026-11-20).
+        'tcp_user_timeout': 45000,
     }
 
 
