@@ -1,6 +1,7 @@
-"""Change-request window lead time (owner revision 2026-11-11): the window
-must start at least 12 hours ahead -- the owner keeps the veto link, but a
-full day of notice proved slower than the work needs."""
+"""Change-request window lead time (owner revisions 2026-11-11 and
+2026-11-20): the window must start at least 6 hours ahead -- a full day of
+notice proved slower than the work needs, and 6h keeps the owner's veto
+decision inside Eastern-time business hours."""
 import datetime
 import os
 import sys
@@ -33,19 +34,25 @@ class WindowLeadTests(unittest.TestCase):
         date, start = self._slot(1)
         ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
         self.assertFalse(ok)
-        self.assertIn('at least 12 hours', res['error'])
+        self.assertIn('at least 6 hours', res['error'])
 
-    def test_thirteen_hours_out_passes_the_lead_check(self):
-        date, start = self._slot(13)
+    def test_five_hours_out_is_refused(self):
+        date, start = self._slot(5)
+        ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
+        self.assertFalse(ok)
+        self.assertIn('at least 6 hours', res['error'])
+
+    def test_seven_hours_out_passes_the_lead_check(self):
+        date, start = self._slot(7)
         ok, res = selfedit.request_window('ada', date, start, 15, 'test reason')
         # Past the lead gate the request may still fail on other contract
         # rules (validator naming, etc.) -- the boundary this pins is that the
         # lead error is gone.
         if not ok:
-            self.assertNotIn('at least 12 hours', res.get('error', ''))
+            self.assertNotIn('at least 6 hours', res.get('error', ''))
 
-    def test_min_lead_constant_is_twelve_hours(self):
-        self.assertEqual(selfedit.WINDOW_MIN_LEAD_S, 12 * 60 * 60)
+    def test_min_lead_constant_is_six_hours(self):
+        self.assertEqual(selfedit.WINDOW_MIN_LEAD_S, 6 * 60 * 60)
 
 
 class OwnerLeadOverrideTests(unittest.TestCase):
@@ -102,7 +109,7 @@ class OwnerLeadOverrideTests(unittest.TestCase):
             ok, res = selfedit.request_window('ada', date, start, 15,
                                               'test reason')
         self.assertFalse(ok)
-        self.assertIn('at least 12 hours', res['error'])
+        self.assertIn('at least 6 hours', res['error'])
 
     def test_missing_value_is_the_constitution_default(self):
         with self._env(None):
@@ -110,7 +117,7 @@ class OwnerLeadOverrideTests(unittest.TestCase):
             ok, res = selfedit.request_window('ada', date, start, 15,
                                               'test reason')
         self.assertFalse(ok)
-        self.assertIn('at least 12 hours', res['error'])
+        self.assertIn('at least 6 hours', res['error'])
 
 
 class TankDownLaneTests(unittest.TestCase):
@@ -139,7 +146,7 @@ class TankDownLaneTests(unittest.TestCase):
         # Past the lead gate the request may fail on other contract rules --
         # the boundary this pins is that the lead refusals are gone.
         if not ok:
-            self.assertNotIn('at least 12 hours', res.get('error', ''))
+            self.assertNotIn('at least 6 hours', res.get('error', ''))
             self.assertNotIn('at least 1 hour', res.get('error', ''))
 
     def test_tank_down_requires_the_emergency_lane(self):

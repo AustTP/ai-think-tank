@@ -56,10 +56,12 @@ def status_snapshot(limit=25):
 WINDOW_MIN_DURATION_MIN = 5
 WINDOW_MAX_DURATION_MIN = 240
 WINDOW_DEFAULT_DURATION_MIN = 15
-# Change-request lead time (owner rule, 2026-10-27; owner revision
-# 2026-11-11): a change window must be requested at least 12 hours ahead --
-# the owner gets the veto link and a real chance to review, but a full day
-# of notice proved slower than the work needs -- and no more than 7 days out
+# Change-request lead time (owner rule, 2026-10-27; owner revisions
+# 2026-11-11 and 2026-11-20): a change window must be requested at least
+# 6 hours ahead -- the owner gets the veto link and a real chance to review;
+# a full day of notice proved slower than the work needs, and 6h still
+# lands the veto decision inside the owner's Eastern-time business hours
+# when requests file in the evening -- and no more than 7 days out
 # -- requests filed further ahead go stale before the window arrives;
 # re-request closer to the work.
 #
@@ -77,13 +79,13 @@ WINDOW_DEFAULT_DURATION_MIN = 15
 # validator, the veto link before it fires, and rollback after it fires
 # before the push). Labeling routine work as tank-down is a Rule 12
 # violation of the same kind as labeling it emergency.
-WINDOW_MIN_LEAD_S = 12 * 60 * 60
+WINDOW_MIN_LEAD_S = 6 * 60 * 60
 
 
 def _owner_min_lead_s():
     """Owner-configurable notice for NORMAL change requests, in hours, via
     the CHANGE_WINDOW_MIN_LEAD_HOURS env key. The constitution default stays
-    WINDOW_MIN_LEAD_S (12h). The owner may lower it when they are personally
+    WINDOW_MIN_LEAD_S (6h). The owner may lower it when they are personally
     authorizing a request (they watch it fire) -- the veto link, supervisor
     review, validator, and rollback all still apply; 0 explicitly waives
     notice. An unreadable value fails SAFE to the default rule, not shorter."""
