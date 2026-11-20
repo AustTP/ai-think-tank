@@ -120,6 +120,52 @@ class RejectPatternAggregation(unittest.TestCase):
         self.assertIsNotNone(state['_patternFixState'][repr(('nora', 'task', 'rejected'))]['cooldownUntil'])
 
 
+class RepeatLeakFixes(unittest.TestCase):
+    """Operator direction 2026-11-20: the same pattern card re-minted dozens
+    of times because the minted title embedded the hit count and the cooldown
+    armed only when the harvest found the terminal card by exact title."""
+
+    def _state(self, rejects):
+        return {'sim': {'owner': 'server'}, 'agents': {}, 'tasks': {},
+                'workQueue': [], 'agentRoster': [], 'lastStaleWorkSweep': 0,
+                'rejectLedger': list(rejects)}
+
+    def test_minted_title_is_count_free(self):
+        state = self._state([_reject(), _reject(age_ms=1000), _reject(age_ms=2000)])
+        with mock.patch.object(sim, 'queue_work') as qw, \
+                mock.patch('serve.log_action'):
+            sim._reject_pattern_step(state, NOW)
+        title = qw.call_args[0][1][0]['title']
+        self.assertNotIn('x3', title)
+        self.assertNotRegex(title, r'x\d+')
+
+    def test_cooldown_arms_at_mint_even_without_terminal_card(self):
+        state = self._state([_reject(), _reject(age_ms=1000), _reject(age_ms=2000)])
+        with mock.patch.object(sim, 'queue_work') as qw, \
+                mock.patch('serve.log_action'):
+            sim._reject_pattern_step(state, NOW)
+            # No terminal card anywhere in tasks; the next sweep must still
+            # not re-mint because the cooldown armed at mint time.
+            state['lastRejectPatternSweep'] = NOW - sim._REJECT_PATTERN_SWEEP_MS - 1
+            state['rejectLedger'].append(_reject(age_ms=-1))  # fresh hit
+            sim._reject_pattern_step(state, NOW + sim._REJECT_PATTERN_SWEEP_MS + 1)
+        self.assertEqual(qw.call_count, 1)
+
+    def test_minted_title_is_stable_for_the_same_pattern(self):
+        state = self._state([_reject(), _reject(age_ms=1000), _reject(age_ms=2000)])
+        with mock.patch.object(sim, 'queue_work') as qw, \
+                mock.patch('serve.log_action'):
+            sim._reject_pattern_step(state, NOW)
+            title1 = qw.call_args[0][1][0]['title']
+        state2 = self._state([_reject(), _reject(age_ms=1000), _reject(age_ms=2000),
+                              _reject(age_ms=3000), _reject(age_ms=4000)])
+        with mock.patch.object(sim, 'queue_work') as qw2, \
+                mock.patch('serve.log_action'):
+            sim._reject_pattern_step(state2, NOW)
+        # 3 hits vs 5 hits: same pattern, same title -> twin dedup can catch it.
+        self.assertEqual(title1, qw2.call_args[0][1][0]['title'])
+
+
 class TeamLessonInjection(unittest.TestCase):
     def test_lesson_note_renders_for_matching_family(self):
         state = {'teamLessons': {repr(('nora', 'task')):

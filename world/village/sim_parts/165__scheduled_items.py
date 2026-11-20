@@ -67,6 +67,46 @@ _SCHEDULED_SEED_ITEM = {
     'lastRunAtMs': 0,
 }
 
+# Operator direction (2026-11-20): the RVP is the village's LangSmith -- an
+# HOURLY proactive hunt, not just the daily alert triage. Constitution rule 9
+# names the regional VP the owner of the village surface (GET /api/ops/failures
+# for machinery/systemic failures). This seed makes that scan a standing item:
+# every hour the RVP reads the failure surface and routes each actionable
+# pattern to the OWNING DIRECTOR as directed work (constitution: an issue the
+# RVP noticed and did not route is the RVP's miss). Digest findings and scan
+# findings must not duplicate: the scan instructions say to skip anything an
+# open issue already covers.
+_SCHEDULED_VILLAGE_SCAN_ITEM = {
+    'id': 'sch-rvp-village-scan',
+    'title': ('[AUDIT] Hourly village scan: read the failure surface and '
+              'route real problems to the owning director'),
+    'ownerRole': 'regional-vp',
+    'cadence': 'hourly',
+    'deliverable': 'report',
+    'taskType': 'report',
+    'instructions': (
+        'Proactive village scan (constitution rule 9): call '
+        'api_call GET /api/ops/failures?hours=24 (your regional VP key is '
+        'the scan authority) and read every section it returns: '
+        'executeBlocks (blocked-command patterns), classifierUnavailable, '
+        'failedActions, healthAlerts. Also GET /api/ops/cards?hours=24 '
+        '(scan authority lets you read every span) for stalled, failed, '
+        'refused and abandoned cards.\n\n'
+        'For each GENUINE problem -- a recurring blocked-command pattern, a '
+        'stall pattern, a machinery failure, a director whose span keeps '
+        'failing the same way -- route it: file ONE issue per problem for '
+        'the OWNING DIRECTOR (api_call POST /api/intent/issues, teamId '
+        'matching the failing team) with the concrete evidence (action '
+        'names, task ids, counts) and what you want done. Do NOT route '
+        'card-level coaching (that is the director\'s own daily scan); '
+        'route village-level patterns. Skip anything already covered by an '
+        'open issue from a previous scan or by a live [PATTERN] card. If '
+        'the surface is clean, finish the scan with a one-line clean '
+        'report -- a clean hour is a real result, not a failure.'),
+    'enabled': True,
+    'lastRunAtMs': 0,
+}
+
 
 def _resolve_scheduled_owners(state, item):
     """Resolve an item's ownerRole to live agent ids. Returns a list; an
@@ -117,6 +157,16 @@ def _scheduled_items_pass(state, now_ms=None):
     items = state.get('scheduledItems') or []
     if not isinstance(items, list):
         return 0
+    # Seed the hourly village scan once (operator direction 2026-11-20). The
+    # v1 digest seed only ever fires on a first boot where the key was absent,
+    # so a running tank would never see new seeds -- ensure-by-id instead,
+    # guarded by a marker so an operator who deletes the scan keeps it
+    # deleted (a present marker never re-seeds).
+    if not state.get('_villageScanSeeded'):
+        if not any(isinstance(i, dict) and i.get('id') == _SCHEDULED_VILLAGE_SCAN_ITEM['id']
+                   for i in items):
+            items.append(dict(_SCHEDULED_VILLAGE_SCAN_ITEM))
+        state['_villageScanSeeded'] = True
     minted = 0
     for item in items:
         if not isinstance(item, dict) or item.get('enabled') is False:

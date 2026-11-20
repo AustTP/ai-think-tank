@@ -820,7 +820,17 @@ def _reject_pattern_step(state, now_ms):
     teamLesson injected into future same-family instructions by
     _team_lesson_note_for) or close it as known-and-accepted. Either
     terminal outcome arms a cooldown so an accepted pattern stops churning.
-    Bounded, cadence-gated, pure state mutation."""
+    Bounded, cadence-gated, pure state mutation.
+
+    Repeat-leak fixes (operator, 2026-11-20): the live action_log showed the
+    same pattern re-minting dozens of times (one title done 12x) because
+    (a) the hit count inside the minted title ('x3' -> 'x5') made every
+    re-mint a new string that twin-dedup and suppression never matched, and
+    (b) the cooldown armed only when the HARVEST found the terminal card by
+    exact title -- which the review flow's wrapper titles ('Review: X')
+    defeated. The title is now count-free (dedup-safe), and the cooldown
+    arms at MINT time so a minted-but-unharvested pattern cannot re-mint
+    inside its window; the terminal harvest still extends it."""
     if now_ms - (state.get('lastRejectPatternSweep') or 0) < _REJECT_PATTERN_SWEEP_MS:
         return
     state['lastRejectPatternSweep'] = now_ms
@@ -830,9 +840,11 @@ def _reject_pattern_step(state, now_ms):
     state['rejectLedger'] = ledger
     pstate = state.setdefault('_patternFixState', {})
     # Harvest finished pattern cards: done with a note -> team lesson;
-    # either terminal outcome -> cooldown for the key.
+    # either terminal outcome -> cooldown for the key. Entries that already
+    # harvested (or were never minted) are skipped; a fresh entry from the
+    # mint gate below carries its own cooldown, legacy entries get one here.
     for key, st in list(pstate.items()):
-        if not isinstance(st, dict) or st.get('cooldownUntil'):
+        if not isinstance(st, dict) or not st.get('title') or st.get('harvestedAt'):
             continue
         t = next((x for x in (state.get('tasks') or {}).values()
                   if isinstance(x, dict) and x.get('title') == st.get('title')
@@ -846,7 +858,8 @@ def _reject_pattern_step(state, now_ms):
                 lessons = state.setdefault('teamLessons', {})
                 lessons[lkey] = {'lesson': lesson[:400], 'atMs': int(now_ms),
                                  'fromPattern': key}
-        st['cooldownUntil'] = now_ms + _PATTERN_FIX_COOLDOWN_MS
+        st.setdefault('cooldownUntil', now_ms + _PATTERN_FIX_COOLDOWN_MS)
+        st['harvestedAt'] = int(now_ms)
         st['taskId'] = None
     groups = {}
     for e in ledger:
@@ -872,8 +885,11 @@ def _reject_pattern_step(state, now_ms):
         evidence = '\n'.join(
             f"- task {h.get('taskId')}: {h.get('note') or 'no note'}"
             for h in g['hits'][-5:])
+        # Count-free title: the same pattern always mints the SAME title, so
+        # queue_work's twin check and the card-pattern suppression both
+        # recognize a re-mint instead of seeing a fresh string per hit count.
         card = {
-            'title': (f"[PATTERN] {g['kind']} rejections x{len(g['hits'])}: "
+            'title': (f"[PATTERN] {g['kind']} rejections: "
                       f"{g['team'] or 'unassigned'}/{g['workType']} -- write the rule"),
             'room': room,
             'taskType': 'task',
@@ -900,7 +916,12 @@ def _reject_pattern_step(state, now_ms):
             queue_work(state, [card])
             pstate[gk] = {'team': g['team'], 'workType': g['workType'],
                           'kind': g['kind'], 'title': card['title'],
-                          'mintedAt': int(now_ms)}
+                          'mintedAt': int(now_ms),
+                          # Cooldown armed at MINT, not at harvest: a minted
+                          # but still-running pattern card cannot re-mint
+                          # inside the window even when the terminal-title
+                          # harvest above misses (wrapper titles).
+                          'cooldownUntil': int(now_ms) + _PATTERN_FIX_COOLDOWN_MS}
             log_action(None, 'reject_pattern_minted',
                        {'team': g['team'], 'workType': g['workType'],
                         'kind': g['kind'], 'hits': len(g['hits']),

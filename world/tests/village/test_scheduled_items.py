@@ -100,6 +100,7 @@ class OnceCadenceTests(unittest.TestCase):
         st = _state()
         st['scheduledItems'] = [self._item(1_700_000_000_000,
                                            owner_role='chief-of-staff')]
+        st['_villageScanSeeded'] = True
         with mock.patch.object(serve, 'log_action'), \
              mock.patch.object(sim, 'queue_work', return_value=1) as qw:
             sim._scheduled_items_pass(st, 1_700_000_000_001)
@@ -116,6 +117,7 @@ class EnginePassTests(unittest.TestCase):
 
     def test_seed_created_once_on_first_pass(self):
         st = _state()
+        st['_villageScanSeeded'] = True
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw, \
                 mock.patch.object(sim, 'serve', create=True):
             sim._scheduled_items_pass(st, now_ms=10_000_000_000)
@@ -137,6 +139,7 @@ class EnginePassTests(unittest.TestCase):
 
     def test_card_is_directed_to_the_owner_with_digest_source(self):
         st = _state()
+        st['_villageScanSeeded'] = True
         with mock.patch.object(sim, 'queue_work', return_value=1) as qw, \
                 mock.patch.object(serve, 'write_telegram_alert_digest',
                                   return_value='analysis/digest.md'):
@@ -162,6 +165,7 @@ class EnginePassTests(unittest.TestCase):
 
     def test_open_previous_instance_dedups_instead_of_duplicating(self):
         st = _state()
+        st['_villageScanSeeded'] = True
         with mock.patch.object(serve, 'write_telegram_alert_digest',
                                return_value=None), \
                 mock.patch.object(sim, 'queue_work',
@@ -171,6 +175,50 @@ class EnginePassTests(unittest.TestCase):
             sim._scheduled_items_pass(st, now_ms=10_000_000_000)
         self.assertEqual(len(st['workQueue']), 1,
                          'an open same-title card suppresses the mint')
+
+
+class VillageScanSeedTests(unittest.TestCase):
+    """Operator direction 2026-11-20: the RVP runs an HOURLY proactive
+    village scan (ops/failures + ops/cards) and routes village-level
+    patterns to the owning director."""
+
+    def test_village_scan_seeds_onto_running_tank(self):
+        # A tank whose scheduledItems already exists (only the v1 digest
+        # seed) must still gain the hourly scan -- the old absence-only
+        # seeding would never fire on a live state.
+        st = _state()
+        st['scheduledItems'] = [dict(sim._SCHEDULED_SEED_ITEM)]
+        with mock.patch.object(sim, 'queue_work', return_value=1), \
+                mock.patch.object(sim, 'serve', create=True):
+            sim._scheduled_items_pass(st, now_ms=10_000_000_000)
+        ids = [i['id'] for i in st['scheduledItems']]
+        self.assertIn('sch-rvp-village-scan', ids)
+
+    def test_village_scan_is_hourly_regional_vp(self):
+        item = sim._SCHEDULED_VILLAGE_SCAN_ITEM
+        self.assertEqual(item['cadence'], 'hourly')
+        self.assertEqual(item['ownerRole'], 'regional-vp')
+        self.assertEqual(sim._resolve_scheduled_owners(
+            _state(), item), ['nora'])
+
+    def test_scan_mentions_surfaces_and_routing(self):
+        item = sim._SCHEDULED_VILLAGE_SCAN_ITEM
+        self.assertIn('/api/ops/failures', item['instructions'])
+        self.assertIn('/api/ops/cards', item['instructions'])
+        self.assertIn('issue', item['instructions'])
+
+    def test_deleted_scan_stays_deleted(self):
+        st = _state()
+        st['scheduledItems'] = [dict(sim._SCHEDULED_SEED_ITEM)]
+        with mock.patch.object(sim, 'queue_work', return_value=1), \
+                mock.patch.object(sim, 'serve', create=True):
+            sim._scheduled_items_pass(st, now_ms=10_000_000_000)
+            # Operator deletes the scan in the UI
+            st['scheduledItems'] = [i for i in st['scheduledItems']
+                                    if i['id'] != 'sch-rvp-village-scan']
+            sim._scheduled_items_pass(st, now_ms=10_000_000_000 + 60_000)
+        ids = [i['id'] for i in st['scheduledItems']]
+        self.assertNotIn('sch-rvp-village-scan', ids)
 
 
 class DigestTests(unittest.TestCase):
