@@ -168,7 +168,7 @@ class LowSeverityBatchingTest(unittest.TestCase):
                 serve._maybe_notify_failure(
                     f'agent{i}', 'tool_use_refused', {'taskId': f'task-{i}'})
             self.assertEqual(len(sent), 1)
-            clock['t'] += 901
+            clock['t'] += 3601  # medium's 2026-11-20 window: 1 hour per label
             serve._maybe_notify_failure(
                 'agent9', 'tool_use_refused', {'taskId': 'task-9'})
             self.assertEqual(len(sent), 2)
