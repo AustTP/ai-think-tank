@@ -189,3 +189,4 @@ think-tank-db-backups/*.log
 # reseed while the marker exists). The server recreates both on first use.
 x_scrape/seeded
 x_scrape/accounts.db
+telegram-media/
