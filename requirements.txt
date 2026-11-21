@@ -19,6 +19,11 @@ pydantic==2.13.4
 # this host.
 cryptography==50.0.0
 playwright==1.60.0
+# TLS-fingerprint impersonation for the /api/curl + api-call lanes
+# (_curl_request_sync): speaks a real browser TLS stack so evaluated hosts
+# see browser-grade ClientHellos. When absent the lane falls back to the
+# urllib path unchanged.
+curl_cffi==0.17.0
 # Document ingestion (/api/library/ingest) -- optional, degrade with a clear
 # per-file error when absent (serve.py guards each import).
 openpyxl==3.0.10
