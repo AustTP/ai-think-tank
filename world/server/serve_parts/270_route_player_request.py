@@ -603,12 +603,46 @@ async def intent_promote_subdirector(request: Request):
                       f'team for additional capacity instead',
              'subdirectors': existing_subs},
             status_code=400)
+    # Owner direction 2026-11-21: a director of no more than two teams may
+    # promote a local director over each team (the multi-village case --
+    # one team per village, so the top director need not keep jumping
+    # between villages to reach their own crews). The DIRECTOR themself
+    # gets this grant only while their span stays at or below two
+    # subdirector-level teams; a wider layer stays the player's call.
+    if actor and actor != 'player' and actor == director_id:
+        other_subs = [s for s in existing_subs if s != agent_id]
+        if len(other_subs) + 1 > 2:
+            return JSONResponse(
+                {'error': f'director {director_id} would lead '
+                          f'{len(other_subs) + 1} subdirector teams; the '
+                          f'self-service local-director grant covers at '
+                          f'most two teams -- the player promotes beyond '
+                          f'that',
+                 'subdirectors': existing_subs},
+                status_code=403)
     moved = 0
+    import village.sim_helpers as _vsh  # noqa: E402 -- lazy, sim <-> serve cycle
 
     if not governance.direct_reports(state, agent_id):
         workers = [rid for rid in governance.direct_reports(state, director_id)
                    if rid != agent_id
                    and not governance.direct_reports(state, rid)]
+        # Village-coherent handover (owner direction 2026-11-21): directors
+        # may SPAN villages, but a director should not hold direct reports
+        # in two villages. When the span does cross villages, the handover
+        # takes ONE whole village cluster -- the largest group outside the
+        # director's own home village -- so the new subdirector is
+        # village-pure and the director's remaining reports are too.
+        clusters = {}
+        for wid in workers:
+            clusters.setdefault(_vsh.village_of_agent(state, wid),
+                                []).append(wid)
+        if len(clusters) > 1:
+            home = _vsh.village_of_agent(state, director_id)
+            outside = [v for v in clusters if v != home]
+            pick = max(outside or list(clusters),
+                       key=lambda v: len(clusters[v]))
+            workers = clusters[pick]
         for wid in workers[:hand_over]:
             index[wid]['director'] = agent_id
             moved += 1
@@ -616,6 +650,27 @@ async def intent_promote_subdirector(request: Request):
     # Re-enforce every active layer: a promotion can cross the threshold on
     # THIS director, and any organic crossing elsewhere gets healed here too.
     rebalanced += governance.enforce_subdirector_layers(state)
+    # Village placement: the new subdirector lives where their reports
+    # live, so the village keeps a local director and the top director is
+    # not commuting between villages to supervise their own crews.
+    placed = None
+    report_villages = {}
+    for rid in governance.direct_reports(state, agent_id):
+        rv = _vsh.village_of_agent(state, rid)
+        report_villages[rv] = report_villages.get(rv, 0) + 1
+    if report_villages:
+        target = max(report_villages, key=lambda v: report_villages[v])
+        if target != _vsh.village_of_agent(state, agent_id) \
+                and _vsh.set_agent_village(state, agent_id, target):
+            placed = target
+            for row in (state.get('agentRoster') or []):
+                if isinstance(row, dict) and row.get('id') == agent_id \
+                        and 'villageId' in row:
+                    row['villageId'] = target
+            log_action(actor or 'player', 'subdirector_village_placement',
+                       {'agentId': agent_id, 'village': placed,
+                        'reportVillages': report_villages},
+                       authorized=True)
     save_state_to_db(state)
     layer_active = governance.has_subdirector_layer(state, director_id)
     log_action('player', 'subdirector_promoted',
@@ -626,7 +681,7 @@ async def intent_promote_subdirector(request: Request):
     return JSONResponse({
         'ok': True, 'agentId': agent_id, 'directorId': director_id,
         'handOver': moved, 'rebalanced': rebalanced,
-        'layerActive': layer_active,
+        'placedVillage': placed, 'layerActive': layer_active,
         'subdirectors': governance.subdirectors_of(state, director_id),
         'directReports': governance.direct_reports(state, director_id),
     })

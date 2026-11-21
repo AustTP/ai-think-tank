@@ -140,3 +140,118 @@ class PromoteSubdirectorEndpoint(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class VillageCoherentSpanTests(unittest.TestCase):
+    """Owner direction 2026-11-21: directors may span villages but must not
+    hold direct reports in two villages. The handover takes one village
+    cluster, the new subdirector is placed in that village, and a director
+    of no more than two teams may self-serve the local-director promotion."""
+
+    def _client_authed_as(self, state, actor):
+        from starlette.testclient import TestClient
+        c = TestClient(serve.app)
+        # The cookie satisfies the deny-by-default auth middleware around
+        # /api/intent; the MOCKED _operator_gate below is what decides the
+        # acting identity (player or an agent).
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+        p1 = unittest.mock.patch.object(serve, 'get_state_from_db',
+                                        return_value=state)
+        p2 = unittest.mock.patch.object(serve, '_operator_gate',
+                                        return_value=(True, actor))
+        for p in (p1, p2):
+            p.start()
+            self.addCleanup(p.stop)
+        return c
+
+    def _mv_state(self):
+        roster = [{'id': 'theo', 'isAdmin': True, 'villageId': 'main'},
+                  {'id': 'dev', 'isDirector': True, 'villageId': 'main'}]
+        for i in range(1, 7):
+            roster.append({'id': f'w{i}', 'director': 'dev',
+                           'villageId': 'north' if i >= 4 else 'main'})
+        villages = [{'id': 'main', 'name': 'Main'},
+                    {'id': 'north', 'name': 'North'}]
+        agents = {r['id']: {'id': r['id'], 'busy': False,
+                            'villageId': r.get('villageId', 'main')}
+                  for r in roster}
+        return {
+            'agentRoster': roster, 'agents': agents,
+            'villages': villages,
+            'teams': [{'id': 'dev', 'directorId': 'dev'}],
+            'tasks': {}, 'workQueue': [], 'playerInbox': [],
+        }
+
+    def _plain_state(self):
+        roster = [{'id': 'theo', 'isAdmin': True}, {'id': 'dev', 'isDirector': True}]
+        for i in range(1, 7):
+            roster.append({'id': f'w{i}', 'director': 'dev',
+                           'villageId': 'main'})
+        return {
+            'agentRoster': roster,
+            'agents': {r['id']: {'id': r['id'], 'busy': False,
+                                 'villageId': 'main'} for r in roster},
+            'villages': [{'id': 'main', 'name': 'Main'}],
+            'teams': [{'id': 'dev', 'directorId': 'dev'}],
+            'tasks': {}, 'workQueue': [], 'playerInbox': [],
+        }
+
+    def test_multi_village_handover_is_village_coherent(self):
+        s = self._mv_state()
+        # Promotee w1 lives in main; the north cluster (w4,w5,w6) moves
+        # whole under w1, who is then placed in north with his crew.
+        r = self._client_authed_as(s, 'player').post(
+            '/api/intent/promote-subdirector', json={'agentId': 'w1',
+                                                     'handOver': 3})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body['handOver'], 3)
+        self.assertEqual(body['placedVillage'], 'north')
+        g = serve.governance
+        # The north cluster moved whole: w1 holds exactly the north workers.
+        self.assertEqual(sorted(g.direct_reports(s, 'w1')),
+                         ['w4', 'w5', 'w6'])
+        # dev's remaining direct reports are main-side only.
+        self.assertEqual(sorted(g.direct_reports(s, 'dev')),
+                         ['w1', 'w2', 'w3'])
+        # The placed row is stamped in the roster too.
+        row = next(d for d in s['agentRoster'] if d.get('id') == 'w1')
+        self.assertEqual(row.get('villageId'), 'north')
+
+    def test_single_village_handover_unchanged(self):
+        s = self._mv_state()
+        # Pull the north workers home first: dev's span is one village.
+        for d in s['agents'].values():
+            d['villageId'] = 'main'
+        r = self._client_authed_as(s, 'player').post(
+            '/api/intent/promote-subdirector', json={'agentId': 'w1',
+                                                     'handOver': 2})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNone(r.json()['placedVillage'])
+        g = serve.governance
+        self.assertEqual(sorted(g.direct_reports(s, 'w1')), ['w2', 'w3'])
+
+    def test_director_self_service_capped_at_two_teams(self):
+        s = self._plain_state()
+        c = self._client_authed_as(s, 'dev')
+        # First self-service promotion: dev hands two workers to w1.
+        r = c.post('/api/intent/promote-subdirector',
+                   json={'agentId': 'w1', 'handOver': 2})
+        self.assertEqual(r.status_code, 200, r.text)
+        g = serve.governance
+        self.assertEqual(sorted(g.direct_reports(s, 'w1')), ['w2', 'w3'])
+        # Second self-service promotion: a director may stand over up to
+        # TWO subdirector teams (one per village in the owner's model),
+        # so this is still allowed.
+        r2 = c.post('/api/intent/promote-subdirector',
+                    json={'agentId': 'w4', 'handOver': 1})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(g.direct_reports(s, 'w4'), ['w5'])
+        # A third subdirector team is player territory.
+        r3 = c.post('/api/intent/promote-subdirector',
+                    json={'agentId': 'w6', 'handOver': 1})
+        self.assertEqual(r3.status_code, 403, r3.text)
+        self.assertIn('at most two teams', r3.json()['error'])
+        # Nothing moved on the refusal.
+        self.assertIn('w6', g.direct_reports(s, 'dev'))
+        self.assertEqual(g.direct_reports(s, 'w6'), [])
