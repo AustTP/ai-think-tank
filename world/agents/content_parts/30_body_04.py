@@ -243,7 +243,12 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
     else:
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
 
-    tier_slug = _serve._coding_tier_slug() or _serve._mid_tier_slug() or _serve._low_tier_slug()
+    # Reviews must not echo the coder: a second opinion is worth having only
+    # when it can disagree, and the same model grading its own family's output
+    # correlates with itself. Prefer the mid tier (a DIFFERENT default-reasoning
+    # model), then the coding tier, then low. Falls back to coding when no mid
+    # tier is configured, so nothing breaks in a single-band install.
+    tier_slug = _serve._mid_tier_slug() or _serve._coding_tier_slug() or _serve._low_tier_slug()
     if not tier_slug:
         _sim_module._store_content_result(task.get('id'),
                                           {'note': f'Tried to {("QA-test" if is_qa else "review")} "{backlog}", but no model tier is configured yet.',
