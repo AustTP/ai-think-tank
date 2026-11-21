@@ -4,6 +4,32 @@
 
 ### Features
 
+- Review-judge diversity (2026-11-21): a review that echoes the author's
+  model family correlates with itself, so the review/QA lane now prefers
+  the mid tier (falling back coding -> low), and gated deliverables face
+  four distinct judges -- the peer-gate mint stamps `reviewSlot`
+  (critic rides the mid tier's deepseek family, the standard reviewer
+  rides the coding tier's glm family), plus the JEV cross-check and the
+  mechanical quality pipeline.
+- Free-pool picker (2026-11-21 ops pass): free endpoints are ranked by
+  utilization, not declaration order. The picker takes the least-utilized
+  READY endpoint (max of rpm/tpm/rpd ratios), paces daily-quota keys with
+  an elapsed-day penalty, and adds bounded jitter (48-72s) to generic
+  cooldowns while keeping Retry-After and daily-limit windows exact.
+- Cross-village mail queue (2026-11-21, the sharding seam): mail between
+  villages rides a durable `state['villageMail']` queue (`vmail-N` ids,
+  queued -> claimed -> done, 5-minute stale-claim recovery, 24h TTL,
+  done-first trim at 2000) delivered by a relay pass on the global tick;
+  the sender never touches another village's agents. Operator API:
+  `POST/GET /api/villages/mail` (operator-gated).
+- Agent-improvable rule tables (2026-11-21): the hot hard-coded rule lists
+  (readonly shell binaries, read-only git subs, forbidden flags, spike
+  problem signals, digest internal-signal actions) move into
+  `world/agent_rules.json`, an additive-only overlay over the code's
+  built-in base with per-namespace caps and token patterns. Stat-guarded
+  reload, no restart; a corrupt file keeps the last-good overlay and logs
+  `agent_rules_file_rejected`; the built-in rails (host-path containment)
+  always outrank the file.
 - Harness optimizer (`core/harness_optimizer.py`, `POST /api/harness/optimize` + `/measure`): measure-first revision of the tank's own memory doctrine, from the Meta FAIR Self-Improving Memory study. The Engine's failure clusters diagnose; the top recurring symptom becomes an epistemic hypothesis citing the sweep; applying writes an indexed symptom-to-fix registry page into the wiki (versioned, 30-day review window, never an append-only monologue); adoption is recorded as a decision with the baseline cluster size; a later sweep completes the measure validation with the delta and recommends keep-or-supersede through the normal review gate. Code never auto-supersedes and nothing can set validated -- the selection loop is the capability, not the generation. No agent-facing tool surface by design.
 - Steal-list surfaces from the PostHog/Sentry/LangSmith comparison: edge secret-scrubbing before any ledger write (`core/redact.py`; evidence claims, epistemic propositions, validations, and decisions all pass through it, so a leaked key never reaches the blob, the audit trail, or backups); dimension queries over the epistemic ledger through a synced SQL index with a blob-scan fallback and a staleness consistency gate (`core.epistemics.query_items`, `POST /api/epistemics/query`); agent-run replay timelines from the action log with typed frames, stats, and error-notable markers (`core/agent_replay.py`, `GET /api/replay/agent/<id>`, self-scoped replay in the epistemics ask tool); Seer failure investigations on real work failures (`core/seer.py`, hooked into `sim.record_agent_failure`, rate-limited and question-registry deduped, remediation card only past two failures); the issue Engine clustering failure-class rows by symptom, root-causing from preceding notable actions, and filing one deduped spike per cluster (`core/issue_engine.py`, `POST /api/issues/engine-sweep`, dry-run by default); and a structural evaluator that can promote strong items to evidenced -- never validated, which stays behind the review gate (`core.epistemics.evaluate_item`).
 - Epistemic ledger (`core/epistemics.py` + the `epistemics` ask tool + `GET/POST /api/epistemics`): the tank now distinguishes what it has ASSERTED from what it has ESTABLISHED. Propositions move unknown -> hypothesized -> evidenced -> validated -> superseded, with disputed/contradicted/blocked/unresolved states and computed staleness (a 30-day review window; stale records stay readable but lose trusted-current status). Evidence attaches through the existing evidence ledger and independence is computed per resolved source identity, so two agents repeating the same source count as one corroboration, never two. Validations make unknowns actionable (what to learn, what evidence resolves it, cost, blockers) and pass through the Bank before running; a completed result does not validate its item until a DIFFERENT agent approves the review. Contradictions stay open and visible until a written resolution names one of the recorded sides (or neither). Decisions are replayable artifacts with citations, resulting actions, and reconsideration triggers. The agent context brief and the synthetic prompt-injection benchmark (`core/epistemic_benchmark.py`, graded on the 13-category answer key, not prose) close the loop.

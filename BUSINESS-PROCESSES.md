@@ -22,7 +22,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
 - 9. Security, risk, and human oversight (BP-47 to BP-56)
-- 10. Communication and lifecycle (BP-57 to BP-84)
+- 10. Communication and lifecycle (BP-57 to BP-86)
 - 11. Player and operator processes
 - 12. Control framework
 - 13. State and record model
@@ -83,6 +83,30 @@ states only what changed in the operating model.
   below the operator's confidence floor is NOT minted as a backlog card;
   it logs `finding_triage_unsure` and surfaces through the digest's
   internal-signals section instead. See BP-82.
+- Review judges run on a different model family than the coder: the
+  review/QA lane prefers the mid tier and falls back coding -> low, so a
+  glm author is not graded by glm (self-agreement bias). See BP-43.
+- Peer-gate reviewer diversity: gated deliverables now face four distinct
+  judges -- the mint stamps `reviewSlot` (critic rides the mid tier's
+  deepseek family, the standard reviewer rides the coding tier's glm
+  family), plus the JEV cross-check and the mechanical quality pipeline.
+- Captcha autonomy knob: the owner can set a default host policy
+  (`CAPTCHA_DEFAULT_HOST_MODE=attempt`) so hosts without an explicit
+  policy row inherit it instead of staying default-off. See BP-32.
+- Free-pool picker (ops research pass): the free pool picks the
+  LEAST-UTILIZED ready endpoint first (max of rpm/tpm/rpd utilization),
+  paces daily-quota keys with an elapsed-day penalty, and adds bounded
+  jitter to cooldown windows while keeping Retry-After and daily-limit
+  windows exact. See BP-43.
+- Cross-village mail queue (the sharding seam): mail between villages
+  rides a durable `state['villageMail']` queue with claim, stale-claim
+  recovery, and TTL expiry, delivered by a relay pass on the global tick.
+  A village never touches another village's agents directly -- the relay
+  is the boundary a process-per-village split needs. See BP-85.
+- Agent-improvable rule tables: the hot hard-coded rule lists move into
+  `world/agent_rules.json`, an additive-only overlay over the code's
+  built-in base, stat-guard reloaded without a restart. Corrupt edits
+  fail closed to the built-in base. See BP-86.
 - Change-request runway tightened on 2026-11-20: the minimum lead is now 6h
   (was 12h earlier in the month, 24h before 2026-11-01), and the window must
   sit OUTSIDE Eastern-time business hours (Mon-Fri 09:00-17:00
@@ -670,6 +694,8 @@ Owner request
 | BP-82 | Scheduled items and the digest quiet-skip | Cadence due on the tick | Per item cadence | Regional VP role, sim | Digest file, scan card, `lastRunAtMs` stamp |
 | BP-83 | Spike finding-triage escalation | Spike executor finishes a finding | Per finding | Spike executor, JEV | Filed issue or `finding_triage_unsure` log |
 | BP-84 | Session vault and operator login requests | Agent hits an auth wall | On demand | Operator | Vaulted session, write-back grant |
+| BP-85 | Cross-village mail queue | Agent or API sends mail to another village | Per mail | Sender village, tick relay, recipient village | `state['villageMail']` entry, mailbox delivery, `village_mail_delivered` log |
+| BP-86 | Agent-improvable rule tables | Agent proposes an entry through its director | Per entry, review-gated | Director, operator review, rule loader | `agent_rules.json` overlay entry, `agent_rules_file_rejected` on bad edits |
 
 ## 4. Core delivery processes
 
@@ -1600,7 +1626,7 @@ only evidence when the command that produced it is attached.
 
 ### BP-32 Page probes, screenshots, and browser act
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-21
 
 **Trigger.** Agent tool call.
 
@@ -1633,8 +1659,10 @@ only evidence when the command that produced it is attached.
 8. If a CAPTCHA is detected, the server crops the screenshot to the union of
    the reported challenge rectangles plus 24 pixels. No rectangle means no
    image is sent. Auto-attempt is off by default. It runs only when the
-   operator sets `CAPTCHA_AUTO_ATTEMPT=1`, the host policy is `attempt`, the
-   request is new, and vision confidence is at least
+   operator sets `CAPTCHA_AUTO_ATTEMPT=1` AND the host policy is `attempt`
+   (a per-host policy row, or the owner's default `CAPTCHA_DEFAULT_HOST_MODE`
+   inherited by hosts without a row -- 2026-11-21), the request is new, and
+   vision confidence is at least
    `CAPTCHA_AUTO_CONFIDENCE` (default 0.95). Interactive challenges always go
    to the owner. Without a usable crop, the owner gets a text notice with the
    page URL.
@@ -2021,7 +2049,7 @@ cap, rollup exclusion, baseline, fail-closed gates, UTC forecast.
 
 ### BP-43 Model tier selection
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-21
 
 **Bands.**
 
@@ -2096,6 +2124,15 @@ band's list immediately, up to two fallback levels. A fallback is only tried
 after a real failure; the first successful answer is its proof. JEV is
 excluded because the catalog has no comparable decision model at its price
 point. A one-shot boot backfill fills the table if it is empty.
+
+**Free pool.** The sub-low band resolves free endpoints before paid ones
+(2026-11-21 ops pass): the picker ranks READY endpoints by the max of
+their rpm/tpm/rpd utilization ratios and picks the least-utilized one
+(declaration order breaks ties), paces keys against their daily quota
+with an elapsed-day penalty so a whole pool is not burned before noon,
+and adds bounded jitter (48-72s) to generic cooldown windows while
+keeping Retry-After and daily-limit windows exact. A circuit-broken
+endpoint is skipped until its breaker re-halves.
 
 **Controls.** Cited scores, quality floor, cheapest pick, test call, price
 ceilings, monthly cap, JEV gate, fail-closed, ranked fallback depth, circuit
@@ -2443,7 +2480,10 @@ approval.
   calls. Ordering is refusals before allows: the host-home path check runs
   FIRST, so no rule table can bypass path containment (the git table used to
   sit ahead of it -- fixed 2026-11-21). A decoded base64 wrapper never
-  pre-approves: the ORIGINAL wrapper is what would run.
+  pre-approves: the ORIGINAL wrapper is what would run. The binary, git-sub,
+  and flag tables are extendable through the additive overlay file
+  (`world/agent_rules.json`, BP-86): the overlay can add entries, never
+  remove a built-in rail, and the path check outranks any overlay.
 - The routing rule behind the lane lives in the `world/core/jev.py` module
   docstring: deterministic code for closed-form decisions, calibrated ML for
   closed-label low-stakes classification, JEV for open-ended judgment, the
@@ -3993,7 +4033,9 @@ nothing happened.
    computed, so every window was zero seconds wide).
 3. The digest writer reads alerts, internal signals, and integrity
    anomalies for the window and writes one Markdown file per scan into
-   `library/analysis/` (path recorded on the item and logged). A QUIET
+   `library/analysis/` (path recorded on the item and logged). The
+   internal-signals action list is extendable through the additive overlay
+   (`world/agent_rules.json`, BP-86). A QUIET
    window -- no alerts, no internal signals, no integrity anomalies; routine
    trend plumbing does not count -- writes NOTHING, logs
    `telegram_digest_quiet`, and the engine marks `lastRunSkipped` with a
@@ -4026,7 +4068,9 @@ passes the deterministic problem-signal pre-filter.
 **Steps.**
 
 1. The deterministic pre-filter runs first (no problem signal in the
-   finding text -> no JEV spend, no card).
+   finding text -> no JEV spend, no card). The signal vocabulary is
+   extendable through the additive overlay (`world/agent_rules.json`,
+   BP-86); the built-in list is the floor.
 2. The JEV triage call returns a typed choice (file_bug / file_story /
    none / inconclusive) with a confidence.
 3. A confident file verdict mints the issue wish exactly as before (the
@@ -4073,6 +4117,86 @@ dance, auth-wall escalation paging.
 
 **Records.** Login requests, session-vault entries, write-back action-log
 rows.
+
+### BP-85 Cross-village mail queue and the sharding seam
+
+**Last checked:** 2026-11-21
+
+**Purpose.** Let one village hand work to another WITHOUT touching the
+other village's agents directly. This is the boundary a process-per-village
+split needs: if inter-village interaction is a durable queue plus a relay,
+the villages can later become separate processes without changing how agents
+talk to each other.
+
+**Steps.**
+
+1. Send. An agent's tool or the operator API
+   (`POST /api/villages/mail`) calls `_village_mail_enqueue`. The sender's
+   village is derived from live state (`village_of_agent`); the target must
+   exist or the enqueue fails closed (404, nothing written).
+2. Queue. The mail is a `vmail-N` entry in the durable
+   `state['villageMail']` list with status `queued`. The sender never
+   writes into the recipient's state.
+3. Relay. One pass of the global tick (`_village_mail_relay_pass`, run in
+   the adversarial phase slot) claims queued mail for delivery, files the
+   entry into the recipient agent's mailbox, and stamps `fromVillage` on
+   it. Delivery counts surface as `village_mail_delivered` when nonzero.
+4. Recovery. A claim that produces no completion within 5 minutes is
+   considered stale and re-queued. Mail older than 24 hours expires.
+   Trimming drops `done` entries first and never drops live ones (cap
+   2000).
+5. Reads. `GET /api/villages/mail` reports counts by status and recent
+   entries, filterable by village; it is operator-gated.
+
+**Controls.** Fail-closed enqueue to unknown villages, relay-only delivery
+(no direct cross-village state writes), stale-claim recovery, TTL expiry,
+done-first trim, operator-gated reads and writes.
+
+**Records.** `state['villageMail']` entries, mailbox deliveries,
+`village_mail_sent` and `village_mail_delivered` action-log rows.
+
+### BP-86 Agent-improvable rule tables
+
+**Last checked:** 2026-11-21
+
+**Purpose.** The hot hard-coded rule lists that agents keep hitting the
+edges of become an additive overlay file, so agents can grow them over
+time WITHOUT touching rails and WITHOUT a restart. The improvement loop is
+the same as any other change: an agent proposes an entry through its
+director, the proposal is reviewed like a code change (BP-60 runway), and
+the reviewed entry lands in the file.
+
+**Steps.**
+
+1. `world/agent_rules.json` holds five namespaced tables:
+   `readonlyBinaries` (extra read-only binaries the command gate may
+   pre-approve), `readonlyGitSubs` (extra read-only git subcommands),
+   `forbiddenFlags` (extra write-capable flags a tool must refuse),
+   `spikeProblemSignals` (extra spike pre-filter phrases), and
+   `internalSignalActions` (extra action kinds surfaced in the digest).
+2. The loader (`server/serve_parts/059_agent_rules.py`) validates every
+   entry against a per-namespace token pattern, enforces hard caps
+   (120 binaries, 40 git subs, 120 flags total, 300 signals, 100
+   actions), and merges the overlay ON TOP of the code's built-in base.
+3. Additive-only: no overlay entry can remove a built-in rail, and the
+   rail checks that outrank tables (host-path containment in the command
+   gate) run first regardless of the file.
+4. Reload is stat-guarded (at most once per second), so an edit lands
+   within a second of saving. No restart.
+5. A corrupt or half-written file keeps the LAST GOOD overlay and logs
+   `agent_rules_file_rejected` once; a first-load failure is an empty
+   overlay. Invalid entries are dropped individually, never poisoning the
+   namespace.
+6. Consumers read the merged table: the readonly shell gate (BP-52), the
+   spike pre-filter (BP-83), and the digest internal-signals section
+   (BP-82).
+
+**Controls.** Additive-only merge, per-namespace caps and token patterns,
+stat-guarded reload, fail-closed on corrupt edits, rail checks before
+table checks, review-gated entry proposals.
+
+**Records.** `agent_rules.json`, `agent_rules_file_rejected` action-log
+row, the reviewing director's decision-tape record.
 
 ## 11. Player and operator processes
 
@@ -4634,6 +4758,8 @@ rather than gate-integrity questions.
 | BP-82 | `village/sim_parts/165__scheduled_items.py`, `server/serve_parts/425_scheduled_items.py` |
 | BP-83 | `agents/content_parts/70_body_08.py` |
 | BP-84 | `server/serve_parts/395_operator_login_request.py`, `tools/agent_browser_login.py`, `tools/login_browser_session.py` |
+| BP-85 | `village/sim_parts/118_village_shards.py`, `village/sim_parts/010__reclaim_orphaned_walking_tasks.py`, `server/serve_parts/477_village_mail_api.py` |
+| BP-86 | `server/serve_parts/059_agent_rules.py`, `agent_rules.json`, `server/serve_parts/182_readonly_shell.py`, `agents/content_parts/70_body_08.py`, `server/serve_parts/425_scheduled_items.py` |
 | BP-52 | `server/serve_parts/182_readonly_shell.py`, `server/serve_parts/360_curl.py`, `server/serve_parts/168_url_trust.py` |
 
 ## 20. Appendix D: review checklist

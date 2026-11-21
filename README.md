@@ -1,16 +1,23 @@
 # AI Think Tank
 
-Two notes are taped inside the front door.
+AI Think Tank is a running AI organization you delegate to, not a toy and not a chat window. LLM agents hold roles in a durable structure: they pick up work from real cards, refine backlogs, peer-review each other, escalate when unsure, get hired and fired, and leave behind reports, code, and written receipts you can audit. The pixel-art building is one monitoring view. The system is the server.
 
-> **Theo, Control Room:** The building runs whether you watch it or not. Agents move, work, argue, review, and file reports. Every position and every decision lives on the server. The browser is a window, not the machinery.
+Two notes taped near that view:
+
+> **Theo, Control Room:** The building runs whether you watch it or not. Every position and every decision lives on the server. The browser is a window, not the machinery.
 
 > **Nora, Personnel:** I keep the files. I know who was hired, who was let go, and who is still pretending the backlog is under control. Read this before you start the server.
 
-This is a persistent simulation. LLM agents walk between rooms, pick up tasks, refine backlogs, peer-review each other's work, get hired and fired, and write reports. Real model calls through OpenRouter drive all of it. A JEV policy classifier gates the calls that cost money. Close the browser and the tank keeps working. Come back and you see what happened while you were gone.
+What that means in practice:
 
-For the full architecture, read `DESIGN.md`. This file is the operator's tour.
+- **Durable work.** Tasks, issues, plans, mail, and decisions are rows in a database, not messages in a chat. Restart the process mid-run and the tank resumes where it stopped.
+- **Spending you can see.** Every model call is priced, logged, and gated. A deterministic-first policy engine (JEV) decides what may spend, and the free model pool is used before paid tiers.
+- **Autonomy with a leash.** Agents browse, run read-only commands, write code in sandboxes, and file work, but money-losing or irreversible paths still route through a classifier or to you.
+- **Self-observation.** The tank runs scheduled digests on itself, investigates its own failures, and keeps an epistemic ledger that separates what it asserted from what it established.
 
-## Start the building
+For the full architecture, read `DESIGN.md`. For the operating procedures, read `BUSINESS-PROCESSES.md`. This file is the operator's tour.
+
+## Run it
 
 ```bash
 cd world
@@ -40,7 +47,7 @@ python3 -m pytest world/tests -q
 node world/tests/js_coverage.mjs
 ```
 
-`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 9,963 collected Python tests and a 90% JavaScript coverage floor.
+`bash world/tests/run_all.sh` runs both plus the package-boundary check. The suite has 9,996 collected Python tests and a 90% JavaScript coverage floor.
 
 For restart and recovery evidence, run the failure-injection soak harness:
 
@@ -57,9 +64,9 @@ python3 evals/run_evals.py --dry-run
 TANK_AGENT_KEY=... python3 evals/run_evals.py
 ```
 
-## Theo's control room
+## The server: work, gates, and money
 
-Theo keeps the building honest. He cares about state, gates, and where the money goes.
+This half of the tour is state, gates, and where the money goes.
 
 Harness doctrine (after Zhang, Chakraborty & Khattab, "Language Model Harnesses Can Be Compositional Generalizers", 2026): a harness should keep every model call locally in-distribution instead of accumulating one long trajectory. The tank already does this structurally -- work is decomposed into cards, each resolved by fresh-context sub-calls; the groom cascade and the route-shadow net are cheap supervision standing in for expensive judgment; escalation, not context length, is the only reason a decision leaves the deterministic or calibrated lanes. The house routing rule lives in `world/core/jev.py`: deterministic code, then calibrated ML, then JEV, then the operator.
 
@@ -69,8 +76,8 @@ Harness doctrine (after Zhang, Chakraborty & Khattab, "Language Model Harnesses 
 - **The executors.** `world/content.py` loads the parts in `world/agents/content_parts/`. It handles research crawls, code writing and review, weather, distillation, media digests, bank reviews, and time-boxed investigations called spikes.
 - **Scheduled items.** The tank keeps its own runbook in `state['scheduledItems']`: recurring body work (a cadence, an owner role, a deliverable path) the sim mints and runs on the tick. Two items are seeded on first boot and are the regional VP's standing duty: a 30-minute Telegram alert digest that writes a Markdown window over alerts, internal signals, and integrity anomalies into `library/analysis/` (a quiet window -- no alerts, no internal signals, no anomalies -- writes nothing and logs `telegram_digest_quiet` instead), and an hourly village scan that reads the digest's surfaces and files cards when a surface is non-empty. The engine stamps `lastRunAtMs` per item, so a quiet period still counts as scanned.
 - **Plan approvals.** A large request is proposed as a durable plan revision before any work is filed. The player can approve, reject with a reason, or revise it. Approval binds the exact plan hash and route; a stale team or authority forces a revision instead of applying an old decision.
-- **The client.** `world/index.html` draws the tank as a pixel-art canvas and lets you interact. It is a viewport. The server owns every position, task, and decision.
-- **The model tiers.** Work starts on the cheap `low` tier. JEV decides which calls earn `mid` or `high`. Coding tasks use the coding tier automatically. 3D work aliases to coding until a dedicated model is configured. The refresh re-picks each band's best-value model from the live OpenRouter catalog. `world/model_providers.json` can point any band, or every band, at a custom endpoint or local model. A custom endpoint is a pin: the tier refresh and the 30-minute price watch both skip that band, and the tier API reports the pin instead of the unused auto-pick. Remove the entry and `POST /api/policy/reload` to let the tank re-pick it.
+- **The client.** `world/index.html` draws the tank as a pixel-art canvas; the Ops board and Telegram digests are the other views. All of them render server state. The server owns every position, task, and decision.
+- **The model tiers.** Work starts on the cheap `low` tier. JEV decides which calls earn `mid` or `high`. Coding tasks use the coding tier automatically. 3D work aliases to coding until a dedicated model is configured. The refresh re-picks each band's best-value model from the live OpenRouter catalog. Free-tier endpoints are picked by measured utilization (least-utilized first, daily-quota pacing, exact Retry-After windows), so a throttled key does not take the whole pool down. `world/model_providers.json` can point any band, or every band, at a custom endpoint or local model. A custom endpoint is a pin: the tier refresh and the 30-minute price watch both skip that band, and the tier API reports the pin instead of the unused auto-pick. Remove the entry and `POST /api/policy/reload` to let the tank re-pick it.
 - **Village art.** A director can outsource a new map as one card: `POST /api/villages/<id>/art` quotes the PixelLab call, then queues a supervise card. The `generate_village_map` tool writes the background, `collision_grid_<id>.json`, `door_triggers_<id>.json`, and a `scenes.json` entry. Collision and doors are exact (mirrored or copied from the main map), never guessed from the image. The quote is checked against a per-call cap, the PixelLab balance, and the shared monthly cap before any spend; the API's real `usage.usd` is charged to the actor. A new scene becomes walkable from the south outlet's travel list on the next page load.
 - **API prices.** `world/api_services.json` carries a `pricing` block per service (free, fixed, per page request, per size bucket, per item, or explicitly variable). The `service_prices` tool lists or quotes any call, and every `api_call` result includes a model-visible price line and a `priceQuote`. Free services report $0; variable ones name the budget that enforces them. `GET/POST /api/service-pricing` exposes the same catalog.
 - **Price drift.** Every call that returns a billed amount records the quote and the actual charge. A 6-hour audit compares the medians; a 20% gap over at least 3 calls logs `service_price_drift` and sends a Telegram notice. `/prices [service]` shows the catalog, budgets, and drift. The catalog is never auto-edited: a drift is a finding for the operator, and `pricing.source_url` is where the published price is checked. Services that return no billed amount cannot be detected from calls; they rely on that periodic page review.
@@ -84,20 +91,22 @@ Harness doctrine (after Zhang, Chakraborty & Khattab, "Language Model Harnesses 
 - **Plain writing.** Prose replies at the model-call boundary carry a "write plainly, no filler" instruction and a word-ban list. The tank spends fewer tokens on the same information. It is on by default. You can opt out per request. JSON prompts are exempt.
 - **Change windows.** Agent-initiated code changes never land live: an armed self-edit applies only inside an operator-approved dormancy window. A normal change request needs at least 6 hours' notice and its whole window must sit outside Eastern-time business hours (Mon-Fri 09:00-17:00 America/New_York) -- the tank ships while the office is closed. Only `tankDown=True` skips the hours gate. A missed window fails closed (`dormancy_window_missed`); nothing auto-applies.
 - **Session vault.** Agents do not hold standing cookies for operator web accounts. An agent that hits an auth wall files an `operator_login_request`; the operator signs in once through a vault-profile browser (`world/tools/agent_browser_login.py`), and the run's success writes back to the canonical service session in the vault. A flow op can carry a bounded federated-OAuth click sequence under a session grant -- the dance cannot survive between acts, so every act re-presents the grant.
+- **Agent-improvable rule tables.** `world/agent_rules.json` is an additive overlay over the code's built-in rule lists, so agents can extend the read-only command gate, the spike triage vocabulary, and the digest's signal list through a reviewed edit instead of a code change. The loader validates entries against per-namespace patterns and caps, reloads within a second of saving, and fails closed on a corrupt file. Additive only: an overlay entry can never remove a built-in rail.
+- **Cross-village mail.** Villages exchange work through a durable mail queue instead of reaching into each other's state. `POST /api/villages/mail` sends; a relay pass on the tick delivers. This is the boundary that will let villages become separate processes later.
 - **Sandbox runtime.** Set `SANDBOX_RUNTIME=runsc` in `.env` and every agent lane runs under gVisor with proxy hostname resolution pinned to IP literals. Per-run memory accounting (`run-mem` log lines) and an RSS watermark dispatch guard (`TANK_RSS_GUARD_FRACTION`, `TANK_RSS_GUARD_BYTES`) keep a runaway tool loop from starving the server.
 - **Daily briefing.** `GET /api/briefing?days=N` joins investigations, evidence relations (strength grades E0-E4), outcome metrics, and route-shadow findings into one operator read. The route-shadow net is a tiny trained classifier that shadows the live triage lane and reports disagreement only -- it never decides.
 
-## Nora's personnel floor
+## People, governance, and memory
 
-Nora keeps the roster, the ceremonies, and the memory. She knows that a think tank is not a stack of code. It is a room full of agents with tasks, reputations, and something to prove.
+The other half of the tour is the roster, the ceremonies, and the memory. A think tank is not a stack of code; it is a staff with roles, tasks, reputations, and records.
 
-- **Villages.** A village is the top-level identity and memory boundary. Every agent belongs to one. The default is `main`. Wiki pages and design taste docs are scoped to the writer's or reader's village, so one village's memory never leaks into another. Every village has a regional VP (role `regional_vp`), installed at creation, backfilled on the tick, or appointed by the player through `/api/villages/chief`. The player creates villages and assigns agents through `/api/villages` and `/api/villages/assign`.
+- **Villages.** A village is the top-level identity and memory boundary. Every agent belongs to one. The default is `main`. Wiki pages and design taste docs are scoped to the writer's or reader's village, so one village's memory never leaks into another. Every village has a regional VP (role `regional_vp`), installed at creation, backfilled on the tick, or appointed by the player through `/api/villages/chief`. The player creates villages and assigns agents through `/api/villages` and `/api/villages/assign`. Villages talk through the cross-village mail queue (see the server list), never through each other's agent state.
 - **Memory hygiene.** Every wiki page records an owner, a clock (slow or fast), a source, and a `reviewAfterMs` expiry. Expired pages stop counting as trusted context. Fast-clock pages get flagged so the village re-fetches the live source instead of trusting the copy. Design taste docs carry an owner and a review-after date. Expired ones are skipped. Every shared-memory write lands in a provenance ledger at `GET /api/memory-ledger`, with claim, source, owner, scope, and review date.
 - **Knowledge sources.** Teams ground on shared sources of truth: append-only truth documents (agents add attributed entries, nobody rewrites) and template repositories (read-only pointers to a GitHub repo or a granted local folder -- agents study the template and build around it; the template stays pristine). Both scope global or per-team. Agents read them through the `knowledge` tool; the player curates through `/api/knowledge`. The seeded global template is the operator's Intel Forge repo.
 - **Bookmarks.** A shared link library, global plus per-team. The player seeds globals through `/api/bookmarks`; agents read global plus their team's links through the `bookmarks` tool, and admin agents curate globals as the player's delegate. A link a player sends in the ask lane is auto-allowlisted for the reply task, so a conversation never stalls on the gate.
 - **The roster.** Agent identities live only in `think_tank.db`. The codebase hardcodes no agent names. The roster is seeded from `.env` on a cold database.
 - **The work floor.** Agents move through rooms, pick up cards, hand work to reviewers, and wait at gates. An idle tank spends no model budget. Governance goes quiet when nothing is happening.
-- **The exits.** Hiring and firing are real processes with approvals, reviews, and records. Nora would like you to remember that.
+- **The exits.** Hiring and firing are real processes with approvals, reviews, and records. Nothing is fired quietly.
 
 ## Where things live
 
@@ -141,7 +150,7 @@ Nora keeps the roster, the ceremonies, and the memory. She knows that a think ta
 - The high tier is bounded twice: a per-model price ceiling and a monthly spend cap. The monthly cap defaults to $5. The per-model ceiling is unset, which disables it.
 - Room descriptions are editable by directors. Room geometry is not. It is a code-graph invariant.
 
-Theo will tell you when the server is unhealthy. Nora will tell you when the people are. Listen to both.
+Health surfaces at `/api/health`; the personnel record is the roster itself. If either disagrees with this tour, the code wins and the doc gets fixed.
 
 ## Security
 
