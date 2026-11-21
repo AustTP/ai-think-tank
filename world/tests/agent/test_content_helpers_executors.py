@@ -458,6 +458,23 @@ class SpikeExecutorBranches(unittest.TestCase):
             wish = content._spike_file_issue_wish('Missing feature: export button.',
                                                   {'room': 'observatory'}, 'Ada', 'b')
             self.assertEqual(wish['issueType'], 'story')
+        # Escalate instead of guess (2026-11-21): a file verdict below the
+        # operator's live confidence floor does NOT mint a card -- it logs
+        # finding_triage_unsure (the RVP digest triages it) and returns None.
+        with mock.patch.object(serve, '_call_openrouter_decision_sync',
+                               return_value={'d': 1}), \
+             mock.patch.object(serve, '_jev_choice',
+                               return_value=('file_bug', 0.3, 0.01)), \
+             mock.patch.object(serve, '_effective_safety_confidence',
+                               return_value=0.6), \
+             mock.patch.object(serve, 'log_action') as la:
+            self.assertIsNone(content._spike_file_issue_wish(
+                'Bug found: login fails.', {'id': 'task-1'}, 'Ada', 'b'))
+        self.assertEqual(la.call_args[0][1], 'finding_triage_unsure')
+        details = la.call_args[0][2]
+        self.assertEqual(details['choice'], 'file_bug')
+        self.assertEqual(details['confidence'], 0.3)
+        self.assertEqual(details['taskId'], 'task-1')
         # Empty/whitespace finding never files (pre-filter rejects it first).
         self.assertIsNone(content._spike_file_issue_wish('  \n  ', {'projectLabel': 'P'}, 'Ada', 'gap here'))
 

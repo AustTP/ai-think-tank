@@ -184,8 +184,26 @@ def _spike_file_issue_wish(finding, task, name, backlog):
                         'none': 'No -- the finding is informational, says things are fine, or only surfaces expected limitations with nothing worth filing.',
                         'inconclusive': 'No -- the finding could not gather enough evidence to say either way (unverified, blocked access, empty workspace): not worth filing until someone re-runs it with working access.'}},
              '_kind': 'finding_triage'})
-    choice, _, _ = _serve._jev_choice(decision)
+    choice, confidence, _ = _serve._jev_choice(decision)
     if choice not in ('file_bug', 'file_story'):
+        return None
+    # Escalate instead of guess (routing rule lane 4, core/jev.py): a
+    # low-confidence file_bug/file_story verdict used to mint a backlog card
+    # as if it were certain -- pure guess-churn the groomer then had to
+    # reject. Below the operator's live confidence floor the finding is NOT
+    # filed; it surfaces as an internal signal the RVP's digest scan
+    # triages, the same lane every other unsure anomaly takes.
+    floor = _serve._effective_safety_confidence()
+    if confidence < floor:
+        try:
+            _serve.log_action('system', 'finding_triage_unsure', {
+                'headline': (headline or '')[:160],
+                'choice': choice,
+                'confidence': round(float(confidence), 3),
+                'floor': round(float(floor), 3),
+                'taskId': (task or {}).get('id')})
+        except Exception:
+            pass
         return None
     feature = (task.get('projectLabel') or task.get('productId') or task.get('room') or 'pressoffice') or 'pressoffice'
     title = headline[:140]

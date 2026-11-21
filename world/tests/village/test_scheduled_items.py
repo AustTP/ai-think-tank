@@ -316,6 +316,10 @@ class DigestTests(unittest.TestCase):
                 {'task': 'task-33799', 'grade': 0.0})),
             (now - 3300, 'task_requeued_unreachable', json.dumps(
                 {'agent': 'piper', 'room': 'observatory'})),
+            (now - 3200, 'finding_triage_unsure', json.dumps(
+                {'headline': 'login endpoint returns 500',
+                 'choice': 'file_bug', 'confidence': 0.31,
+                 'floor': 0.6, 'taskId': 'task-35601'})),
         ]
         written = {}
 
@@ -359,11 +363,13 @@ class DigestTests(unittest.TestCase):
         self.assertIn('grade_artifact_mismatch (x1)', text)
         self.assertIn('task_requeued_unreachable (x1)', text)
         self.assertIn('piper could not reach observatory', text)
+        self.assertIn('finding_triage_unsure (x1)', text)
+        self.assertIn('login endpoint returns 500 (file_bug @ 0.31)', text)
         # The log row records the internal counts so the operator can see the
         # feed is no longer blind.
         counts = la.call_args[0][2]
-        self.assertEqual(counts['internalSignals'], 3)
-        self.assertEqual(counts['internalClasses'], 3)
+        self.assertEqual(counts['internalSignals'], 4)
+        self.assertEqual(counts['internalClasses'], 4)
 
     def test_digest_carries_selfedit_integrity_reconciliation(self):
         # Owner direction 2026-11-14: the normalized-deviation review found

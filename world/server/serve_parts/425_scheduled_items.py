@@ -135,7 +135,12 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         'free_pool_fallback', 'model_circuit_broken',
         'jev_model_auto_failover', 'provider_pivot',
         'work_item_abandoned', 'credits_pause_started',
-        'telegram_poll_failed', 'telegram_poll_recovered')
+        'telegram_poll_failed', 'telegram_poll_recovered',
+        # 2026-11-21 noul steal: a spike finding whose triage verdict came
+        # back below the confidence floor is NOT filed as a backlog card --
+        # it escalates here instead of guessing, and the VP's triage decides
+        # whether it was real.
+        'finding_triage_unsure')
     internal_rows = []
     try:
         with _db() as conn:
@@ -160,6 +165,8 @@ def write_telegram_alert_digest(now=None, since_ts=None):
             tail = f"{d.get('agent')} could not reach {d.get('room')}"
         elif action in ('card_pattern_suppressed', 'repair_loop_stopped'):
             tail = str(d.get('taskId') or '')
+        elif action == 'finding_triage_unsure':
+            tail = f"{d.get('headline') or ''} ({d.get('choice')} @ {d.get('confidence')})"
         else:
             tail = str(d.get('title') or d.get('taskId') or d.get('path') or '')
         internal_by_class.setdefault(action, []).append(
