@@ -10,7 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-import unittest.mock
+import unittest.mock as mock
 
 from PIL import Image
 
@@ -89,6 +89,23 @@ class Lifecycle(_CaptchaCase):
         self.assertEqual(captcha.policy_for_host('example.com'), 'relay')
         captcha.set_policy('example.com', 'attempt', updated_by='player')
         self.assertEqual(captcha.policy_for_host('example.com'), 'attempt')
+
+    def test_default_host_mode_knob(self):
+        # Owner autonomy knob: CAPTCHA_DEFAULT_HOST_MODE=attempt makes every
+        # UNCONFIGURED host attempt-capable without a per-host operator row.
+        # An explicit row always wins, and an invalid knob value falls back
+        # to relay.
+        with mock.patch.object(serve, '_load_env',
+                               return_value={'CAPTCHA_DEFAULT_HOST_MODE': 'attempt'}):
+            self.assertEqual(captcha.policy_for_host('knob-unset-host.test'), 'attempt')
+        captcha.set_policy('knob-explicit-host.test', 'relay', updated_by='player')
+        with mock.patch.object(serve, '_load_env',
+                               return_value={'CAPTCHA_DEFAULT_HOST_MODE': 'attempt'}):
+            self.assertEqual(captcha.policy_for_host('knob-explicit-host.test'), 'relay')
+        with mock.patch.object(serve, '_load_env',
+                               return_value={'CAPTCHA_DEFAULT_HOST_MODE': 'bogus'}):
+            self.assertEqual(captcha.policy_for_host('knob-bogus-host.test'), 'relay')
+        self.assertEqual(captcha.policy_for_host(''), 'relay')
 
     def test_interactive_never_attempts(self):
         self.assertTrue(captcha.needs_human('recaptcha'))

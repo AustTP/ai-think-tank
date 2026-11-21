@@ -75,6 +75,7 @@ def _row(row):
 def policy_for_host(host):
     host = (host or '').strip().lower()
     if not host:
+        # No host context -> no consent -> relay.
         return 'relay'
     s = _serve()
     with s._db() as conn:
@@ -82,7 +83,17 @@ def policy_for_host(host):
                            (host,)).fetchone()
     if row and row[0] in MODES:
         return row[0]
-    return 'relay'
+    # Owner autonomy knob (2026-11-21): CAPTCHA_DEFAULT_HOST_MODE=attempt
+    # flips the DEFAULT for every unconfigured host so the agents do not
+    # need a per-host operator decision before trying an automatic solve.
+    # An explicit per-host row (either mode) always wins. The default stays
+    # 'relay' -- the operator owns the ToS/consent question per site.
+    load_env = getattr(s, '_load_env', None)
+    if not callable(load_env):
+        return 'relay'
+    default_mode = ((load_env().get('CAPTCHA_DEFAULT_HOST_MODE') or '')
+                    .strip().lower())
+    return default_mode if default_mode in MODES else 'relay'
 
 
 def set_policy(host, mode, notes='', updated_by='player'):

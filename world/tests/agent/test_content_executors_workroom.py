@@ -570,11 +570,16 @@ class WorkroomAndProductBuildContent(_ExecutorTestCase):
                                           {'id': 'w3', 'projectLabel': 'P', 'taskType': 'qa'})
             rev.assert_called_once()
 
-    def test_review_uses_mid_tier_not_the_coder(self):
+    def test_review_tier_selection_per_slot(self):
         # 2026-11-21: a second opinion is worth having only when it can
-        # disagree. The review/QA lane prefers the MID tier (a different
-        # model family than the author's coding tier) and falls back to the
-        # coding tier only when no mid tier is configured.
+        # disagree. Peer gates mint TWO review tasks with explicit slots;
+        # the executor picks a different model family per slot:
+        #   critic   -> mid tier   (deepseek family)
+        #   standard -> coding tier (glm family)
+        # so critic, standard reviewer, JEV cross-check, and the author are
+        # four distinct vantage points. Unmarked review tasks (other mint
+        # sites) default to the coding-first order; both paths fall back
+        # down the ladder when a band is unconfigured.
         seen = _store()
         _base_mocks()
         chat_models = []
@@ -589,42 +594,37 @@ class WorkroomAndProductBuildContent(_ExecutorTestCase):
                 return {'ok': True}
             return {}
 
-        with mock.patch.object(content, '_agent_name', return_value='Cora'), \
-             mock.patch.object(content, '_review_sandbox_id', return_value='s'), \
-             mock.patch.object(content, '_gather_unified_context', return_value=''), \
-             mock.patch.object(content, '_run_quality_pipeline',
-                               return_value={'ok': True, 'note': 'green',
-                                             'skipped': False}), \
-             mock.patch.object(content, '_review_screenshot',
-                               return_value={'ok': True, 'review': 'page looks right'}), \
-             mock.patch.object(serve, '_http_json', side_effect=fake_http), \
-             mock.patch.object(serve, '_call_openrouter_decision_sync',
-                               return_value={'d': 1}), \
-             mock.patch.object(serve, '_jev_choice', return_value=(None, 0.0, 0.0)), \
-             mock.patch.object(serve, '_mid_tier_slug', return_value='mid-slug'), \
-             mock.patch.object(serve, '_coding_tier_slug', return_value='coding-slug'):
-            content._run_review_content(_snapshot(), 'cora',
-                                        {'id': 'rev1', 'taskType': 'review'})
-        self.assertEqual(chat_models, ['mid-slug'])
-        # Fallback: with no mid tier configured, the coding tier still runs.
-        chat_models.clear()
-        with mock.patch.object(content, '_agent_name', return_value='Cora'), \
-             mock.patch.object(content, '_review_sandbox_id', return_value='s'), \
-             mock.patch.object(content, '_gather_unified_context', return_value=''), \
-             mock.patch.object(content, '_run_quality_pipeline',
-                               return_value={'ok': True, 'note': 'green',
-                                             'skipped': False}), \
-             mock.patch.object(content, '_review_screenshot',
-                               return_value={'ok': True, 'review': 'page looks right'}), \
-             mock.patch.object(serve, '_http_json', side_effect=fake_http), \
-             mock.patch.object(serve, '_call_openrouter_decision_sync',
-                               return_value={'d': 1}), \
-             mock.patch.object(serve, '_jev_choice', return_value=(None, 0.0, 0.0)), \
-             mock.patch.object(serve, '_mid_tier_slug', return_value=None), \
-             mock.patch.object(serve, '_coding_tier_slug', return_value='coding-slug'):
-            content._run_review_content(_snapshot(), 'cora',
-                                        {'id': 'rev2', 'taskType': 'review'})
-        self.assertEqual(chat_models, ['coding-slug'])
+        def _run(task_id, slot, mid, coding):
+            chat_models.clear()
+            with mock.patch.object(content, '_agent_name', return_value='Cora'), \
+                 mock.patch.object(content, '_review_sandbox_id', return_value='s'), \
+                 mock.patch.object(content, '_gather_unified_context', return_value=''), \
+                 mock.patch.object(content, '_run_quality_pipeline',
+                                   return_value={'ok': True, 'note': 'green',
+                                                 'skipped': False}), \
+                 mock.patch.object(content, '_review_screenshot',
+                                   return_value={'ok': True, 'review': 'page looks right'}), \
+                 mock.patch.object(serve, '_http_json', side_effect=fake_http), \
+                 mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                   return_value={'d': 1}), \
+                 mock.patch.object(serve, '_jev_choice', return_value=(None, 0.0, 0.0)), \
+                 mock.patch.object(serve, '_mid_tier_slug', return_value=mid), \
+                 mock.patch.object(serve, '_coding_tier_slug', return_value=coding):
+                content._run_review_content(_snapshot(), 'cora',
+                                            {'id': task_id, 'taskType': 'review',
+                                             'reviewSlot': slot})
+            return list(chat_models)
+
+        self.assertEqual(_run('rev1', 'critic', 'mid-slug', 'coding-slug'),
+                         ['mid-slug'])
+        self.assertEqual(_run('rev2', 'standard', 'mid-slug', 'coding-slug'),
+                         ['coding-slug'])
+        # Unmarked task (legacy mint site): coding-first default.
+        self.assertEqual(_run('rev3', None, 'mid-slug', 'coding-slug'),
+                         ['coding-slug'])
+        # Fallback: critic with no mid tier rides the coding tier.
+        self.assertEqual(_run('rev4', 'critic', None, 'coding-slug'),
+                         ['coding-slug'])
 
     def test_workroom_project_label_coding_with_ls_context(self):
         seen = _store()

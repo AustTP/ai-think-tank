@@ -841,6 +841,12 @@ def _enter_peer_review(state, task, now_ms, preferred=None, force_rearm=False):
                              'with no concrete, fixable problems. Be a skeptical reviewer, not a rubber stamp.'),
             'goal': task.get('projectLabel') or task.get('goal'),
             'taskType': 'review',
+            # Slot marker: which of the two independent judges this task is.
+            # The review executor reads it to pick a different model family
+            # for the critic than for the standard reviewer (and different
+            # from the author's coding model), so both opinions CAN disagree
+            # with the author and with each other.
+            'reviewSlot': 'critic' if critic else 'standard',
             # projectLabel + taskType=review is what routes pressoffice work to the
             # review executor; reviewOf links this vote back to the story.
             'projectLabel': task.get('projectLabel') or task.get('title'),
