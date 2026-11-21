@@ -4,6 +4,17 @@
 
 ### Features
 
+- Anti-bot hardening (2026-11-21): the browser driver now runs the
+  patchright fork of Playwright (patched Chromium, no CDP automation
+  tells) from its own baked browsers dir, falling back to stock
+  playwright when patchright is absent; every result reports
+  `driverFork` so an operator can see which fork ran. The `/api/curl`
+  and api-call lanes send browser-grade TLS ClientHellos via curl_cffi
+  (Chrome impersonation) with per-hop DNS pinning through
+  `CurlOpt.RESOLVE` and the same SSRF re-checks on every redirect hop,
+  falling back to the urllib path unchanged when curl_cffi is missing or
+  a transport error occurs. Sandbox image rebuild required to pick up
+  the browser layer.
 - Review-judge diversity (2026-11-21): a review that echoes the author's
   model family correlates with itself, so the review/QA lane now prefers
   the mid tier (falling back coding -> low), and gated deliverables face
