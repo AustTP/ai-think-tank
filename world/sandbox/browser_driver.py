@@ -537,6 +537,34 @@ def _launch(playwright, action):
     return ctx, page
 
 
+def _import_driver_fork():
+    """Import-time fork selection, shared by the run() fast path above. The
+    patchright fork removes stock Playwright's CDP automation tells; its
+    chromium build is patched separately, so it lives in its own
+    PLAYWRIGHT_BROWSERS_PATH. Any patchright import failure falls back to
+    stock playwright at the baked /opt/ms-playwright path; when THAT is
+    missing too, the caller's error contract applies (a None entry for
+    'playwright.sync_api' in sys.modules means deliberately unavailable)."""
+    try:
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright-patchright'
+        from patchright.sync_api import sync_playwright as sync_playwright_fn
+        return sync_playwright_fn, 'patchright'
+    except Exception:
+        pass
+    _saved = os.environ.get('PLAYWRIGHT_BROWSERS_PATH')
+    os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright'
+    try:
+        from playwright.sync_api import sync_playwright as sync_playwright_fn  # noqa: F811
+        return sync_playwright_fn, 'playwright'
+    except Exception as e:
+        if _saved is None:
+            os.environ.pop('PLAYWRIGHT_BROWSERS_PATH', None)
+        else:
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = _saved
+        raise RuntimeError(
+            f'playwright not available in sandbox image: {e}') from e
+
+
 def run(action):
     op = action.get('op')
     if op not in OPS:
@@ -583,21 +611,30 @@ def run(action):
     # a partial install. _DRIVER_FORK is stamped into every _state() result
     # so an operator can see which fork ran.
     global _DRIVER_FORK
-    try:
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright-patchright'
-        from patchright.sync_api import sync_playwright as _sync_playwright
-        _DRIVER_FORK = 'patchright'
-    except Exception:
-        # Restore the STOCK browsers path (the image bakes it via ENV;
-        # popping the var entirely would send stock playwright to the
-        # default ~/.cache, where the sandbox user has no browsers).
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright'
-        from playwright.sync_api import sync_playwright as _sync_playwright  # noqa: F811
+    # Fork selection (2026-11-21): patchright first, stock playwright as
+    # fallback. A preloaded 'playwright.sync_api' entry in sys.modules wins
+    # FIRST -- that is the injection point the integration-test fakes (and
+    # any embedder who has already chosen a fork) use. A None entry there
+    # means playwright is deliberately unavailable, so the error contract
+    # below applies. In production neither module is preloaded, so the
+    # import order decides: patchright at its own baked browsers path, stock
+    # playwright on any patchright import failure.
+    _sync_playwright = None
+    _preloaded = sys.modules.get('playwright.sync_api')
+    if _preloaded is not None and hasattr(_preloaded, 'sync_playwright'):
+        _sync_playwright = _preloaded.sync_playwright
         _DRIVER_FORK = 'playwright'
+    if _sync_playwright is None:
+        try:
+            _sync_playwright, _DRIVER_FORK = _import_driver_fork()
+        except Exception as e:
+            return {'ok': False, 'op': op,
+                    'error': f'playwright not available in sandbox image: {e}'}
     try:
         with _sync_playwright() as p:
             ctx, page = _launch(p, action)
-            ctx._think_tank_driver_fork = _DRIVER_FORK
+            if ctx is not None:
+                ctx._think_tank_driver_fork = _DRIVER_FORK
             try:
                 # Every op that carries a url navigates there first. Without
                 # this, fill/click/submit/read each open a blank page (the
