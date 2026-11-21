@@ -8,6 +8,7 @@ Run:
   python3 -m unittest tests.server.test_serve_free_pool -v
 """
 import json
+import calendar
 import os
 import shutil
 import sys
@@ -228,6 +229,59 @@ class FreePoolPickerTests(unittest.TestCase):
                 'stamps': [time.time()] * 2}
         self.assertEqual(serve._freepool_route_for_band('low'),
                          '@freepool:low:groq-x')
+
+    def test_least_utilized_endpoint_wins(self):
+        # Operations-research pass (2026-11-21): the picker no longer serves
+        # the first READY endpoint in declaration order; it serves the LEAST
+        # utilized one. With gemini-x half-through its rpm window and groq-x
+        # untouched, the pick must move to groq-x even though gemini-x is
+        # still ready.
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpm']['gemini-x'] = {
+                'minute': serve._freepool_minute_bucket(),
+                'stamps': [time.time()] * 1}  # 1 of rpm=2 used
+        self.assertEqual(serve._freepool_route_for_band('low'),
+                         '@freepool:low:groq-x')
+        # Reversed: groq-x fully spent, gemini-x idle -> gemini-x wins
+        # despite being second in declaration order.
+        _reset_pool_state()
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpm']['groq-x'] = {
+                'minute': serve._freepool_minute_bucket(),
+                'stamps': [time.time()] * 3}  # 3 of rpm=3 used
+        self.assertEqual(serve._freepool_route_for_band('low'),
+                         '@freepool:low:gemini-x')
+
+    def test_idle_tie_breaks_by_declaration_order(self):
+        # Two untouched endpoints: utilization ties at 0.0, the stable
+        # min() comparison keeps the first-declared endpoint.
+        self.assertEqual(serve._freepool_route_for_band('low'),
+                         '@freepool:low:gemini-x')
+
+    def test_rpd_pacing_deprioritizes_ahead_of_schedule(self):
+        # Budget pacing: an endpoint that spent more of its daily allowance
+        # than the elapsed UTC-day fraction justifies takes the +0.25
+        # penalty and loses the pick to a sibling on pace. The clock is
+        # frozen at 02:00 UTC so the pace target is 2.5/5 for gemini-x and
+        # 0.2/4 for groq-x: gemini-x (5/5, spent) and groq-x (2/4, ahead of
+        # pace) BOTH take the penalty, leaving openrouter-free (640/1000,
+        # 6.4x ahead of the 100-call pace but far enough under its ceiling
+        # that 0.64 + 0.25 stays the winner) -- no, the point is groq-x must
+        # LOSE to the sibling with the smaller ratio. With all three ahead
+        # of pace at 02:00 UTC, groq-x loses on the ratio ordering alone:
+        # openrouter 0.64 < groq 0.5+0.25=0.75 < gemini 1.0+0.25. Assert the
+        # pick lands on the least-penalized endpoint, openrouter-free.
+        frozen = calendar.timegm((2026, 11, 21, 2, 0, 0)) + 0.5
+        with serve._free_pool_lock:
+            serve._free_pool_state['rpd']['gemini-x'] = {
+                'date': serve._utc_today(), 'count': 5}  # cap 5, ratio 1.0
+            serve._free_pool_state['rpd']['groq-x'] = {
+                'date': serve._utc_today(), 'count': 2}  # cap 4, ratio 0.5
+            serve._free_pool_state['rpd']['openrouter-free'] = {
+                'date': serve._utc_today(), 'count': 640}  # cap 1000, ratio 0.64
+        with unittest.mock.patch.object(serve.time, 'time', return_value=frozen):
+            self.assertEqual(serve._freepool_route_for_band('low'),
+                             '@freepool:low:openrouter-free')
 
     def test_rpd_exhaustion_skips_endpoint_for_the_day(self):
         with serve._free_pool_lock:
@@ -487,6 +541,23 @@ class FreePoolQuotaTests(unittest.TestCase):
         with serve._free_pool_lock:
             until = serve._free_pool_state['cooldown']['gemini-x']
         self.assertGreater(until, time.time() + 60)
+
+    def test_default_cooldown_jitter(self):
+        # Operations-research pass (2026-11-21): the default 60s refill
+        # cooldown jitters +/-20% (48-72s) so throttled endpoints do not all
+        # wake on the same instant and burst-rethrottle together. Retry-After
+        # windows (above) and daily-limit windows stay exact.
+        values = []
+        for _ in range(40):
+            serve._note_free_pool_rate_limited(self._prov, 'rate limit exceeded')
+            with serve._free_pool_lock:
+                until = serve._free_pool_state['cooldown']['gemini-x']
+            value = until - time.time()
+            self.assertGreaterEqual(value, 47.0)
+            self.assertLessEqual(value, 73.0)
+            values.append(value)
+        self.assertLess(min(values), 55.0)
+        self.assertGreater(max(values), 65.0)
 
     def test_daily_limit_cools_until_utc_midnight(self):
         serve._note_free_pool_rate_limited(self._prov, 'requests per day limit reached')

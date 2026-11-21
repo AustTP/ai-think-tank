@@ -46,6 +46,7 @@ backstop on top.
 import contextvars
 import json
 import os
+import random
 import threading
 import time
 import urllib.parse
@@ -687,6 +688,61 @@ def _freepool_kind_allows(ep, kind):
     return kind in allowed
 
 
+def _freepool_utilization(ep, band):
+    """How loaded this ready endpoint already is, as one comparable number
+    (2026-11-21 operations-research pass on throttle risk). The picker used
+    to serve the FIRST ready endpoint in declaration order until it hit a
+    limit, which concentrates traffic: the head endpoint throttles while
+    its siblings sit idle. Now the picker spreads load across every ready
+    endpoint by choosing the LEAST utilized. Components (each 0..1-ish):
+      - rpm ratio: calls this minute / configured rpm cap
+      - tpm ratio: tokens this minute / configured tpm cap
+      - rpd ratio: calls today / configured daily cap
+    plus a PACING penalty (operations-research budget pacing, ad-tech
+    style): a day-capped endpoint should spend its allowance evenly across
+    the UTC day, not burn it all by 09:00 and go dark. If today's spend is
+    already ahead of the even pace (rpd_used > cap * elapsed_day_fraction),
+    the endpoint takes +0.25 in the ranking -- deprioritized, not blocked:
+    readiness stays the hard gate, pacing only shapes the choice when
+    another endpoint is available. Auto-gemini's counter is per model, so
+    the ratio reads the band's currently-chosen model. Ties break by
+    declaration order (stable sort) so behavior is deterministic."""
+    now = time.time()
+    # Resolve the auto-gemini per-model rpd key BEFORE taking the lock:
+    # _freepool_gemini_model takes _free_pool_lock itself, and this lock is
+    # not reentrant -- nesting them deadlocks the picker.
+    rpd_key = ep['name']
+    if ep['service'] == 'gemini' and (ep.get('model') or 'auto') == 'auto':
+        chosen = None
+        try:
+            chosen = _freepool_gemini_model(band, ep)
+        except Exception:
+            chosen = None
+        if chosen:
+            rpd_key = ep['name'] + '::' + chosen
+    util = 0.0
+    with _free_pool_lock:
+        if ep['rpm']:
+            rpm = _free_pool_state['rpm'].get(ep['pool_key']) or {}
+            stamps = [t for t in (rpm.get('stamps') or []) if t > now - 60]
+            util = max(util, len(stamps) / float(ep['rpm']))
+        if ep['tpm']:
+            tpm = _free_pool_state['tpm'].get(ep['pool_key']) or {}
+            used = tpm.get('tokens', 0) \
+                if tpm.get('minute') == _freepool_minute_bucket(now) else 0
+            util = max(util, used / float(ep['tpm']))
+        rpd = _free_pool_state['rpd'].get(rpd_key) or {}
+        rpd_used = rpd.get('count', 0) if rpd.get('date') == _utc_today() else 0
+    if ep['rpd']:
+        util = max(util, rpd_used / float(ep['rpd']))
+        midnight = now - (now % 86400.0)
+        elapsed = max(now - midnight, 3600.0)
+        pace_target = ep['rpd'] * min(elapsed / 86400.0, 1.0)
+        if rpd_used > pace_target:
+            util += 0.25
+    return util
+
+
 def _freepool_route_for_band(band, force=False):
     """The band's current free route as a synthetic slug, or None to use the
     normal paid pick. `force` ignores the mode gate (used by the paid-failure
@@ -722,6 +778,7 @@ def _freepool_route_for_band(band, force=False):
                 if not (credits_pause_active() or _think_tank_spend_cap_exceeded()
                         or paid_blocked):
                     return None
+        ready = []
         for ep in cfg['endpoints']:
             # Per-endpoint band scoping (operator, 2026-11-14): an endpoint
             # listing 'bands' serves ONLY those bands -- the capable Numes
@@ -733,7 +790,26 @@ def _freepool_route_for_band(band, force=False):
             if not _freepool_kind_allows(ep, kind):
                 continue
             if _freepool_ready(ep, band):
-                return f'@freepool:{band}:{ep["name"]}'
+                ready.append(ep)
+        if not ready:
+            return None
+        # Least-utilized-first (2026-11-21 operations-research pass on
+        # throttle risk): the old first-ready-in-declaration-order walk
+        # concentrated traffic on the head endpoint until it throttled
+        # while its siblings sat idle. min() with a stable tiebreak spreads
+        # the load across every ready endpoint and delays throttle onset;
+        # a utilization failure on one endpoint drops it out of ranking
+        # rather than failing the whole pick.
+        best = None
+        best_util = None
+        for ep in ready:
+            try:
+                util = _freepool_utilization(ep, band)
+            except Exception:
+                util = 0.0
+            if best_util is None or util < best_util:
+                best, best_util = ep, util
+        return f'@freepool:{band}:{best["name"]}'
     except Exception:
         return None
     return None
@@ -969,6 +1045,14 @@ def _note_free_pool_rate_limited(provider, detail='', retry_after=None):
             if _freepool_exhaust_model_day(provider):
                 return
             cooldown = max(60.0, _next_utc_midnight(now) - now)
+        if cooldown == 60.0:
+            # Jitter the default refill window (operations-research pass,
+            # 2026-11-21): a fixed 60s cooldown wakes every throttled
+            # endpoint at the SAME instant, so the pool's next calls land
+            # as one synchronized burst the provider re-throttles together.
+            # +/-20% desynchronizes recovery. Retry-After and daily-limit
+            # windows keep their provider-exact values.
+            cooldown = 60.0 * (0.8 + random.random() * 0.4)
         with _free_pool_lock:
             _free_pool_state['cooldown'][provider['name']] = now + cooldown
     except Exception:
