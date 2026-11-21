@@ -1,9 +1,9 @@
 # Think Tank Business Processes
 
-Status: review draft, code-checked 2026-11-16
+Status: review draft, code-checked 2026-11-21
 Date: 2026-10-25
 Freshness: per section. A "Last checked" date records the last review pass for
-THAT section; sections absent from the 2026-10-26..2026-11-16 change log were
+THAT section; sections absent from the 2026-10-26..2026-11-21 change log were
 last checked 2026-11-02 and may lag the code.
 Owner: operator (the player)
 Scope: the operating processes of the AI think tank as implemented in this repository
@@ -22,7 +22,7 @@ Scope: the operating processes of the AI think tank as implemented in this repos
 - 7. Knowledge and evidence (BP-34 to BP-41)
 - 8. Money and resources (BP-42 to BP-46)
 - 9. Security, risk, and human oversight (BP-47 to BP-56)
-- 10. Communication and lifecycle (BP-57 to BP-69)
+- 10. Communication and lifecycle (BP-57 to BP-84)
 - 11. Player and operator processes
 - 12. Control framework
 - 13. State and record model
@@ -61,6 +61,37 @@ Three source documents were used:
 
 This is a dated change record. Git history carries commit detail; this section
 states only what changed in the operating model.
+
+**2026-11-21**
+
+- The JEV routing rule is codified in `world/core/jev.py`: place a decision in
+  the first lane that applies -- deterministic code for closed-form rules,
+  calibrated ML for closed-label classification with labeled history and cheap
+  mistakes, JEV for open-ended judgment, the operator for the irreversible.
+  The read-only command parse (BP-52) is the first named application.
+- Read-only commands are pre-approved before the JEV classifier runs: a
+  command that parses as provably read-only (`_readonly_shell_command`) or a
+  single read-only git invocation is decided by the rule table, and refusals
+  now run BEFORE allows so path containment outranks every table. See BP-52.
+- Digest quiet-window skip + scheduled items documentation: a 30-minute
+  Telegram digest window with no alerts, no internal signals, and no
+  integrity anomalies writes nothing and logs `telegram_digest_quiet`
+  instead of minting a "Total alerts: 0" file every half hour. The
+  `since_ts` window-collapse bug (the stamp was applied before the window
+  was computed, collapsing every window to zero) is fixed. See BP-82.
+- Finding-triage escalation: a spike finding whose JEV file verdict lands
+  below the operator's confidence floor is NOT minted as a backlog card;
+  it logs `finding_triage_unsure` and surfaces through the digest's
+  internal-signals section instead. See BP-82.
+- Change-request runway tightened on 2026-11-20: the minimum lead is now 6h
+  (was 12h earlier in the month, 24h before 2026-11-01), and the window must
+  sit OUTSIDE Eastern-time business hours (Mon-Fri 09:00-17:00
+  America/New_York), with `tankDown=True` the only exception. See BP-60.
+- The route-shadow net (a tiny trained classifier shadowing the live triage
+  lane) and a unified daily briefing endpoint became code-checked surfaces
+  on 2026-11-18; they amend BP-80 and BP-81.
+- Session-vault logins and the gVisor sandbox runtime are documented under
+  BP-80.
 
 **2026-11-16**
 
@@ -636,6 +667,9 @@ Owner request
 | BP-76 | Workflow templates | Breakdown match; weekly learning | Per goal, weekly | Scrum masters | Learned template set |
 | BP-77 | Live feed registries and temp access | Agent window grant or operator registry edit | Per window | Any authenticated agent (window), director/admin/player (registry) | Feed registry rows, `feed_access_granted`/`feed_access_cleared` log |
 | BP-78 | Team work board | Ops page request | On demand | Owner | Team-grouped card view |
+| BP-82 | Scheduled items and the digest quiet-skip | Cadence due on the tick | Per item cadence | Regional VP role, sim | Digest file, scan card, `lastRunAtMs` stamp |
+| BP-83 | Spike finding-triage escalation | Spike executor finishes a finding | Per finding | Spike executor, JEV | Filed issue or `finding_triage_unsure` log |
+| BP-84 | Session vault and operator login requests | Agent hits an auth wall | On demand | Operator | Vaulted session, write-back grant |
 
 ## 4. Core delivery processes
 
@@ -2385,7 +2419,7 @@ approval.
 
 ### BP-52 Browse, command, egress, and VPN
 
-**Last checked:** 2026-10-25
+**Last checked:** 2026-11-21
 
 **Browse.**
 
@@ -2399,6 +2433,21 @@ approval.
 
 - JEV allow/block with a safety floor.
 - Blocked commands escalate. Human-only.
+- **Read-only pre-approval lane (2026-11-21).** Before the model is asked,
+  `_classify_command` decides two deterministic classes: (a) one plain
+  read-only git invocation (`_git_read_only_command`), and (b) any command
+  whose whole text parses as provably read-only (`_readonly_shell_command`:
+  every segment a whitelisted read-only binary, output redirection confined
+  to /dev/null and its aliases, `$(...)` recursion-checked, interpreters and
+  exec-wrappers absent). These were ~30% of the month's `cmd_allow` model
+  calls. Ordering is refusals before allows: the host-home path check runs
+  FIRST, so no rule table can bypass path containment (the git table used to
+  sit ahead of it -- fixed 2026-11-21). A decoded base64 wrapper never
+  pre-approves: the ORIGINAL wrapper is what would run.
+- The routing rule behind the lane lives in the `world/core/jev.py` module
+  docstring: deterministic code for closed-form decisions, calibrated ML for
+  closed-label low-stakes classification, JEV for open-ended judgment, the
+  operator for the irreversible.
 
 **Sandbox egress.**
 
@@ -2806,15 +2855,25 @@ telemetry never produces work (BP-33).
 
 ### BP-60 Code self-edits and dormancy windows
 
-**Last checked:** 2026-11-02
+**Last checked:** 2026-11-21
 
-**Change-request runway (2026-10-27).** Every dormancy-window change request
-must be scheduled at least 24 hours before its window (the owner's veto link
-needs a real review opportunity) and no more than 7 days out; both bounds
-fail closed. An `emergency` changeType may use a 1-hour minimum, is loud
-(logged and Telegram-announced), and keeps the supervisor review and owner
-veto unchanged. Constitution Rule 9 names the lane and warns that labeling
-routine work as emergency is a Rule 12 violation.
+**Change-request runway (2026-10-27, tightened 2026-11-20).** Every
+dormancy-window change request must be scheduled at least 6 hours before its
+window (the owner's veto link needs a real review opportunity; the operator
+can shorten this in `.env`) and no more than 7 days out; both bounds fail
+closed. An `emergency` changeType may use a 1-hour minimum, is loud (logged
+and Telegram-announced), and keeps the supervisor review and owner veto
+unchanged. Constitution Rule 9 names the lane and warns that labeling routine
+work as emergency is a Rule 12 violation.
+
+**Business-hours gate (2026-11-20).** A normal change window must sit
+ENTIRELY outside Eastern-time business hours (Mon-Fri 09:00-17:00
+America/New_York) -- the tank applies its changes while the office is closed.
+`tankDown=True` is the ONLY exemption: a bug that prevents the tank from
+running is fixed immediately, whatever the clock says. Plain emergency
+changes observe the gate like normal changes. The gate walks the window
+minute-by-minute in `America/New_York`, so a UTC-night window that overlaps
+a business-hour ET morning is refused.
 
 **Missed windows fail closed (2026-11-02).** A window the owner never acts on
 does not auto-apply: the firing sweep marks an approved window whose slot has
@@ -3910,6 +3969,111 @@ injected context, so a bad page is visible to every worker fast.
 **Records.** The epistemic hypothesis/decision/validation chain, the
 `harness` wiki page versions, and the sweep reports they cite.
 
+### BP-82 Scheduled items and the digest quiet-skip
+
+**Last checked:** 2026-11-21
+
+**Purpose.** Let the tank keep its own runbook: recurring body work (a
+cadence, an owner role, a deliverable path) that mints and runs on the tick
+without a standing crew, and stop the runbook from minting noise when
+nothing happened.
+
+**Trigger.** The scheduled-items engine pass on the tick, per item cadence.
+
+**Steps.**
+
+1. Two items are seeded on a running tank via sticky markers: the
+   `sch-rvp-telegram-digest` item (30-minute cadence, owner role RVP) and
+   `sch-rvp-village-scan` (hourly). Seeding happens exactly once; a present
+   (even empty) `scheduledItems` list never reseeds.
+2. When an item's cadence is due, the engine mints its card and stamps
+   `lastRunAtMs` with the PRE-period stamp kept for the window -- the digest
+   always reads the window since its previous scan, never a collapsed one
+   (the 2026-11-21 fix: the stamp used to be applied before the window was
+   computed, so every window was zero seconds wide).
+3. The digest writer reads alerts, internal signals, and integrity
+   anomalies for the window and writes one Markdown file per scan into
+   `library/analysis/` (path recorded on the item and logged). A QUIET
+   window -- no alerts, no internal signals, no integrity anomalies; routine
+   trend plumbing does not count -- writes NOTHING, logs
+   `telegram_digest_quiet`, and the engine marks `lastRunSkipped` with a
+   `digest-quiet` reason and logs `scheduled_item_skipped`. The period still
+   counts as scanned.
+4. The village scan reads the digest surfaces; a non-empty surface files a
+   scan card for the RVP role. An empty surface mints nothing.
+5. Item mutation goes through the schedules API (`PATCH
+   /api/schedules/item/<id>`); the engine never edits an item's identity.
+
+**Controls.** Owner-role gating on minted cards, cadence stamps (not wall
+clock jobs), quiet-window suppression, marker-guarded seeding, API-only
+mutation.
+
+**Records.** `state['scheduledItems']`, digest files in `library/analysis/`,
+`telegram_digest_quiet` / `scheduled_item_skipped` action-log rows, scan
+cards.
+
+### BP-83 Spike finding-triage escalation
+
+**Last checked:** 2026-11-21
+
+**Purpose.** Stop low-confidence JEV file verdicts from minting backlog
+cards: a spike finding whose file_bug/file_story verdict lands below the
+operator's live confidence floor escalates instead of guessing.
+
+**Trigger.** A spike executor finishing with a non-empty finding that
+passes the deterministic problem-signal pre-filter.
+
+**Steps.**
+
+1. The deterministic pre-filter runs first (no problem signal in the
+   finding text -> no JEV spend, no card).
+2. The JEV triage call returns a typed choice (file_bug / file_story /
+   none / inconclusive) with a confidence.
+3. A confident file verdict mints the issue wish exactly as before (the
+   sim side resolves the owning team, dedups, and files).
+4. A verdict below `_effective_safety_confidence()` does NOT mint: the
+   executor logs `finding_triage_unsure` (headline, choice, confidence,
+   floor, task id) and returns nothing. The action kind is in the digest's
+   internal-signals list, so unsure findings surface to the RVP triage
+   instead of becoming churn the groomer must reject.
+
+**Controls.** Confidence floor (operator policy), deterministic pre-filter,
+wish indirection (the executor never files directly), digest surfacing.
+
+**Records.** Decision tape (`finding_triage`), `finding_triage_unsure`
+action-log rows, the digest internal-signals section.
+
+### BP-84 Session vault and operator login requests
+
+**Last checked:** 2026-11-21
+
+**Purpose.** Replace standing agent-profile cookies for operator web
+accounts with need-based, operator-vaulted sign-ins: an agent that hits an
+auth wall asks; the operator signs in once; the vault holds the session.
+
+**Steps.**
+
+1. An agent whose api_call or browser run hits an auth wall files an
+   `operator_login_request`; the request pages the operator with the
+   service and profile. The gate uses `_actor_is_authorized`, so a player
+   session may act for any agent.
+2. The operator signs in through the one-time login tool
+   (`world/tools/agent_browser_login.py`), which mounts the lane's real
+   profile tree under a dedicated browser session.
+3. An in-run auth success writes back to the canonical service session in
+   the vault, so the NEXT run needs no operator.
+4. A flow op can carry a bounded federated-OAuth click sequence under a
+   session grant; the grant cannot survive between acts, so every act
+   re-presents it. Credential-access loaders preserve session and
+   sessionProfile flags end to end.
+
+**Controls.** Operator-only approval of login requests, one-time browser
+session, vault write-back instead of cookie persistence, bounded OAuth
+dance, auth-wall escalation paging.
+
+**Records.** Login requests, session-vault entries, write-back action-log
+rows.
+
 ## 11. Player and operator processes
 
 | Process | Surface | What the owner does |
@@ -4089,6 +4253,8 @@ Task records also carry `completionRecovery`, `transportRecovery`,
 |---|---|---|---|
 | Movement | 1s | Simulation | Walk and arrive |
 | Task cycle | 6s | Simulation | One read-modify-write pass |
+| Telegram alert digest | 30min (per scheduled item) | Wall | Quiet windows write nothing; `telegram_digest_quiet` logged |
+| Village scan | 60min (per scheduled item) | Wall | Mints a scan card only when a digest surface is non-empty |
 | Completion recovery | 6s | Simulation | Observe, then bounded repair with backoff |
 | Safari cookie sync | Per browser run | Wall | Facebook and Instagram only; fresh Safari seed |
 | Photo album watch | 30s | Wall | One album, 3 pending assets per tick |
@@ -4462,6 +4628,13 @@ rather than gate-integrity questions.
 | BP-76 | `world/village/sim_parts/135_workflow_templates.py`, `world/server/serve_parts/428_workflow_templates_api.py` |
 | BP-77 | `world/server/ws.py`, `world/integrations/rss.py`, `world/server/serve_parts/350_api_channel_execute.py`, `world/server/serve_parts/240_make_web_tools_executor.py` |
 | BP-78 | `world/agents/pulse_ui.py`, `world/agents/content_parts/90_body_10.py`, `world/server/serve_parts/430_jev_model_get.py` |
+| BP-79 | `core/epistemics.py`, `evidence.py`, `evidence_policy.py` |
+| BP-80 | `server/serve_parts/446_steal_list_api.py`, `agent_replay.py`, `seer.py`, `issue_engine.py`, `server/serve_parts/447_investigations_api.py` |
+| BP-81 | `core/harness_optimizer.py` |
+| BP-82 | `village/sim_parts/165__scheduled_items.py`, `server/serve_parts/425_scheduled_items.py` |
+| BP-83 | `agents/content_parts/70_body_08.py` |
+| BP-84 | `server/serve_parts/395_operator_login_request.py`, `tools/agent_browser_login.py`, `tools/login_browser_session.py` |
+| BP-52 | `server/serve_parts/182_readonly_shell.py`, `server/serve_parts/360_curl.py`, `server/serve_parts/168_url_trust.py` |
 
 ## 20. Appendix D: review checklist
 

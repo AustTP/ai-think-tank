@@ -687,6 +687,18 @@ keyed/kid-stamped entry.
    membership list to drift.
 10. **Ceremonies run concurrently** — refinement has per-team slots. One
     team's scrum master never blocks another's from grooming their backlog.
+11. **Context stays local (2026-11-21)** — after Zhang, Chakraborty &
+    Khattab, "Language Model Harnesses Can Be Compositional Generalizers":
+    a harness that accumulates one long trajectory goes
+    out-of-distribution; a harness that keeps every model call locally
+    in-distribution composes existing capability over novel tasks. The
+    tank's structure is the second shape: work decomposes into cards,
+    each resolved by fresh-context sub-calls; the groom cascade and the
+    route-shadow net are cheap supervision standing in for expensive
+    judgment; a decision leaves the deterministic or calibrated lanes for
+    escalation, never for length. The routing rule is codified in
+    `world/core/jev.py`: deterministic code, then calibrated ML, then
+    JEV, then the operator.
 
 ---
 
