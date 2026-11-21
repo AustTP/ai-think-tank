@@ -537,6 +537,22 @@ def _sim_loop_pass_inner():
             serve._adversarial_village_tick(state)
         except Exception as e:
             print(f'[sim] adversarial village tick error: {e}', flush=True)
+        # Cross-village mail relay (118_village_shards): recover stale
+        # claims, expire TTL'd mail, then deliver every village's queued
+        # mail into recipient mailboxes + wake queues INSIDE this single
+        # read-modify-write, so a delivered note can never be clobbered by a
+        # concurrent whole-blob save. This is the seam that lets villages
+        # grow into independent processes -- the mail queue becomes their
+        # ONLY coupling. Returns {villageId: deliveredCount}; logged only
+        # when something actually moved.
+        _phase('village_mail_relay')
+        try:
+            _relay_counts = _village_mail_relay_pass(state, int(now * 1000))
+            if any(c > 0 for c in _relay_counts.values()):
+                serve.log_action(None, 'village_mail_delivered',
+                                 {'counts': _relay_counts}, authorized=True)
+        except Exception as e:
+            print(f'[sim] village mail relay error: {e}', flush=True)
         # Consume ONE pending sim-watchdog failure event (R6): stamped on the
         # module side channel by serve's watchdog thread, delivered here
         # INSIDE the single read-modify-write so the mailbox/work-queue writes
