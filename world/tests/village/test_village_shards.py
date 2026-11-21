@@ -108,3 +108,54 @@ def test_village_of_defaults_to_main():
     state = _state_with_villages()
     assert sim._village_of(state, 'ada') == 'main'
     assert sim._village_of(state, 'unknown') == 'main'
+
+
+def _api_client(monkeypatch, state, authed=True):
+    import serve
+    from starlette.testclient import TestClient
+    c = TestClient(serve.app)
+    if authed:
+        c.cookies.set(serve.SESSION_COOKIE_NAME, serve.create_session())
+    monkeypatch.setattr(serve, 'get_state_from_db', lambda: state)
+    monkeypatch.setattr(serve, 'save_state_to_db', lambda s: None)
+    monkeypatch.setattr(serve, 'log_action',
+                        lambda *a, **k: None)
+    return c
+
+
+def test_mail_api_post_queues_and_returns_id(monkeypatch):
+    state = _state_with_villages()
+    r = _api_client(monkeypatch, state).post(
+        '/api/villages/mail', json={'toVillage': 'vlg-1', 'toAgent': 'ben',
+                                    'text': 'handoff ready'})
+    assert r.status_code == 200
+    body = r.json()
+    assert body['status'] == 'queued'
+    assert body['id'] == 'vmail-1'
+    queue = sim._village_mail_queue(state)
+    assert len(queue) == 1
+    assert queue[0]['entry']['mail']['fromVillage'] == 'main'
+
+
+def test_mail_api_post_unknown_village_is_404(monkeypatch):
+    r = _api_client(monkeypatch, _state_with_villages()).post(
+        '/api/villages/mail', json={'toVillage': 'nope', 'text': 'x'})
+    assert r.status_code == 404
+
+
+def test_mail_api_get_lists_queue(monkeypatch):
+    state = _state_with_villages()
+    sim._village_mail_enqueue(state, 'main', 'vlg-1',
+                              {'toAgent': 'ben', 'kind': 'village_mail'}, 1000)
+    r = _api_client(monkeypatch, state).get('/api/villages/mail')
+    assert r.status_code == 200
+    body = r.json()
+    assert body['counts']['queued'] == 1
+    assert body['total'] == 1
+    assert body['mail'][0]['to'] == 'vlg-1'
+
+
+def test_mail_api_get_requires_operator_auth(monkeypatch):
+    r = _api_client(monkeypatch, _state_with_villages(),
+                    authed=False).get('/api/villages/mail')
+    assert r.status_code == 401

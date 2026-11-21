@@ -39,10 +39,11 @@ async def villages_mail_endpoint(request: Request):
         state = None
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
-    from village.sim_helpers import village_of_agent
+    import sim as _sim  # noqa: E402 -- lazy, sim <-> serve import cycle
+    from village.sim_helpers import village_of_agent  # noqa: E402
     actor_village = village_of_agent(state, actor or 'player') if actor \
         and actor != 'player' else 'main'
-    mail_id = _village_mail_enqueue(state, actor_village, to_village,
+    mail_id = _sim._village_mail_enqueue(state, actor_village, to_village,
                                     {'toAgent': str(body.get('toAgent') or ''),
                                      'kind': str(body.get('kind') or 'village_mail'),
                                      'about': str(body.get('about') or ''),
@@ -74,12 +75,13 @@ async def villages_mail_list_endpoint(request: Request):
         state = None
     if not state:
         return JSONResponse({'error': 'state unavailable'}, status_code=503)
+    import sim as _sim  # noqa: E402 -- lazy, sim <-> serve import cycle
     village = str(request.query_params.get('village') or '').strip()
     try:
         limit = max(1, min(int(request.query_params.get('limit') or 50), 200))
     except (TypeError, ValueError):
         limit = 50
-    queue = _village_mail_queue(state)
+    queue = _sim._village_mail_queue(state)
     counts = {'queued': 0, 'claimed': 0, 'done': 0}
     for m in queue:
         counts[m.get('status')] = counts.get(m.get('status'), 0) + 1
