@@ -117,6 +117,12 @@ async def _lifespan(app):
         else asyncio.create_task(_photo_album_watch_loop())
     tier_price_watch_task = None if VILLAGE_MODE \
         else asyncio.create_task(_tier_price_watch_loop())
+    # Morning report (owner, 2026-11-21): the 07:30 ET nightly summary to
+    # Telegram. Org-level and Telegram-pushing, so village workers skip it
+    # exactly like the poll loop (two pollers 409-conflict).
+    morning_report_task = (None if VILLAGE_MODE
+                           or not _morning_report_enabled()
+                           else asyncio.create_task(_morning_report_loop()))
     # Provider cap crossings (operator, 2026-11-13): spend crossing a
     # provider's monthly cap re-picks the tiers within a minute, so the
     # bands migrate off a capped provider instead of waiting for the next
@@ -229,6 +235,8 @@ async def _lifespan(app):
         photo_watch_task.cancel()
     if tier_price_watch_task is not None:
         tier_price_watch_task.cancel()
+    if morning_report_task is not None:
+        morning_report_task.cancel()
     if provider_cap_watch_task is not None:
         provider_cap_watch_task.cancel()
     if service_price_drift_task is not None:
