@@ -353,3 +353,97 @@ class AsyncReturn:
         fut = asyncio.get_event_loop().create_future()
         fut.set_result(self._value)
         return fut
+
+
+class TelegramMediaIntake(unittest.TestCase):
+    """Photo/document intake (2026-11-21): the bridge used to silently drop
+    every non-text message. An operator-sent image must download into
+    world/telegram-media/ and come back as a text path the operator can
+    reference. Same allowlist as text; largest photo size wins."""
+
+    def _photo_update(self, chat_id=123, sizes=None, document=None):
+        message = {'chat': {'id': chat_id}}
+        if sizes:
+            message['photo'] = sizes
+        if document:
+            message['document'] = document
+        return {'update_id': 1, 'message': message}
+
+    def test_photo_from_allowed_chat_picks_largest_and_replies_with_path(self):
+        sizes = [
+            {'file_id': 'small', 'file_size': 100},
+            {'file_id': 'large', 'file_size': 9000},
+        ]
+        with unittest.mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS',
+                                        frozenset({'123'})), \
+                unittest.mock.patch.object(
+                    serve, '_telegram_save_media_sync',
+                    return_value='Image saved to telegram-media/tg-x.jpg') as save:
+            result = asyncio.run(serve._telegram_process_update(
+                self._photo_update(chat_id='123', sizes=sizes)))
+        save.assert_called_once_with('large')
+        self.assertIn('Image saved', result[1])
+        self.assertEqual(result[0], '123')
+
+    def test_photo_from_unknown_chat_is_ignored(self):
+        with unittest.mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS',
+                                        frozenset({'123'})):
+            result = asyncio.run(serve._telegram_process_update(
+                self._photo_update(chat_id='999', sizes=[{'file_id': 'x'}])))
+        self.assertIsNone(result)
+
+    def test_document_file_id_is_taken(self):
+        with unittest.mock.patch.object(serve, 'TELEGRAM_ALLOWED_CHAT_IDS',
+                                        frozenset({'123'})), \
+                unittest.mock.patch.object(
+                    serve, '_telegram_save_media_sync',
+                    return_value='saved doc') as save:
+            result = asyncio.run(serve._telegram_process_update(
+                self._photo_update(
+                    document={'file_id': 'doc1', 'file_name': 'r.png'})))
+        save.assert_called_once_with('doc1')
+        self.assertEqual(result[1], 'saved doc')
+
+    def test_save_media_sync_downloads_trims_and_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            media_dir = os.path.join(tmp, 'telegram-media')
+            os.makedirs(media_dir)
+            for i in range(55):
+                with open(os.path.join(media_dir, f'tg-old-{i:03d}.jpg'), 'wb') as fh:
+                    fh.write(b'x')
+            class _Resp:
+                def read(self, n=-1):
+                    return b'PNGDATA'
+                def __enter__(self):
+                    return self
+                def __exit__(self, *a):
+                    return False
+            fetched = {}
+            def fake_api(method, params=None, timeout=30):
+                fetched['file_id'] = (params or {}).get('file_id')
+                return {'file_path': 'photos/report.jpg'}
+            def fake_urlopen(req, timeout=60):
+                return _Resp()
+            with unittest.mock.patch.object(serve.config, 'ROOT', tmp), \
+                    unittest.mock.patch.object(serve, '_telegram_api_sync',
+                                               side_effect=fake_api), \
+                    unittest.mock.patch('urllib.request.urlopen',
+                                        side_effect=fake_urlopen):
+                reply = serve._telegram_save_media_sync('fid-1')
+            self.assertIn('tg-', reply)
+            self.assertIn('7 bytes', reply)
+            self.assertEqual(fetched['file_id'], 'fid-1')
+            names = sorted(os.listdir(media_dir))
+            self.assertEqual(len(names), 50, 'oldest files must be trimmed to 50')
+            # The just-written file (newest mtime) must SURVIVE the trim.
+            self.assertTrue(any(n.startswith('tg-2') for n in names),
+                            f'new file must survive: {names[:5]}')
+            self.assertIn('tg-old-054.jpg', names)
+            self.assertNotIn('tg-old-000.jpg', names)
+
+    def test_save_media_sync_failure_returns_soft_reply(self):
+        with unittest.mock.patch.object(serve, '_telegram_api_sync',
+                                        return_value=None):
+            reply = serve._telegram_save_media_sync('fid-2')
+        self.assertIn('could not fetch', reply.lower())
+        self.assertIn('telegram', reply.lower())

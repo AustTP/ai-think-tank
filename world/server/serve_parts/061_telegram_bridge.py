@@ -109,6 +109,52 @@ def _telegram_poll_outcome(ok, err=''):
         pass
 
 
+def _telegram_save_media_sync(file_id):
+    """Download one inbound Telegram photo/document to world/telegram-media/
+    and return the reply text naming where it landed. The operator sends the
+    tank things it must SEE (a screenshot of the report layout she wants
+    reproduced nightly, a captcha screenshot); before 2026-11-21 every such
+    message was dropped silently because the bridge only read message.text.
+    Bounded: 20 MiB per file, 50 files kept (oldest trimmed). Never raises."""
+    try:
+        info = _telegram_api_sync('getFile', {'file_id': file_id})
+        remote_path = (info or {}).get('file_path')
+        if not remote_path:
+            return 'Got the image but could not fetch its file record from Telegram.'
+        url = f'https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{remote_path}'
+        suffix = os.path.splitext(remote_path)[1][:10] or '.jpg'
+        media_dir = os.path.join(config.ROOT, 'telegram-media')
+        os.makedirs(media_dir, exist_ok=True)
+        stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        dest = os.path.join(media_dir, f'tg-{stamp}{suffix}')
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=60) as resp:  # nosec B310 -- fixed Telegram host
+            raw = resp.read(20 * 1024 * 1024 + 1)
+        if len(raw) > 20 * 1024 * 1024:
+            return 'Image received but it exceeded the 20 MiB intake cap and was dropped.'
+        with open(dest, 'wb') as fh:
+            fh.write(raw)
+        # Trim to the newest 50 files, by mtime (a name sort would delete
+        # the just-written file: 'tg-<date>' sorts before 'tg-old-*').
+        try:
+            entries = [f for f in os.listdir(media_dir) if f.startswith('tg-')]
+            entries.sort(key=lambda f: os.path.getmtime(
+                os.path.join(media_dir, f)))
+            for old in entries[:-50]:
+                try:
+                    os.unlink(os.path.join(media_dir, old))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return (f'Image saved to telegram-media/{os.path.basename(dest)} '
+                f'({len(raw)} bytes). The tank can see it now; reference it '
+                'by that name.')
+    except Exception as e:
+        print(f'[telegram] media save failed: {e}', flush=True)
+        return 'Got the image but saving it failed; try resending.'
+
+
 def _telegram_send_photo_sync(png_bytes, caption):
     if not telegram_push_allowed():
         return 0
@@ -727,10 +773,26 @@ async def _telegram_process_update(update):
     message = update.get('message') or {}
     chat_id = str((message.get('chat') or {}).get('id') or '')
     text = (message.get('text') or '').strip()
-    if not chat_id or not text:
+    # Photo/document intake (2026-11-21): the bridge used to drop every
+    # non-text message silently. Images the operator sends (screenshots of a
+    # report layout, captcha screenshots, anything the tank must SEE) now
+    # download to world/telegram-media/ and land as a text path the operator
+    # can reference. Same allowlist as text; the largest photo size wins.
+    if not chat_id or chat_id not in TELEGRAM_ALLOWED_CHAT_IDS:
+        if chat_id:
+            print(f'[telegram] message from non-allowlisted chat {chat_id}, ignored', flush=True)
         return None
-    if chat_id not in TELEGRAM_ALLOWED_CHAT_IDS:
-        print(f'[telegram] message from non-allowlisted chat {chat_id}, ignored', flush=True)
+    photo_ref = None
+    if message.get('photo'):
+        sizes = [p for p in message['photo'] if isinstance(p, dict) and p.get('file_id')]
+        if sizes:
+            photo_ref = max(sizes, key=lambda p: p.get('file_size') or 0)['file_id']
+    elif isinstance(message.get('document'), dict) and (message['document'].get('file_id')):
+        photo_ref = message['document']['file_id']
+    if photo_ref is not None:
+        saved = await asyncio.to_thread(_telegram_save_media_sync, photo_ref)
+        return chat_id, saved
+    if not text:
         return None
     # Operator is present: reset dormancy exactly like an HTTP request.
     _telegram_operator_wake()
