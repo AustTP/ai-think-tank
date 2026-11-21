@@ -512,6 +512,52 @@ def _git_read_only_command(text):
     return False
 
 
+# Plain read-only coreutils (2026-11-21): the git pre-approval above is the
+# same lane-1 idea (core/jev.py routing rule: deterministic code before a
+# model call) extended to the binaries that dominate the cmd_allow tape --
+# `ls`, `cat`, and friends were 30%+ of 24k JEV round-trips a month. A
+# closed-form read has a correct answer the rule table gives for free; the
+# wrong-pre-approval risk here is near zero because these invocations
+# CANNOT do anything: no shell metacharacters (so no redirect, no pipe, no
+# command substitution), and every listed binary only reads files, reads
+# stdin it cannot receive without `<`, or prints. Interpreters and anything
+# that EXECUTES its argument (env, timeout, nice, nohup, watch, xargs,
+# sh/bash) stay out: the payload is where the danger lives. find is the one
+# exception case -- allowed except its write/exec predicates.
+_PLAIN_READ_ONLY_BINARIES = frozenset({
+    'ls', 'cat', 'head', 'tail', 'wc', 'pwd', 'which', 'type', 'file',
+    'stat', 'du', 'df', 'date', 'cal', 'id', 'uname', 'whoami',
+    'hostname', 'echo', 'printf', 'basename', 'dirname', 'realpath',
+    'grep', 'egrep', 'fgrep', 'diff', 'cmp', 'sort', 'uniq', 'cut',
+    'comm', 'cksum', 'md5sum', 'sha256sum', 'tree', 'seq', 'true',
+    'false', 'test', '[', 'find',
+})
+_FIND_WRITE_PREDICATES = frozenset({
+    '-exec', '-execdir', '-ok', '-okdir', '-delete',
+    '-fprint', '-fprint0', '-fprintf',
+})
+
+
+def _plain_read_only_command(text):
+    """True when `text` is ONE plain invocation of a read-only coreutil
+    (no shell metacharacters, no exec/delete predicates). Deterministic
+    pre-approval ahead of the JEV classifier, same contract as
+    `_git_read_only_command`: anything ambiguous, wrapped, or compound
+    still goes to JEV as before."""
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped or any(meta in stripped for meta in _GIT_SHELL_META):
+        return False
+    tokens = stripped.split()
+    if not tokens or tokens[0] not in _PLAIN_READ_ONLY_BINARIES:
+        return False
+    if tokens[0] == 'find' and any(
+            tok in _FIND_WRITE_PREDICATES for tok in tokens[1:]):
+        return False
+    return True
+
+
 async def _classify_command(command, purpose, agent_id='unknown'):
     """Returns (allowed, reason, blockKind). blockKind distinguishes WHY a
     command was refused so callers can react differently: 'policy' is a real
@@ -530,26 +576,33 @@ async def _classify_command(command, purpose, agent_id='unknown'):
         'block': 'The command, or its stated purpose, suggests: ' + '; '.join(EXECUTE_BLOCK_CATEGORIES) + '.',
     }
     reviewed = review_target(command)
-    # Deterministic read-only-git pre-approval before the model is asked.
-    # Never for a decoded wrapper: the ORIGINAL base64 wrapper is what would
-    # run, and this pre-approval only ever saw the decoded text.
-    if not reviewed['decoded'] and _git_read_only_command(reviewed['text']):
-        return True, 'allow', None
-
-    # Deterministic host-path refusal before the model is asked. The sandbox
+    # Deterministic host-path refusal BEFORE any pre-approval. The sandbox
     # mounts the task directory at /workspace and has its own ephemeral /tmp;
-    # a host home path is never ordinary work. This also keeps the read path
-    # consistent with the write path, which previously allowed a /tmp scratch
-    # write and then blocked reading the same file (task-389). The refusal
-    # names the sanctioned alternative so a high-ranking agent (the chief of
-    # staff reaching for the production database for a supervision report) is
-    # pointed at the real tool instead of just a wall.
+    # a host home path is never ordinary work. Refusals come before allows so
+    # a read-only rule table can never bypass path containment. This also
+    # keeps the read path consistent with the write path, which previously
+    # allowed a /tmp scratch write and then blocked reading the same file
+    # (task-389). The refusal names the sanctioned alternative so a
+    # high-ranking agent (the chief of staff reaching for the production
+    # database for a supervision report) is pointed at the real tool instead
+    # of just a wall.
     _host_home = os.path.expanduser('~')
     if _host_home and _host_home != '/' and _host_home in reviewed['text']:
         return False, ('blocked: the command references a host filesystem path outside the sandbox. '
                        'Use /workspace, or the sandbox\'s own /tmp. The sandbox cannot see the '
                        'host filesystem at all -- for org-level stats (task counts, spend) use '
                        'the state_records tool with op=stats instead.'), 'policy'
+    # Deterministic read-only-git pre-approval before the model is asked.
+    # Never for a decoded wrapper: the ORIGINAL base64 wrapper is what would
+    # run, and this pre-approval only ever saw the decoded text.
+    if not reviewed['decoded'] and _git_read_only_command(reviewed['text']):
+        return True, 'allow', None
+
+    # Deterministic plain-read-only pre-approval before the model is asked
+    # (same lane as the git check above; see _plain_read_only_command).
+    if not reviewed['decoded'] and _plain_read_only_command(reviewed['text']):
+        return True, 'allow', None
+
     instructions = (f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\n'
                     f'Stated reason: {purpose or "not given"}\n'
                     'The sandbox is a container: /workspace is the task directory and its /tmp is '

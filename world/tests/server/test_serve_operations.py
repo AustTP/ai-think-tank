@@ -992,3 +992,75 @@ class OptIntTest(unittest.TestCase):
             {'taskId': 't', 'name': 'n', 'agentCount': 'bad'})[1])
         self.assertIn('>=', serve._standing_task_from_body(
             {'taskId': 't', 'name': 'n', 'agentCount': 0})[1])
+
+
+class PlainReadOnlyPreapprovalTests(unittest.TestCase):
+    """Lane-1 deterministic pre-approval in _classify_command (2026-11-21):
+    plain read-only coreutils never reach the JEV classifier -- the routing
+    rule in core/jev.py puts closed-form reads in the rule-table lane."""
+
+    def test_read_only_shapes_preapprove(self):
+        for cmd in ('ls -la', 'ls', 'cat notes/plan.md', 'cat a.txt b.txt',
+                    'head -20 log.txt', 'tail -f server.log',
+                    'grep -rn "TODO" src/', 'grep -c error out.txt',
+                    'wc -l *.py', 'df -h', 'du -sh .', 'date',
+                    'echo hello', 'pwd', 'which python', 'file x.bin',
+                    'stat out.txt', 'id', 'whoami', 'diff a.txt b.txt',
+                    'sort names.txt', 'uniq -c counts.txt',
+                    'find . -name "*.py"', 'find src -type f -mtime -7',
+                    'md5sum data.bin', 'true', 'test -f x.txt',
+                    '[ -d src ]'):
+            self.assertTrue(serve._plain_read_only_command(cmd), cmd)
+
+    def test_dangerous_shapes_still_go_to_jev(self):
+        for cmd in (
+                # shell metacharacters: the pre-approval never saw what
+                # actually runs after the redirect/pipe/substitution
+                'ls > out.txt', 'cat a | grep b', 'echo $(whoami)',
+                'echo hi; rm -rf /', 'cat x `cat y`',
+                # find's write/exec predicates
+                'find . -delete', 'find . -name "*.tmp" -exec rm {} \\;',
+                'find . -fprint hits.txt',
+                # wrappers that EXECUTE their argument
+                'timeout 5 ls', 'env FOO=1 ls', 'nice -n 5 ls',
+                'nohup ls', 'watch ls', 'xargs ls < files',
+                # interpreters and network/write tools
+                'python -c "print(1)"', 'python3 script.py',
+                'node -e "console.log(1)"', 'curl https://x.test',
+                'wget https://x.test', 'rm x', 'mv a b', 'mkdir d',
+                'touch f', 'sed -i s/a/b/ f', 'awk \'{print}\' f',
+                'sh -c "ls"'):
+            self.assertFalse(serve._plain_read_only_command(cmd), cmd)
+
+    def test_classify_never_calls_the_model_for_a_plain_read(self):
+        async def forbidden(*a, **k):
+            raise AssertionError('JEV quorum must not run for `ls`')
+
+        with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+                mock.patch.object(serve, '_jev_quorum_decision',
+                                  side_effect=forbidden):
+            allowed, reason, kind = asyncio.run(
+                serve._classify_command('ls -la', 'listing files'))
+        self.assertTrue(allowed)
+        self.assertEqual(reason, 'allow')
+        self.assertIsNone(kind)
+
+    def test_classify_decoded_wrappers_skip_the_preapproval(self):
+        # The ORIGINAL base64 wrapper is what would run; the pre-approval
+        # only ever saw the decoded text, so a decoded snippet must go to
+        # JEV even though its text contains an ordinary read.
+        import base64 as _b64
+        blob = _b64.b64encode(b'import os\nos.getcwd()').decode()
+        wrapped = 'python -c "exec(base64.b64decode(\'{}\'))"'.format(blob)
+        with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+                mock.patch.object(serve, '_jev_quorum_decision',
+                                  new=mock.AsyncMock(
+                                      return_value=('block', 0.9, 0.0,
+                                                    'tr'))), \
+                mock.patch.object(serve, '_jev_safety_gate',
+                                  return_value=False):
+            allowed, reason, kind = asyncio.run(
+                serve._classify_command(wrapped, 'run snippet'))
+        self.assertFalse(allowed)
+        self.assertEqual(reason, 'block')
+        self.assertEqual(kind, 'policy')
