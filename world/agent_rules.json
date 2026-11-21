@@ -1,0 +1,8 @@
+{
+  "_schema": "agent-improvable rule overlay, additive-only over code constants; see world/server/serve_parts/059_agent_rules.py",
+  "readonlyBinaries": [],
+  "readonlyGitSubs": [],
+  "forbiddenFlags": {},
+  "spikeProblemSignals": [],
+  "internalSignalActions": []
+}

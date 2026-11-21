@@ -200,8 +200,11 @@ def _word_ok(word, binary_mode=False):
         # A statement's head must be a whitelisted binary. Inert keywords
         # (do/then/...) are only valid as bare statements or opener bodies;
         # accepting them here would swallow the rest of the statement as
-        # mere arguments (e.g. `do rm "$f"`).
-        return word in _READONLY_BINARIES
+        # mere arguments (e.g. `do rm "$f"`). The agent-rules overlay
+        # (059_agent_rules) can extend the whitelist additively; the base
+        # set below is the floor that can never shrink.
+        return word in _READONLY_BINARIES \
+            or word in _agent_rules_extra('readonlyBinaries')
     if word in _NULL_REDIRECTS:
         return True
     if word == '<':
@@ -264,9 +267,12 @@ def _segment_ok(statement):
     head = words[0]
     if head == 'find' and any(w in _FIND_WRITE_FLAGS for w in words[1:]):
         return False
-    if head == 'git' and (len(words) < 2 or words[1] not in _READONLY_GIT_SUBS):
+    if head == 'git' and (len(words) < 2 or (
+            words[1] not in _READONLY_GIT_SUBS
+            and words[1] not in _agent_rules_extra('readonlyGitSubs'))):
         return False
-    for banned in _FORBIDDEN_FLAGS.get(head, ()):
+    for banned in tuple(_FORBIDDEN_FLAGS.get(head, ())) \
+            + _agent_rules_forbidden(head):
         if any(w == banned or w.startswith(banned + '=') for w in words[1:]):
             return False
     if _dev_analysis_ok(words):

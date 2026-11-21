@@ -159,7 +159,11 @@ def _spike_file_issue_wish(finding, task, name, backlog):
     large share of real findings report "could not verify" rather than "all
     fine", and forcing that class into the none-vs-bug binary was the single
     biggest driver of low-confidence triage answers)."""
-    signals = _SPIKE_ISSUE_PROBLEM_SIGNALS
+    # Agent-rules overlay (059_agent_rules): agents can grow the signal
+    # vocabulary additively as findings drift; the built-in list is the
+    # floor.
+    signals = _SPIKE_ISSUE_PROBLEM_SIGNALS + tuple(
+        _serve._agent_rules_table('spikeProblemSignals') or ())
     if not (finding or '').strip():
         return None
     haystack = ' '.join((finding or '').split()).lower()

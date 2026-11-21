@@ -143,12 +143,16 @@ def write_telegram_alert_digest(now=None, since_ts=None):
         'finding_triage_unsure')
     internal_rows = []
     try:
+        # Agent-rules overlay (059_agent_rules): new action kinds can be
+        # surfaced here additively without a code change.
+        actions = tuple(_INTERNAL_SIGNAL_ACTIONS) + tuple(
+            _agent_rules_table('internalSignalActions') or ())
         with _db() as conn:
-            marks = ','.join('?' * len(_INTERNAL_SIGNAL_ACTIONS))
+            marks = ','.join('?' * len(actions))
             internal_rows = conn.execute(
                 'SELECT ts, action, details FROM action_log '
                 f'WHERE action IN ({marks}) AND ts >= ? ORDER BY ts ASC',
-                (*_INTERNAL_SIGNAL_ACTIONS, cutoff)).fetchall()
+                (*actions, cutoff)).fetchall()
     except Exception:
         internal_rows = []
     internal_by_class = {}
