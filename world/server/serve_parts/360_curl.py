@@ -512,52 +512,6 @@ def _git_read_only_command(text):
     return False
 
 
-# Plain read-only coreutils (2026-11-21): the git pre-approval above is the
-# same lane-1 idea (core/jev.py routing rule: deterministic code before a
-# model call) extended to the binaries that dominate the cmd_allow tape --
-# `ls`, `cat`, and friends were 30%+ of 24k JEV round-trips a month. A
-# closed-form read has a correct answer the rule table gives for free; the
-# wrong-pre-approval risk here is near zero because these invocations
-# CANNOT do anything: no shell metacharacters (so no redirect, no pipe, no
-# command substitution), and every listed binary only reads files, reads
-# stdin it cannot receive without `<`, or prints. Interpreters and anything
-# that EXECUTES its argument (env, timeout, nice, nohup, watch, xargs,
-# sh/bash) stay out: the payload is where the danger lives. find is the one
-# exception case -- allowed except its write/exec predicates.
-_PLAIN_READ_ONLY_BINARIES = frozenset({
-    'ls', 'cat', 'head', 'tail', 'wc', 'pwd', 'which', 'type', 'file',
-    'stat', 'du', 'df', 'date', 'cal', 'id', 'uname', 'whoami',
-    'hostname', 'echo', 'printf', 'basename', 'dirname', 'realpath',
-    'grep', 'egrep', 'fgrep', 'diff', 'cmp', 'sort', 'uniq', 'cut',
-    'comm', 'cksum', 'md5sum', 'sha256sum', 'tree', 'seq', 'true',
-    'false', 'test', '[', 'find',
-})
-_FIND_WRITE_PREDICATES = frozenset({
-    '-exec', '-execdir', '-ok', '-okdir', '-delete',
-    '-fprint', '-fprint0', '-fprintf',
-})
-
-
-def _plain_read_only_command(text):
-    """True when `text` is ONE plain invocation of a read-only coreutil
-    (no shell metacharacters, no exec/delete predicates). Deterministic
-    pre-approval ahead of the JEV classifier, same contract as
-    `_git_read_only_command`: anything ambiguous, wrapped, or compound
-    still goes to JEV as before."""
-    if not isinstance(text, str):
-        return False
-    stripped = text.strip()
-    if not stripped or any(meta in stripped for meta in _GIT_SHELL_META):
-        return False
-    tokens = stripped.split()
-    if not tokens or tokens[0] not in _PLAIN_READ_ONLY_BINARIES:
-        return False
-    if tokens[0] == 'find' and any(
-            tok in _FIND_WRITE_PREDICATES for tok in tokens[1:]):
-        return False
-    return True
-
-
 async def _classify_command(command, purpose, agent_id='unknown'):
     """Returns (allowed, reason, blockKind). blockKind distinguishes WHY a
     command was refused so callers can react differently: 'policy' is a real
@@ -592,15 +546,19 @@ async def _classify_command(command, purpose, agent_id='unknown'):
                        'Use /workspace, or the sandbox\'s own /tmp. The sandbox cannot see the '
                        'host filesystem at all -- for org-level stats (task counts, spend) use '
                        'the state_records tool with op=stats instead.'), 'policy'
-    # Deterministic read-only-git pre-approval before the model is asked.
-    # Never for a decoded wrapper: the ORIGINAL base64 wrapper is what would
-    # run, and this pre-approval only ever saw the decoded text.
+    # Deterministic read-only pre-approvals before the model is asked (lane 1
+    # of the core/jev.py routing rule). First the git-specific table (its
+    # read-only subcommand set is wider than the parse's), then
+    # 182_readonly_shell's provably-read-only parse -- the same parser the
+    # safety gate already trusts for model-free decisions -- so `ls`, `cat`,
+    # pipes of reads, and the whole read-only shape family never pay for a
+    # JEV round-trip. Never for a decoded wrapper: the ORIGINAL base64
+    # wrapper is what would run, and these pre-approvals only ever saw the
+    # decoded text. Refusals (the host-path check above) come before allows
+    # so no rule table can bypass path containment.
     if not reviewed['decoded'] and _git_read_only_command(reviewed['text']):
         return True, 'allow', None
-
-    # Deterministic plain-read-only pre-approval before the model is asked
-    # (same lane as the git check above; see _plain_read_only_command).
-    if not reviewed['decoded'] and _plain_read_only_command(reviewed['text']):
+    if not reviewed['decoded'] and _readonly_shell_command(reviewed['text']):
         return True, 'allow', None
 
     instructions = (f'An in-game agent in the Work Room wants to run this command: {reviewed["text"]}\n'

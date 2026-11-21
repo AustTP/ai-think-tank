@@ -996,10 +996,22 @@ class OptIntTest(unittest.TestCase):
 
 class PlainReadOnlyPreapprovalTests(unittest.TestCase):
     """Lane-1 deterministic pre-approval in _classify_command (2026-11-21):
-    plain read-only coreutils never reach the JEV classifier -- the routing
-    rule in core/jev.py puts closed-form reads in the rule-table lane."""
+    a command that 182_readonly_shell's parse proves read-only never reaches
+    the JEV classifier -- the routing rule in core/jev.py puts closed-form
+    reads in the rule-table lane. Refusals run before allows."""
 
-    def test_read_only_shapes_preapprove(self):
+    def _classify_no_model(self, command):
+        async def forbidden(*a, **k):
+            raise AssertionError('JEV quorum must not run for a read-only '
+                                 'command: %r' % command)
+
+        with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+                mock.patch.object(serve, '_jev_quorum_decision',
+                                  side_effect=forbidden):
+            return asyncio.run(
+                serve._classify_command(command, 'ordinary reading'))
+
+    def test_plain_reads_preapprove_without_the_model(self):
         for cmd in ('ls -la', 'ls', 'cat notes/plan.md', 'cat a.txt b.txt',
                     'head -20 log.txt', 'tail -f server.log',
                     'grep -rn "TODO" src/', 'grep -c error out.txt',
@@ -1009,58 +1021,53 @@ class PlainReadOnlyPreapprovalTests(unittest.TestCase):
                     'sort names.txt', 'uniq -c counts.txt',
                     'find . -name "*.py"', 'find src -type f -mtime -7',
                     'md5sum data.bin', 'true', 'test -f x.txt',
-                    '[ -d src ]'):
-            self.assertTrue(serve._plain_read_only_command(cmd), cmd)
+                    '[ -d src ]', 'git log --oneline -5',
+                    'git status --short',
+                    # compound shapes the 182 parse proves read-only
+                    'cat a.txt | grep pattern',
+                    'ls -la >/dev/null',
+                    'for f in *.py; do wc -l "$f"; done'):
+            allowed, reason, kind = self._classify_no_model(cmd)
+            self.assertTrue(allowed, cmd)
+            self.assertEqual(reason, 'allow', cmd)
+            self.assertIsNone(kind, cmd)
 
     def test_dangerous_shapes_still_go_to_jev(self):
+        import base64 as _b64
+        blob = _b64.b64encode(b'import os\nos.getcwd()').decode()
+        wrapped = 'python -c "exec(base64.b64decode(\'{}\'))"'.format(blob)
         for cmd in (
-                # shell metacharacters: the pre-approval never saw what
-                # actually runs after the redirect/pipe/substitution
-                'ls > out.txt', 'cat a | grep b', 'echo $(whoami)',
-                'echo hi; rm -rf /', 'cat x `cat y`',
-                # find's write/exec predicates
-                'find . -delete', 'find . -name "*.tmp" -exec rm {} \\;',
-                'find . -fprint hits.txt',
-                # wrappers that EXECUTE their argument
-                'timeout 5 ls', 'env FOO=1 ls', 'nice -n 5 ls',
-                'nohup ls', 'watch ls', 'xargs ls < files',
                 # interpreters and network/write tools
                 'python -c "print(1)"', 'python3 script.py',
                 'node -e "console.log(1)"', 'curl https://x.test',
                 'wget https://x.test', 'rm x', 'mv a b', 'mkdir d',
                 'touch f', 'sed -i s/a/b/ f', 'awk \'{print}\' f',
-                'sh -c "ls"'):
-            self.assertFalse(serve._plain_read_only_command(cmd), cmd)
+                'sh -c "ls"',
+                # find's write predicates and sort's output flag
+                'find . -delete', 'find . -name "*.tmp" -exec rm {} \\;',
+                'find . -fprint hits.txt', 'sort -o out.txt names.txt',
+                # wrappers that EXECUTE their argument
+                'timeout 5 ls', 'env FOO=1 ls', 'nohup ls', 'xargs ls',
+                # decoded base64 wrappers: the ORIGINAL is what would run
+                wrapped):
+            async def fake_quorum(*a, **k):
+                return 'block', 0.9, 0.0, 'tr'
+            with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
+                    mock.patch.object(serve, '_jev_quorum_decision',
+                                      side_effect=fake_quorum), \
+                    mock.patch.object(serve, '_jev_safety_gate',
+                                      return_value=False):
+                allowed, reason, kind = asyncio.run(
+                    serve._classify_command(cmd, 'ordinary work'))
+            self.assertFalse(allowed, cmd)
+            self.assertEqual(kind, 'policy', cmd)
 
-    def test_classify_never_calls_the_model_for_a_plain_read(self):
-        async def forbidden(*a, **k):
-            raise AssertionError('JEV quorum must not run for `ls`')
-
-        with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
-                mock.patch.object(serve, '_jev_quorum_decision',
-                                  side_effect=forbidden):
-            allowed, reason, kind = asyncio.run(
-                serve._classify_command('ls -la', 'listing files'))
-        self.assertTrue(allowed)
-        self.assertEqual(reason, 'allow')
-        self.assertIsNone(kind)
-
-    def test_classify_decoded_wrappers_skip_the_preapproval(self):
-        # The ORIGINAL base64 wrapper is what would run; the pre-approval
-        # only ever saw the decoded text, so a decoded snippet must go to
-        # JEV even though its text contains an ordinary read.
-        import base64 as _b64
-        blob = _b64.b64encode(b'import os\nos.getcwd()').decode()
-        wrapped = 'python -c "exec(base64.b64decode(\'{}\'))"'.format(blob)
-        with mock.patch.object(serve, 'OPENROUTER_API_KEY', 'k'), \
-                mock.patch.object(serve, '_jev_quorum_decision',
-                                  new=mock.AsyncMock(
-                                      return_value=('block', 0.9, 0.0,
-                                                    'tr'))), \
-                mock.patch.object(serve, '_jev_safety_gate',
-                                  return_value=False):
-            allowed, reason, kind = asyncio.run(
-                serve._classify_command(wrapped, 'run snippet'))
+    def test_host_home_path_is_refused_before_any_preapproval(self):
+        # Path containment outranks the read-only rule table: even a plain
+        # `cat` of a host path must get the deterministic refusal, not the
+        # sandbox-can't-see-it pre-approval.
+        allowed, reason, kind = self._classify_no_model(
+            'cat ' + os.path.expanduser('~') + '/secret.txt')
         self.assertFalse(allowed)
-        self.assertEqual(reason, 'block')
         self.assertEqual(kind, 'policy')
+        self.assertIn('host filesystem path', reason)

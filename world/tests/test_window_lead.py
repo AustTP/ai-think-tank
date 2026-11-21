@@ -153,19 +153,23 @@ class OutsideBusinessHoursTests(unittest.TestCase):
     def _weekday_slot(cls, hour_et, minute_et=0):
         """A slot 2-4 days out that lands on a Mon-Fri day (at least one of
         today+2..today+4 is always a business day), so the lead check passes
-        and only the business-hours rules decide."""
+        and only the business-hours rules decide. The weekday is picked in
+        ET -- the clock the gate walks -- because between 19:00 and midnight
+        ET the UTC calendar is already a day ahead of the ET one."""
+        from zoneinfo import ZoneInfo
         for extra in (2, 3, 4):
             wd = (datetime.datetime.now(
-                datetime.timezone.utc).weekday() + extra) % 7
+                ZoneInfo('America/New_York')).weekday() + extra) % 7
             if wd < 5:
                 return cls._et_utc_slot(extra, hour_et, minute_et)
         raise AssertionError('unreachable')
 
     @classmethod
     def _weekend_slot(cls, hour_et):
+        from zoneinfo import ZoneInfo
         for extra in range(1, 7):
             wd = (datetime.datetime.now(
-                datetime.timezone.utc).weekday() + extra) % 7
+                ZoneInfo('America/New_York')).weekday() + extra) % 7
             if wd >= 5:
                 return cls._et_utc_slot(extra, hour_et)
         raise AssertionError('unreachable')

@@ -446,7 +446,12 @@ class RoleFraming(unittest.TestCase):
             return _jev_response(choice='allow')
 
         async def drive():
-            return await serve._classify_command('ls /workspace', 'list the task dir', 'ruth')
+            # Not a lane-1 pre-approved command: `ls` now pre-approves
+            # deterministically (360_curl read-only table) and would never
+            # reach the model this test frames.
+            return await serve._classify_command(
+                'python /workspace/scripts/ingest.py', 'run the ingest',
+                'ruth')
 
         with unittest.mock.patch.object(serve, 'get_state_from_db',
                                         return_value={'agentRoster': self.ROSTER}), \
