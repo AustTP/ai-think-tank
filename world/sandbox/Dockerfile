@@ -36,9 +36,17 @@ RUN python -m pip install --no-cache-dir \
 # /root/.cache: the runner starts the container as the HOST user (see
 # _run_browser_act_sync --user), which cannot traverse root's 0700 home.
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
-RUN python -m pip install --no-cache-dir playwright==1.60.0
-RUN python -m playwright install --with-deps chromium \
-    && chmod -R a+rX /opt/ms-playwright
+# Patchright (2026-11-21): the patched Playwright fork removes stock
+# Playwright's CDP automation tells. Its chromium build is patched
+# separately, so it bakes into its OWN browsers dir
+# (/opt/ms-playwright-patchright); browser_driver.py points
+# PLAYWRIGHT_BROWSERS_PATH there when the patchright import wins, and at
+# /opt/ms-playwright for stock playwright. curl_cffi is baked for the
+# server-side TLS-impersonated fetch path.
+RUN python -m pip install --no-cache-dir playwright==1.60.0 patchright curl_cffi \
+    && python -m playwright install --with-deps chromium \
+    && PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright-patchright python -m patchright install chromium \
+    && chmod -R a+rX /opt/ms-playwright /opt/ms-playwright-patchright
 COPY browser_driver.py /opt/browser_driver.py
 COPY browser_cf.py /opt/browser_cf.py
 

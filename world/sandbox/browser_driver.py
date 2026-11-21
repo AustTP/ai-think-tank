@@ -44,6 +44,7 @@ OPS = ('goto', 'read', 'fill', 'fill_many', 'login', 'click', 'submit',
 MAX_TEXT = int(os.environ.get('BROWSER_ACT_MAX_TEXT', '16000'))
 MAX_FIELDS = 40
 MAX_LINKS = 40
+_DRIVER_FORK = 'playwright'  # set by run(): patchright when its import wins
 
 # Hard read-only backstop for the player-vetted social hosts. The server
 # already refuses these ops, but the driver is the last place that sees the
@@ -244,6 +245,7 @@ def _state(page, action, response=None, max_text=None):
     if max_text is None:
         max_text = int(action.get('maxText') or MAX_TEXT)
     state = _page_state(page, int(max_text), response=response)
+    state['driverFork'] = _DRIVER_FORK
     if solver:
         state['captchaSolver'] = solver
         if solver.get('solved'):
@@ -571,13 +573,31 @@ def run(action):
                 return {'ok': False, 'op': op,
                         'error': 'captcha_act click coordinates are out of range'}
     timeout_ms = int(action.get('timeoutMs') or 30000)
+    # Patchright first (2026-11-21): the patched Playwright fork removes the
+    # CDP Runtime.enable / console / isolated-world tells stock Playwright
+    # leaks. Importing it changes NOTHING else -- every call below is the
+    # identical playwright API -- except the browsers dir: patchright's
+    # chromium build is patched separately, so it lives in its own
+    # PLAYWRIGHT_BROWSERS_PATH. Any import failure falls back to stock
+    # playwright at the inherited path, so the sandbox never hard-breaks on
+    # a partial install. _DRIVER_FORK is stamped into every _state() result
+    # so an operator can see which fork ran.
+    global _DRIVER_FORK
     try:
-        from playwright.sync_api import sync_playwright
-    except Exception as e:
-        return {'ok': False, 'op': op, 'error': f'playwright not available in sandbox image: {e}'}
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright-patchright'
+        from patchright.sync_api import sync_playwright as _sync_playwright
+        _DRIVER_FORK = 'patchright'
+    except Exception:
+        # Restore the STOCK browsers path (the image bakes it via ENV;
+        # popping the var entirely would send stock playwright to the
+        # default ~/.cache, where the sandbox user has no browsers).
+        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright'
+        from playwright.sync_api import sync_playwright as _sync_playwright  # noqa: F811
+        _DRIVER_FORK = 'playwright'
     try:
-        with sync_playwright() as p:
+        with _sync_playwright() as p:
             ctx, page = _launch(p, action)
+            ctx._think_tank_driver_fork = _DRIVER_FORK
             try:
                 # Every op that carries a url navigates there first. Without
                 # this, fill/click/submit/read each open a blank page (the

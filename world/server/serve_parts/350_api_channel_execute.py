@@ -992,6 +992,68 @@ async def api_service_revoke(request: Request):
 
 
 def _curl_request_sync(method, url, headers, body):
+    # TLS-fingerprint impersonation (2026-11-21): urllib's Python TLS
+    # ClientHello is a standing bot signal on evaluated hosts (Cloudflare
+    # flags the request before any page logic runs). curl_cffi speaks a real
+    # browser's TLS stack, so the fetch looks like the fetch a browser on
+    # this IP would make. Redirects are followed ONE HOP AT A TIME here (no
+    # auto-redirect): every hop gets its own DNS resolve -> CurlOpt.RESOLVE
+    # pin -> _is_safe_public_host check, the same re-bind guarantee
+    # _safe_urlopen gives by pinning the socket. Any resolve failure, unsafe
+    # host, redirect cap, or transport error falls back to the original
+    # _safe_urlopen path verbatim, so exactly the old behavior remains the
+    # safety net.
+    try:
+        from curl_cffi import requests as cffi_requests
+        from curl_cffi.const import CurlOpt
+        import socket as _socket
+        current = url
+        current_method = method
+        merged_headers = dict(headers or {})
+        if 'User-Agent' not in {k.title() for k in merged_headers}:
+            merged_headers['User-Agent'] = 'AIThinkTankAgent/1.0'
+        for _hop in range(10):
+            hop_parsed = urllib.parse.urlparse(current)
+            host = (hop_parsed.hostname or '').strip()
+            if not _is_safe_public_host(host):
+                raise ValueError('redirected to a disallowed host')
+            port = hop_parsed.port or (443 if hop_parsed.scheme == 'https' else 80)
+            ip = _socket.gethostbyname(host)
+            if not _is_safe_public_host(ip):
+                raise ValueError('redirected to a disallowed host')
+            resp = cffi_requests.request(
+                current_method, current, headers=merged_headers,
+                data=body.encode() if body and _hop == 0 else None,
+                timeout=CURL_TIMEOUT_S, impersonate='chrome',
+                allow_redirects=False,
+                curl_options={CurlOpt.RESOLVE: [f'{host}:{port}:{ip}']})
+            if resp.status_code in (301, 302, 303, 307, 308) and _hop < 9:
+                location = resp.headers.get('Location')
+                if location:
+                    body = None  # a redirect never carries the original body
+                    current = urllib.parse.urljoin(current, location)
+                    if resp.status_code == 303 or \
+                            (current_method in ('POST', 'PUT', 'PATCH')
+                             and resp.status_code in (301, 302)):
+                        current_method = 'GET'
+                    continue
+            raw = resp.content[:CURL_MAX_BODY_BYTES + 1]
+            truncated = len(raw) > CURL_MAX_BODY_BYTES
+            return {
+                'status': resp.status_code,
+                'finalUrl': current,
+                'headers': dict(resp.headers.items()),
+                'body': raw[:CURL_MAX_BODY_BYTES].decode(errors='replace'),
+                'truncated': truncated,
+                'tlsImpersonation': 'chrome',
+            }
+        raise ValueError('too many redirects')
+    except ImportError:
+        pass
+    except ValueError:
+        raise  # an SSRF policy verdict or the redirect cap is a real verdict
+    except Exception:
+        pass  # offline / no DNS / transport hiccup -> original path handles it
     data = body.encode() if body else None
     req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
     if 'User-Agent' not in {k.title() for k in (headers or {})}:

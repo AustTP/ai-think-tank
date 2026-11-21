@@ -852,3 +852,112 @@ class CurlRequestSync(unittest.TestCase):
         result = self._run(resp)
         self.assertTrue(result['truncated'])
         self.assertEqual(len(result['body']), serve.CURL_MAX_BODY_BYTES)
+
+
+class CurlTlsImpersonation(unittest.TestCase):
+    """TLS impersonation wrapper over _curl_request_sync (2026-11-21): the
+    curl_cffi path pins DNS per hop through CurlOpt.RESOLVE, re-runs the
+    SSRF check on every hop, and falls back to the _safe_urlopen path on
+    transport failure without losing any guarantee."""
+
+    def _run(self, fn=None):
+        with unittest.mock.patch.object(serve, '_safe_urlopen', return_value=None) as m:
+            result = serve._curl_request_sync('GET', 'https://api.example.com/x', {}, None)
+            return result, m
+
+    def test_fallback_on_dns_failure_returns_urllib_path(self):
+        # No network/DNS in the test env: gethostbyname raises gaierror, the
+        # wrapper falls back to _safe_urlopen (mocked here) instead of erroring.
+        class _R:
+            status = 200
+            headers = {'Content-Type': 'text/plain'}
+            def geturl(self):
+                return 'https://api.example.com/x'
+            def read(self, n=-1):
+                return b'fallback'
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        fake = _R()
+        with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+                unittest.mock.patch.object(serve, '_safe_urlopen', return_value=fake):
+            result = serve._curl_request_sync('GET', 'https://api.example.com/x', {}, None)
+        self.assertEqual(result['status'], 200)
+        self.assertEqual(result['body'], 'fallback')
+        self.assertNotIn('tlsImpersonation', result)
+
+    def test_ssrf_verdict_propagates_not_fallback(self):
+        # A pinned-IP SSRF verdict must NOT be swallowed into the fallback
+        # path -- the unsafe host is refused outright.
+        with unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=False):
+            with self.assertRaises(ValueError):
+                serve._curl_request_sync('GET', 'https://api.example.com/x', {}, None)
+
+    def test_unsafe_final_redirect_host_refused(self):
+        # The redirect loop re-checks the HOST of every Location hop.
+        calls = []
+        def fake_gethostbyname(h):
+            calls.append(h)
+            return '93.184.216.34'
+        class _Resp:
+            status_code = 302
+            headers = {'Location': 'https://internal.example.com/next'}
+            content = b''
+        def fake_request(*a, **k):
+            return _Resp()
+        # `from curl_cffi import requests` resolves via getattr on the
+        # parent module object, so the parent mock must CARRY the request
+        # mock as .requests (a sys.modules entry alone is never consulted
+        # when getattr succeeds).
+        cffi_req = unittest.mock.MagicMock()
+        cffi_req.request = fake_request
+        cffi_parent = unittest.mock.MagicMock()
+        cffi_parent.requests = cffi_req
+        cffi_parent.const.CurlOpt.RESOLVE = 10203
+        with unittest.mock.patch.dict(sys.modules, {
+                'curl_cffi': cffi_parent,
+                'curl_cffi.const': cffi_parent.const}), \
+                unittest.mock.patch.object(serve, '_is_safe_public_host',
+                                           side_effect=lambda h: h != 'internal.example.com'), \
+                unittest.mock.patch('socket.gethostbyname', fake_gethostbyname):
+            with self.assertRaises(ValueError):
+                serve._curl_request_sync('GET', 'https://api.example.com/x', {}, None)
+        # The unsafe redirect target is refused at the HOST check, BEFORE
+        # any DNS resolution of it ever happens.
+        self.assertEqual(calls, ['api.example.com'])
+
+    def test_redirect_body_is_dropped_per_hop(self):
+        # A redirecting hop must not carry the original POST body forward.
+        bodies = []
+        class _Redirect:
+            status_code = 302
+            headers = {'Location': 'https://api.example.com/next'}
+            content = b''
+        class _Final:
+            status_code = 200
+            headers = {}
+            content = b'done'
+        def fake_request(method, url, **k):
+            bodies.append(k.get('data'))
+            return _Redirect() if url.endswith('/x') else _Final()
+        # `from curl_cffi import requests` resolves via getattr on the
+        # parent module object, so the parent mock must CARRY the request
+        # mock as .requests (a sys.modules entry alone is never consulted
+        # when getattr succeeds).
+        cffi_req = unittest.mock.MagicMock()
+        cffi_req.request = fake_request
+        cffi_parent = unittest.mock.MagicMock()
+        cffi_parent.requests = cffi_req
+        cffi_parent.const.CurlOpt.RESOLVE = 10203
+        with unittest.mock.patch.dict(sys.modules, {
+                'curl_cffi': cffi_parent,
+                'curl_cffi.const': cffi_parent.const}), \
+                unittest.mock.patch.object(serve, '_is_safe_public_host', return_value=True), \
+                unittest.mock.patch('socket.gethostbyname', return_value='93.184.216.34'):
+            result = serve._curl_request_sync('POST', 'https://api.example.com/x',
+                                              {}, 'secret-payload')
+        self.assertEqual(result['status'], 200)
+        self.assertEqual(result['body'], 'done')
+        self.assertEqual(bodies[0], b'secret-payload')
+        self.assertIsNone(bodies[1])
