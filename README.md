@@ -152,6 +152,28 @@ The other half of the tour is the roster, the ceremonies, and the memory. A thin
 
 Health surfaces at `/api/health`; the personnel record is the roster itself. If either disagrees with this tour, the code wins and the doc gets fixed.
 
+## Operator knobs added 2026-11-22
+
+Three capabilities landed with their own `.env` controls; all are documented
+in `.env.template` and default to safe behavior.
+
+- **YOLO object detection on Colab** (`391_vision_detect.py`): video frames
+  captured by `/api/youtube-frames` get a detection pass as one ephemeral
+  Colab job. `YOLO_DETECT_ENABLED=0` disables the pass,
+  `YOLO_DETECT_MODEL` picks any ultralytics slug (default `yolov8n.pt`),
+  `YOLO_DETECT_CONF` is the confidence floor, `YOLO_DETECT_MAX_FRAMES`
+  caps the batch, `YOLO_DETECT_RUNTIME` picks gpu/cpu.
+- **Rare-day Colab IP lane** (also `391_vision_detect.py`): when the VM's
+  datacenter IP draws a 403/429 from the plain browse path, one best-effort
+  fetch of the same already-cleared URL runs through a Colab runtime's
+  egress. Same Colab budget and account-affinity gates as every other Colab
+  job. `COLAB_FETCH_ENABLED=0` shuts the lane off.
+- **Jev institutional memory** (`392_jev_lessons.py`): confident
+  director-chain verdicts on Jev's unsure cases are stored as lessons the
+  safety gate recalls before escalating the same case again. Denies
+  generalize by host/command-family; allows stay URL-exact. `JEV_LESSONS_DIR`
+  overrides the store location (test hook).
+
 ## Security
 
 Read `SECURITY.md` before exposing this server to a network. Never commit
