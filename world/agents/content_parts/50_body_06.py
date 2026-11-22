@@ -750,6 +750,14 @@ def _make_spike_report_writer(agent_id, key, report_path, task_id=None):
 # a search_library lookup with a documented call signature, not a rediscovery.
 _SKILL_REQUIRED_HEADINGS = ('## Purpose', '## Key facts', '## Sources', '## Lessons learned')
 
+# Claim citation (operator, 2026-11-22, society-of-AI-scientists steal):
+# every numeric claim binds to the artifact that produced it, so a reviewer
+# can re-run the number instead of trusting the prose.
+_CLAIM_CITATION_LINE = (
+    '## Claim ledger: every number or load-bearing claim in the card names '
+    'the file, query, or command output it came from, so a reviewer can '
+    're-run it rather than trust the prose.')
+
 
 def _build_skill_card(slug, title, source_task, team, interface, body):
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -775,7 +783,9 @@ _PUBLISH_SKILL_TOOL = {
                        'specific resource. You must give a slug, a title, the source task id, your '
                        'team/agent id, a short interface contract (how to invoke it, its inputs, its '
                        'outputs, one example), and the distilled body (headings: ## Purpose, '
-                       '## Key facts, ## Sources, ## Lessons learned). The card is written to '
+                       '## Key facts, ## Sources, ## Lessons learned). Include a ## Claim ledger '
+                       'section: every number or load-bearing claim names the file, query, or command '
+                       'output it came from, so a reviewer can re-run it. The card is written to '
                        'pending_review/skills/ and goes through skill review before it is trusted.',
         'parameters': {
             'type': 'object',
@@ -827,6 +837,15 @@ def _make_skill_publisher(agent_id, key):
                     f'Rewrite the card without instructions or code that '
                     f'bypass controls, exfiltrate secrets, or run destructive '
                     f'commands.\n{findings}')
+        ledger_note = ''
+        if '## Claim ledger' not in card:
+            ledger_note = ('\nNote: future cards should include a ## Claim '
+                           'ledger section: every number or load-bearing '
+                           'claim names the file, query, or command output '
+                           'it came from, so a reviewer can re-run it.')
+            _serve.log_action(agent_id, 'skill_ledger_missing',
+                              {'slug': slug, 'path': path},
+                              authorized=True)
         try:
             _serve._http_json('POST', _serve.SELF_BASE_URL, '/api/library/file',
                               {'agentId': agent_id, 'path': path, 'content': card,
@@ -836,7 +855,7 @@ def _make_skill_publisher(agent_id, key):
         _serve.log_action(agent_id, 'skill_published',
                           {'slug': slug, 'path': path, 'sourceTask': source_task}, authorized=True)
         return (f'Filed skill card to {path}. It is in pending review and will be judged before it '
-                f'is trusted -- keep working as if nothing is promoted yet.')
+                f'is trusted -- keep working as if nothing is promoted yet.{ledger_note}')
     return execute_tool
 # Deliberately on-demand only, not a recurring cadence -- real
 # per-call cost against Treg's own $10+ balance (separate from the

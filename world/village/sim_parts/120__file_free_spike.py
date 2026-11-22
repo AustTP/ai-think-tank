@@ -661,6 +661,17 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
                          'that reason, and let scrum decide next steps. Do '
                          'not burn retries on a broken tool; the tank closes '
                          'repeat-failure cards itself.')
+        # Executable review (operator, 2026-11-22, society-of-AI-scientists
+        # steal): a review card must RUN the objection, not assert it -- the
+        # paper's finding that text-only referees could not tell flawed from
+        # fixed papers while script-aided review overturned half of major
+        # objections. Applied to our review/qa coding-lane cards.
+        if str(req.get('taskType') or '') in ('review', 'qa'):
+            instructions += (' OBJECTION RULE: for every objection you raise, '
+                             'attempt to demonstrate it: run the check, paste '
+                             'the actual command output, and state whether the '
+                             'flaw reproduces. An objection you did not attempt '
+                             'does not count as a finding.')
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room (prioritization only, not a scope gate): {ctx}."
