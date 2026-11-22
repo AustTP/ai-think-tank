@@ -83,7 +83,9 @@ class NativeRunSuccessPath(unittest.TestCase):
                                   return_value=(True, '')), \
                 mock.patch.object(serve, '_accrue_colab_units'), \
                 mock.patch.object(serve, '_native_enabled',
-                                  return_value=True):
+                                  return_value=True), \
+                mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
+                mock.patch.object(serve, 'COLAB_ENABLED', True):
             ok, res = serve._native_model_run_sync('whisper-s', ['a.wav'])
         self.assertTrue(ok)
         self.assertEqual(res['texts'][0]['text'], 'hi')
