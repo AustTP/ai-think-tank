@@ -249,6 +249,19 @@ def compile_morning_report(now=None):
     lines.append(f"- Reopen signals: {sb.get('reopened', 0)}")
     lines.append(f"- Escalations needing you: {sb.get('escalations', 0)}")
     lines.append(f"- Cards completed vs auto-closed: {sb.get('completions', 0)} vs {sb.get('autoCloses', 0)}")
+    # Counter-metrics (operator, 202 exit-placeholder, goal-engineering piece)
+    lines.append(f"- Counter-metrics: {sb.get('reverts', 0)} reverts, "
+                 f"{sb.get('laneFails', 0)} lane failures")
+    # Stall exit (operator, 2026-11-23, goal-engineering piece): a standing
+    # goal with no verified output for the configured horizon is surfaced,
+    # not silently kept alive.
+    stall_days = int(_load_env().get('OUTPUT_STALL_DAYS') or 7)
+    stalled = (sb.get('prMerged', 0) == 0 and sb.get('completions', 0) == 0
+               and sb.get('escalations', 0) == 0)
+    if stalled:
+        lines.append(f"!! STALL: no merged PR, no card completions, and no "
+                     f"resolved escalations in this {window_h}h window "
+                     f"(stall horizon {stall_days}d; OUTPUT_STALL_DAYS)")
     lines.append('(Full record: library/analysis/morning-report-*.)')
     text = '\n'.join(lines)[:3800]
     stats = {'runs': runs, 'prevRuns': prev_runs, 'deltaPct': delta,
@@ -332,8 +345,18 @@ def _morning_scoreboard(conn, cutoff):
     auto_closes = one(
         "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
         "AND action = 'task_auto_closed'", (cutoff,))
+    # Counter-metrics (operator, 2026-11-23, goal-engineering piece): every
+    # metric gets a counter-metric. Merged PRs are the metric; reverts and
+    # post-merge lane failures are what gaming it would cost.
+    reverts = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'selfedit_revert'", (cutoff,))
+    lane_fails = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'change_lane_failed'", (cutoff,))
     return {
         'prOpened': pr_opened, 'prMerged': merged, 'reopened': reopened,
         'blocked': blocked, 'escalations': escalations,
         'completions': completions, 'autoCloses': auto_closes,
+        'reverts': reverts, 'laneFails': lane_fails,
     }

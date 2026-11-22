@@ -184,3 +184,26 @@ class MorningReport(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MorningReportCounterMetrics(MorningReport):
+    """Counter-metrics + stall exit (202-sub-note 2>/dev/null)."""
+
+    def setUp(self):
+        super().setUp()
+
+    def test_scoreboard_counts_reverts_and_lane_fails(self):
+        now = int(time.time())
+        self._seed_action('a1', 'change_lane_merged', ts=now - 3600)
+        self._seed_action('a1', 'selfedit_revert', ts=now - 3600)
+        self._seed_action('a1', 'change_lane_failed', ts=now - 7200)
+        with serve._db() as conn:
+            scores = serve._morning_scoreboard(conn, 0)
+        self.assertEqual(scores['prMerged'], 1)
+        self.assertEqual(scores['reverts'], 1)
+        self.assertEqual(scores['laneFails'], 1)
+
+    def test_stall_line_renders_when_window_is_empty(self):
+        now = int(time.time())
+        text, stats = serve.compile_morning_report(now=now)
+        self.assertIn('!! STALL', text)
