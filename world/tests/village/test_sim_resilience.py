@@ -443,6 +443,10 @@ def test_sim_loop_pass_tick_errors(monkeypatch):
     monkeypatch.setattr(serve, '_apply_pending_ask_results', lambda s: None)
     monkeypatch.setattr(serve, '_peer_review_tick', lambda s: None)
     monkeypatch.setattr(serve, '_adversarial_village_tick', lambda s: None)
+    # The relay pass used to die on an unset `now` before touching state
+    # (2026-11-22 fix); now it really runs, so stub it like every other
+    # phase-effect -- this test is about error swallowing, not relay output.
+    monkeypatch.setattr(sim, '_village_mail_relay_pass', lambda s, n: {})
     import agents.story_tracking as story_tracking
     import agents.completion_watchdog as completion_watchdog
     monkeypatch.setattr(story_tracking, 'refresh', lambda *a: None)
