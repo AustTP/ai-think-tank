@@ -88,6 +88,17 @@ class ChangeLaneEnqueue(unittest.TestCase):
     def setUp(self):
         self.saved = (None, serve._CHANGE_LANE_ENABLED)
         serve._CHANGE_LANE_QUEUE.clear()
+        # CI has no .env (GITHUB_WATCH_REPO/GITHUB_TOKEN come from the
+        # repo's secret store, not the environment): without stubs the
+        # creds check would correctly refuse to enqueue and this class
+        # would test the refusal rather than the queue.
+        self._cred_patches = [
+            mock.patch.object(serve, '_CHANGE_LANE_REPO', 'AustTP/ai-think-tank'),
+            mock.patch.object(serve, '_CHANGE_LANE_TOKEN', 'token-for-tests'),
+        ]
+        for p in self._cred_patches:
+            p.start()
+            self.addCleanup(p.stop)
         self.addCleanup(lambda: (
             serve._CHANGE_LANE_QUEUE.clear(),
             setattr(serve, '_CHANGE_LANE_ENABLED', self.saved[1])))
