@@ -427,6 +427,16 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
             return captcha_solve_tool(tool_name, args)
         if tool_name == 'list_capability_handles':
             return list_handles_tool(tool_name, args)
+        if tool_name == 'publish_skill':
+            return skill_publisher(tool_name, args)
+        if tool_name == 'flag_knowledge_gap':
+            return _serve.flag_knowledge_gap(agent_id, args.get('kind'),
+                                             args.get('about'),
+                                             note=args.get('note'),
+                                             trace_hint=args.get('traceHint'),
+                                             verdict=args.get('verdict'),
+                                             verdict_action=args.get('verdictAction'),
+                                             verdict_target=args.get('verdictTarget'))
         if tool_name in ('search_library', 'read_library_file'):
             return library_tool(tool_name, args)
         if tool_name in ('pulse_watch', 'read_pulse'):

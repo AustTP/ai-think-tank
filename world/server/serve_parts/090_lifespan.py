@@ -155,6 +155,12 @@ async def _lifespan(app):
                                 or not _CHANGE_LANE_TOKEN) \
         else asyncio.create_task(_change_lane_loop())
     del change_lane_task  # referenced by name only for startup clarity
+    # Knowledge factory (operator, 2026-11-22): gap flags age/paging pass +
+    # curator pass (deterministic-first: verdict flags become jev lessons;
+    # the rest file wiki proposals via the operator-gated flow). Parent-only.
+    knowledge_factory_task = None if (VILLAGE_MODE or not _KC_ENABLED) \
+        else asyncio.create_task(_knowledge_curator_loop())
+    del knowledge_factory_task  # referenced by name only for startup clarity
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and not VILLAGE_MODE:
         telegram_task = asyncio.create_task(_telegram_poll_loop())
