@@ -31,6 +31,13 @@ _CHANGE_LANE_ENABLED = str(
     (_load_env().get('CHANGE_LANE_ENABLED') or '1')).lower() not in ('0', 'false', 'no')
 _CHANGE_LANE_MAX_PER_DAY = int(_load_env().get('CHANGE_LANE_MAX_PER_DAY') or 6)
 _CHANGE_LANE_CI_TIMEOUT_S = int(_load_env().get('CHANGE_LANE_CI_TIMEOUT_S') or 1800)
+# Review resilience (operator direction 2026-11-22): the free model pool
+# wobbles; a change request must survive that. Jev retries on HARD failures
+# (exception or malformed verdict); a None/unsure verdict is a VALID outcome
+# that routes to the director chain unretried. If the review cannot convene
+# after all attempts, the PR stays open and the owner is escalated directly.
+_CHANGE_LANE_REVIEW_ATTEMPTS = 3
+_CHANGE_LANE_RETRY_BACKOFF_S = 60
 _CHANGE_LANE_REPO = (_load_env().get('GITHUB_WATCH_REPO') or '').strip()
 _CHANGE_LANE_TOKEN = (_load_env().get('GITHUB_TOKEN') or '').strip()
 
@@ -202,6 +209,31 @@ def _change_lane_merge(number, note, job):
     return False
 
 
+def _change_lane_review_with_retry(job, instructions, criteria):
+    """Jev quorum with lane-level resilience. Retries only on hard failures
+    (exception, malformed verdict); a None/unsure verdict is a VALID outcome
+    and routes to the director chain without retry. Returns
+    (decision, confidence, available)."""
+    for attempt in range(_CHANGE_LANE_REVIEW_ATTEMPTS):
+        if attempt:
+            time.sleep(_CHANGE_LANE_RETRY_BACKOFF_S)
+        try:
+            raw, confidence, _cost = _jev_quorum_choice_sync(
+                instructions, criteria)
+        except Exception as e:  # noqa: BLE001
+            log_action('system', 'change_lane_review_retry',
+                       {**job, 'attempt': attempt + 1,
+                        'reason': str(e)[:160]}, authorized=True)
+            continue
+        if raw in ('approve', 'deny', 'unsure') or raw is None:
+            return raw, confidence, True
+        log_action('system', 'change_lane_review_retry',
+                   {**job, 'attempt': attempt + 1,
+                    'reason': f'malformed verdict {str(raw)[:60]}'},
+                   authorized=True)
+    return None, None, False
+
+
 def _change_lane_process(job):
     """Failure containment boundary: a lane job dies with a log row, never a
     traceback that could take a caller with it (the async loop's to_thread
@@ -310,7 +342,27 @@ def _change_lane_process_inner(job):
                            'material in the diff.',
                 'deny': 'Wrong, unsafe, out of scope, leaks secrets, or '
                         'gaming the tests.'}
-    decision, confidence, _cost = _jev_quorum_choice_sync(instructions, criteria)
+    decision, confidence, review_available = \
+        _change_lane_review_with_retry(job, instructions, criteria)
+    if not review_available:
+        _change_lane_pr_comment(
+            number, 'The review could not convene after '
+                    f'{_CHANGE_LANE_REVIEW_ATTEMPTS} attempts (model pool '
+                    'unavailable). The PR stays OPEN; an owner decision has '
+                    'been requested through the escalation flow.')
+        log_action('system', 'change_lane_review_unavailable',
+                   {'taskId': job['taskId'], 'pr': number}, authorized=True)
+        create_escalation(
+            'change lane review unavailable',
+            f'PR #{number} (card {job["taskId"]}) could not be reviewed: the '
+            f'Jev quorum could not convene after '
+            f'{_CHANGE_LANE_REVIEW_ATTEMPTS} attempts. CI is green; the '
+            'change waits on a human or a recovered model pool. The PR '
+            'stays open.',
+            what_checked='Jev quorum: 3 attempts with 60s backoff, all hard-failed',
+            look_first=f'PR #{number}',
+            agent_id=job.get('agent') or 'system')
+        return
     threshold = _effective_safety_confidence()
     if decision == 'approve' and confidence >= threshold:
         _change_lane_merge(number, f'Jev approved at confidence '

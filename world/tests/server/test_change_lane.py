@@ -284,3 +284,75 @@ class ChangeLaneProcess(unittest.TestCase):
                                side_effect=RuntimeError('boom')), \
                 mock.patch.object(serve, 'log_action'):
             serve._change_lane_process(dict(_J))
+
+
+class ChangeLaneReviewResilience(unittest.TestCase):
+    """Retry covers hard failures only; unsure routes unretried; an
+    un-convenable review leaves the PR open and escalates to the owner."""
+
+    def setUp(self):
+        self.saved = (serve._CHANGE_LANE_DAY, serve._CHANGE_LANE_COUNT)
+        self.addCleanup(lambda: (
+            setattr(serve, '_CHANGE_LANE_DAY', self.saved[0]),
+            setattr(serve, '_CHANGE_LANE_COUNT', self.saved[1])))
+        sleep_patcher = mock.patch.object(serve.time, 'sleep', lambda s: None)
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+
+    def _merges(self, rec):
+        return [c for c in rec if c[0] == 'PUT' and '/merge' in c[1]]
+
+    def _closes(self, rec):
+        return [c for c in rec if c[0] == 'PATCH' and c[1] == '/pulls/7']
+
+    def test_hard_failure_then_success_merges(self):
+        rec = []
+        calls = []
+        with mock.patch.object(serve, '_change_lane_sandbox_for',
+                               return_value='sb'), \
+                mock.patch.object(serve, '_change_lane_run', side_effect=_git(True)), \
+                mock.patch.object(serve, '_change_lane_api',
+                                  side_effect=_api_caller(rec)), \
+                mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                  side_effect=[RuntimeError('pool down'),
+                                               ('approve', 0.95, 0.01)]), \
+                mock.patch.object(serve, 'log_action'):
+            serve._change_lane_process(dict(_J))
+        self.assertEqual(len(self._merges(rec)), 1)
+        self.assertEqual(len(calls), 0)
+
+    def test_three_hard_failures_escalate_and_keep_pr_open(self):
+        rec = []
+        with mock.patch.object(serve, '_change_lane_sandbox_for',
+                               return_value='sb'), \
+                mock.patch.object(serve, '_change_lane_run', side_effect=_git(True)), \
+                mock.patch.object(serve, '_change_lane_api',
+                                  side_effect=_api_caller(rec)), \
+                mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                  side_effect=RuntimeError('pool down')), \
+                mock.patch.object(serve, '_director_second_opinion') as director, \
+                mock.patch.object(serve, 'create_escalation') as esc, \
+                mock.patch.object(serve, 'log_action'):
+            serve._change_lane_process(dict(_J))
+        self.assertEqual(self._merges(rec), [])
+        self.assertEqual(self._closes(rec), [])
+        director.assert_not_called()
+        esc.assert_called_once()
+
+    def test_unsure_is_not_retried(self):
+        rec = []
+        with mock.patch.object(serve, '_change_lane_sandbox_for',
+                               return_value='sb'), \
+                mock.patch.object(serve, '_change_lane_run', side_effect=_git(True)), \
+                mock.patch.object(serve, '_change_lane_api',
+                                  side_effect=_api_caller(rec)), \
+                mock.patch.object(serve, '_jev_quorum_choice_sync',
+                                  return_value=('unsure', 0.2, 0.01)) as jev, \
+                mock.patch.object(serve, '_director_second_opinion',
+                                  return_value=False), \
+                mock.patch.object(serve, 'create_escalation') as esc, \
+                mock.patch.object(serve, 'log_action'):
+            serve._change_lane_process(dict(_J))
+        self.assertEqual(jev.call_count, 1)
+        esc.assert_not_called()
+        self.assertEqual(self._merges(rec), [])
