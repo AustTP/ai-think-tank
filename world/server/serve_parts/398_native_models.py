@@ -126,13 +126,13 @@ def _native_model_run_sync(route, payload_list, purpose=''):
     if not _native_enabled():
         return False, {'error': 'native models are disabled '
                                 '(NATIVE_MODELS_ENABLED=0)'}
+    items = [str(x) for x in (payload_list or []) if str(x).strip()]
+    if not items:
+        return False, {'error': 'no payload for the native job'}
     if not COLAB_CLI_AVAILABLE:
         return False, {'error': 'the colab CLI is not installed on this machine'}
     if not COLAB_ENABLED:
         return False, {'error': 'Colab compute is disabled (COLAB_ENABLED=0)'}
-    items = [str(x) for x in (payload_list or []) if str(x).strip()]
-    if not items:
-        return False, {'error': 'no payload for the native job'}
     def inner():
         with _COLAB_COMPUTE_LOCK:
             start = time.time()
