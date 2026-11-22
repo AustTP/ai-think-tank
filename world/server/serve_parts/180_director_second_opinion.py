@@ -94,6 +94,13 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
                         'reviewerConfidence': reviewer_conf, 'level': level,
                         'model': review_model, 'traceId': trace_id},
                        authorized=False)
+            # Institutional memory (2026-11-22, 392): this confident director
+            # refusal is a lesson -- the same case-class will not re-escalate
+            # next time (deny generalizes by host/command-family per the
+            # store's asymmetry rule).
+            _jev_lesson_record(action, target, 'deny',
+                               source=f'director:{reviewer_id}',
+                               note=purpose, confidence=reviewer_conf)
             return False
         if decision == 'approve' and reviewer_conf >= threshold:
             log_action(reviewer_id, 'jev_chain_approved',
@@ -102,6 +109,11 @@ def _director_second_opinion(agent_id, action, noun, target, purpose,
                         'reviewerConfidence': reviewer_conf, 'level': level,
                         'model': review_model, 'traceId': trace_id},
                        authorized=False)
+            # Lesson for the EXACT case only (allow never generalizes --
+            # see 392 for the asymmetry rationale).
+            _jev_lesson_record(action, target, 'allow',
+                               source=f'director:{reviewer_id}',
+                               note=purpose, confidence=reviewer_conf)
             return True
         if decision is None:
             # None = the reviewer call FAILED (unreachable model, unparseable
@@ -181,6 +193,26 @@ def _jev_safety_gate(agent_id, action, noun, target, purpose, decision, confiden
     if action == 'execute_classify' and _readonly_shell_command(target or ''):
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed', 'confidence': confidence, 'cost': cost, 'reason': 'read-only command allowlist (deterministic parse)'}, authorized=authorized, trace_id=trace_id)
         return True
+    # Institutional recall (2026-11-22, 392): a direction the escalation
+    # chain or the operator already gave for THIS exact case resolves the
+    # gate now, at zero LLM cost and zero new human ping. Deny lessons
+    # generalize by host/command-family (the teacher sealed the class);
+    # allow lessons are exact-URL/prefix-only (a different page or command
+    # re-escalates -- same asymmetry as a human's approval breadth).
+    if action in _URLISH_ACTIONS or action in _EXECUTE_ACTIONS:
+        # An exact-case allow recall only lifts a Jev ALLOW (confident or
+        # not) -- a FIRM Jev block on the same URL stands regardless of the
+        # stored approval, because the classifier saw something the earlier
+        # teacher may not have.
+        if decision in ('allow', 'approve'):
+            lesson = _jev_lesson_lookup(action, target, 'allow')
+            if lesson and confidence >= _effective_safety_confidence() * 0.6:
+                log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'allowed', 'confidence': confidence, 'cost': cost, 'reason': 'jev: previously approved for this exact case (institutional recall)'}, authorized=authorized, trace_id=trace_id)
+                return True
+        deny_lesson = _jev_lesson_lookup(action, target, 'deny')
+        if deny_lesson:
+            log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: previously refused for this case-class (institutional recall)'}, authorized=authorized, trace_id=trace_id)
+            return False
     if decision != 'allow' and decision != 'approve':
         log_action(agent_id, action, {'target': target, 'purpose': purpose, 'decision': 'blocked', 'confidence': confidence, 'cost': cost, 'reason': 'jev: ' + (decision or 'classifier unavailable, failed closed')}, authorized=authorized, trace_id=trace_id)
         return False

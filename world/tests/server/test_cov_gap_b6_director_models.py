@@ -58,6 +58,19 @@ def _chain_state():
 
 
 class DirectorSecondOpinionTest(unittest.TestCase):
+    def setUp(self):
+        # The chain's teach path (392 institutional memory) now records real
+        # lessons; keep them out of the shared Library (pytest-randomly made
+        # the ordering visible: one test's deny-lesson on host x blocked a
+        # later gate test).
+        self._lessons_tmp = tempfile.mkdtemp()
+        patcher = mock.patch.dict(os.environ,
+                                  {'JEV_LESSONS_DIR': self._lessons_tmp})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: shutil.rmtree(self._lessons_tmp,
+                                              ignore_errors=True))
+
     def test_state_read_failure_fails_closed(self):
         with mock.patch.object(serve, 'get_state_from_db',
                                side_effect=RuntimeError('db down')):
