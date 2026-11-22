@@ -652,6 +652,15 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             contract_bits.append('hard prohibitions: ' + str(_nv)[:400])
         if contract_bits:
             instructions += ' Filed contract: ' + ' | '.join(contract_bits) + '.'
+        # Stop rule (operator, 2026-11-22): identical failure twice = stop
+        # retrying and mark the card blocked; the tank closes repeat-failure
+        # cards rather than letting a broken tool become a recurring expense.
+        instructions += (' STOP RULE: if any command or tool fails with the '
+                         'same error twice, stop retrying it: record what you '
+                         'tried in your workroom, mark the card blocked with '
+                         'that reason, and let scrum decide next steps. Do '
+                         'not burn retries on a broken tool; the tank closes '
+                         'repeat-failure cards itself.')
         ctx = _refinement_context_for_room(state, req.get('room'))
         if ctx:
             instructions += f" Roadmap context for this room (prioritization only, not a scope gate): {ctx}."

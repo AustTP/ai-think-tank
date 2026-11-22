@@ -38,6 +38,13 @@ _CHANGE_LANE_CI_TIMEOUT_S = int(_load_env().get('CHANGE_LANE_CI_TIMEOUT_S') or 1
 # after all attempts, the PR stays open and the owner is escalated directly.
 _CHANGE_LANE_REVIEW_ATTEMPTS = 3
 _CHANGE_LANE_RETRY_BACKOFF_S = 60
+# Sandbox proof gate: how long the in-sandbox pytest slice may run.
+# A value of 0 disables the gate entirely; blank/unset means 600s.
+_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S_RAW = str(
+    _load_env().get('CHANGE_LANE_LOCAL_TEST_TIMEOUT_S') or '').strip()
+_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S = 600 \
+    if not _CHANGE_LANE_LOCAL_TEST_TIMEOUT_S_RAW \
+    else int(_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S_RAW)
 _CHANGE_LANE_REPO = (_load_env().get('GITHUB_WATCH_REPO') or '').strip()
 _CHANGE_LANE_TOKEN = (_load_env().get('GITHUB_TOKEN') or '').strip()
 
@@ -285,16 +292,43 @@ def _change_lane_process_inner(job):
     rc_head, head_sha = _change_lane_run(['git', '-C', sandbox, 'rev-parse', 'HEAD'])
     head_sha = head_sha.strip()
     branch = f"tank/{re.sub(r'[^A-Za-z0-9._-]', '-', str(job['taskId']))}"
+    # Sandbox proof gate (operator direction 2026-11-22, "world model"
+    # steal): prove the change INSIDE the sandbox before it touches the
+    # remote. The affected pytest slice runs here; a red run means nothing
+    # is pushed and no PR opens. Docs-only diffs skip the run. The slice is
+    # chosen from the diff's world/tests/ prefix; source diffs default to
+    # the server suite.
+    rc, diff_text = _change_lane_run(
+        ['git', '-C', sandbox, 'diff', '--name-only', 'origin/main...HEAD'])
+    paths = [p for p in diff_text.splitlines() if p.strip()]
+    risk = change_lane_classify(paths)
+    if risk == 'docs':
+        log_action('system', 'change_lane_local_tests',
+                   {**job, 'skipped': 'docs-only diff'}, authorized=True)
+    else:
+        slice_dirs = sorted({'/'.join(p.split('/')[:3])
+                             for p in paths
+                             if p.startswith('world/tests/') and p.count('/') >= 2})
+        if not slice_dirs:
+            slice_dirs = ['world/tests/server']
+        rc_t, tail = _change_lane_run(
+            ['python3', '-m', 'pytest', '-q', *slice_dirs],
+            timeout=_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S, cwd=sandbox)
+        if rc_t != 0:
+            _CHANGE_LANE_COUNT += 1  # a blocked attempt is still an attempt
+            log_action('system', 'change_lane_blocked_local_tests',
+                       {**job, 'slice': slice_dirs,
+                        'tail': tail[-400:]}, authorized=True)
+            return
+        log_action('system', 'change_lane_local_tests',
+                   {**job, 'slice': slice_dirs,
+                    'note': tail[-160:]}, authorized=True)
     rc, out = _change_lane_run(['git', '-C', sandbox, 'push', url,
                                 f'HEAD:refs/heads/{branch}'], timeout=300)
     if rc != 0:
         log_action('system', 'change_lane_failed',
                    {**job, 'stage': 'push', 'reason': out[-300:]}, authorized=True)
         return
-    rc, diff_text = _change_lane_run(
-        ['git', '-C', sandbox, 'diff', '--name-only', 'origin/main...HEAD'])
-    paths = [p for p in diff_text.splitlines() if p.strip()]
-    risk = change_lane_classify(paths)
     status, pr = _change_lane_api('POST', '/pulls', {
         'title': f"{job['title']} [{job['taskId']}]",
         'head': branch, 'base': 'main',

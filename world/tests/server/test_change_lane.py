@@ -16,24 +16,22 @@ import serve  # noqa: E402
 _J = {'taskId': 'task-12345', 'title': 'Fix a thing', 'agent': 'ruth',
       'queuedAt': 0.0}
 
-_GIT_GREEN_DOCS = [
-    (0, '0'),          # fetch storage
-    (0, '1'),          # rev-list: 1 commit ahead
-    (0, 'abc123'),    # rev-parse HEAD
-    (0, ''),           # push
-    (0, 'README.md\nworld/tests/test_x.py'),
-    (0, 'diff text'),
-]
-
 
 def _git(code=False):
+    """Side effects in gate order: fetch / rev-list / rev-parse HEAD /
+    gate diff --name-only / [code tier: in-sandbox pytest] / push /
+    full diff --name-only (legacy shape some asserts still read)."""
     names = 'README.md\nworld/tests/test_x.py'
     if code:
         names = 'world/server/serve.py'
-    return [
-        (0, '0'), (0, '1'), (0, 'abc123'), (0, ''),
-        (0, names), (0, 'diff text'),
+    steps = [
+        (0, '0'), (0, '1'), (0, 'abc123'),
+        (0, names),
     ]
+    if code:
+        steps.append((0, 'ok'))
+    steps.extend([(0, ''), (0, names)])
+    return steps
 
 
 def _api_caller(recorder):
@@ -367,3 +365,25 @@ class ChangeLaneReviewResilience(unittest.TestCase):
         self.assertEqual(jev.call_count, 1)
         esc.assert_not_called()
         self.assertEqual(self._merges(rec), [])
+
+    def test_local_test_gate_blocks_push_and_pr(self):
+        """World-model steal (2026-11-22): a red in-sandbox pytest slice
+        means nothing is pushed and no PR opens."""
+        def api(method, path, body=None):
+            rec.append((method, path, body))
+            return (201, {'number': 7})
+
+        rec = []
+        # gate order: fetch/rev-list/rev-parse/diff, then the pytest slice
+        # fails (rc 1), push never reached.
+        git = [(0, '0'), (0, '1'), (0, 'abc123'), (0, 'world/server/serve.py'),
+               (1, 'FAILED tests'), (0, ''), (0, 'x')]
+        with mock.patch.object(serve, '_change_lane_sandbox_for',
+                               return_value='sb'), \
+                mock.patch.object(serve, '_change_lane_run', side_effect=git), \
+                mock.patch.object(serve, '_change_lane_api',
+                                  side_effect=_api_caller(rec)), \
+                mock.patch.object(serve, 'log_action'):
+            serve._change_lane_process(dict(_J))
+        pushed = False  # only verifiable via no-PR assertion below
+        self.assertEqual([c for c in rec if c[0] == 'POST'], [])

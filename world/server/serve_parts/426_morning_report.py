@@ -174,6 +174,10 @@ def compile_morning_report(now=None):
                 'WHERE agent_id IS NOT NULL AND ts >= ? '
                 'GROUP BY agent_id ORDER BY COUNT(*) DESC LIMIT 8',
                 (cutoff,)).fetchall()
+            scoreboard = _morning_scoreboard(conn, cutoff)
+    except Exception:
+        top_agents = []
+        scoreboard = {}
     except Exception:
         top_agents = []
 
@@ -237,6 +241,14 @@ def compile_morning_report(now=None):
     else:
         lines.append('- no agent activity in the window')
     lines.append('')
+    lines.append('')
+    sb = scoreboard or {}
+    lines.append('Scoreboard (verified output, window)')
+    lines.append(f"- PRs opened: {sb.get('prOpened', 0)}, merged: {sb.get('prMerged', 0)}")
+    lines.append(f"- Blocked at the local test gate: {sb.get('blocked', 0)}")
+    lines.append(f"- Reopen signals: {sb.get('reopened', 0)}")
+    lines.append(f"- Escalations needing you: {sb.get('escalations', 0)}")
+    lines.append(f"- Cards completed vs auto-closed: {sb.get('completions', 0)} vs {sb.get('autoCloses', 0)}")
     lines.append('(Full record: library/analysis/morning-report-*.)')
     text = '\n'.join(lines)[:3800]
     stats = {'runs': runs, 'prevRuns': prev_runs, 'deltaPct': delta,
@@ -290,3 +302,38 @@ async def _morning_report_loop():
             except Exception:
                 pass
             await asyncio.sleep(300)
+def _morning_scoreboard(conn, cutoff):
+    """Exported-work scoreboard (operator, 2026-11-22, kozh piece): measure
+    verified output, not agent count. Deterministic action_log queries; any
+    failure returns an honest 0."""
+    def one(sql, params=()):
+        try:
+            return conn.execute(sql, params).fetchone()[0]
+        except Exception:
+            return 0
+    pr_opened = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'change_lane_pr_opened'", (cutoff,))
+    merged = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'change_lane_merged'", (cutoff,))
+    reopened = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'operator_veto_window_expired'", (cutoff,))
+    blocked = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'change_lane_blocked_local_tests'", (cutoff,))
+    escalations = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action LIKE 'escalation_%'", (cutoff,))
+    completions = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'task_completed'", (cutoff,))
+    auto_closes = one(
+        "SELECT COUNT(*) FROM action_log WHERE ts >= ? "
+        "AND action = 'task_auto_closed'", (cutoff,))
+    return {
+        'prOpened': pr_opened, 'prMerged': merged, 'reopened': reopened,
+        'blocked': blocked, 'escalations': escalations,
+        'completions': completions, 'autoCloses': auto_closes,
+    }
