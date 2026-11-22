@@ -24,6 +24,7 @@ import re
 import subprocess
 import time
 import urllib.request
+import sys
 from collections import deque
 
 
@@ -66,14 +67,16 @@ def _change_lane_scrub(text):
     return re.sub(r'x-access-token:[^@]+@', 'x-access-token:***@', text or '')
 
 
-def _change_lane_run(args, timeout=300, cwd=None):
+def _change_lane_run(args, timeout=300, cwd=None, env_extra=None):
     """One git subprocess inside a sandbox clone. Never raises; the captured
     output is token-scrubbed. Returns (rc, scrubbed_stdout)."""
     try:
+        env = {'GIT_TERMINAL_PROMPT': '0',
+               'PATH': '/usr/bin:/bin:/usr/local/bin'}
+        if env_extra:
+            env.update(env_extra)
         proc = subprocess.run(
-            args, capture_output=True, timeout=timeout, cwd=cwd,
-            env={'GIT_TERMINAL_PROMPT': '0',
-                 'PATH': '/usr/bin:/bin:/usr/local/bin'})
+            args, capture_output=True, timeout=timeout, cwd=cwd, env=env)
         return proc.returncode, _change_lane_scrub(proc.stdout.decode(errors='replace'))
     except Exception as e:
         return 1, f'git failed: {e}'
@@ -311,9 +314,32 @@ def _change_lane_process_inner(job):
                              if p.startswith('world/tests/') and p.count('/') >= 2})
         if not slice_dirs:
             slice_dirs = ['world/tests/server']
+        # AWS-shaped diffs get a loopback moto server for the slice (boot
+        # inside the sandbox context, torn down in the finally below).
+        aws_proc = None
+        aws_env = None
+        if _change_lane_diff_is_awsshaped(paths, sandbox):
+            aws_proc, aws_url = _change_lane_aws_mock_boot()
+            if aws_proc is not None:
+                aws_env = {'AWS_ACCESS_KEY_ID': 'testing',
+                           'AWS_SECRET_ACCESS_KEY': 'testing',
+                           'AWS_DEFAULT_REGION': 'us-east-1',
+                           'AWS_ENDPOINT_URL': aws_url,
+                           'AWS_ENDPOINT_URL_S3': aws_url,
+                           'AWS_ENDPOINT_URL_SQS': aws_url,
+                           'AWS_ENDPOINT_URL_DYNAMODB': aws_url}
+                log_action('system', 'change_lane_aws_mock_booted',
+                           {**job, 'url': aws_url}, authorized=True)
+            else:
+                log_action('system', 'change_lane_aws_mock_boot_failed',
+                           {**job, 'reason': str(aws_url)[:200]},
+                           authorized=True)
         rc_t, tail = _change_lane_run(
             ['python3', '-m', 'pytest', '-q', *slice_dirs],
-            timeout=_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S, cwd=sandbox)
+            timeout=_CHANGE_LANE_LOCAL_TEST_TIMEOUT_S, cwd=sandbox,
+            env_extra=aws_env)
+        if aws_proc is not None:
+            _change_lane_aws_mock_teardown()
         if rc_t != 0:
             _CHANGE_LANE_COUNT += 1  # a blocked attempt is still an attempt
             log_action('system', 'change_lane_blocked_local_tests',
@@ -452,3 +478,88 @@ async def _change_lane_loop():
         except Exception as e:  # noqa: BLE001
             print(f'[change-lane] loop error: {e}', flush=True)
         await asyncio.sleep(20)
+
+
+# --- AWS-shaped proof gate (operator, 2026-11-23, "aws-emulator" direction):
+# diffs that read like AWS integration code are proven against a LOOPBACK-ONLY
+# moto server booted inside the sandbox for the duration of the pytest slice.
+
+
+# --- AWS-shaped proof gate (operator, 2026-11-23, "aws-emulator"
+# direction): diffs that read like AWS integration code are proven against
+# a LOOPBACK-ONLY moto server booted inside the sandbox for the duration
+# of the pytest slice. Loopback bind, dummy creds, torn down after the
+# run. Best-effort: a failed boot falls back to the plain slice run.
+_AWS_SHAPE_PATTERN = re.compile(
+    r'(?i)\b(boto3|botocore|s3client|sqsclient|dynamodbclient|'
+    r'aws_access_key|s3\.amazonaws|sqs\.amazonaws|dynamodb\.amazonaws)\b')
+_AWS_MOCK_HOST = '127.0.0.1'
+_AWS_MOCK_PORTS = range(5190, 5210)
+_MOTO_PROC = None
+
+
+def _change_lane_diff_is_awsshaped(paths, sandbox):
+    """True when any changed file's bytes mention AWS client shapes."""
+    for rel in list(paths or [])[:40]:
+        try:
+            with open(os.path.join(sandbox, rel), 'rb') as fh:
+                blob = fh.read(200000)
+            if _AWS_SHAPE_PATTERN.search(blob.decode(errors='replace')):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _change_lane_aws_mock_boot():
+    """Boots a loopback-only moto server on a free 127.0.0.1 port. Returns
+    (proc, base_url) or (None, error). Dummy creds only; the process is
+    killed by _change_lane_aws_mock_teardown. **Best-effort: a failed boot
+    means the gate falls back to the plain slice run rather than blocking
+    an otherwise-provable diff.**"""
+    global _MOTO_PROC
+    try:
+        import socket
+        for port in _AWS_MOCK_PORTS:
+            with socket.socket() as probe:
+                try:
+                    probe.bind((_AWS_MOCK_HOST, port))
+                except OSError:
+                    continue
+            _MOTO_PROC = subprocess.Popen(
+                [sys.executable, '-m', 'moto.server', '-p', str(port),
+                 '-H', _AWS_MOCK_HOST],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env={'AWS_ACCESS_KEY_ID': 'testing',
+                     'AWS_SECRET_ACCESS_KEY': 'testing',
+                     'AWS_DEFAULT_REGION': 'us-east-1',
+                     'PATH': '/usr/bin:/bin:/usr/local/bin'})
+            base_url = f'http://{_AWS_MOCK_HOST}:{port}'
+            for _ in range(30):
+                try:
+                    with urllib.request.urlopen(base_url, timeout=2) as r:
+                        if r.status == 200:
+                            return _MOTO_PROC, base_url
+                except Exception:
+                    time.sleep(0.3)
+            break
+        _change_lane_aws_mock_teardown()
+        return None, 'moto server did not come up on any loopback port'
+    except Exception as e:
+        _change_lane_aws_mock_teardown()
+        return None, f'aws mock boot failed: {e}'
+
+
+def _change_lane_aws_mock_teardown():
+    """Kills the moto server and resets the handle. Never raises."""
+    global _MOTO_PROC
+    try:
+        if _MOTO_PROC is not None:
+            _MOTO_PROC.terminate()
+            try:
+                _MOTO_PROC.wait(timeout=10)
+            except Exception:
+                _MOTO_PROC.kill()
+    except Exception:
+        pass
+    _MOTO_PROC = None

@@ -387,3 +387,67 @@ class ChangeLaneReviewResilience(unittest.TestCase):
             serve._change_lane_process(dict(_J))
         pushed = False  # only verifiable via no-PR assertion below
         self.assertEqual([c for c in rec if c[0] == 'POST'], [])
+
+
+class ChangeLaneAwsMockGate(unittest.TestCase):
+    """AWS-shaped proof gate: detector, loopback moto boot, env injection,
+    teardown. All moto/colab contact mocked; no real server, no network."""
+
+    def setUp(self):
+        sleep_patcher = mock.patch.object(serve.time, 'sleep', lambda s: None)
+        sleep_patcher.start()
+        self.addCleanup(sleep_patcher.stop)
+        self.addCleanup(serve._change_lane_aws_mock_teardown)
+
+    def test_detects_boto3_shaped_diff_and_ignores_plain_code(self):
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, 'awsy.py'), 'w') as fh:
+            fh.write('import boto3\ns3 = boto3.client("s3")\n')
+        with open(os.path.join(tmp, 'plain.py'), 'w') as fh:
+            fh.write('import asyncio\nprint("hello")\n')
+        self.assertTrue(serve._change_lane_diff_is_awsshaped(
+            ['awsy.py'], tmp))
+        self.assertFalse(serve._change_lane_diff_is_awsshaped(
+            ['plain.py'], tmp))
+
+    def test_boot_refuses_without_moto_installed(self):
+        # moto absent (CI/venv without moto): boot must fail CLOSED via
+        # (None, reason), never raise; the gate falls back to the plain run.
+        def broken_popen(*a, **k):
+            raise FileNotFoundError('no moto module')
+        with mock.patch.object(serve.subprocess, 'Popen',
+                               side_effect=broken_popen):
+            proc, err = serve._change_lane_aws_mock_boot()
+        self.assertIsNone(proc)
+        self.assertIn('failed', str(err))
+        self.assertIsNone(serve._MOTO_PROC)
+
+    def test_teardown_is_idempotent(self):
+        serve._change_lane_aws_mock_teardown()
+        serve._change_lane_aws_mock_teardown()
+        self.assertIsNone(serve._MOTO_PROC)
+
+
+class ChangeLaneAwsMockBoot(unittest.TestCase):
+    """Real moto boot (needs moto[server]); skips politely when the extra
+    is absent so CI without it stays hermetic."""
+
+    def setUp(self):
+        # NOTE: no sleep-patching here: the boot's readiness polling needs
+        # real pacing while moto binds its loopback port.
+        self.addCleanup(serve._change_lane_aws_mock_teardown)
+
+    def test_real_boot_serves_loopback_and_teardowns(self):
+        try:
+            import flask  # noqa: F401
+        except ModuleNotFoundError:
+            self.skipTest('moto[server] extras not installed')
+        proc, url = serve._change_lane_aws_mock_boot()
+        self.assertIsNotNone(proc)
+        self.assertTrue(url.startswith('http://127.0.0.1:'))
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+        serve._change_lane_aws_mock_teardown()
+        self.assertIsNone(serve._MOTO_PROC)
