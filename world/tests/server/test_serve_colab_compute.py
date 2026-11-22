@@ -66,7 +66,7 @@ class ColabCli(unittest.TestCase):
         self.assertEqual((rc, out), (0, 'out\nerr'))
         run.assert_called_once_with(
             [serve.COLAB_CLI_PATH, 'status', '-s', 's'],
-            capture_output=True, text=True, timeout=120, input=None,
+            capture_output=True, text=True, timeout=120, input=None, env=None,
         )
 
     def test_timeout_returns_negative_rc(self):
@@ -224,12 +224,12 @@ class ColabComputeIdleLoop(unittest.TestCase):
              unittest.mock.patch.object(serve, '_COLAB_COMPUTE_LAST_USED', 1.0), \
              unittest.mock.patch.object(
                  serve, '_colab_session_exists',
-                 side_effect=lambda s: s == serve.COLAB_GPU_SESSION), \
+                 side_effect=lambda s, account='primary': s == serve.COLAB_GPU_SESSION), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
             with self.assertRaises(_StopLoop):
                 asyncio.run(serve._colab_compute_idle_loop())
         cli.assert_called_once_with(
-            'stop', '-s', serve.COLAB_GPU_SESSION, timeout=120)
+            'stop', '-s', serve.COLAB_GPU_SESSION, timeout=120, account='primary')
 
     def test_idle_teardown_error_is_swallowed(self):
         with unittest.mock.patch.object(serve.asyncio, 'sleep', new=_stop_loop), \
@@ -265,7 +265,7 @@ class ColabAccountUsage(unittest.TestCase):
 
     def test_serves_fresh_cache(self):
         data = {'balance': 3.0, 'rate': 1, 'assignments': 2}
-        cache = {'at': time.time(), 'data': data}
+        cache = {'primary': {'at': time.time(), 'data': data}}
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_COLAB_USAGE_CACHE', cache), \
              unittest.mock.patch.object(serve, '_colab_cli') as cli:
@@ -273,14 +273,14 @@ class ColabAccountUsage(unittest.TestCase):
         cli.assert_not_called()
 
     def test_cli_error_returns_none(self):
-        cache = {'at': 0.0, 'data': None}
+        cache = {'primary': {'at': 0.0, 'data': None}}
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_COLAB_USAGE_CACHE', cache), \
              unittest.mock.patch.object(serve, '_colab_cli', return_value=(1, 'err')):
             self.assertIsNone(serve._colab_account_usage())
 
     def test_unparseable_output_returns_none(self):
-        cache = {'at': 0.0, 'data': None}
+        cache = {'primary': {'at': 0.0, 'data': None}}
         with unittest.mock.patch.object(serve, 'COLAB_CLI_AVAILABLE', True), \
              unittest.mock.patch.object(serve, '_COLAB_USAGE_CACHE', cache), \
              unittest.mock.patch.object(
@@ -403,8 +403,11 @@ class ColabComputeRun(unittest.TestCase):
         self.assertIn('could not provision', result['error'])
 
     def test_sharding_degrades_when_extra_runtime_not_granted(self):
-        def provision(session=None, kind='gpu'):
-            return (True, 'ok') if session == serve.COLAB_GPU_SESSION else (False, 'no quota')
+        def provision(session=None, kind='gpu', account='primary'):
+            # The account's OWN primary session is granted; extras are not
+            # (multi-account: the primary name depends on the picked account).
+            granted = serve._colab_session_name(kind or 'gpu', account)
+            return (True, 'ok') if session == granted else (False, 'no quota')
 
         with self._base_patches(), \
              unittest.mock.patch.object(serve, '_colab_compute_provision',
@@ -416,7 +419,9 @@ class ColabComputeRun(unittest.TestCase):
             result = serve._colab_compute_run(
                 'agent', 'print(1)', 'testing', [], 300, runtimes=2)
         self.assertEqual(result['runtimes'], 1)
-        self.assertEqual(result['shards'][0]['session'], serve.COLAB_GPU_SESSION)
+        self.assertIn(
+            result['shards'][0]['session'],
+            {serve._colab_session_name('gpu', a) for a in serve.COLAB_ACCOUNTS})
 
     def test_package_install_failure_errors(self):
         with self._base_patches(), \
@@ -976,3 +981,103 @@ class BestValueQualifiers(unittest.TestCase):
 
     def test_empty_when_nothing_scored(self):
         self.assertEqual(serve._best_value_qualifiers_sync([{'id': 'a', 'price': 1.0}], {}), [])
+
+
+class ColabAccountAffinity(unittest.TestCase):
+    """Two-account isolation (operator, 2026-11-21): one run_on_colab call
+    must provision, exec, and stop ONLY its chosen account's sessions -- the
+    shard set is never split across accounts."""
+
+    def test_session_names_are_per_account(self):
+        self.assertEqual(serve._colab_session_name('gpu'), 'think-tank-gpu')
+        self.assertEqual(serve._colab_session_name('cpu'), 'think-tank-cpu')
+        self.assertEqual(serve._colab_session_name('gpu', 'second'),
+                         'think-tank-gpu-second')
+
+    def test_pick_account_rotates(self):
+        with unittest.mock.patch.object(serve, 'COLAB_ACCOUNTS',
+                                        ['primary', 'second']):
+            first = serve._colab_pick_account()
+            second = serve._colab_pick_account()
+        self.assertEqual({first, second}, {'primary', 'second'})
+
+    def test_account_env_overrides_home(self):
+        # A non-primary account runs the CLI under ITS HOME; if that ever
+        # equals the process HOME the env passthrough is harmless (None).
+        proc = unittest.mock.Mock(returncode=0, stdout='o', stderr='')
+        with unittest.mock.patch.dict(serve.COLAB_ACCOUNT_HOMES,
+                                      {'second': '/tmp/acct-home'}), \
+                unittest.mock.patch.object(serve.subprocess, 'run',
+                                           return_value=proc) as run:
+            serve._colab_cli('usage', account='second')
+        env = run.call_args.kwargs['env']
+        self.assertEqual(env['HOME'], '/tmp/acct-home')
+        self.assertIn('XDG_DATA_HOME', env)
+
+    def test_primary_account_uses_process_env(self):
+        proc = unittest.mock.Mock(returncode=0, stdout='o', stderr='')
+        with unittest.mock.patch.object(serve.subprocess, 'run',
+                                        return_value=proc) as run:
+            serve._colab_cli('usage', account='primary')
+        self.assertIsNone(run.call_args.kwargs['env'])
+
+    def test_sharded_run_stays_on_one_account(self):
+        # Both shards (primary + the extra) must belong to the SAME account.
+        accounts = []
+        captured = {}
+
+        def provision(session=None, kind='gpu', account='primary'):
+            accounts.append((session, account))
+            captured[session] = account
+            return (True, 'ok')
+
+        def cli(*args, timeout=120, input=None, account=None):
+            op = args[0]
+            if op == 'exec':
+                # Account-agnostic: the shard session's name depends on which
+                # account rotation picked, so read the owner from the map.
+                session = args[2]
+                self.assertEqual(account, captured.get(session),
+                                 'shard exec must run on the job account')
+                return 0, 'hello\n__COLAB_DONE__\n'
+            if op == 'stop':
+                self.assertEqual(account, captured.get(args[2]),
+                                 'extra teardown must run on the job account')
+                return 0, ''
+            return 0, ''
+
+        with unittest.mock.patch.dict(
+                serve.COLAB_ACCOUNT_HOMES,
+                {'primary': '/home/ubuntu', 'second': '/tmp/acct-home'},
+                clear=True), \
+                unittest.mock.patch.object(serve, 'COLAB_ACCOUNTS',
+                                           ['primary', 'second']), \
+                unittest.mock.patch.object(serve, 'COLAB_GPU_ACCEL', 'T4'), \
+                unittest.mock.patch.object(serve, '_colab_compute_provision',
+                                           side_effect=provision), \
+                unittest.mock.patch.object(serve, '_colab_cli',
+                                           side_effect=cli), \
+                unittest.mock.patch.object(
+                    serve, '_jev_is_degraded', return_value=False), \
+                unittest.mock.patch.object(
+                    serve, '_colab_shard_band',
+                    return_value=('shard', 0.99)), \
+                unittest.mock.patch.object(serve, '_colab_denied',
+                                           return_value=None), \
+                unittest.mock.patch.object(serve, '_colab_gate_urls',
+                                           return_value=None), \
+                unittest.mock.patch.object(serve,
+                                           '_colab_budget_exceeded',
+                                           return_value=False), \
+                unittest.mock.patch.object(serve,
+                                           '_accrue_colab_units'), \
+                unittest.mock.patch.object(serve, 'log_action'), \
+                unittest.mock.patch.object(serve, 'SPEND_CAP_USD', 0):
+            result = serve._colab_compute_run(
+                'agent-x', 'print("hi")', 'test purpose', [], 10, runtimes=2,
+                kind='gpu')
+        self.assertNotIn('error', result)
+        self.assertEqual(result['runtimes'], 2)
+        owned = {acct for _, acct in accounts}
+        self.assertEqual(len(owned), 1,
+                         'shard set must live on exactly ONE account')

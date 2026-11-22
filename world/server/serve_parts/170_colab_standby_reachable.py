@@ -118,6 +118,25 @@ COLAB_CLI_PATH = shutil.which('colab') or os.path.expanduser('~/.local/bin/colab
 COLAB_CLI_AVAILABLE = bool(COLAB_CLI_PATH) and os.path.exists(COLAB_CLI_PATH)
 COLAB_GPU_SESSION = 'think-tank-gpu'
 COLAB_GPU_ACCEL = 'T4'
+# Two-account support (operator, 2026-11-21): each account's CLI state (OAuth
+# token keyring + session registry) lives under its own HOME, so tokens and
+# registries can never cross. One run_on_colab call picks ONE account and
+# provisions, execs, and tears down ONLY that account's sessions -- a job's
+# shard set is never split across accounts (owner direction: never shard
+# runtimes between accounts). Google's auth boundary already forbids one
+# account touching another's runtimes; the per-job affinity keeps a single
+# computation on one account's quota, so its shards burn one account's
+# capacity, not a blend. The COLAB_MONTHLY_UNITS convention cap stays
+# combined on purpose: it caps total think-tank usage, not per-account use.
+COLAB_ACCOUNT_HOMES = {'primary': os.path.expanduser('~')}
+for _acct_spec in (_load_env().get('COLAB_ACCOUNT_HOMES') or '').split(','):
+    _acct_name, sep, _acct_home = _acct_spec.partition('=')
+    if sep and _acct_name.strip() and _acct_home.strip():
+        COLAB_ACCOUNT_HOMES[_acct_name.strip()] = os.path.expanduser(_acct_home.strip())
+COLAB_ACCOUNTS = [a.strip() for a in (_load_env().get('COLAB_ACCOUNTS') or 'primary').split(',') if a.strip()]
+COLAB_ACCOUNTS = [a for a in COLAB_ACCOUNTS if a in COLAB_ACCOUNT_HOMES] or ['primary']
+_COLAB_ACCOUNT_ROTATION = 0
+_COLAB_SESSION_ACCOUNTS = {}  # session name -> owning account, set at provision
 # CPU is a first-class runtime option too, not a fallback: a large task that
 # is purely CPU-bound (no CUDA/torch-GPU call) should not have to rent a T4
 # at all -- free-tier CPU runtimes are more likely to be granted than a GPU
@@ -128,7 +147,7 @@ COLAB_MONTHLY_UNITS = float(_load_env().get('COLAB_MONTHLY_UNITS', '0') or 0)
 COLAB_FREE_TIER = str(_load_env().get('COLAB_FREE_TIER', '') or '').lower() in ('1', 'true', 'yes')
 COLAB_ENABLED = str(_load_env().get('COLAB_ENABLED', '1') or '1').lower() not in ('0', 'false', 'no')
 COLAB_LEDGER_KEY = '__colab_compute__'
-_COLAB_USAGE_CACHE = {'at': 0.0, 'data': None}
+_COLAB_USAGE_CACHE = {}
 _COLAB_USAGE_CACHE_TTL_S = 120
 COLAB_MIN_UNITS_PER_RUN = 1.0       # every run pays a floor, even a 5s one
 COLAB_UNITS_PER_MIN_GPU = 1.0       # T4 burn estimate per elapsed minute
@@ -166,14 +185,27 @@ _COLAB_COMPUTE_LOCK = threading.Lock()
 
 
 
-def _colab_cli(*args, timeout=120, input=None):
+def _colab_cli(*args, timeout=120, input=None, account=None):
     """Run a colab CLI subcommand. Returns (exit_code, output_text). Never
     raises -- every caller surfaces the text like any other tool result.
-    Inherits this process's environment (PATH for the SSH bridge etc.)."""
+    Inherits this process's environment (PATH for the SSH bridge etc.).
+    account=None uses the process HOME (primary account). With an account
+    name, the subprocess runs under that account's OWN HOME (its keyring and
+    session registry), so account A can never read account B's token or
+    sessions."""
+    if account and account in COLAB_ACCOUNT_HOMES \
+            and COLAB_ACCOUNT_HOMES[account] != os.environ.get('HOME'):
+        env = dict(os.environ)
+        acct_home = COLAB_ACCOUNT_HOMES[account]
+        env['HOME'] = acct_home
+        env['XDG_DATA_HOME'] = os.path.join(acct_home, '.local')
+        env['XDG_CONFIG_HOME'] = os.path.join(acct_home, '.config')
+    else:
+        env = None
     cmd = [COLAB_CLI_PATH] + [str(a) for a in args]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, input=input)
+                              timeout=timeout, input=input, env=env)
         return proc.returncode, ((proc.stdout or '') + '\n' + (proc.stderr or '')).strip()
     except subprocess.TimeoutExpired:
         return -1, f'timeout after {timeout}s'
@@ -181,21 +213,23 @@ def _colab_cli(*args, timeout=120, input=None):
         return -1, str(e)
 
 
-def _colab_session_exists(session):
-    """True when a colab CLI session with this name is currently provisioned.
+def _colab_session_exists(session, account='primary'):
+    """True when a colab CLI session with this name is currently provisioned
+    ON THIS ACCOUNT (each account's session registry lives under its own
+    HOME; a name that exists on account A is invisible to account B).
     The CLI exits 0 even for a missing session -- it prints "Session 'X' not
     found." to stderr with a 0 exit code -- so the exit code alone is not
     enough: a stale/phantom registration would make provision skip `colab new`
     and every later exec fail against a session that does not exist. "not
     found" / "no active sessions" in the output therefore means not-existing."""
-    rc, out = _colab_cli('status', '-s', session, timeout=90)
+    rc, out = _colab_cli('status', '-s', session, timeout=90, account=account)
     if rc != 0:
         return False
     low = (out or '').lower()
     return 'not found' not in low and 'no active sessions' not in low
 
 
-def _colab_account_usage():
+def _colab_account_usage(account='primary'):
     """Live reconcile against the REAL Colab account via `colab usage`:
     current compute-unit balance, burn rate, active assignments. Colab
     publishes no fixed quota (limits are dynamic -- session caps, idle auto-
@@ -205,15 +239,18 @@ def _colab_account_usage():
     (CLI missing, timeout, unparseable) so callers fail closed and fall back
     to the operator cap alone. Cached briefly like the Apify/OpenRouter
     reconciles: a bank readout or availability check shouldn't always shell
-    out to the CLI."""
+    out to the CLI. Per-account: each account's CLI state lives under its own
+    HOME, so usage reads never touch another account's token."""
+    global _COLAB_ACCOUNT_ROTATION
     if not COLAB_CLI_AVAILABLE:
         return None
+    account = account or COLAB_ACCOUNTS[_COLAB_ACCOUNT_ROTATION % len(COLAB_ACCOUNTS)]
     now = time.time()
-    cached = _COLAB_USAGE_CACHE
+    cached = _COLAB_USAGE_CACHE.setdefault(account, {'at': 0.0, 'data': None})
     if cached['data'] is not None \
             and (now - cached['at']) < _COLAB_USAGE_CACHE_TTL_S:
         return cached['data']
-    rc, out = _colab_cli('usage', timeout=30)
+    rc, out = _colab_cli('usage', timeout=30, account=account)
     if rc != 0:
         return None
     data = {'balance': None, 'rate': None, 'assignments': None}
@@ -238,7 +275,28 @@ def _colab_account_usage():
     return data
 
 
-def _colab_compute_provision(session=None, kind='gpu'):
+def _colab_session_name(kind, account='primary'):
+    """Per-account session name: the primary account keeps the historical
+    names (think-tank-gpu / think-tank-cpu); other accounts get the account
+    name appended, so logs and the session registry are never ambiguous
+    about which account owns a runtime."""
+    base = COLAB_GPU_SESSION if kind == 'gpu' else COLAB_CPU_SESSION
+    return base if account == 'primary' else f'{base}-{account}'
+
+
+def _colab_pick_account():
+    """Choose ONE account for a whole run_on_colab call (round-robin). The
+    caller must use the returned account for every provision/exec/stop of
+    this job -- shard sets never mix accounts."""
+    global _COLAB_ACCOUNT_ROTATION
+    if not COLAB_ACCOUNTS:
+        return 'primary'
+    account = COLAB_ACCOUNTS[_COLAB_ACCOUNT_ROTATION % len(COLAB_ACCOUNTS)]
+    _COLAB_ACCOUNT_ROTATION += 1
+    return account
+
+
+def _colab_compute_provision(session=None, kind='gpu', account='primary'):
     """Idempotent: ensure a Colab runtime with the given name exists
     (defaults to the dedicated think-tank-gpu session; kind 'gpu' rents a T4,
     'cpu' rents a CPU runtime -- CPU slots are more likely granted on the free
@@ -251,7 +309,7 @@ def _colab_compute_provision(session=None, kind='gpu'):
     session = session or COLAB_GPU_SESSION
     if not COLAB_CLI_AVAILABLE:
         return False, 'the colab CLI is not installed on this machine'
-    if _colab_session_exists(session):
+    if _colab_session_exists(session, account=account):
         return True, 'ok'
     out = ''
     for attempt, delay in enumerate((0,) + COLAB_PROVISION_RETRY_DELAYS_S):
@@ -260,8 +318,9 @@ def _colab_compute_provision(session=None, kind='gpu'):
         cmd = ['new', '-s', session]
         if kind == 'gpu':
             cmd += ['--gpu', COLAB_GPU_ACCEL]
-        rc, out = _colab_cli(*cmd, timeout=300)
+        rc, out = _colab_cli(*cmd, timeout=300, account=account)
         if rc == 0:
+            _COLAB_SESSION_ACCOUNTS[session] = account
             return True, 'ok'
     return False, f'provision failed: {out[-500:]}'
 
@@ -446,7 +505,6 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
     the account balance is NOT a gate there (see _colab_budget_exceeded)."""
     global _COLAB_COMPUTE_LAST_USED
     kind = 'gpu' if kind != 'cpu' else 'cpu'
-    primary_session = COLAB_GPU_SESSION if kind == 'gpu' else COLAB_CPU_SESSION
     units_per_min = COLAB_UNITS_PER_MIN_GPU if kind == 'gpu' else COLAB_UNITS_PER_MIN_CPU
     if not code or not code.strip():
         return {'error': 'code is required'}
@@ -528,17 +586,23 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
         timeout = 300
     with _COLAB_COMPUTE_LOCK:
         start = time.time()
+        # Per-job account affinity (operator, 2026-11-21): ONE account owns
+        # this job end to end -- provision, exec, teardown. Shard sets never
+        # mix accounts, so a job's shards burn one account's free-tier
+        # capacity, not a blend of two.
+        account = _colab_pick_account()
+        primary_session = _colab_session_name(kind, account)
         # Provision the primary (must succeed) plus best-effort extras. The
         # account grants what it grants; anything less than requested is a
         # graceful degradation, reported back, not an error.
         sessions = []
-        ok, msg = _colab_compute_provision(primary_session, kind=kind)
+        ok, msg = _colab_compute_provision(primary_session, kind=kind, account=account)
         if not ok:
             return {'error': f'could not provision a Colab {kind} session: {msg}'}
         sessions.append(primary_session)
         for i in range(1, runtimes):
             extra = f'{primary_session}-{i}'
-            ok, _msg = _colab_compute_provision(extra, kind=kind)
+            ok, _msg = _colab_compute_provision(extra, kind=kind, account=account)
             if ok:
                 sessions.append(extra)
             else:
@@ -552,7 +616,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                     rc, out = _colab_cli(
                         'exec', '-s', session, '--timeout', '600',
                         '--env', f'COLAB_PKGS={pkg_line}',
-                        timeout=660,
+                        timeout=660, account=account,
                         input=('import os, subprocess\n'
                                'subprocess.run("pip install -q " + os.environ["COLAB_PKGS"], '
                                'shell=True, timeout=540)\nprint("__COLAB_PKGS_INSTALLED__")\n'))
@@ -578,7 +642,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
                 # Host-side subprocess timeout must exceed the CLI's own
                 # --timeout, or the host kills the exec (and the transcript
                 # transcription with it) before the CLI can finish or report.
-                timeout=timeout + 90,
+                timeout=timeout + 90, account=account,
                 input=code + '\nprint("__COLAB_DONE__")\n')
             elapsed = max(1, int(time.time() - shard_start))
             _COLAB_COMPUTE_LAST_USED = time.time()
@@ -606,7 +670,7 @@ def _colab_compute_run(agent_id, code, purpose, packages, timeout_seconds, runti
         # unlimited but NOT nothing: every minute of GPU is still real usage.
         for extra in sessions[1:]:
             try:
-                _colab_cli('stop', '-s', extra, timeout=120)
+                _colab_cli('stop', '-s', extra, timeout=120, account=account)
             except Exception:
                 pass
         total_elapsed = max(1, int(time.time() - start))
@@ -639,15 +703,22 @@ async def _colab_compute_idle_loop():
     sessions once they have sat idle past COLAB_IDLE_GRACE_S, so a standing
     runtime stops burning the account's compute units between agent jobs.
     Same lifecycle ownership as the Jev standby, but for the agent-compute
-    sessions and driven by an idle timer rather than a health signal."""
+    sessions and driven by an idle timer rather than a health signal.
+    Per-account (operator, 2026-11-21): each account's sessions are torn down
+    under THAT account's HOME -- account A never touches account B's runtimes
+    even for cleanup."""
     while True:
         try:
             if _COLAB_COMPUTE_LAST_USED > 0 \
                     and (time.time() - _COLAB_COMPUTE_LAST_USED) > COLAB_IDLE_GRACE_S:
-                for session, label in ((COLAB_GPU_SESSION, 'GPU'), (COLAB_CPU_SESSION, 'CPU')):
-                    if _colab_session_exists(session):
-                        print(f'[colab-compute] {label} session idle; tearing down', flush=True)
-                        _colab_cli('stop', '-s', session, timeout=120)
+                for kind, label in (('gpu', 'GPU'), ('cpu', 'CPU')):
+                    for account in COLAB_ACCOUNTS:
+                        session = _colab_session_name(kind, account)
+                        if _colab_session_exists(session, account=account):
+                            print(f'[colab-compute] {label} session idle '
+                                  f'({account}); tearing down', flush=True)
+                            _colab_cli('stop', '-s', session, timeout=120,
+                                       account=account)
         except Exception as e:
             print(f'[colab-compute] idle teardown error: {e}', flush=True)
         await asyncio.sleep(5 * 60)
