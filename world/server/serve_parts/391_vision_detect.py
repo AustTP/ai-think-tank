@@ -210,3 +210,112 @@ def _yolo_detect_images_sync(images, purpose='YOLO video-frame detection',
         return True, {'rows': rows, 'account': account, 'session': session,
                       'model': model_slug, 'conf': conf, 'elapsedS': elapsed,
                       'units': units}
+
+
+# --- Colab fetch lane (rare-day fallback) -----------------------------------
+# Operator question (2026-11-22): when the VM's datacenter IP gets blocked
+# (403/429 from e.g. a Cloudflare-fronted host), a fetch from a Colab
+# runtime's Google Cloud egress is occasionally granted where both the VM's
+# IP and the Mullvad exits are refused. The existing browser fallback
+# (_do_fetch_with_browser_fallback) only changes the RENDERER on 404/410 --
+# it never changes the IP. This lane changes the IP. Deliberately narrow:
+# only wired where the browser fallback was NOT wired (no VPN branches), one
+# attempt per fetch, best-effort (failure returns the original error), and
+# the URL was already Jev/allowlist-cleared before the first fetch -- a
+# Colab lane grants no second unvetted path, it is another way to read an
+# already-cleared page. Budget + single-account affinity identical to every
+# other Colab job. Env: COLAB_FETCH_ENABLED=0 to shut it off entirely.
+_COLAB_FETCH_ENABLED = str(
+    _load_env().get('COLAB_FETCH_ENABLED', '1') or '').lower() not in ('0', 'false', 'no')
+_COLAB_FETCH_LAST_AT = 0.0
+_COLAB_FETCH_MIN_INTERVAL_S = 30.0  # rare-day lane: never hot-looping
+
+def _colab_fetch_sync(url, purpose=''):
+    """Fetch an already-Jev-cleared URL through a Colab runtime's network.
+    Returns (ok, data): ok=True -> data = {'body', 'contentType', 'finalUrl',
+    'account', 'elapsedS', 'units'}; ok=False -> {'error'}. Best-effort by
+    design: callers swallow failure and keep their original error. Blocks;
+    call from a worker thread. Takes _COLAB_COMPUTE_LOCK so it serializes
+    with run_on_colab jobs (one exec at a time per session)."""
+    global _COLAB_FETCH_LAST_AT, _COLAB_COMPUTE_LAST_USED
+    if not _COLAB_FETCH_ENABLED:
+        return False, {'error': 'the Colab fetch lane is disabled '
+                                '(COLAB_FETCH_ENABLED=0)'}
+    if not COLAB_CLI_AVAILABLE:
+        return False, {'error': 'the colab CLI is not installed'}
+    if not COLAB_ENABLED:
+        return False, {'error': 'Colab compute is disabled (COLAB_ENABLED=0)'}
+    now = time.time()
+    if now - _COLAB_FETCH_LAST_AT < _COLAB_FETCH_MIN_INTERVAL_S:
+        return False, {'error': 'the Colab fetch lane is rate-limited '
+                                f'(one attempt per '
+                                f'{_COLAB_FETCH_MIN_INTERVAL_S:.0f}s)'}
+    if _colab_budget_exceeded():
+        return False, {'error': 'the think tank has used its monthly Colab '
+                                'unit cap; the fetch lane is paused'}
+    with _COLAB_COMPUTE_LOCK:
+        start = time.time()
+        account = _colab_pick_account()
+        session = _colab_session_name('cpu', account)
+        ok, msg = _colab_compute_provision(session, kind='cpu', account=account)
+        if not ok:
+            return False, {'error': f'could not provision a Colab cpu '
+                                    f'session: {msg}', 'account': account}
+        exec_code = (
+            'import os, urllib.request, sys\n'
+            'req = urllib.request.Request(os.environ[\'COLAB_FETCH_URL\'], '
+            'headers={\'User-Agent\': \'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            ' AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36\'})\n'
+            'try:\n'
+            '    with urllib.request.urlopen(req, timeout=60) as resp:\n'
+            '        raw = resp.read(3_000_000)\n'
+            '        print(resp.status)\n'
+            '        print(resp.headers.get(\'Content-Type\', \'\'))\n'
+            '        print(resp.geturl())\n'
+            '        sys.stdout.flush()\n'
+            '        sys.stdout.buffer.write(raw)\n'
+            'except Exception as e:\n'
+            '    print(f\'FETCHERR {e}\')\n'
+            'print(\'__COLAB_DONE__\')\n'
+        )
+        rc, out = _colab_cli(
+            'exec', '-s', session, '--timeout', '90',
+            '--env', f'COLAB_FETCH_URL={url}',
+            timeout=150, account=account,
+            input=exec_code)
+        elapsed = max(1, int(time.time() - start))
+        _COLAB_COMPUTE_LAST_USED = time.time()
+        _COLAB_FETCH_LAST_AT = time.time()
+        if rc != 0 or '__COLAB_DONE__' not in (out or ''):
+            return False, {'error': f'Colab fetch failed (exit {rc}): '
+                                    f'{(out or "")[-400:]}',
+                           'account': account}
+        units = max(COLAB_MIN_UNITS_PER_RUN,
+                    round(elapsed / 60.0 * COLAB_UNITS_PER_MIN_CPU, 3))
+        _accrue_colab_units(units)
+        # The CLI streams the exec's stdout; the first line is the HTTP
+        # status, the second the content type, the third the final URL
+        # (three lines so a content type carrying "; charset=utf-8" can
+        # never bleed into the URL -- a real 2026-11-22 test catch), and
+        # everything after the third newline is the raw body.
+        head_and_body = (out or '').split('__COLAB_DONE__')[0].rstrip('\n')
+        first_line = head_and_body.split('\n', 1)[0]
+        if first_line.startswith('FETCHERR'):
+            return False, {'error': f'remote fetch refused: {first_line}',
+                           'account': account}
+        parts = head_and_body.split('\n', 3)
+        if len(parts) < 3:
+            return False, {'error': 'unparseable Colab fetch header: '
+                                    f'{head_and_body[:200]}',
+                           'account': account}
+        status, content_type, final_url = parts[0], parts[1], parts[2]
+        raw_body = parts[3] if len(parts) > 3 else ''
+        log_action('system', 'colab_fetch_run',
+                   {'url': url[:300], 'purpose': (purpose or '')[:120],
+                    'status': status, 'bytes': len(raw_body),
+                    'account': account, 'session': session,
+                    'elapsedS': elapsed, 'units': units},
+                   authorized=True)
+        return True, {'body': raw_body, 'contentType': content_type,
+                      'finalUrl': final_url, 'account': account,
+                      'elapsedS': elapsed, 'units': units}

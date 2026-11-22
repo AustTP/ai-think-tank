@@ -591,6 +591,15 @@ async def containers_switch(container_id: str, request: Request):
 # BROWSER_FALLBACK_ENABLED=false in ~/ai-think-tank/.env to shut it off.
 BROWSER_FALLBACK_ENABLED = _load_env().get('BROWSER_FALLBACK_ENABLED', 'true').strip().lower() != 'false'
 _BROWSER_FALLBACK_CODES = frozenset({404, 410})
+# Rare-day IP lane (2026-11-22): 403/429 often means the fetching IP class
+# (datacenter / VPN-exit ranges) is refused outright, not that the page is
+# gone -- changing the RENDERER (the browser fallback above) cannot fix that,
+# but fetching through a Colab runtime's Google Cloud egress occasionally
+# passes. One best-effort attempt, same approved URL, plain path only; the
+# lane itself lives in 391 (Colab auxiliary) and carries every Colab gate
+# (budget, account affinity, rate limit). COLAB_FETCH_ENABLED=0 in .env shuts
+# it off; lane failure leaves the original 403/429 untouched.
+_COLAB_FETCH_FALLBACK_CODES = frozenset({403, 429})
 
 
 @app.post('/api/browse')
@@ -732,6 +741,38 @@ async def browse(request: Request):
 
     fallback_state = {'used': False}
 
+    async def _do_fetch_with_colab_ip_fallback(http_err_code):
+        """One best-effort try of the SAME approved url through a Colab
+        runtime's network (a different IP class -- the one axis the renderer
+        fallback cannot change). Any lane failure returns None and the
+        caller keeps its original error. Deliberately NOT wired into the
+        VPN branches: those already changed the network lane on purpose, and
+        stacking fallbacks there mixes three knobs in one failure."""
+        ok, payload = await asyncio.to_thread(_colab_fetch_sync, url, purpose)
+        if not ok:
+            log_action(agent_id, 'browse',
+                       {'url': url, 'purpose': purpose,
+                        'decision': 'colab_fallback_failed',
+                        'status': http_err_code,
+                        'reason': ((payload or {}).get('error') or '')[:200]},
+                       authorized=authorized, trace_id=trace_id)
+            return None
+        fb_body = payload.get('body') or ''
+        fb_final = payload.get('finalUrl') or url
+        fb_content_type = payload.get('contentType') or 'text/plain'
+        is_html = 'html' in fb_content_type
+        fb_text = _strip_html_to_text(fb_body) if is_html else fb_body[:BROWSE_MAX_BYTES]
+        fb_links = _extract_links(fb_body, fb_final) if is_html else []
+        fb_text = fb_text[:20000]
+        fallback_state['used'] = True
+        log_action(agent_id, 'browse',
+                   {'url': url, 'purpose': purpose,
+                    'decision': 'colab_fallback_success',
+                    'status': http_err_code, 'bytes': len(fb_body)},
+                   authorized=authorized, trace_id=trace_id)
+        return (fb_final, fb_content_type, fb_body,
+                len(fb_body) >= BROWSE_MAX_BYTES, None, fb_text, fb_links)
+
     async def _do_fetch_with_browser_fallback():
         """Plain-path fetch, then one read-only browser retry of the SAME
         approved url on a 404/410. Deliberately NOT wired into the VPN
@@ -745,12 +786,21 @@ async def browse(request: Request):
         try:
             return await _do_fetch()
         except urllib.error.HTTPError as http_err:
-            if (http_err.code not in _BROWSER_FALLBACK_CODES
+            # The except-bound name is deleted on block exit; keep the code.
+            http_err_code = http_err.code
+            # Rare-day IP lane first: a 403/429 from the VM's own IP may
+            # still pass through a Colab runtime's egress. Lane failure
+            # here falls through to the original behavior unchanged.
+            if http_err_code in _COLAB_FETCH_FALLBACK_CODES \
+                    and _COLAB_FETCH_ENABLED:
+                result = await _do_fetch_with_colab_ip_fallback(http_err_code)
+                if result is not None:
+                    return result
+            if (http_err_code not in _BROWSER_FALLBACK_CODES
                     or not BROWSER_FALLBACK_ENABLED
                     or sync_playwright is None):
                 raise
-            # The except-bound name is deleted on block exit; keep the code.
-            fallback_status = http_err.code
+            fallback_status = http_err_code
         log_action(agent_id, 'browse',
                    {'url': url, 'purpose': purpose,
                     'decision': 'browser_fallback_attempt',
