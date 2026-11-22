@@ -147,6 +147,14 @@ async def _lifespan(app):
         else asyncio.create_task(_colab_failover_loop())
     colab_compute_task = None if (VILLAGE_MODE or not COLAB_CLI_AVAILABLE) \
         else asyncio.create_task(_colab_compute_idle_loop())
+    # Change lane (operator, 2026-11-22): card completions with validated
+    # code deliverables become branches, PRs, CI runs, and risk-tiered
+    # merge decisions. Parent-only (touches GitHub + the sim's sandboxes
+    # from the parent's CWD) and disabled without git credentials.
+    change_lane_task = None if (VILLAGE_MODE or not _CHANGE_LANE_REPO
+                                or not _CHANGE_LANE_TOKEN) \
+        else asyncio.create_task(_change_lane_loop())
+    del change_lane_task  # referenced by name only for startup clarity
     telegram_task = None
     if TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_IDS and not VILLAGE_MODE:
         telegram_task = asyncio.create_task(_telegram_poll_loop())

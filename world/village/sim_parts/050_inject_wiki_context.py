@@ -1340,8 +1340,15 @@ def finish_task(state, agent_id, grid=None):
         log_action(agent_id, 'task_completed', {'taskId': task['id'] if task else None,
                                                 'title': task['title'] if task else None},
                    authorized=True)
+        # Change lane (393): a validated code deliverable (codePublished)
+        # entry point is _change_lane_on_task_completed(task, agent_id) --
+        # defined in serve_parts/393_change_lane.py (shared namespace).
+        try:
+            _change_lane_on_task_completed(task, agent_id)
+        except Exception:  # noqa: BLE001
+            pass
         # Card close reports no longer reach the player on any
-        # channel -- the sprint retro is the player's close signal.
+        # channel -- the sprint retro is the close signal.
         # The call keeps its once-per-card idempotency flag.
         _deliver_card_report(state, task, 'completed')
 
