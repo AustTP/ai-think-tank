@@ -1016,15 +1016,41 @@ async def youtube_frames(request: Request):
     if not seconds_list:
         return JSONResponse({'error': 'timestamps must be a non-empty list of seconds'}, status_code=400)
     want_review = body.get('review', True)
+    want_detect = str(body.get('detect', '1') or '1').strip().lower() not in ('0', 'false', 'no')
     review_budget = seconds_list[:YOUTUBE_FRAMES_REVIEW_MAX] if want_review else []
     log_action(agent_id, 'youtube_frames', {'url': url, 'videoId': vid,
                                             'timestamps': seconds_list,
-                                            'review': bool(want_review)},
+                                            'review': bool(want_review),
+                                            'detect': bool(want_detect)},
                authorized=authorized)
     frames = await asyncio.to_thread(_extract_youtube_frames, url, vid, seconds_list)
     if not any(data for data in frames.values()):
         return JSONResponse({'error': 'no frame could be captured (download or seek failed)'},
                             status_code=502)
+    # YOLO detection pass (2026-11-21): cheap deterministic detections on the
+    # captured frames, run as one ephemeral Colab job. Completion is
+    # best-effort: a failure or refusal leaves every frame's `detections`
+    # null with an explicit `detectionsError` reason -- the vision reviews
+    # below still work, so detection outages never block frame capture.
+    detections_by_seconds = {}
+    detections_error = None
+    if want_detect:
+        captured_frames = [frames.get(s) for s in seconds_list if frames.get(s)]
+        if captured_frames:
+            ok, payload = await asyncio.to_thread(
+                _yolo_detect_images_sync, captured_frames,
+                f'YOLO detection on YouTube frames ({vid})')
+            if ok:
+                rows = payload.get('rows') or []
+                yielded = 0
+                for seconds in seconds_list:
+                    if not frames.get(seconds):
+                        continue
+                    if yielded < len(rows):
+                        detections_by_seconds[seconds] = rows[yielded]['detections']
+                    yielded += 1
+            else:
+                detections_error = (payload or {}).get('error') or 'detection failed'
     question = (body.get('question') or '').strip()[:500]
     out_frames = []
     reviewed = 0
@@ -1038,6 +1064,10 @@ async def youtube_frames(request: Request):
                  'libraryPath': _youtube_frame_rel(vid, seconds),
                  'sha256': hashlib.sha256(data).hexdigest(),
                  'bytes': len(data)}
+        if detections_by_seconds.get(seconds) is not None:
+            entry['detections'] = detections_by_seconds[seconds]
+        elif detections_error:
+            entry['detectionsError'] = detections_error
         if seconds in review_budget:
             ok, text = _vision_describe_frame(
                 data, question, f'YouTube video {vid} at {seconds}s')
