@@ -194,7 +194,7 @@ def _colab_cli(*args, timeout=120, input=None, account=None):
     session registry), so account A can never read account B's token or
     sessions."""
     if account and account in COLAB_ACCOUNT_HOMES \
-            and COLAB_ACCOUNT_HOMES[account] != os.environ.get('HOME'):
+            and COLAB_ACCOUNT_HOMES[account] != os.path.expanduser('~'):
         env = dict(os.environ)
         acct_home = COLAB_ACCOUNT_HOMES[account]
         env['HOME'] = acct_home
