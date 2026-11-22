@@ -547,7 +547,8 @@ def _sim_loop_pass_inner():
         # when something actually moved.
         _phase('village_mail_relay')
         try:
-            _relay_counts = _village_mail_relay_pass(state, int(now * 1000))
+            _relay_counts = _village_mail_relay_pass(
+                state, int(time.time() * 1000))
             if any(c > 0 for c in _relay_counts.values()):
                 serve.log_action(None, 'village_mail_delivered',
                                  {'counts': _relay_counts}, authorized=True)
