@@ -730,7 +730,9 @@ class MakeWebToolsExecutor(unittest.TestCase):
         self.assertIn("Could not file", out)
 
     def test_search_web(self):
-        with unittest.mock.patch.object(serve, "_api_execute",
+        with unittest.mock.patch.object(serve, "_merged_search",
+                                        return_value=None), \
+                unittest.mock.patch.object(serve, "_api_execute",
                                         return_value={"ok": True, "textForModel": "wrapped",
                                                       "modelInstruction": "inst"}):
             out = self._exec()("search_web", {"query": "news"})

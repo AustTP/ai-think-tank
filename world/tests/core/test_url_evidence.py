@@ -38,7 +38,8 @@ def test_search_then_browse_uses_exact_discovered_url():
               'textForModel': '- Docs (https://example.org/overview): Text'}
     page = {'allowed': True, 'textForModel': 'Actual page',
             'modelInstruction': 'page data'}
-    with patch.object(serve, '_api_execute', return_value=search), \
+    with patch.object(serve, '_merged_search', return_value=None), \
+            patch.object(serve, '_api_execute', return_value=search), \
             patch.object(serve, 'log_action'), \
             patch.object(serve, '_http_json', return_value=page) as fetch:
         tool = serve._make_web_tools_executor('oliver', 'test')

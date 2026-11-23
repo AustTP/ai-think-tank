@@ -652,6 +652,19 @@ def _resolve_refinement(state, pending, now_ms, decider=None, reader=None):
             contract_bits.append('hard prohibitions: ' + str(_nv)[:400])
         if contract_bits:
             instructions += ' Filed contract: ' + ' | '.join(contract_bits) + '.'
+        # Saved-deliverable pointer (operator, 2026-11-23, task-35790):
+        # report/spike completion is graded on the SAVED FILE, not the chat
+        # reply. Two prior cards auto-closed on missing_saved_deliverable
+        # because a finished worker never called the writer. Name the tool
+        # and the fallback explicitly so completion always has a file.
+        if (req.get('deliverable') or '') == 'report':
+            instructions += (
+                ' DELIVERABLE: the completion gate grades the saved report '
+                'file, not your chat reply: write it with the spike-report '
+                'tool (the one that saves under archive/), or if that tool '
+                'is not in your toolbelt, file it with the library-file '
+                'tool, which links to this task automatically. Never end '
+                'the card without saving the file.')
         # Stop rule (operator, 2026-11-22): identical failure twice = stop
         # retrying and mark the card blocked; the tank closes repeat-failure
         # cards rather than letting a broken tool become a recurring expense.

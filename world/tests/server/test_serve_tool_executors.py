@@ -491,14 +491,18 @@ class WebToolsExecutorTest(unittest.TestCase):
 
     def test_search_web(self):
         ex = self._ex()
-        with mock.patch.object(serve, '_api_base_url',
+        with mock.patch.object(serve, '_merged_search',
+                               return_value=None), \
+             mock.patch.object(serve, '_api_base_url',
                                return_value='http://api'), \
              mock.patch.object(serve, '_api_execute',
                                return_value={'ok': True,
                                              'modelInstruction': 'mi',
                                              'textForModel': 'txt'}):
             self.assertEqual(ex('search_web', {}), 'mi\n\ntxt')
-        with mock.patch.object(serve, '_api_base_url',
+        with mock.patch.object(serve, '_merged_search',
+                               return_value=None), \
+             mock.patch.object(serve, '_api_base_url',
                                return_value='http://api'), \
              mock.patch.object(serve, '_api_execute',
                                return_value={'ok': False, 'reason': 'r'}):
