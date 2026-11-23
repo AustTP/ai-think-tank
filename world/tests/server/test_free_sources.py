@@ -76,7 +76,8 @@ class MergedSearch(unittest.TestCase):
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             'fs_standalone',
-            'world/server/serve_parts/362_free_sources.py')
+            os.path.join(os.path.dirname(os.path.abspath(serve.__file__)),
+                'server', 'serve_parts', '362_free_sources.py'))
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
         with mock.patch.object(m, '_hn', lambda q: []), \
