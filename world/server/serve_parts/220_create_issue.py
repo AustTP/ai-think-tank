@@ -38,6 +38,35 @@ async def create_issue(request: Request):
     issue_type = (body.get('type') or '').strip().lower()
     if issue_type not in _sim.ISSUE_TYPES:
         return JSONResponse({'error': f"type must be one of: {', '.join(_sim.ISSUE_TYPES)}"}, status_code=400)
+    # Filing-time deliverable mapping (operator, 2026-11-23, BEN-204):
+    # a generic 'task' whose description carries acceptance criteria but no
+    # expected code artifact graded as a CODE card (deliverable note ->
+    # taskType code) and the grade loop then rejected every honest attempt
+    # 8 times (grade_artifact_mismatch -> repeated rejections). A review or
+    # read-and-judge request is a REPORT card: map it to spike/report
+    # explicitly unless the filer already named a deliverable. The filer
+    # can always override by passing explicit 'deliverable'.
+    if issue_type == 'task' and not body.get('deliverable'):
+        d = body.get('description')
+        crit_bits = []
+        if isinstance(d, dict):
+            crit_bits.append(str(d.get('userStory') or ''))
+            crit_bits.append(' '.join(str(c) for c in
+                                      (d.get('acceptanceCriteria') or [])))
+            crit_bits.append(' '.join(str(n) for n in (d.get('never') or [])))
+        elif isinstance(d, str):
+            crit_bits.append(d)
+        blob = ' '.join(crit_bits).lower()
+        read_only = any(w in blob for w in
+                        ('review', 'assess', 'judge', 'read only',
+                         'do not modify', 'no code changes',
+                         'read and judge'))
+        builds = any(w in blob for w in
+                     ('then run', 'then commit', 'then push',
+                      'then implement', 'then add', 'then fix',
+                      'then deploy', 'then build'))
+        if read_only and not builds:
+            body['deliverable'] = 'report'
     issue = _sim.file_issue(
         state, team_id, issue_type, (body.get('summary') or '').strip(),
         (body.get('feature') or '').strip(),

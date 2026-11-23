@@ -597,8 +597,29 @@ def _stop_repair_loop(state, task, info, author):
     task['failNote'] = (f"Repair loop stopped after {info['failures']} failures of "
                         f"the same card: the lane output and the completion gate "
                         f"disagree. Fix the contract before re-carding.")[:300]
-    task['nextAction'] = ('Compare what the lane produces with what the '
-                          'completion gate accepts; do not mint another Fix card.')
+    # Actionable refusal (operator, 2026-11-23, task-35790): the stop
+    # message must tell the next reader WHAT to check first. When a saved
+    # artifact already exists, the deliverable was produced and the gate
+    # never saw it -- say that instead of the generic contract line.
+    from serve import _safe_library_path as _fsi  # noqa: F401  (probe only)
+    try:
+        import os as _os
+        _artifact = task.get('reportPath') or task.get('libraryPath')
+        _full = _fsi(str(_artifact)) if _artifact else None
+        _has_artifact = bool(_full and _os.path.isfile(_full))
+    except Exception:
+        _has_artifact = False
+    if _has_artifact:
+        task['nextAction'] = (
+            f'The deliverable is already saved at {_artifact}. Do NOT redo '
+            'the work or mint another Fix card: graduate the card (verify '
+            'the saved file against the acceptance criteria and re-run the '
+            'completion gate) -- the blocked-with-deliverable sweep re-issues '
+            'blocked cards whose saved file exists.')
+    else:
+        task['nextAction'] = ('Compare what the lane produces with what the '
+                              'completion gate accepts; do not mint another '
+                              'Fix card.')
     key = f"repair_loop:{info['root']}"
     notified = state.setdefault('_repairLoopNotified', {})
     if key not in notified:

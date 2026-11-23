@@ -282,6 +282,56 @@ def _stale_work_step(state, now, now_ms):
         if isinstance(d, dict)
     }
     replanned = 0
+
+    # Graduation sweep (operator, 2026-11-23, task-35817): a card BLOCKED by
+    # the repair loop after the worker actually saved its deliverable never
+    # re-enters the completion gate -- finished work rots in 'blocked'. When
+    # the saved artifact exists on disk, graduate the card ONCE: re-issue it
+    # (reissueOf, so twin-dedup cannot strand it) with instructions that
+    # name the saved file and the only-completion-accepts-it rule. Bounded:
+    # one graduation per title root (the replan map), so a card that refuses
+    # again falls back to the normal repair machinery.
+    for tid, task in list(tasks.items()):
+        if not isinstance(task, dict) or task.get('status') != 'blocked':
+            continue
+        artifact_rel = task.get('reportPath') or task.get('libraryPath')
+        if not artifact_rel:
+            continue
+        try:
+            from serve import _safe_library_path
+            full = _safe_library_path(str(artifact_rel))
+            if not (full and os.path.isfile(full)):
+                continue
+        except Exception:
+            continue
+        gkey = 'grad:' + str(task.get('title') or '')[:120]
+        if replan_map.get(gkey, 0) >= 1:
+            continue
+        replan_map[gkey] = 1
+        queue_work(state, [{
+            'title': task.get('title'),
+            'reissueOf': task.get('id'),
+            'room': task.get('room') or _resolve_assignment_room(task),
+            'instructions': (
+                (task.get('instructions') or '') +
+                '\n\n[graduated] The deliverable for this card was already '
+                f'saved at {artifact_rel}. Do not redo the work: verify the '
+                'saved file matches the acceptance criteria, then complete '
+                'the card the normal way. The completion gate accepts only '
+                'the saved file.'),
+            'goal': task.get('goal'),
+            'taskType': task.get('taskType') or 'code',
+            'teamId': task.get('teamId'),
+            'priority': WORK_PRIORITY['high'],
+            'deliverable': task.get('deliverable'),
+            'issueKey': task.get('issueKey'),
+        }])
+        _log_governance(state, 'admin', 'blocked_card_graduated',
+                        {'task': tid,
+                         'title': (task.get('title') or '')[:120],
+                         'artifact': str(artifact_rel)[:160]})
+        del tasks[tid]
+        replanned += 1
     for tid, task in list(tasks.items()):
         if not isinstance(task, dict):
             continue

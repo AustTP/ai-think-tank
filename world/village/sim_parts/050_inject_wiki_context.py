@@ -1197,9 +1197,13 @@ def _completion_evidence_gap(task):
     deliverable = str(task.get('deliverable') or '').strip().lower()
     if deliverable == 'report':
         if not (task.get('libraryPath') or task.get('reportPath')):
-            return 'no reportPath or task note'
+            return ('no reportPath or task note: save the report with the '
+                    'write_spike_report tool (files under archive/ and links '
+                    'this task), or the library-file tool, then complete')
         if not str(task.get('note') or '').strip():
-            return 'no reportPath or task note'
+            return ('the report file exists but the task note is empty: '
+                    'record one line on what the report concludes, then '
+                    'complete')
         gap = _research_provenance_gap(task)
         if gap:
             return gap
@@ -1215,7 +1219,9 @@ def _completion_evidence_gap(task):
     if ttype in ('spike', 'report'):
         artifact = task.get('libraryPath') or task.get('reportPath')
         if not artifact or not str(task.get('note') or '').strip():
-            return 'no reportPath or task note'
+            return ('no reportPath or task note: save the report with the '
+                    'write_spike_report tool (files under archive/ and links '
+                    'this task), or the library-file tool, then complete')
         gap = _research_provenance_gap(task)
         if gap:
             return gap
