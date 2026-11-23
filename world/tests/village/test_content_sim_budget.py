@@ -516,3 +516,34 @@ class SpikeContentTest(_Base):
                 _snapshot(), 'cora', task, base_ctx='ctx')
         self.assertTrue(run.called)
         self.assertTrue(run.call_args.kwargs['base_ctx'].startswith('design'))
+
+
+class QueueWorkDeliverablePointer(unittest.TestCase):
+    """Saved-deliverable pointer (operator, 2026-11-23, task-35790/35816):
+    report cards must carry the save-path line at task birth, composed in
+    queue_work so the LLM groomer cannot eat it."""
+
+    def _state(self):
+        return {'workQueue': [], '_dedupCache': {}}
+
+    def test_report_card_gets_save_path_line(self):
+        import sim
+        before = len(self._state()['workQueue'])
+        st = self._state()
+        sim.queue_work(st, [{'title': 'Coherence review',
+                             'taskType': 'spike',
+                             'deliverable': 'report',
+                             'instructions': 'Read the packet.'}])
+        item = st['workQueue'][-1]
+        self.assertIn('DELIVERABLE:', item['instructions'])
+        self.assertIn('write_spike_report', item['instructions'])
+
+    def test_non_report_card_has_no_save_path_line(self):
+        import sim
+        st = self._state()
+        sim.queue_work(st, [{'title': 'Ship the button',
+                             'taskType': 'code',
+                             'deliverable': 'code',
+                             'instructions': 'Build it.'}])
+        item = st['workQueue'][-1]
+        self.assertNotIn('DELIVERABLE:', item['instructions'])

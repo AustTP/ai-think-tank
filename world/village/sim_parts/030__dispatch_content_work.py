@@ -421,10 +421,28 @@ def queue_work(state, items):
                 except Exception:
                     pass
                 continue
+        instructions_text = item.get('instructions') or \
+            f"Pick whoever is best suited for: {item['title']}"
+        # Saved-deliverable pointer (operator, 2026-11-23, task-35790/35816):
+        # report-card completion is graded on the SAVED FILE, not the chat
+        # reply. Task instructions are LLM-composed in refinement and the
+        # lesson blob eats long tails, so the save-path line rides HERE --
+        # the one chokepoint every card passes through -- composed
+        # deterministically at task birth. Mirrors the spike-executor note
+        # (80_body_09) and the refinement pointer (120).
+        if (item.get('deliverable') or '') == 'report':
+            instructions_text += (
+                ' DELIVERABLE: the completion gate grades the saved report '
+                'file, not your chat reply: write it with the write_spike_report '
+                'tool (saves under archive/ and links this task), or if that '
+                'tool is not in your toolbelt, file it with the library-file '
+                'tool (also links to this task). Never end the card without '
+                'saving the file; refusing completion as '
+                'missing_saved_deliverable wastes the whole attempt.')
         work_queue.append({
             'title': item['title'],
             'room': item.get('room') or None,
-            'instructions': item.get('instructions') or f"Pick whoever is best suited for: {item['title']}",
+            'instructions': instructions_text,
             # A player-filed JIRA card's contract: the normalized user story +
             # acceptance criteria survive the queue round trip onto the real task
             # (see _resolve_refinement -> _assign_due_item -> assign_task), so the
