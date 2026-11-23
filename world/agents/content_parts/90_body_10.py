@@ -65,7 +65,8 @@ def project_board(args):
     import time as _time
     _cutoff = _time.time() - 24 * 3600
     _taskTeam = {str(tid): str((t or {}).get('teamId') or '')
-                 for tid, t in (state.get('tasks') or {}).items()}
+                 for tid, t in (state.get('tasks') or {}).items()
+                 if isinstance(t, dict)}
     _stoppedTeams = set()
     try:
         with _serve._db() as _conn:
