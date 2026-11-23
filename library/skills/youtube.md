@@ -62,3 +62,28 @@ and it survives tank restarts unchanged.
 - Store findings under `library/research/` and cite the video URL.
 - Never upload the tank's credentials anywhere; credentials come only
   through the ask flow, and YouTube research needs none.
+
+## Rate limits (empirical, operator-verified 2026-11-23, BEN-210)
+
+YouTube posts NO published rate limit for the lanes below. The only
+official quoted quota is the YouTube Data API (10,000 units/day per
+project; search costs 100 units -- we do not use it). Everything else is
+reputation-based and unannounced. The empirical envelope (task-35861):
+
+- Watch-page/extractor calls (yt-dlp, youtube-transcript-api, the
+  transcript shim): a short burst from one IP fails within minutes
+  (HTTP 429 on captions; "Sign in to confirm you're not a bot" on the
+  watch page). Cloud/VPS/Colab IPs are challenged far earlier than
+  residential ones. Published limit: none. Work like there is one.
+- Back off AT LEAST 60 minutes after any 429 or bot challenge from
+  that IP; do not burn retries (the stop rule applies).
+- Batch extractor work: one session, few calls, captions-then-whisper
+  in a single pass. Never probe the watch page per-frame.
+- `i.ytimg.com` thumbnails and the oEmbed endpoint are CDN-served and
+  effectively unmetered; prefer them for identity/metadata checks.
+- Colab is the escape hatch (Google-egress IPs): run the whole job
+  there in ONE exec (install, fetch, transcribe, save) rather than
+  round-tripping between host and runtime.
+- The host transcript shim needs youtube-transcript-api installed in
+  the server venv; if it ModuleNotFound-errors, fix the venv first --
+  do not file a card about the tool being "broken."

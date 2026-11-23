@@ -34,6 +34,30 @@ def _sweep(state):
     sim._workflow_template_sweep(state, 1_000_000, archived={})
 
 
+def _code_family_state():
+    """A code-family workflow (fix+bug+test tokens) whose learned shape is
+    implement -> verify; NOT a single-deliverable goal, so the real
+    multi-step shape survives into the template."""
+    state = _base_state()
+    goal = 'Fix the login timeout bug and add a regression test.'
+    state['backlogRequests'] = [_request('r1', goal)]
+    state['tasks'] = {
+        't1': _task('t1', 'r1', title='Implement the fix', task_type='code', budget=1.0),
+        't2': _task('t2', 'r1', title='Verify the fix passes tests', task_type='code'),
+        # t2 sequence 0 == t1 sequence 0; _workflow_steps sorts by sequence
+        # then createdAt, both equal -> order ambiguous. Pin the order.
+    }
+    state['tasks']['t2']['sequence'] = 1
+    _sweep(state)
+    return state
+
+
+def _has_governance(state, action):
+    rows = state.get('governance') or []
+    return any(str((g or {}).get('action') or '') == action for g in rows
+               if isinstance(g, dict))
+
+
 def _learned_state():
     state = _base_state()
     goal = ('Research and write a 300-word cited brief on repair-card loops. '
@@ -185,3 +209,42 @@ def test_two_failures_retire_a_template():
     state['tasks']['t5'] = _task('t5', 'r5', status='failed')
     _sweep(state)
     assert template['status'] == 'retired'
+
+
+def test_backport_enriches_parent_instead_of_forking():
+    # A richer second run (adds a gather step ahead of implement) folds INTO
+    # the parent template -- the backport leg -- instead of forking a second
+    # candidate. Provenance, counts, the richer shape, and the audit line all
+    # land on the parent.
+    state = _code_family_state()
+    parent = next(iter(state['workflowTemplates'].values()))
+    goal2 = 'Fix the retry-storm bug in the dispatch queue and add a regression test.'
+    state['backlogRequests'].append(_request('r2', goal2))
+    state['tasks']['t3'] = _task('t3', 'r2', title='Gather reproducer and stack traces', task_type='code')
+    state['tasks']['t3']['sequence'] = -1
+    state['tasks']['t4'] = _task('t4', 'r2', title='Implement the fix', task_type='code')
+    state['tasks']['t5'] = _task('t5', 'r2', title='Verify the fix passes tests', task_type='code')
+    state['tasks']['t5']['sequence'] = 1
+    import unittest.mock as mock
+    import serve as serve_mod
+    with mock.patch.object(serve_mod, 'log_action') as la:
+        sim._workflow_template_sweep(state, 2_000_000, archived={})
+    assert len(state['workflowTemplates']) == 1, 'richer run must fold into the parent, not fork'
+    assert [s['role'] for s in parent['steps']] == ['gather', 'step', 'verify']
+    assert parent['successCount'] == 2
+    actions = [c.args[1] for c in la.call_args_list if len(c.args) > 1]
+    assert 'workflow_template_backported' in actions
+    assert any(k == 'addedRoles' for c in la.call_args_list
+               if len(c.args) > 2 for k in (c.args[2] or {}))
+
+def test_backport_never_fires_when_shape_diverges():
+    # A run that SKIPS the parent's step shape is a divergence: no backport,
+    # no fold -- it becomes its own candidate template.
+    state = _code_family_state()
+    goal2 = 'Fix the dispatch queue bug and add a regression test.'
+    state['backlogRequests'].append(_request('r2', goal2))
+    state['tasks']['t4'] = _task('t4', 'r2', title='Verify the fix passes tests')
+    state['tasks']['t5'] = _task('t5', 'r2', title='Implement the fix')
+    state['tasks']['t5']['sequence'] = 1
+    sim._workflow_template_sweep(state, 2_000_000, archived={})
+    assert len(state['workflowTemplates']) == 2, 'divergence forks, does not fold'

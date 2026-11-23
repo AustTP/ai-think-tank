@@ -63,11 +63,10 @@ _WORKFLOW_CORE = {
 }
 
 
-def _workflow_template_id(tokens, steps):
-    # The id must survive a topic change and optional details: "brief on
-    # repair loops" and "brief on retry storms" are the same workflow, whether
-    # or not the goal repeats "save" or "cited". Keep the artifact kind and
-    # the core intent words; drop topic words and optional save wording.
+def _workflow_family(tokens):
+    """The intent half of a workflow's identity: artifact kind + core intent
+    words (topic words excluded -- 'brief on repair loops' and 'brief on
+    retry storms' are one workflow family)."""
     if tokens & {'brief', 'report', 'memo', 'summary', 'writeup'}:
         kind = 'report'
     elif 'research' in tokens:
@@ -77,7 +76,15 @@ def _workflow_template_id(tokens, steps):
         kind = 'code'
     else:
         kind = 'general'
-    core = sorted(set(tokens) & _WORKFLOW_CORE)
+    return kind, sorted(set(tokens) & _WORKFLOW_CORE)
+
+
+def _workflow_template_id(tokens, steps):
+    # The id must survive a topic change and optional details: "brief on
+    # repair loops" and "brief on retry storms" are the same workflow, whether
+    # or not the goal repeats "save" or "cited". Keep the artifact kind and
+    # the core intent words; drop topic words and optional save wording.
+    kind, core = _workflow_family(tokens)
     key = kind + '|' + ','.join(core) + '||' + '|'.join(
         f"{s.get('role')}:{s.get('type')}" for s in steps)
     return 'wft-' + hashlib.sha256(key.encode()).hexdigest()[:16]
@@ -140,6 +147,64 @@ def _workflow_log(state, agent_id, action, details):
         pass
 
 
+def _roles_cover(parent_steps, new_steps):
+    """True when the parent's role sequence survives, in order, inside the
+    new run's roles -- i.e. the new run is the parent workflow PLUS MORE,
+    not a divergence. Enrich-only: a shape that drops or reorders steps is
+    a different workflow, and stays a fork."""
+    pos = 0
+    new_roles = [s.get('role') for s in new_steps]
+    for s in parent_steps:
+        role = s.get('role')
+        while pos < len(new_roles) and new_roles[pos] != role:
+            pos += 1
+        if pos >= len(new_roles):
+            return False
+        pos += 1
+    return True
+
+
+def _workflow_backport_steps(parent, new_steps):
+    """Fold the new run's richer shape into the parent template, keeping the
+    parent's own step record for roles it already had and adopting the new
+    step dict for roles it lacked, re-ordered to the new run's (proven)
+    execution order. Budget shares recompute over the merged steps. Returns
+    the added role names (empty list = nothing to learn)."""
+    parent_by_role = {s.get('role'): s for s in (parent.get('steps') or [])}
+    added = [s.get('role') for s in new_steps
+             if s.get('role') not in parent_by_role]
+    if not added:
+        return []
+    merged = [parent_by_role.get(s.get('role'), s) for s in new_steps]
+    total = sum(float(s.get('budgetUsd') or 0) for s in merged) or 0.0
+    for s in merged:
+        s['budgetShare'] = ((float(s.get('budgetUsd') or 0) / total)
+                            if total else (1.0 / len(merged)))
+    parent['steps'] = merged
+    return added
+
+
+def _workflow_backport_parent(templates, tokens, steps, statuses=('candidate', 'active')):
+    """The strongest same-intent template the given richer shape could be
+    folded into (None when none matches the family). Strength = verified
+    successes; deterministic on ties."""
+    kind, core = _workflow_family(tokens)
+    best = None
+    best_score = None
+    for cand in templates.values():
+        if cand.get('status') not in statuses:
+            continue
+        ck, cc = _workflow_family(set(cand.get('tokens') or []))
+        if (ck, cc) != (kind, core):
+            continue
+        score = (int(cand.get('successCount') or 0)
+                 + int(cand.get('crossTeamSuccess') or 0),
+                 cand.get('id') or '')
+        if best_score is None or score > best_score:
+            best, best_score = cand, score
+    return best
+
+
 def _workflow_record_success(state, req, tasks, team_id, now_ms):
     goal = req.get('goal') or req.get('title') or ''
     tokens = _workflow_tokens(goal)
@@ -168,6 +233,30 @@ def _workflow_record_success(state, req, tasks, team_id, now_ms):
     template_id = _workflow_template_id(tokens, steps)
     template = templates.get(template_id)
     if template is None:
+        # The run's shape differs from every exact-shape template. Before
+        # forking a new candidate, check whether this is the same intent
+        # family running a RICHER shape than an existing template: if the
+        # parent's role sequence survives inside this run's roles, this is
+        # the video's backport leg -- every proven run makes the template
+        # one capability richer, not one fork poorer. Enrich-only: a run
+        # that drops/reorders steps is a divergence and stays a fork.
+        parent = _workflow_backport_parent(templates, tokens, steps)
+        if parent is not None and _roles_cover(parent.get('steps') or [], steps):
+            added = _workflow_backport_steps(parent, steps)
+            parent['successCount'] = int(parent.get('successCount') or 0) + 1
+            parent['updatedAt'] = now_ms
+            for rid in (req.get('id'),):
+                if rid not in (parent.get('sourceRequests') or []):
+                    parent.setdefault('sourceRequests', []).append(rid)
+            _workflow_log(state, parent.get('createdBy'),
+                          'workflow_template_backported',
+                          {'templateId': parent.get('id'),
+                           'addedRoles': added,
+                           'requestId': req.get('id'),
+                           'fromTeam': team_id})
+            req['_workflowSuccessCounted'] = True
+            _workflow_promote(state, parent, now_ms)
+            return
         template = {
             'id': template_id,
             'name': _workflow_template_name(goal),
