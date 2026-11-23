@@ -50,6 +50,23 @@ footer{color:var(--muted);font-size:11px;margin-top:18px}
 .syncdot.green{background:#76d275;box-shadow:0 0 5px #76d275}
 .syncdot.amber{background:#f2b84b;box-shadow:0 0 5px #f2b84b}
 .syncdot.red{background:#ff7b72;box-shadow:0 0 6px #ff7b72}
+.roster-row{display:flex;align-items:center;gap:8px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;margin:0 0 6px;background:#0e1620;cursor:pointer}
+.roster-row:hover{border-color:var(--accent)}
+.roster-row img{width:28px;height:28px;border-radius:6px;background:#0c131b;flex:0 0 28px}
+.roster-nopic{width:28px;height:28px;border-radius:6px;flex:0 0 28px;background:#16222f;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:12px}
+.roster-row .ri{flex:1;min-width:0}
+.roster-row .ri .n{font-weight:600;display:flex;gap:6px;align-items:baseline}
+.roster-row .ri .r{color:var(--muted);font-size:11px}
+.roster-row .ri .m{color:var(--muted);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.roster-row.busy .n{color:var(--warn)}
+.roster-chip{display:inline-block;width:8px;height:8px;border-radius:50%;flex:0 0 8px}
+.roster-drawer{border:1px solid var(--accent);border-radius:8px;padding:12px;margin:10px 0;background:#0e1620}
+.roster-drawer .hd{display:flex;gap:10px;align-items:center;margin-bottom:8px}
+.roster-drawer img.big{width:96px;height:96px;border-radius:8px;background:#0c131b}
+.roster-drawer .big-nopic{width:96px;height:96px;border-radius:8px;background:#16222f;display:flex;align-items:center;justify-content:center;font-size:28px;color:var(--muted)}
+.roster-drawer .m{color:var(--muted);font-size:12px;margin-top:6px}
+.roster-drawer .cols{display:flex;gap:14px}
+.roster-drawer .cols>div{flex:1;min-width:0}
 </style></head><body>
 <header>
   <h1>TANK OPS</h1><span class="sub">pulse desk / team work board</span>
@@ -80,6 +97,15 @@ footer{color:var(--muted);font-size:11px;margin-top:18px}
                style="flex:1;min-width:120px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit">
       </div>
       <div id="board" class="empty">Loading...</div>
+    </section>
+    <section>
+      <h2>Agent roster</h2>
+      <div class="meta" style="margin-bottom:10px">
+        <select id="rosterTeam" style="min-width:140px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit"></select>
+        <input id="rosterSearch" placeholder="search" autocomplete="off"
+               style="flex:1;min-width:120px;background:#0c131b;color:inherit;border:1px solid var(--line);border-radius:6px;padding:6px 8px;font:inherit">
+      </div>
+      <div id="roster" class="empty">Loading...</div>
     </section>
     <section>
       <h2>Browser sessions</h2>
@@ -213,6 +239,102 @@ function renderBoardSections() {
   });
 }
 let boardTeamStats = {};
+let rosterRows = [];
+let openAgent = null;
+const ORIENTATIONS = ['front', 'left', 'right', 'back'];
+async function loadRoster() {
+  try {
+    const data = await getJSON('/api/team-roster');
+    rosterRows = data.agents || [];
+    renderRosterFilters();
+    renderRoster();
+  } catch (e) { $('roster').className='empty'; $('roster').textContent = e.message; }
+}
+function renderRosterFilters() {
+  const sel = $('rosterTeam');
+  const keep = sel.value;
+  const teams = [];
+  rosterRows.forEach(r => { if (r.teamId && teams.indexOf(r.teamId) < 0) teams.push(r.teamId); });
+  teams.sort();
+  sel.textContent = '';
+  const all = el('option', null, 'All teams'); all.value = ''; sel.appendChild(all);
+  teams.forEach(t => { const o = el('option', null, t); o.value = t; sel.appendChild(o); });
+  if (keep && teams.indexOf(keep) >= 0) sel.value = keep;
+}
+function rosterVisual(r, big) {
+  const wrap = el('div', big ? 'big-nopic' : 'roster-nopic');
+  wrap.textContent = (r.name || '?').slice(0, 1).toUpperCase();
+  if (!r.hasAvatar) return wrap;
+  const img = el('img');
+  img.src = '/api/avatar/' + encodeURIComponent(r.id) + '/front.png';
+  img.alt = r.name || r.id;
+  return img;
+}
+function renderRoster() {
+  const box = $('roster');
+  box.className = '';
+  box.textContent = '';
+  if (openAgent) {
+    const a = rosterRows.find(r => r.id === openAgent);
+    if (a) box.appendChild(agentDrawer(a));
+  }
+  const teamF = $('rosterTeam').value;
+  const q = ($('rosterSearch').value || '').trim().toLowerCase();
+  const rows = rosterRows.filter(r => {
+    if (teamF && r.teamId !== teamF) return false;
+    if (q && (r.name + ' ' + r.role + ' ' + r.mission + ' ' + r.id).toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  });
+  if (!rows.length) { const d = el('div','empty','No agents match.'); d.style.marginTop='8px'; box.appendChild(d); return; }
+  const frag = document.createDocumentFragment();
+  rows.forEach(r => {
+    const row = el('div', 'roster-row' + (r.busy ? ' busy' : ''));
+    row.appendChild(rosterVisual(r, false));
+    if (r.color) { const c = el('span', 'roster-chip'); c.style.background = r.color; row.appendChild(c); }
+    const ri = el('div', 'ri');
+    const n = el('div', 'n');
+    n.appendChild(el('span', null, r.name || r.id));
+    n.appendChild(el('span', 'r', r.role || ''));
+    ri.appendChild(n);
+    if (r.mission) ri.appendChild(el('div', 'm', r.mission));
+    row.appendChild(ri);
+    row.onclick = () => { openAgent = (openAgent === r.id) ? null : r.id; renderRoster(); };
+    frag.appendChild(row);
+  });
+  box.appendChild(frag);
+}
+function agentDrawer(a) {
+  const d = el('div', 'roster-drawer');
+  const hd = el('div', 'hd');
+  hd.appendChild(rosterVisual(a, true));
+  const hi = el('div');
+  hi.appendChild(el('div', 'n', a.name || a.id));
+  hi.appendChild(el('div', 'r', (a.role || '') + (a.teamId ? ' / team ' + a.teamId : '') + (a.busy ? ' / busy' : ' / idle')));
+  hd.appendChild(hi);
+  d.appendChild(hd);
+  const av = el('div', 'meta', 'Avatar: ' + (a.hasAvatar ? 'generated' : 'none yet (generate_agent_avatar tools exist)'));
+  d.appendChild(av);
+  if (a.mission) {
+    const m = el('div', 'm', a.mission);
+    d.appendChild(m);
+  }
+  const notes = el('div', 'meta');
+  const link = el('a', 'btn', 'Open trace');
+  link.href = '#';
+  link.onclick = (ev) => {
+    ev.preventDefault();
+    const sel = $('traceAgent');
+    const keep = traceAgentId;
+    loadAgents().then(() => {
+      if (keep) sel.value = keep;
+      sel.value = a.id; loadTrace();
+      window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
+    });
+  };
+  notes.appendChild(link);
+  d.appendChild(notes);
+  return d;
+}
 function renderBoard(data) {
   boardTasks = data.tasks || [];
   boardTeamStats = {};
@@ -336,6 +458,7 @@ async function refresh() {
   } catch (e) { $('error').textContent = e.message; }
   await loadSessions();
   await loadAgents();
+  await loadRoster();
   await loadTrace();
 }
 $('sessStart').addEventListener('click', async () => {
@@ -363,6 +486,8 @@ $('traceAuto').addEventListener('change', () => {
   if (traceTimer) { clearInterval(traceTimer); traceTimer = null; }
   if ($('traceAuto').checked) traceTimer = setInterval(loadTrace, 10000);
 });
+$('rosterTeam').addEventListener('change', renderRoster);
+$('rosterSearch').addEventListener('input', renderRoster);
 refresh();
 setInterval(refresh, 30000);
 traceTimer = setInterval(loadTrace, 10000);
