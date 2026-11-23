@@ -46,6 +46,10 @@ pre{white-space:pre-wrap;background:#0c131b;border:1px solid var(--line);border-
 .empty{color:var(--muted);font-size:12px}
 .err{color:var(--bad)}
 footer{color:var(--muted);font-size:11px;margin-top:18px}
+.syncdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-left:2px}
+.syncdot.green{background:#76d275;box-shadow:0 0 5px #76d275}
+.syncdot.amber{background:#f2b84b;box-shadow:0 0 5px #f2b84b}
+.syncdot.red{background:#ff7b72;box-shadow:0 0 6px #ff7b72}
 </style></head><body>
 <header>
   <h1>TANK OPS</h1><span class="sub">pulse desk / team work board</span>
@@ -193,13 +197,26 @@ function renderBoardSections() {
     const head = el('div', 'group-h');
     head.appendChild(el('b', null, g.label));
     head.appendChild(el('span', 'badge', g.open + ' open / ' + g.done + ' done'));
+    // Team-rollup extras (Meta Factory steal, 2026-11-23): live spend counter
+    // and a sync dot. Green = pipeline healthy; amber = blocked cards;
+    // red = a repair loop stopped on this team inside 24h.
+    if (boardMode === 'team' && boardTeamStats[g.key || 'unassigned']) {
+      const s = boardTeamStats[g.key || 'unassigned'];
+      const dot = el('span', 'syncdot ' + (s.sync || 'green'), '');
+      dot.title = 'sync ' + (s.sync || 'green') + ' (' + (s.blocked || 0) + ' blocked)';
+      head.appendChild(dot);
+      head.appendChild(el('span', 'badge', 'open-spend $' + (s.spendOpenUsd || 0).toFixed(4) + ' / total $' + (s.spendTotalUsd || 0).toFixed(4)));
+    }
     sec.appendChild(head);
     g.tasks.forEach(t => sec.appendChild(boardCard(t)));
     b.appendChild(sec);
   });
 }
+let boardTeamStats = {};
 function renderBoard(data) {
   boardTasks = data.tasks || [];
+  boardTeamStats = {};
+  (data.teams || []).forEach(x => { boardTeamStats[x.teamId] = x; });
   const teams = [];
   boardTasks.forEach(t => { const id = t.teamId || ''; if (id && teams.indexOf(id) < 0) teams.push(id); });
   teams.sort();

@@ -55,4 +55,56 @@ def project_board(args):
             'updatedAt': task.get('updatedAt') or task.get('createdAt') or 0,
         })
     rows.sort(key=lambda r: (r['status'] == 'done', -(float(r['updatedAt']) if r['updatedAt'] else 0)))
-    return json.dumps({'ok': True, 'counts': counts, 'tasks': rows[:limit]}, sort_keys=True)
+    # Team rollup (operator, 2026-11-23, the Meta Factory steal): each team
+    # gets one header line on the pulse board with its in-flight spend and a
+    # health dot. The dot is 'sync' in the video's sense (is this team's
+    # pipeline healthy right now) but computed from OUR ground truth: green
+    # when open cards and none blocked, amber when cards are blocked,
+    # red when a repair loop stopped for the team in the last 24h -- never a
+    # CI fraction the server cannot see.
+    import time as _time
+    _cutoff = _time.time() - 24 * 3600
+    _taskTeam = {str(tid): str((t or {}).get('teamId') or '')
+                 for tid, t in (state.get('tasks') or {}).items()}
+    _stoppedTeams = set()
+    try:
+        with _serve._db() as _conn:
+            for (det,) in _conn.execute(
+                    "SELECT details FROM action_log WHERE action = 'repair_loop_stopped' "
+                    "AND ts >= ?", (_cutoff,)).fetchall():
+                try:
+                    _tid = str(json.loads(det or '{}').get('taskId') or '')
+                except Exception:
+                    _tid = ''
+                if _tid and _taskTeam.get(_tid):
+                    _stoppedTeams.add(_taskTeam[_tid])
+    except Exception:
+        pass
+    teams = {}
+    for r in rows:
+        tid = r.get('teamId') or 'unassigned'
+        g = teams.setdefault(tid, {
+            'teamId': tid, 'open': 0, 'done': 0, 'blocked': 0,
+            'spendOpenUsd': 0.0, 'spendTotalUsd': 0.0, 'sync': 'green',
+        })
+        st = r.get('status') or ''
+        spent = float(r.get('spentUsd') or 0)
+        g['spendTotalUsd'] += spent
+        if st == 'done':
+            g['done'] += 1
+        elif st in ('cancelled', 'abandoned'):
+            pass
+        else:
+            g['open'] += 1
+            g['spendOpenUsd'] += spent
+            if st in ('blocked', 'repairing', 'failed'):
+                g['blocked'] += 1
+    for k, g in teams.items():
+        if k in _stoppedTeams or g['blocked'] >= 3:
+            g['sync'] = 'red'
+        elif g['blocked']:
+            g['sync'] = 'amber'
+    return json.dumps({'ok': True, 'counts': counts, 'tasks': rows[:limit],
+                       'teams': sorted(teams.values(),
+                                       key=lambda g: -g['spendTotalUsd'])},
+                      sort_keys=True)

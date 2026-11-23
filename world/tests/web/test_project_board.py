@@ -19,6 +19,13 @@ class ProjectBoard(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix='board-test-')
         self.library = os.path.join(self.tmp, 'library')
         os.makedirs(self.library)
+        # Hermetic repair-stop log: an empty DB context so the rollup's
+        # repair_loop_stopped query never touches the real database.
+        fake_conn = unittest.mock.MagicMock()
+        fake_conn.execute.return_value.fetchall.return_value = []
+        ctx = unittest.mock.MagicMock()
+        ctx.__enter__ = unittest.mock.MagicMock(return_value=fake_conn)
+        ctx.__exit__ = unittest.mock.MagicMock(return_value=False)
         self.state = {'tasks': {
             't1': {'title': 'Open research', 'status': 'working', 'assignedTo': 'cora',
                    'teamId': 'nora', 'projectLabel': 'Atlas', 'priority': 'high',
@@ -37,6 +44,7 @@ class ProjectBoard(unittest.TestCase):
         self.patcher = unittest.mock.patch.multiple(
             serve, LIBRARY_DIR=self.library,
             get_state_from_db=lambda *a, **k: self.state,
+            _db=lambda *a, **k: ctx,
         )
         self.patcher.start()
 
@@ -58,6 +66,45 @@ class ProjectBoard(unittest.TestCase):
         self.assertEqual({t['taskId'] for t in out['tasks']}, {'t1', 't2'})
         done = json.loads(content.project_board({'status': 'done'}))
         self.assertEqual([t['taskId'] for t in done['tasks']], ['t2'])
+
+    def test_team_rollup_sync_and_spend(self):
+        # Rollup shape per team; spend sums over open+done, blocked counting.
+        out = json.loads(content.project_board({'status': 'all'}))
+        teams = {g['teamId']: g for g in out['teams']}
+        self.assertEqual(set(teams), {'nora', 'ruth'})
+        nora = teams['nora']
+        self.assertEqual(nora['open'], 1)
+        self.assertEqual(nora['done'], 1)
+        self.assertEqual(nora['blocked'], 0)
+        self.assertAlmostEqual(nora['spendOpenUsd'], 0.2)
+        self.assertAlmostEqual(nora['spendTotalUsd'], 0.2)
+        self.assertEqual(nora['sync'], 'green')
+
+    def test_team_rollup_blocked_amber_and_repair_red(self):
+        self.state['tasks']['t3']['status'] = 'blocked'
+        out = json.loads(content.project_board({'status': 'all'}))
+        ruth = {g['teamId']: g for g in out['teams']}['ruth']
+        self.assertEqual(ruth['blocked'], 1)
+        self.assertEqual(ruth['sync'], 'amber')
+        # A repair_loop_stopped log row inside 24h for one of this team's
+        # tasks flips the dot red -- the honest ground-truth signal.
+        row = (json.dumps({'taskId': 't3'}),)
+        fake_conn = unittest.mock.MagicMock()
+        fake_conn.execute.return_value.fetchall.return_value = [row]
+        ctx = unittest.mock.MagicMock()
+        ctx.__enter__ = unittest.mock.MagicMock(return_value=fake_conn)
+        ctx.__exit__ = unittest.mock.MagicMock(return_value=False)
+        with unittest.mock.patch.object(serve, '_db', return_value=ctx):
+            out2 = json.loads(content.project_board({'status': 'all'}))
+        ruth2 = {g['teamId']: g for g in out2['teams']}['ruth']
+        self.assertEqual(ruth2['sync'], 'red')
+
+    def test_team_rollup_present_for_every_filter(self):
+        for filt in ({'status': 'open'}, {'status': 'done'}, {'team': 'nora'}):
+            out = json.loads(content.project_board(filt))
+            self.assertIn('teams', out)
+
+
 
 
 NODE = shutil.which('node')
@@ -167,7 +214,6 @@ class PulseBoardTeamGroups(unittest.TestCase):
         self.assertIn('boardProject', html)
         self.assertIn('renderBoardSections()', html)
         self.assertIn("'project '+t.projectLabel", html)
-
 
 if __name__ == '__main__':
     unittest.main()
