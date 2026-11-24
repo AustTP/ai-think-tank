@@ -85,33 +85,26 @@ _SCHEDULED_VILLAGE_SCAN_ITEM = {
     'deliverable': 'report',
     'taskType': 'report',
     'instructions': (
-        'Proactive village scan (constitution rule 9): call '
-        'api_call GET /api/ops/failures?hours=24 (your regional VP key is '
-        'the scan authority) and read every section it returns: '
-        'executeBlocks (blocked-command patterns), classifierUnavailable, '
-        'failedActions, healthAlerts. Also GET /api/ops/cards?hours=24 '
-        '(scan authority lets you read every span) for stalled, failed, '
-        'refused and abandoned cards.\n\n'
-        'For each GENUINE problem -- a recurring blocked-command pattern, a '
-        'stall pattern, a machinery failure, a director whose span keeps '
-        'failing the same way -- route it: file ONE issue per problem for '
-        'the OWNING DIRECTOR (api_call POST /api/intent/issues, teamId '
-        'matching the failing team) with the concrete evidence (action '
-        'names, task ids, counts) and what you want done. Do NOT route '
-        'card-level coaching (that is the director\'s own daily scan); '
-        'route village-level patterns. Skip anything already covered by an '
-        'open issue from a previous scan or by a live [PATTERN] card. If '
-        'the surface is clean, finish the scan with a one-line clean '
-        'report -- a clean hour is a real result, not a failure.'),
+        'Proactive village scan (constitution rule 9). Read the failure '
+        'surface with your NATIVE tools -- api_call cannot reach internal '
+        'endpoints (loopback is blocked by security policy; do not attempt '
+        'it, and browsing localhost is rejected too):\n\n'
+        '1. search_library "telegram-alert-digest" then read_library_file '
+        'the most recent digest (the last 24h of telegram alerts, '
+        'dimensioned every 30 minutes).\n'
+        '2. project_board: open/stalled/failed/refused cards across the '
+        'village -- note repeat families and anything stuck for hours.\n'
+        '3. read_pulse: quiet agents, sync dots, spend pressure.\n\n'
+        'For each GENUINE village-level problem -- a recurring alert '
+        'family, a stall pattern, a machinery failure -- write the '
+        'evidence into your saved report: action names, task ids, counts, '
+        'and which OWNING DIRECTOR should handle it. Do NOT route '
+        'card-level coaching (that is the director\'s own daily scan). '
+        'Skip anything an open issue or a live [PATTERN] card already '
+        'covers. If the surface is clean, finish the scan with a one-line '
+        'clean report -- a clean hour is a real result, not a failure.'),
     'enabled': True,
     'lastRunAtMs': 0,
-    # The instructions above direct api_call GETs (failures/cards) and a
-    # POST (intent/issues). api_call is commit-tier (fail-closed per task),
-    # so without this grant every scan burned 2 tool_policy_denied refusals
-    # plus a MEDIUM telegram alert before finishing via library tools alone
-    # (2026-11-24, task-35908..35912). The GETs are read-only; the POST is
-    # the scan's designed routing authority.
-    'approvedTools': ['api_call'],
 }
 
 

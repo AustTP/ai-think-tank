@@ -236,9 +236,15 @@ class VillageScanSeedTests(unittest.TestCase):
 
     def test_scan_mentions_surfaces_and_routing(self):
         item = sim._SCHEDULED_VILLAGE_SCAN_ITEM
-        self.assertIn('/api/ops/failures', item['instructions'])
-        self.assertIn('/api/ops/cards', item['instructions'])
-        self.assertIn('issue', item['instructions'])
+        text = item['instructions']
+        # 2026-11-24: the failure surface is read with agent-NATIVE tools
+        # (search_library/read_library_file/project_board/read_pulse).
+        # api_call cannot reach internal endpoints (SSRF-gated loopback),
+        # so the template must not command it or any /api/ops path.
+        self.assertNotIn('/api/ops/', text)
+        for tool in ('search_library', 'read_library_file', 'project_board',
+                     'read_pulse'):
+            self.assertIn(tool, text)
 
     def test_deleted_scan_stays_deleted(self):
         st = _state()
