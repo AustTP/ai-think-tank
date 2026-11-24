@@ -16,6 +16,7 @@
 # OWNER_CALENDAR_ICS_URL takes effect without a restart.
 
 import asyncio
+import calendar
 import json
 import os
 import time
@@ -38,6 +39,19 @@ _CALENDAR_KEEP_DAYS = 30
 WATCH_FREE_MODELS_PATH = os.path.join(THINK_TANK_DIR, 'watches_free_models.json')
 WATCH_OSV_PATH = os.path.join(THINK_TANK_DIR, 'watches_osv.json')
 WATCH_GITHUB_PATH = os.path.join(THINK_TANK_DIR, 'watches_github.json')
+
+# CI watcher storm gates (2026-11-23 BEN-212 autopsy): the watcher used to
+# mint ONE webhook ask per red run id -- 50+ commit-failures became 50+
+# repair cards and the open fleet drowned. Two gates at the mint point:
+# a NEWER green run on the same branch voids every older red run (false
+# premise), and one failure ask per branch|workflow family per window
+# (the pump cap).
+_CI_STORM_WINDOW_S = 6 * 3600
+_CI_STORM_MAX_FAMILIES = 64
+# In-memory family->last-alert time; persisted state would race the sim's
+# writers, and a restart resetting the window fails open (one extra ask).
+_CI_STORM_STATE = {}
+
 CALENDAR_BLACKOUTS_PATH = os.path.join(THINK_TANK_DIR, 'calendar_blackouts.json')
 
 # Words that indicate a real degradation on a provider status feed. Matched
@@ -347,10 +361,68 @@ def _github_watch_append(entry):
         f.write(json.dumps(entry) + '\n')
 
 
+def _ci_run_started_epMs(run):
+    """Run-start epoch ms from an ISO timestamp; 0 when unparseable."""
+    ts = str(run.get('run_started_at') or run.get('created_at') or '')
+    try:
+        tt = time.strptime(ts.replace('Z', '+0000'), '%Y-%m-%dT%H:%M:%S%z')
+        return int(calendar.timegm(tt) * 1000)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _ci_storm_gate(runs, red_list):
+    """(keep, family_of) filter for the red runs about to become asks.
+
+    keep = red runs that survive BOTH gates; family_of maps each kept run id
+    to its 'branch|workflow' family. Gate 1 -- premise void: a NEWER success
+    on the same branch means the failure is already stale (the repair storm
+    lived for days on premise-less claims). Gate 2 -- pump cap: one failure
+    ask per family per storm window (in-memory family state, reset-on-restart
+    fails open). Both gates fail open: unparseable times never suppress a
+    first alert."""
+    def started(r):
+        return _ci_run_started_epMs(r)
+
+    green_branches = {}
+    for r in runs:
+        if (r.get('status') == 'completed'
+                and (r.get('conclusion') or '') == 'success'):
+            branch = r.get('head_branch') or '?'
+            at = started(r)
+            if at and (branch not in green_branches
+                       or at > green_branches[branch]):
+                green_branches[branch] = at
+
+    keep = []
+    family_of = {}
+    now = time.time()
+    state = _CI_STORM_STATE
+    for run in red_list:
+        branch = run.get('head_branch') or '?'
+        family = branch + '|' + (run.get('name') or 'workflow')
+        at = started(run)
+        # gate 1: premise void -- a newer green run on this branch
+        if at and branch in green_branches and green_branches[branch] > at:
+            continue
+        # gate 2: pump cap -- one ask per family per window
+        last = state.get(family) or 0
+        if last and now - last < _CI_STORM_WINDOW_S:
+            continue
+        keep.append(run)
+        family_of[run.get('id')] = family
+        state[family] = now
+    if len(state) > _CI_STORM_MAX_FAMILIES:
+        for k in sorted(state, key=state.get)[:-_CI_STORM_MAX_FAMILIES]:
+            state.pop(k, None)
+    return keep, family_of
+
+
 def _github_watch_once(repo):
     data = _load_watch_file(WATCH_GITHUB_PATH, {'runs': [], 'issues': []})
     runs_seen = set(data.get('runs') or [])
     issues_seen = set(data.get('issues') or [])
+    red_list = []
     runs, err = _github_call(
         'GET', f'https://api.github.com/repos/{repo}/actions/runs?per_page=10')
     if err and 'rate limit' in str(err).lower():
@@ -367,13 +439,18 @@ def _github_watch_once(repo):
             conclusion = run.get('conclusion') or 'unknown'
             if conclusion in ('success', 'skipped'):
                 continue
+            red_list.append(run)
+        keep, _family_of = _ci_storm_gate(
+            runs.get('workflow_runs') or [], red_list)
+        for run in keep:
             actor = ((run.get('actor') or {}).get('login')) or 'github-actions'
             _github_watch_append({
-                'id': f'run-{rid}',
+                'id': f'run-{run.get("id")}',
                 'author': actor,
                 'text': f'CI run on {run.get("head_branch") or "?"} '
                         f'@ {(run.get("head_sha") or "")[:7]} finished: '
-                        f'{conclusion} ({run.get("name") or "workflow"})',
+                        f'{run.get("conclusion") or "unknown"} '
+                        f'({run.get("name") or "workflow"})',
                 'url': run.get('html_url') or ''})
     issues, _err = _github_call(
         'GET', f'https://api.github.com/repos/{repo}/issues'
