@@ -86,6 +86,31 @@ PROVIDER_CATALOGS = {
     'nous': '_fetch_nous_catalog_sync',
 }
 
+# Tier-distinct rule (operator, 2026-11-24): sublow/low/mid/high are distinct
+# reasoning rungs, EXCEPT the operator explicitly waived low==mid. Coding is
+# a capability band that MAY share the high band's model (both serve
+# deep-work calls; the sweep may still pick them differently) but must NEVER
+# equal sublow/low/mid -- mid peer-reviews the coding band's output, and one
+# model grading its own work is the failure mode. Bounty and vision sit
+# outside the ladder. Keys list the bands a band must differ from; the loop
+# only needs each pair listed on one side (the later band's check fires).
+BAND_MUST_DIFFER = {
+    'sublow': ('low', 'mid', 'coding', 'high'),
+    'low': ('sublow', 'coding', 'high'),
+    'mid': ('sublow', 'coding', 'high'),
+    'coding': ('sublow', 'low', 'mid'),
+    'high': ('sublow', 'low', 'mid'),
+}
+
+
+def _band_pick_conflict(band, slug, chosen):
+    """The already-picked band this band's candidate collides with under the
+    tier-distinct rule, or None when the pick is allowed."""
+    for other in BAND_MUST_DIFFER.get(band, ()):
+        if (chosen.get(other) or {}).get('id') == slug:
+            return other
+    return None
+
 
 def _sync_provider_catalog_rows(provider, models):
     """Persist one provider's raw catalog slice into model_provider_catalog
@@ -690,6 +715,39 @@ async def refresh_model_tiers():
             print(f'[model-tiers] no working candidate found for {band} band after 3 attempts')
             continue
         if picked is not None:
+            _conflict = _band_pick_conflict(band, picked['id'], chosen)
+            if _conflict:
+                # Tier-distinct rule: this band resolved onto a model already
+                # taken by a band it must differ from (cheapest-value pressure
+                # collapsing two rungs onto one model). Walk the same
+                # value-ranked qualifiers and take the best allowed one,
+                # live-verified like every pick; none allowed -> keep the
+                # previous pick (fail-closed, same as the floor path).
+                _ranked = _best_value_qualifiers_sync(
+                    candidate_pool, scores, BAND_QUALITY_FLOOR_GAP.get(band),
+                    min_score=BAND_MIN_SCORE.get(band) if scores else None)
+                _alt = None
+                for _cand in _speed_tie_order(_ranked, band):
+                    if _cand['id'] == picked['id']:
+                        continue
+                    if _band_pick_conflict(band, _cand['id'], chosen):
+                        continue
+                    if await asyncio.to_thread(_verify_model_works_sync,
+                                               _cand['id'],
+                                               _cand.get('provider') or pick_provider):
+                        _alt = _cand
+                        break
+                if _alt is not None:
+                    print(f'[model-tiers] {band}: {_conflict} already holds '
+                          f'{picked["id"]}; tier-distinct rule moved the pick '
+                          f'to {_alt["id"]}', flush=True)
+                    picked = _alt
+                    cheapest_qual = None
+                else:
+                    print(f'[model-tiers] {band}: no non-conflicting candidate '
+                          f'available; keeping the previous pick '
+                          f'(tier-distinct rule)', flush=True)
+                    continue
             _attach_latency_audit(picked, cheapest_qual)
         chosen[band] = picked
         fallbacks[band] = _tier_fallback_candidates(

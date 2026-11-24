@@ -818,3 +818,87 @@ class MergeServerOwnedAgent(unittest.TestCase):
         self.assertEqual(merged['x'], 5)
         self.assertEqual(merged['y'], 6)
         self.assertEqual(merged['busy'], True)
+
+
+class TierDistinctRule(unittest.TestCase):
+    """Operator rule (2026-11-24): coding may equal high but must never equal
+    sublow/low/mid -- mid peer-reviews the coding band's output, and one
+    model grading its own work is the failure mode. Sublow/low/mid/high are
+    distinct rungs except the explicitly waived low==mid."""
+
+    def setUp(self):
+        with serve._db() as conn:
+            conn.execute('DELETE FROM model_catalog')
+            conn.execute('DELETE FROM model_benchmark_scores')
+            conn.execute('DELETE FROM model_tiers')
+        # A sibling test class pins tier_provider mid-module; the pin leaks
+        # into this class and suppresses every other provider's model
+        # listings (pin = pick from that provider's slice only). The rule
+        # tests must run on the default registry-order picker.
+        no_pin = unittest.mock.patch.object(serve, '_get_setting',
+                                            return_value='')
+        no_pin.start()
+        self.addCleanup(no_pin.stop)
+
+    def _model(self, id_, prompt, completion):
+        return {
+            'id': id_, 'name': id_,
+            'pricing': {'prompt': prompt, 'completion': completion},
+            'architecture': {'input_modalities': ['text'],
+                             'output_modalities': ['text']},
+        }
+
+    def test_coding_never_collapses_onto_mid(self):
+        # One model is the best coding value AND mid's pick: the loop reaches
+        # coding after mid, sees the collision, and must move coding to the
+        # next value-ranked qualifier INSTEAD of letting mid peer-review its
+        # own work. m2's coding score must sit within the 6-point quality
+        # floor gap of m1's, or it is not an eligible alternative.
+        models = [
+            self._model('mid/m1', '0.000002', '0.000002'),    # $4/M blended
+            self._model('mid/m2', '0.0000025', '0.0000025'),  # $5/M blended
+        ]
+        serve.set_model_benchmark_score('mid/m1', 'intelligence_index', 75.0, 'u')
+        serve.set_model_benchmark_score('mid/m2', 'intelligence_index', 74.0, 'u')
+        serve.set_model_benchmark_score('mid/m1', 'coding_index', 90.0, 'u')
+        serve.set_model_benchmark_score('mid/m2', 'coding_index', 86.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        # m1 is mid's pick only because mid's bucket holds nothing else at a
+        # better value; m2 is the coding band's allowed alternative. Both
+        # prices sit under the coding/high ceilings ($5/M), sublow's $0.09
+        # cap excludes both, and low has no landing bucket.
+        self.assertEqual(chosen['mid']['id'], 'mid/m1')
+        self.assertNotEqual(chosen['coding']['id'], chosen['mid']['id'])
+        self.assertEqual(chosen['coding']['id'], 'mid/m2')
+
+    def test_coding_may_equal_high(self):
+        # The waiver: both capability bands resolving onto the SAME strong
+        # model is allowed. m_mid holds mid's intelligence score so mid never
+        # claims h1; h1 carries the agentic and coding scores so coding's
+        # best qualifier and high's best qualifier are the same model -- and
+        # that is permitted, because mid peer-reviews but high does not.
+        models = [
+            self._model('mid/m_mid', '0.0000004', '0.0000004'),  # $0.8/M blended
+            self._model('high/h1', '0.000002', '0.000002'),      # $4/M blended
+        ]
+        serve.set_model_benchmark_score('mid/m_mid', 'intelligence_index', 70.0, 'u')
+        serve.set_model_benchmark_score('high/h1', 'agentic_index', 60.0, 'u')
+        serve.set_model_benchmark_score('high/h1', 'coding_index', 90.0, 'u')
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=models), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(chosen['mid']['id'], 'mid/m_mid')
+        self.assertEqual(chosen['coding']['id'], 'high/h1')
+        self.assertEqual(chosen['high']['id'], 'high/h1')
