@@ -425,6 +425,10 @@ OPENROUTER_SPEND_CAP_USD = float(_load_env().get('OPENROUTER_SPEND_CAP_USD', '5'
 JEV_SPEND_CAP_USD = float(_load_env().get('JEV_SPEND_CAP_USD', '0.5') or 0)
 STRAITLY_SPEND_CAP_USD = float(_load_env().get('STRAITLY_SPEND_CAP_USD', '0.5') or 0)
 CHEAPERINFERENCE_SPEND_CAP_USD = float(_load_env().get('CHEAPERINFERENCE_SPEND_CAP_USD', '0.5') or 0)
+# Nous Portal ($20 promo credit, 2026-11-24): the cap is the credit itself --
+# when the promo budget is spent, _pick_provider skips nous and every band
+# falls back to the regular dialing providers automatically.
+NOUS_SPEND_CAP_USD = float(_load_env().get('NOUS_SPEND_CAP_USD', '20') or 0)
 # The shared model-router pool (operator, 2026-11-13): OpenRouter and
 # Straitly draw from ONE monthly budget -- not a hard half each. Either
 # router may spend the whole pool; THIS gate at the transport is the binding
