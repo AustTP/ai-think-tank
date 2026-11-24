@@ -1042,15 +1042,21 @@ def _benchmark_name_tokens(name):
 def _aa_leaderboard_scores(html):
     """Parse the Artificial Analysis LLM leaderboard page into
     {display_name: intelligence_index}. Tolerates the '*' flags and the
-    non-numeric cells that mark models AA has not indexed."""
+    non-numeric cells that mark models AA has not indexed. The score lives
+    in the SECOND column (cells[1], 'Artificial Analysis Intelligence
+    Index'); cells[3] is 'Time per Task Minutes', and reading it instead
+    dot-strips latency like 63.8 into 638, which hijacked the score-DESC
+    rank (2026-11-24: solar-pro4 landed 638 and won the low/mid picks)."""
     out = {}
     for row in re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.S):
         cells = [' '.join(re.sub(r'<[^>]+>', ' ', c).split())
                  for c in re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.S)]
-        if len(cells) >= 4 and cells[0]:
-            index = cells[3].replace('*', '').replace('.', '', 1)
-            if index.isdigit():
+        if len(cells) >= 2 and cells[0]:
+            index = cells[1].replace('*', '').strip()
+            try:
                 out[cells[0]] = float(index)
+            except ValueError:
+                continue
     return out
 
 
