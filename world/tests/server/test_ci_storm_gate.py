@@ -83,5 +83,26 @@ class CiStormGate(unittest.TestCase):
         self.assertEqual(seen, [])
 
 
+    def test_family_state_persists_through_the_watch_file(self):
+        # The pump cap must survive a process restart: the second poll of
+        # the same family reads its window from the watch file's ciStorm
+        # record, not from module globals.
+        seen = []
+        with mock.patch.object(serve, '_load_watch_file',
+                               return_value={'runs': [], 'issues': [],
+                                             'ciStorm': {'main|ci': 1e12}}), \
+             mock.patch.object(serve, '_save_watch_file'), \
+             mock.patch.object(serve, '_github_call',
+                               side_effect=[({'workflow_runs': [
+                                   _run(9, conclusion='failure')]}, None),
+                                 ([], None)]), \
+             mock.patch.object(serve, '_github_watch_append',
+                               side_effect=lambda e: seen.append(e)), \
+             mock.patch.object(serve, 'log_action'):
+            serve._github_watch_once('x/y')
+        self.assertEqual(seen, [], 'family last-alert inside the window '
+                         'must cap the second poll after a restart')
+
+
 if __name__ == '__main__':
     unittest.main()

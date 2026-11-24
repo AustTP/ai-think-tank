@@ -48,8 +48,10 @@ WATCH_GITHUB_PATH = os.path.join(THINK_TANK_DIR, 'watches_github.json')
 # (the pump cap).
 _CI_STORM_WINDOW_S = 6 * 3600
 _CI_STORM_MAX_FAMILIES = 64
-# In-memory family->last-alert time; persisted state would race the sim's
-# writers, and a restart resetting the window fails open (one extra ask).
+# Per-repo family->last-alert times, seeded from the watch file each poll
+# and written back after it (watches_github.json carries 'ciStorm' next to
+# 'runs'/'issues') so processes and tests with different WATCH_GITHUB_PATHs
+# never share a window.
 _CI_STORM_STATE = {}
 
 CALENDAR_BLACKOUTS_PATH = os.path.join(THINK_TANK_DIR, 'calendar_blackouts.json')
@@ -378,9 +380,9 @@ def _ci_storm_gate(runs, red_list):
     to its 'branch|workflow' family. Gate 1 -- premise void: a NEWER success
     on the same branch means the failure is already stale (the repair storm
     lived for days on premise-less claims). Gate 2 -- pump cap: one failure
-    ask per family per storm window (in-memory family state, reset-on-restart
-    fails open). Both gates fail open: unparseable times never suppress a
-    first alert."""
+    ask per family per storm window (family state seeded from the watch
+    file's 'ciStorm' record and written back by the caller). Both gates fail
+    open: unparseable times never suppress a first alert."""
     def started(r):
         return _ci_run_started_epMs(r)
 
@@ -423,6 +425,10 @@ def _github_watch_once(repo):
     runs_seen = set(data.get('runs') or [])
     issues_seen = set(data.get('issues') or [])
     red_list = []
+    # Seed the pump-cap family state from this watch file's own record so
+    # tests/restarts with separate files never share a window (CI gate).
+    _CI_STORM_STATE.clear()
+    _CI_STORM_STATE.update(data.get('ciStorm') or {})
     runs, err = _github_call(
         'GET', f'https://api.github.com/repos/{repo}/actions/runs?per_page=10')
     if err and 'rate limit' in str(err).lower():
@@ -468,6 +474,7 @@ def _github_watch_once(repo):
                 'url': issue.get('html_url') or ''})
     _save_watch_file(WATCH_GITHUB_PATH, {
         'updatedAt': time.time(),
+        'ciStorm': dict(_CI_STORM_STATE),
         'runs': sorted(runs_seen)[-_GITHUB_WATCH_SEEN_MAX:],
         'issues': sorted(issues_seen)[-_GITHUB_WATCH_SEEN_MAX:]})
 
