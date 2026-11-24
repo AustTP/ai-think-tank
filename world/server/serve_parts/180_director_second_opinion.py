@@ -616,6 +616,21 @@ _PROVIDER_CATALOG_SPECS = {
         'vision_path': ('capabilities', 'vision'),   # bool -> image modality
         'name_template': '{owned_by}/{id}',
     },
+    'nous': {
+        # Nous Portal (portal.nousresearch.com) — OpenAI-compatible line:
+        # /v1/models echoes OpenRouter's shape (per-token decimal pricing
+        # strings). Its :free variants carry zero prices, which the price
+        # bucket filter already excludes (free lanes belong to free_pool).
+        'url': 'https://inference-api.nousresearch.com/v1/models',
+        'key_env': 'NOUS_API_KEY',
+        'items_path': 'data',
+        'price_unit': 1.0,
+        'price_input': ('pricing', 'prompt'),
+        'price_output': ('pricing', 'completion'),
+        'context_path': ('context_length',),
+        'modalities_path': ('architecture', 'input_modalities'),
+        'name_path': ('name',),
+    },
 }
 
 
@@ -715,6 +730,13 @@ def _fetch_straitly_catalog_sync():
 
 def _fetch_cheaperinference_catalog_sync():
     return _fetch_provider_catalog_sync(_PROVIDER_CATALOG_SPECS['cheaperinference'])
+
+
+def _fetch_nous_catalog_sync():
+    """Empty list when NOUS_API_KEY is unset -- same fail-open as straitly:
+    an unconfigured provider contributes nothing to the sync instead of
+    failing the whole refresh (keyed off the spec's key_env)."""
+    return _fetch_provider_catalog_sync(_PROVIDER_CATALOG_SPECS['nous'])
 
 
 def _bucket_models_by_price(models):

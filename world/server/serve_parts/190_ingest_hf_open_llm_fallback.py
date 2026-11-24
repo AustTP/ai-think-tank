@@ -83,6 +83,7 @@ PROVIDER_CATALOGS = {
     'openrouter': '_fetch_openrouter_catalog_sync',
     'straitly': '_fetch_straitly_catalog_sync',
     'cheaperinference': '_fetch_cheaperinference_catalog_sync',
+    'nous': '_fetch_nous_catalog_sync',
 }
 
 
