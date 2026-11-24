@@ -105,6 +105,13 @@ _SCHEDULED_VILLAGE_SCAN_ITEM = {
         'report -- a clean hour is a real result, not a failure.'),
     'enabled': True,
     'lastRunAtMs': 0,
+    # The instructions above direct api_call GETs (failures/cards) and a
+    # POST (intent/issues). api_call is commit-tier (fail-closed per task),
+    # so without this grant every scan burned 2 tool_policy_denied refusals
+    # plus a MEDIUM telegram alert before finishing via library tools alone
+    # (2026-11-24, task-35908..35912). The GETs are read-only; the POST is
+    # the scan's designed routing authority.
+    'approvedTools': ['api_call'],
 }
 
 
@@ -281,6 +288,11 @@ def _scheduled_items_pass(state, now_ms=None):
                 'assignedTo': aid,
                 'directedTo': True,
                 'sourcePaths': source_paths,
+                # Commit-tool grants ride the minted card: the item-level
+                # approvedTools (e.g. the scan's api_call authority) must
+                # survive queue_work's whitelist to reach task_tool_policy,
+                # or the card burns tool_policy_denied refusals (2026-11-24).
+                'approvedTools': list(item.get('approvedTools') or []),
                 'priority': item.get('priority') or 'low',
                 'feature': item.get('feature')
                     or f"scheduled:{item.get('id')}",

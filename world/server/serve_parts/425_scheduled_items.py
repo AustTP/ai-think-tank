@@ -317,6 +317,13 @@ def _validate_scheduled_item(body):
         'teamId': (str(body.get('teamId') or '').strip() or None),
         'agentId': (str(body.get('agentId') or '').strip() or None),
         'feature': (str(body.get('feature') or '').strip() or None),
+        # Commit-tool grants on the minted cards (2026-11-24): a scheduled
+        # item whose instructions direct api_call (the hourly village scan
+        # reads /api/ops/* through the RVP's scan authority) needs the card
+        # to carry the grant, or every mint burns tool_policy_denied refusals
+        # and a telegram alert before finishing via library tools alone.
+        'approvedTools': [str(t).strip() for t in (body.get('approvedTools') or [])
+                          if isinstance(t, str) and str(t).strip()],
     }
     return item, None
 
@@ -377,9 +384,10 @@ async def patch_scheduled_item(item_id: str, request: Request):
         item['enabled'] = bool(body['enabled'])
     merged = {k: item.get(k) for k in ('title', 'ownerRole', 'cadence',
                                        'deliverable', 'instructions',
-                                       'villageId', 'teamId', 'agentId')}
+                                       'villageId', 'teamId', 'agentId',
+                                       'approvedTools')}
     for k in ('title', 'ownerRole', 'cadence', 'deliverable', 'instructions',
-              'villageId', 'teamId', 'agentId'):
+              'villageId', 'teamId', 'agentId', 'approvedTools'):
         if k in body:
             merged[k] = body[k]
     validated, err = _validate_scheduled_item(merged)
