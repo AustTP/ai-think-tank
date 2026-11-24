@@ -763,6 +763,12 @@ DIALING_PROVIDERS = ('openrouter', 'straitly', 'cheaperinference')
 #                        operator registers an MPP-priced vendor and funds
 #                        the treasury.
 _PROVIDER_DIALING = {
+    'nous': {
+        # Nous Portal (portal.nousresearch.com) — OpenAI-compatible
+        # inference API; free lanes ride free_pool, paid tiers dial here.
+        'base_url': 'https://inference-api.nousresearch.com/v1/chat/completions',
+        'api_key_env': 'NOUS_API_KEY',
+    },
     'straitly': {
         'base_url': 'https://api.straitly.ai/v1/chat/completions',
         'api_key_env': 'STRAITLY_API_KEY',

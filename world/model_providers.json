@@ -150,6 +150,42 @@
       "data_collection": "deny"
      }
     }
+   },
+   {
+    "name": "nous-longcat-2.5",
+    "service": "nous",
+    "base_url": "https://inference-api.nousresearch.com/v1/chat/completions",
+    "model": "meituan/longcat-2.5:free",
+    "api_key_env": "NOUS_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "nous",
+    "rpm": 10,
+    "rpd": 0,
+    "tpm": 0,
+    "comment": "Nous Portal free lane (operator key 2026-11-24, pong-verified). Portal publishes no rate limits or evals for the free tier; conservative rpm cap, rpd 0 (untracked). Step 3.7 Flash and Solar Mini 4 rejected as nonstandard ('missing tags' 400).",
+    "extra": {
+     "provider": {
+      "data_collection": "deny"
+     }
+    }
+   },
+   {
+    "name": "nous-hy4-flash",
+    "service": "nous",
+    "base_url": "https://inference-api.nousresearch.com/v1/chat/completions",
+    "model": "tencent/hy4-flash:free",
+    "api_key_env": "NOUS_API_KEY",
+    "price_per_m": 0,
+    "pool_key": "nous",
+    "rpm": 10,
+    "rpd": 0,
+    "tpm": 0,
+    "comment": "Nous Portal free lane #2. Parent Tencent Hy4 scored 35 on the AA Intelligence Index (#2 open weights); the flash variant is unbenchmarked but same family.",
+    "extra": {
+     "provider": {
+      "data_collection": "deny"
+     }
+    }
    }
   ],
   "or_free_min_score": 20,
