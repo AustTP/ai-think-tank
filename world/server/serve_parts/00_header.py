@@ -956,7 +956,7 @@ _LAST_LOG_PRUNE = None
 # re-pick: the model slug is resolved once when the call starts and the
 # request is already in flight; model_tiers rows update in one transaction,
 # so readers see the old complete set or the new complete set, never a mix.
-MODEL_TIER_REFRESH_INTERVAL_S = 2 * 3600   # full re-pick: every other hour
+MODEL_TIER_REFRESH_INTERVAL_S = 6 * 3600   # full re-pick: every 6h (catalog fetches + Jev picks + live-verify grew to 4 providers / 1,400 models; the 30-min price watch carries frequent moves, the sweep only adds value catching new models / delistings / promo repricing)
 TIER_PRICE_WATCH_INTERVAL_S = 30 * 60      # price watch: every 30 minutes
 _MAX_IDLE_MINUTES = 0.0  # 0 = disabled; set via --max-idle-minutes (float: allows <1m)
 _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
