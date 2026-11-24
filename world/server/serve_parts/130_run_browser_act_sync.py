@@ -989,9 +989,15 @@ def _tier_provider_spec(model):
                 'SELECT provider, price_per_m FROM model_tiers WHERE slug = ? AND provider IS NOT NULL',
                 (model,)).fetchone()
             if not row:
+                # ORDER BY rank: fallbacks for one slug are a priority list
+                # (PK is (band, rank); rank 1 = cheapest/best failover leg).
+                # Without the ordering, fetchone() on a Postgres table is
+                # nondeterministic -- bounty's nous/openrouter pair (same
+                # slug, ranks 1/2) flipped between calls at 2026-11-24 test.
                 row = conn.execute(
                     'SELECT provider, price_per_m FROM model_tier_fallbacks '
-                    'WHERE slug = ? AND provider IS NOT NULL', (model,)).fetchone()
+                    'WHERE slug = ? AND provider IS NOT NULL '
+                    'ORDER BY rank ASC LIMIT 1', (model,)).fetchone()
     except Exception:
         return None
     if not row:

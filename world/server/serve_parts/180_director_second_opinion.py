@@ -296,6 +296,13 @@ async def _jev_re_gate_redirect_final(agent_id, action, noun, approved_url, fina
 # each model's `benchmarks.artificial_analysis` block, ingested automatically.
 # Source citation for auto-ingested rows is the model's own OpenRouter page.
 CATALOG_ARTIFICIAL_ANALYSIS_METRICS = ('intelligence_index', 'coding_index', 'agentic_index')
+# Sanity clamp (2026-11-24): the catalog sync once ingested garbage values
+# (claude-fable-5.2-batch "intelligence_index" 416, lfm-3-1.7b:free 148 --
+# the AA scale tops out ~65). One corrupted row at price 0 would hijack the
+# free-model auto-picker's score-DESC ranking and route real traffic to a
+# 1.7B toy model. Any AA value above 65 is a metric mismatch, not a score;
+# refuse it rather than storing it.
+CATALOG_AA_SCORE_CEILING = 65.0
 CATALOG_BENCHMARK_SOURCE_URL = 'https://openrouter.ai/'
 # Evaluator labels (who actually measured a score). The catalog's AA block and
 # the AA leaderboard backfill are the SAME evaluator, delivered two ways.
@@ -981,6 +988,8 @@ def _ingest_catalog_benchmarks(models):
             for metric in CATALOG_ARTIFICIAL_ANALYSIS_METRICS:
                 value = aa.get(metric)
                 if not isinstance(value, (int, float)):
+                    continue
+                if float(value) > CATALOG_AA_SCORE_CEILING:
                     continue
                 conn.execute(
                     'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
