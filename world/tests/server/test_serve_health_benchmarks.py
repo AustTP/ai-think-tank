@@ -581,14 +581,30 @@ class CatalogBenchmarkIngest(unittest.TestCase):
         self.assertEqual(serve.BAND_BENCHMARK['low'], ('intelligence_index', 'MMLU-Pro'))
         self.assertEqual(serve.BAND_BENCHMARK['sublow'], ('intelligence_index', 'MMLU-Pro'))
         self.assertEqual(serve.BAND_BENCHMARK['mid'], ('intelligence_index', 'MMLU-Pro'))
-        self.assertEqual(serve.BAND_BENCHMARK['high'], ('agentic_index',))
-        self.assertEqual(serve.BAND_BENCHMARK['coding'], ('coding_index',))
+        self.assertEqual(serve.BAND_BENCHMARK['high'], ('agentic_index', 'intelligence_index'))
+        self.assertEqual(serve.BAND_BENCHMARK['coding'], ('coding_index', 'intelligence_index'))
         self.assertEqual(serve.BAND_BENCHMARK['vision'], ('MMMU',))
 
-    def test_sync_model_catalog_ingests_then_carries_into_catalog_row(self):
-        models = [self._model('vendor/model-a', {'intelligence_index': 34.3})]
+    def test_ingest_scores_then_sync_carries_into_catalog_row(self):
+        # Score ingestion and the per-row carry no longer share one call
+        # (operator, 2026-11-25): _ingest_benchmark_scores owns the backfills
+        # on the midnight cadence, and _sync_model_catalog only carries the
+        # scores ALREADY on file into the model_catalog row.
+        models = [self._model('vendor/model-a', aa={'intelligence_index': 34.3})]
         purged = serve._sync_model_catalog(models)
         self.assertEqual(purged, 0)
+        added = serve._ingest_benchmark_scores(models)
+        self.assertIsInstance(added, int)
+        with serve._db() as conn:
+            rows = conn.execute('SELECT model_id, benchmark, score, evaluator '
+                                'FROM model_benchmark_scores').fetchall()
+        scored = {r[0]: r for r in rows}
+        self.assertIn('vendor/model-a', scored)
+        self.assertEqual(scored['vendor/model-a'][1], 'intelligence_index')
+        self.assertEqual(scored['vendor/model-a'][2], 34.3)
+        self.assertEqual(scored['vendor/model-a'][3], 'artificial_analysis')
+        # The carry: a sync AFTER the ingest lands the scores on the row.
+        serve._sync_model_catalog(models)
         with serve._db() as conn:
             row = conn.execute('SELECT scores FROM model_catalog WHERE model_id=?',
                                ('vendor/model-a',)).fetchone()
@@ -601,7 +617,8 @@ class CatalogBenchmarkIngest(unittest.TestCase):
         # `number < text` matched EVERY row and a refresh wiped the whole
         # catalog). A model absent from the fresh snapshot for longer than
         # one refresh interval must be purged from BOTH tables; a present
-        # model must survive untouched.
+        # model must survive untouched; a benchmark row needs an explicit
+        # ingest now that sync no longer backfills.
         stale = time.time() - serve.MODEL_TIER_REFRESH_INTERVAL_S - 1
         with serve._db() as conn:
             conn.execute(
@@ -611,7 +628,9 @@ class CatalogBenchmarkIngest(unittest.TestCase):
             conn.execute(
                 'INSERT INTO model_benchmark_scores (model_id, benchmark, score, source_url, checked_at) '
                 'VALUES (?,?,?,?,?)', ('gone/model', 'intelligence_index', 30.0, 'http://x', stale))
-        purged = serve._sync_model_catalog([self._model('vendor/model-a', {'intelligence_index': 34.3})])
+        present = [self._model('vendor/model-a', {'intelligence_index': 34.3})]
+        self.assertEqual(serve._ingest_benchmark_scores(present), 1)
+        purged = serve._sync_model_catalog(present)
         self.assertEqual(purged, 1)
         with serve._db() as conn:
             self.assertIsNone(conn.execute('SELECT model_id FROM model_catalog WHERE model_id=?',
@@ -711,8 +730,8 @@ class BenchmarkDataSources(unittest.TestCase):
 
     def test_aa_ingest_uses_configured_url_and_evaluator(self):
         self._set(aa_leaderboard_url='https://aa.test/leaderboard')
-        html = ('<table><tr><td>MiMo-V2.6-Pro</td><td>1M</td><td>Xiaomi</td>'
-                '<td>46</td><td>$0.13</td></tr></table>')
+        html = ('<table><tr><th>Model</th><th>Artificial Analysis Intelligence Index</th></tr>'
+                '<tr><td>MiMo-V2.6-Pro</td><td>46</td></tr></table>')
         resp = unittest.mock.MagicMock()
         resp.read.return_value = html.encode()
         resp.__enter__.return_value = resp
@@ -730,7 +749,7 @@ class BenchmarkDataSources(unittest.TestCase):
         self._set(aa_leaderboard_url='https://aa.test/leaderboard')
         serve.set_model_benchmark_score('xiaomi/mimo-v2.6-pro', 'intelligence_index', 37.9,
                                         'https://openrouter.ai/xiaomi/mimo-v2.6-pro', 'artificial_analysis')
-        html = ('<tr><td>MiMo-V2.6-Pro</td><td>1M</td><td>Xiaomi</td><td>46</td><td>$0.13</td></tr>')
+        html = ('<tr><td>MiMo-V2.6-Pro</td><td>46</td></tr>')
         resp = unittest.mock.MagicMock()
         resp.read.return_value = html.encode()
         resp.__enter__.return_value = resp

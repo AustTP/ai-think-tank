@@ -289,8 +289,11 @@ class RefreshIntegratesProviders(unittest.TestCase):
                     'straitly': '_fetch_straitly_catalog_sync'}
         backfilled = {}
 
-        def fake_aa(models):
-            backfilled['aa'] = sorted(m['id'] for m in models)
+        def fake_ingest(models):
+            # _score_ingest_loop feeds _ingest_benchmark_scores the catalog
+            # union it reads from model_provider_catalog; the per-source
+            # ingestors hang inside that entry point.
+            backfilled['union'] = sorted(m['id'] for m in models)
             return 0
 
         with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
@@ -299,17 +302,19 @@ class RefreshIntegratesProviders(unittest.TestCase):
              unittest.mock.patch.object(serve, '_fetch_straitly_catalog_sync',
                                         return_value=st_models), \
              unittest.mock.patch.object(serve, 'MODEL_BAND_PURPOSE', {}), \
-             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',
-                                        return_value=0), \
-             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', fake_aa), \
-             unittest.mock.patch.object(serve, '_ingest_mmmu_leaderboard',
-                                        return_value=0), \
-             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback',
-                                        return_value=0), \
              unittest.mock.patch.object(serve, 'log_action'):
             asyncio.run(serve.refresh_model_tiers())
-        # The UNION (not the OpenRouter list) is what the score backfills see.
-        self.assertEqual(backfilled['aa'],
+            # The UNION (not the OpenRouter list) is what the score backfills
+            # see: the midnight loop reads model_provider_catalog -- inside the
+            # patched registry, exactly as production's loop runs -- and hands
+            # the union to _ingest_benchmark_scores.
+            union_scope = serve._catalog_union_models_for_scores()
+        self.assertEqual(sorted(m['id'] for m in union_scope),
+                         ['or/m', 'shared/x', 'st/vision'])
+        with unittest.mock.patch.object(serve, '_ingest_benchmark_scores',
+                                        fake_ingest):
+            serve._ingest_benchmark_scores(union_scope)
+        self.assertEqual(backfilled['union'],
                          ['or/m', 'shared/x', 'st/vision'])
         with serve._db() as conn:
             canon = {r[0]: (r[1], r[2]) for r in conn.execute(
@@ -342,15 +347,16 @@ class TierProviderPin(unittest.TestCase):
         serve.set_model_benchmark_score('or/cheap', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('st/best', 'intelligence_index', 70.0, 'u')
         # Pricing is per-token; the bucket math converts to per-million.
-        # $2/M lands both fixtures in the SAME 'mid' bucket (0.5-5 $/M), so
-        # the ONLY thing deciding the pick is the provider pin.
+        # $2.4/M lands both fixtures in the SAME 'mid' bucket (0.5-3 $/M
+        # since the 2026-11-25 retune), so the ONLY thing deciding the pick
+        # is the provider pin.
         with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
              unittest.mock.patch.object(
                  serve, '_fetch_openrouter_catalog_sync',
-                 return_value=[_model('or/cheap', 0.000002, 0.000002)]), \
+                 return_value=[_model('or/cheap', 0.0000012, 0.0000012)]), \
              unittest.mock.patch.object(
                  serve, '_fetch_straitly_catalog_sync',
-                 return_value=[_model('st/best', 0.000002, 0.000002)]), \
+                 return_value=[_model('st/best', 0.0000012, 0.0000012)]), \
              unittest.mock.patch.object(serve, '_sync_model_catalog',
                                         return_value=0), \
              unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',

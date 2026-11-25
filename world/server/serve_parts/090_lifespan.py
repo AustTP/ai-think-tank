@@ -92,6 +92,7 @@ async def _lifespan(app):
     prune_task = asyncio.create_task(_log_prune_loop())
     disk_task = asyncio.create_task(_disk_hygiene_loop())
     tier_refresh_task = asyncio.create_task(_model_tier_refresh_loop())
+    score_ingest_task = asyncio.create_task(_score_ingest_loop())
     # External watches (owner expansion, 2026-10-27): dead-man switch ping,
     # new free-model discovery, weekly OSV dependency audit, GitHub CI/issue
     # watcher, owner calendar ICS sync. Each loop is env-gated and fails open.
@@ -244,6 +245,7 @@ async def _lifespan(app):
     prune_task.cancel()
     disk_task.cancel()
     tier_refresh_task.cancel()
+    score_ingest_task.cancel()
     tier_boot_backfill_task.cancel()
     if photo_watch_task is not None:
         photo_watch_task.cancel()

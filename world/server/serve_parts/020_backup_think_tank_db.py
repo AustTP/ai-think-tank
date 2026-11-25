@@ -505,8 +505,9 @@ async def _model_tier_refresh_loop():
     """Full model-tier re-pick of every band, every
     MODEL_TIER_REFRESH_INTERVAL_S (every other hour), run AS a governance
     action (see _tier_refresh_logged). Catches what a price watch cannot:
-    a new/better model entering the catalog, an availability change, or a
-    benchmark score update while the selected models' own prices hold."""
+    a new/better model entering the catalog, or an availability change --
+    benchmark score UPDATE is deliberately not among its reasons anymore:
+    scores now ride the midnight score loop (operator, 2026-11-25)."""
     while True:
         await asyncio.sleep(MODEL_TIER_REFRESH_INTERVAL_S)
         try:
@@ -518,6 +519,62 @@ async def _model_tier_refresh_loop():
             # ghosts for a day because the message alone named no frame.
             import traceback
             print(f'[model-tiers] tier refresh failed (keeping current tiers): {e}\n{traceback.format_exc()}', flush=True)
+
+
+async def _score_ingest_loop():
+    """Benchmark-score ingestion, once per day at midnight UTC
+    (SCORE_INGEST_INTERVAL_S). Separate trigger because the sources update
+    at most daily: AA publishes leaderboard revisions on its own schedule,
+    the HF parquet is an archive dump, MMMU is player-entered -- none of the
+    three has anything that changes between midnights for the 6h sweep to
+    catch. The next scheduled re-pick (up to 6h later) reads whatever landed,
+    and the price watch re-picks cheaper qualifiers within ~30 min of a move
+    with the scores ALREADY on file -- so a fresh score that would change a
+    band's pick waits at most one sweep. A failed source contributes an empty
+    slice (fail-open, same as every ingestion); rows already resolved are
+    never clobbered (INSERT OR IGNORE)."""
+    while True:
+        # Sleep to the next midnight UTC (the cadence the sources actually
+        # follow) rather than a fixed interval from boot, which drifted into
+        # mid-afternoon daily ingests nobody read.
+        now = time.time()
+        day = 24 * 3600
+        await asyncio.sleep(day - (now % day))
+        added = 0
+        try:
+            added = await asyncio.to_thread(
+                lambda: _ingest_benchmark_scores(
+                    list(_catalog_union_models_for_scores())))
+        except Exception as e:
+            print(f'[model-tiers] score ingest failed (continuing): '
+                  f'{type(e).__name__}: {e}', flush=True)
+        if added:
+            print(f'[model-tiers] score ingest: {added} new benchmark rows', flush=True)
+
+
+def _catalog_union_models_for_scores():
+    """The current catalog UNION (every provider's slice) as the scope for
+    score backfills -- a model only one provider sells still gets scored,
+    exactly as when the ingests ran inside the sync. Reads model_provider_catalog
+    rows and returns model dicts in the refresh shape (id/name/pricing/
+    architecture) so _ingest_benchmark_scores needs no new plumbing. One
+    entry per model id -- the same dedupe _merge_provider_catalogs applies
+    before the sync -- with the CHEAPEST listing's prices, so a model listed
+    by several providers is scored once, not once per provider."""
+    per_provider = {}
+    with _db() as conn:
+        for provider, model_id, name, prompt_price, completion_price in conn.execute(
+                'SELECT provider, model_id, name, prompt_price, completion_price '
+                'FROM model_provider_catalog').fetchall():
+            per_provider.setdefault(provider, []).append(
+                {'id': model_id, 'name': name,
+                 'pricing': {'prompt': prompt_price, 'completion': completion_price}})
+    if not per_provider:
+        # Registry empty (legacy DB / pre-sync state): scores contribute
+        # nothing this cycle; tomorrow's loop reads a populated catalog.
+        return []
+    union, _keep = _merge_provider_catalogs(per_provider)
+    return union
 
 
 def _tier_watch_moves_sync():

@@ -199,6 +199,42 @@ def _merge_provider_catalogs(per_provider):
     return list(merged.values()), keep_ids
 
 
+def _ingest_benchmark_scores(models):
+    """Pull evaluation scores for the current catalog union from the
+    operator-registered sources (AA/HF fallback/MMMU) and carry every known
+    score into the catalog rows' `scores` column.
+
+    Runs on its OWN midnight cadence (_score_ingest_loop), NOT inside
+    _sync_model_catalog: AA updates at most daily, so the 6h sweep spent
+    three no-op HTTP GETs per cycle on a source that had not changed (the
+    2026-11-25 morning state). Catalog prices, delistings and the purge
+    stay with the price cycles.  Returns the number of rows the backfills
+    actually added -- informational; a source failing contributes an empty
+    slice (fail-open, same shape as the sync-time ingests)."""
+    before = _count_benchmark_rows()
+    _ingest_catalog_benchmarks(models)
+    _ingest_aa_leaderboard(models)
+    _ingest_mmmu_leaderboard(models)
+    _ingest_hf_open_llm_fallback(models)
+    now = time.time()
+    with _db() as conn:
+        # Carry over each model's known benchmark scores into the catalog row.
+        known = {}
+        for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
+            known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
+        for mid, bench_scores in known.items():
+            conn.execute(
+                'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
+                (json.dumps(bench_scores), mid),
+            )
+    return _count_benchmark_rows() - before
+
+
+def _count_benchmark_rows():
+    with _db() as conn:
+        return conn.execute('SELECT COUNT(*) FROM model_benchmark_scores').fetchone()[0]
+
+
 def _sync_model_catalog(models, keep_ids=None):
     """Persist the current multi-provider catalog UNION into model_catalog
     and reconcile it against what the DB already knows:
@@ -206,27 +242,20 @@ def _sync_model_catalog(models, keep_ids=None):
         comma list of catalogs listing the model (absent on legacy callers
         keeps whatever the row already says)
       * known models get refreshed prices -- the merge already selected the
-        CHEAPEST provider's listing -- plus carried-over benchmark scores
-        (catalog AA indices are auto-ingested first -- _ingest_catalog_benchmarks;
-        player-entered research under other benchmark names is carried over)
-      * models no catalog scores yet are backfilled from Artificial
-        Analysis's public leaderboard (_ingest_aa_leaderboard), then the HF
-        Open LLM Leaderboard's MMLU-Pro fallback for open-weights models AA
-        never measured (_ingest_hf_open_llm_fallback); vision MMMU scores
-        come from the operator-registered MMMU leaderboard
-        (_ingest_mmmu_leaderboard)
-      * models gone from EVERY provider are removed from BOTH model_catalog
-        and model_benchmark_scores -- a score record for a model nobody
-        sells anymore is dead weight the value pick can never use. keep_ids
-        is that every-provider scope (from _merge_provider_catalogs); None
-        (legacy single-catalog callers/tests) scopes the purge to `models`
-        alone.
+        CHEAPEST provider's listing
+      * score ingestion does NOT run here: benchmark sources update at most
+        daily, so _score_ingest_loop (midnight) owns the backfills and the
+        scores column carry-over (_ingest_benchmark_scores)
     Returns the number of models purged (0 normally), so callers can surface
-    catalog churn."""
-    _ingest_catalog_benchmarks(models)
-    _ingest_aa_leaderboard(models)
-    _ingest_mmmu_leaderboard(models)
-    _ingest_hf_open_llm_fallback(models)
+    catalog churn. Score ingestion is NOT part of this: it runs on its own
+    midnight cadence (_ingest_benchmark_scores / _score_ingest_loop).
+
+    * models gone from EVERY provider are removed from the catalog -- the
+      every-provider scope (from _merge_provider_catalogs) is also the purge
+      scope; None (legacy single-catalog callers/tests) scopes it to `models`
+      alone. A score record for a model nobody sells anymore rides the same
+      purge -- a benchmark row for a delisted model is dead weight the value
+      pick can never use."""
     now = time.time()
     seen_ids = set()
     _log_date = time.strftime('%Y-%m-%d', time.gmtime())

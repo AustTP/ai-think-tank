@@ -154,14 +154,17 @@ class RefreshModelTiers(unittest.TestCase):
     def test_picks_every_band_and_vision_from_benchmarks(self):
         models = [
             self._model('low/m1', '0.0000001', '0.0000001'),
-            self._model('mid/m1', '0.000002', '0.000002'),
+            # Mid band is [0.5, 3) $/M blended since the 2026-11-25
+            # retune; $2.4/M lands both inside it.
+            self._model('mid/m1', '0.0000012', '0.0000012'),
             self._model('mid/v1', '0.0000005', '0.0000005',
                         input_mods=('image', 'text')),
-            self._model('mid/c1', '0.0000015', '0.0000015'),
-            # Priced under the HIGH_TIER_MAX_PRICE_USD cap (default $5/M
-            # blended, loaded from the operator's .env) so the band pool
-            # includes the fixture instead of falling through to the
-            # intelligence chain.
+            self._model('mid/c1', '0.0000012', '0.0000012'),
+            # Priced exactly at the HIGH_TIER_MAX_PRICE_USD cap (default
+            # $5/M blended, loaded from the operator's .env, inclusive
+            # check) and on the high band's lo-inclusive edge
+            # ([5, 50) $/M) so the band pool includes the fixture
+            # instead of falling through to the intelligence chain.
             self._model('high/h1', '0.0000025', '0.0000025'),
             self._model('vendor/batch:batch', '0.000001', '0.000001'),
             dict(self._model('vendor/reason', '0.000001', '0.000001',
@@ -180,7 +183,14 @@ class RefreshModelTiers(unittest.TestCase):
         serve.set_model_benchmark_score('mid/c1', 'coding_index', 0.65, 'u')
         serve.set_model_benchmark_score('high/h1', 'agentic_index', 0.55, 'u')
         serve.set_model_benchmark_score('mid/v1', 'MMMU', 0.6, 'u')
-        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+        # The *_TIER_MAX_PRICE_USD caps load from the operator's real .env at
+        # import (before setUpModule repoints THINK_TANK_DIR), so a fixture
+        # priced near a bucket edge must pin the cap it assumes. Both band
+        # comments below say $5/M; 5.0 is inclusive on both the high bucket's
+        # lo edge and the ceilings.
+        with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=True), \
@@ -436,7 +446,10 @@ class RefreshModelTiers(unittest.TestCase):
     def test_empty_band_fails_closed_and_skips(self):
         # 2026-11-25 rewrite: no Jev classifier fallback for an unscored
         # pool. The band keeps its previous pick; nothing is written.
-        models = [self._model('mid/only', '0.000002', '0.000002')]
+        # Mid band is [0.5, 3) $/M blended; $2.4/M keeps the unscored
+        # fixture inside the mid bucket so the band reaches the
+        # fail-closed path under test.
+        models = [self._model('mid/only', '0.0000012', '0.0000012')]
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
@@ -521,7 +534,10 @@ class RefreshModelTiers(unittest.TestCase):
         # a classifier pick carries no evaluation score, and trusting one is
         # exactly how a corrupt score row hijacked a band overnight. When no
         # scored candidate qualifies, the band keeps its previous pick.
-        models = [self._model('mid/only', '0.000002', '0.000002')]
+        # Mid band is [0.5, 3) $/M blended; $2.4/M keeps the unscored
+        # fixture inside the mid bucket so the band reaches the
+        # fail-closed path under test.
+        models = [self._model('mid/only', '0.0000012', '0.0000012')]
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
@@ -893,14 +909,23 @@ class TierDistinctRule(unittest.TestCase):
         # own work. m2's coding score must sit within the 6-point quality
         # floor gap of m1's, or it is not an eligible alternative.
         models = [
-            self._model('mid/m1', '0.000002', '0.000002'),    # $4/M blended
-            self._model('mid/m2', '0.0000025', '0.0000025'),  # $5/M blended
+            # Mid band is [0.5, 3) $/M blended since the 2026-11-25
+            # retune; $2.4/M keeps m1 in mid's bucket and $2.5/M keeps
+            # m2 there too, preserving the price ranking and the
+            # 6-point qualifier gap.
+            self._model('mid/m1', '0.0000012', '0.0000012'),  # $2.4/M blended
+            self._model('mid/m2', '0.00000125', '0.00000125'),  # $2.5/M blended
         ]
         serve.set_model_benchmark_score('mid/m1', 'intelligence_index', 75.0, 'u')
         serve.set_model_benchmark_score('mid/m2', 'intelligence_index', 74.0, 'u')
         serve.set_model_benchmark_score('mid/m1', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('mid/m2', 'coding_index', 86.0, 'u')
-        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+        # The coding/high ceilings load from the operator's real .env at
+        # import (CODING=2.00 here), before setUpModule repoints
+        # THINK_TANK_DIR; pin the $5/M caps the rule test's comments assume.
+        with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=True), \
@@ -910,8 +935,9 @@ class TierDistinctRule(unittest.TestCase):
             chosen = asyncio.run(serve.refresh_model_tiers())
         # m1 is mid's pick only because mid's bucket holds nothing else at a
         # better value; m2 is the coding band's allowed alternative. Both
-        # prices sit under the coding/high ceilings ($5/M), sublow's $0.09
-        # cap excludes both, and low has no landing bucket.
+        # prices sit under the coding/high ceilings pinned to $5/M in the
+        # patch below, sublow's $0.09 cap excludes both, and low has no
+        # landing bucket.
         self.assertEqual(chosen['mid']['id'], 'mid/m1')
         self.assertNotEqual(chosen['coding']['id'], chosen['mid']['id'])
         self.assertEqual(chosen['coding']['id'], 'mid/m2')
@@ -924,12 +950,18 @@ class TierDistinctRule(unittest.TestCase):
         # that is permitted, because mid peer-reviews but high does not.
         models = [
             self._model('mid/m_mid', '0.0000004', '0.0000004'),  # $0.8/M blended
-            self._model('high/h1', '0.000002', '0.000002'),      # $4/M blended
+            # $5.0/M blended: on the high bucket's lo-inclusive edge and
+            # exactly at the HIGH_TIER_MAX_PRICE_USD cap (inclusive check).
+            self._model('high/h1', '0.0000025', '0.0000025'),
         ]
         serve.set_model_benchmark_score('mid/m_mid', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('high/h1', 'agentic_index', 60.0, 'u')
         serve.set_model_benchmark_score('high/h1', 'coding_index', 90.0, 'u')
-        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+        # Same import-time .env leak: pin the ceilings this waiver scenario
+        # assumes ($5/M, inclusive on both bands' caps).
+        with unittest.mock.patch.object(serve, 'CODING_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, 'HIGH_TIER_MAX_PRICE_USD', 5.0), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=True), \

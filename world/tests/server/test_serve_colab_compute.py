@@ -763,13 +763,15 @@ class IngestMmmuLeaderboard(unittest.TestCase):
     def test_sync_backfills_mmmu_from_leaderboard(self):
         def fake_ds(key, default=None):
             return 'https://pricepertoken.com/leaderboards/benchmark/mmmu' if key == 'mmmu_leaderboard_url' else default
+        # MMMU backfill left the sync when scoring moved to the midnight loop
+        # (_score_ingest_loop -> _ingest_benchmark_scores); the sync test
+        # rewires the same way the production flow now runs.
         with unittest.mock.patch.object(serve, '_get_data_source', side_effect=fake_ds), \
              unittest.mock.patch.object(serve.urllib.request, 'urlopen', return_value=self._fake_resp()), \
              unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks', return_value=0), \
              unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', return_value=0), \
              unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback', return_value=0):
-            purged = serve._sync_model_catalog(self._models())
-        self.assertEqual(purged, 0)
+            serve._ingest_benchmark_scores(self._models())
         with serve._db() as conn:
             rows = conn.execute(
                 "SELECT model_id, score, evaluator FROM model_benchmark_scores WHERE benchmark='MMMU'"
@@ -787,7 +789,7 @@ class IngestMmmuLeaderboard(unittest.TestCase):
              unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks', return_value=0), \
              unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', return_value=0), \
              unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback', return_value=0):
-            serve._sync_model_catalog(self._models())
+            serve._ingest_benchmark_scores(self._models())
         with serve._db() as conn:
             row = conn.execute(
                 "SELECT score, evaluator FROM model_benchmark_scores "
