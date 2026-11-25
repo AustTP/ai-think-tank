@@ -37,25 +37,34 @@
    "MMLU-Pro"
   ],
   "high": [
-   "agentic_index"
+   "agentic_index",
+   "intelligence_index"
   ],
   "coding": [
-   "coding_index"
+   "coding_index",
+   "intelligence_index"
   ],
   "vision": [
    "MMMU"
   ],
   "3d": [
-   "coding_index"
+   "coding_index",
+   "intelligence_index"
   ],
   "bounty": [
    "coding_index",
-   "agentic_index"
+   "agentic_index",
+   "intelligence_index"
   ]
  },
  "quality_floor_gap": {
   "default": 6,
   "high": 2
+ },
+ "min_score": {
+  "low": 30,
+  "sublow": 20,
+  "mid": 30
  },
  "tier_gate_criteria": {
   "high": "High-stakes, one-shot planning or decomposition where getting it wrong wastes every downstream step (e.g. breaking one large vague request into the subtasks everything else depends on).",

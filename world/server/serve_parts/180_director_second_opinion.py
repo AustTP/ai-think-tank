@@ -305,6 +305,18 @@ CATALOG_ARTIFICIAL_ANALYSIS_METRICS = ('intelligence_index', 'coding_index', 'ag
 # value above 100 is a metric mismatch, not a score; refuse it.
 CATALOG_AA_SCORE_CEILING = 100.0
 CATALOG_BENCHMARK_SOURCE_URL = 'https://openrouter.ai/'
+# Pick-time scale guard (2026-11-25): a stored benchmark score above the
+# metric's ceiling is corrupt data, never a model that good. The catalog
+# ingest refuses such values up front (CATALOG_AA_SCORE_CEILING), and this
+# ceiling applies the same refusal at PICK time: stale corruption from
+# before the ingest guard existed (or from any future parser slip) must not
+# hijack the score-DESC pick order -- that is exactly the 2026-11-24 outage
+# shape, where a Time-per-Task 63.8 read as 638 handed the low/mid bands to
+# one model overnight. Observed legit maxima: intelligence 65, agentic 57.2,
+# coding 80.7; every AA index is a 0-100 scale, and MMMU is a percentage, so
+# one shared 100 ceiling covers every metric a band reads. NaN fails the
+# comparison too, which also drops non-finite rows.
+BENCHMARK_SCALE_MAX = 100.0
 # Evaluator labels (who actually measured a score). The catalog's AA block and
 # the AA leaderboard backfill are the SAME evaluator, delivered two ways.
 EVALUATOR_ARTIFICIAL_ANALYSIS = 'artificial_analysis'
@@ -526,7 +538,9 @@ def _best_value_qualifiers_sync(candidates, scores, floor_gap=None,
     if floor_gap is None:
         floor_gap = BAND_QUALITY_FLOOR_GAP.get('default',
                                                BENCHMARK_QUALITY_FLOOR_GAP)
-    scored = [m for m in candidates if m['id'] in scores]
+    scored = [m for m in candidates
+              if scores.get(m['id']) is not None
+              and scores[m['id']] <= BENCHMARK_SCALE_MAX]
     if not scored:
         return []
     if min_score is not None:

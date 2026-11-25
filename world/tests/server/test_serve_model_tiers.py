@@ -158,7 +158,11 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('mid/v1', '0.0000005', '0.0000005',
                         input_mods=('image', 'text')),
             self._model('mid/c1', '0.0000015', '0.0000015'),
-            self._model('high/h1', '0.00001', '0.00001'),
+            # Priced under the HIGH_TIER_MAX_PRICE_USD cap (default $5/M
+            # blended, loaded from the operator's .env) so the band pool
+            # includes the fixture instead of falling through to the
+            # intelligence chain.
+            self._model('high/h1', '0.0000025', '0.0000025'),
             self._model('vendor/batch:batch', '0.000001', '0.000001'),
             dict(self._model('vendor/reason', '0.000001', '0.000001',
                              input_mods=('image', 'text')),
@@ -384,6 +388,29 @@ class RefreshModelTiers(unittest.TestCase):
         self.assertTrue(any('no evaluation score on file' in str(c)
                             for c in pr.call_args_list))
 
+    def test_corrupt_out_of_scale_score_is_never_a_qualifier(self):
+        # BENCHMARK_SCALE_MAX pick-time guard: a stored score above the AA
+        # 0-100 ceiling (e.g. the 2026-11-24 Time-per-Task 63.8 read as 638)
+        # is corrupt data, never a model that good. It must not set the
+        # best-score anchor nor win a pick, and it must not empty the band
+        # when honest candidates exist alongside it.
+        models = [
+            self._model('low/sane', '0.00000008', '0.00000008'),
+            self._model('low/corrupt', '0.00000001', '0.00000001'),
+            self._model('low/slow', '0.00000009', '0.00000009'),
+        ]
+        serve.set_model_benchmark_score('low/sane', 'intelligence_index', 40.0, 'u')
+        serve.set_model_benchmark_score('low/corrupt', 'intelligence_index', 638.0, 'u')
+        serve.set_model_benchmark_score('low/slow', 'intelligence_index', 38.0, 'u')
+        scores = {r['model_id']: r['score'] for r in serve.get_model_benchmark_scores()}
+        pool = serve._band_candidate_pools(models)['low']
+        quals = serve._best_value_qualifiers_sync(
+            pool, scores, serve.BAND_QUALITY_FLOOR_GAP.get('low'),
+            min_score=serve.BAND_MIN_SCORE.get('low'))
+        # slow (38) sits inside the 6-point gap of sane (40), so it stays a
+        # legitimate qualifier; the corrupt 638 must be the thing that's gone.
+        self.assertEqual([m['id'] for m in quals], ['low/sane', 'low/slow'])
+
     def test_floored_band_keeps_previous_pick_when_floor_unreachable(self):
         # The floor exists nowhere in the catalog (no scored candidate holds
         # it): fail closed -- keep the previous pick, never an unscored one.
@@ -406,20 +433,23 @@ class RefreshModelTiers(unittest.TestCase):
         self.assertTrue(any('keeping the previous pick' in str(c)
                             for c in pr.call_args_list))
 
-    def test_empty_band_skips_and_classifier_fallback_picks(self):
+    def test_empty_band_fails_closed_and_skips(self):
+        # 2026-11-25 rewrite: no Jev classifier fallback for an unscored
+        # pool. The band keeps its previous pick; nothing is written.
         models = [self._model('mid/only', '0.000002', '0.000002')]
-        decision = {'answers': {'q': {'choice': 'mid/only'}}, 'usage': {'cost': 0.01}}
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=True), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
-                                        return_value=decision), \
+                                        side_effect=RuntimeError('unused')), \
              unittest.mock.patch.object(serve, '_jev_model', return_value='test-jev'), \
-             unittest.mock.patch.object(serve, 'log_action'):
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch('builtins.print') as pr:
             chosen = asyncio.run(serve.refresh_model_tiers())
-        self.assertEqual(chosen['mid']['id'], 'mid/only')
-        self.assertNotIn('vision', chosen)
+        self.assertEqual(chosen, {})
+        self.assertTrue(any('keeping the previous pick' in str(c)
+                            for c in pr.call_args_list))
 
     def test_default_enabled_reasoning_model_is_score_eligible(self):
         # default_enabled reasoning no longer bars a model from the pools:
@@ -470,22 +500,27 @@ class RefreshModelTiers(unittest.TestCase):
         self.assertEqual(chosen['low']['id'], 'low/mand')
 
     def test_no_working_candidate_is_logged_and_skipped(self):
-        models = [self._model('mid/only', '0.000002', '0.000002')]
-        decision = {'answers': {'q': {'choice': 'mid/only'}}, 'usage': {'cost': 0.01}}
+        # Vision: a scored pool candidate that fails live-verify (and no
+        # MMMU fallback path reaches the shortlist either under the rewrite)
+        # leaves nothing chosen for the vision band.
+        models = [self._model('mid/v1', '0.0000005', '0.0000005',
+                              input_mods=('image', 'text'))]
+        serve.set_model_benchmark_score('mid/v1', 'MMMU', 60.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=False), \
-             unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
-                                        return_value=decision), \
-             unittest.mock.patch.object(serve, '_jev_model', return_value='test-jev'), \
              unittest.mock.patch.object(serve, 'log_action'), \
              unittest.mock.patch('builtins.print') as pr:
             chosen = asyncio.run(serve.refresh_model_tiers())
         self.assertEqual(chosen, {})
-        self.assertTrue(any('no working candidate' in str(a) for a in pr.call_args_list))
+        self.assertTrue(any('no working' in str(a) for a in pr.call_args_list))
 
-    def test_classifier_error_falls_back_to_verify(self):
+    def test_no_qualified_scored_candidate_keeps_previous_pick(self):
+        # Fail-closed (2026-11-25): the Jev classifier fallback is gone --
+        # a classifier pick carries no evaluation score, and trusting one is
+        # exactly how a corrupt score row hijacked a band overnight. When no
+        # scored candidate qualifies, the band keeps its previous pick.
         models = [self._model('mid/only', '0.000002', '0.000002')]
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
@@ -495,9 +530,12 @@ class RefreshModelTiers(unittest.TestCase):
                  serve, '_call_openrouter_decision_sync',
                  side_effect=RuntimeError('jev down')), \
              unittest.mock.patch.object(serve, '_jev_model', return_value='test-jev'), \
-             unittest.mock.patch.object(serve, 'log_action'):
+             unittest.mock.patch.object(serve, 'log_action'), \
+             unittest.mock.patch('builtins.print') as pr:
             chosen = asyncio.run(serve.refresh_model_tiers())
-        self.assertEqual(chosen['mid']['id'], 'mid/only')
+        self.assertEqual(chosen, {})
+        self.assertTrue(any('keeping the previous pick' in str(a)
+                            for a in pr.call_args_list))
 
     def _refresh(self, models):
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',

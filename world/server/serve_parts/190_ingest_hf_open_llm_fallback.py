@@ -324,8 +324,13 @@ def _ensure_tier_fallbacks_table(conn):
 
 def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
     """The next-best alternates for a band after `picked`: in-floor
-    qualifiers under the winning benchmark first (cheapest first), then the
-    cheapest remaining pool members. Excludes the pick; not live-verified."""
+    qualifiers under the winning benchmark first (cheapest first). A
+    capability band's chain is never filled with unscored pool members --
+    an unscored fallback last ran real work to a 1.7B toy model once a
+    corrupt score row emptied the qualifier list (2026-11-24). Fewer than
+    `limit` qualifiers means a shorter chain; that is what live-call
+    failures falling through to the Jev default model are for. Excludes the
+    pick; not live-verified."""
     if not picked:
         return []
     seen = {picked['id']}
@@ -338,22 +343,6 @@ def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
             seen.add(m['id'])
         if len(out) >= limit:
             break
-    if len(out) < limit:
-        # Quality-first fill for the capability bands: an unavailable planning
-        # or coding model must not degrade to the cheapest small model just
-        # because it was next by price. Cost bands keep price order, which is
-        # their whole purpose.
-        if scores and band in ('coding', 'high'):
-            rest = sorted(pool, key=lambda x: (-scores.get(x['id'], -1e9),
-                                               x['price'], x['id']))
-        else:
-            rest = sorted(pool, key=lambda x: (x['price'], x['id']))
-        for m in rest:
-            if m['id'] not in seen:
-                out.append(m)
-                seen.add(m['id'])
-            if len(out) >= limit:
-                break
     return out
 
 
@@ -684,33 +673,19 @@ async def refresh_model_tiers():
             scores = wide_scores
 
         if picked is None:
-            # Cap the shortlist Jev actually sees -- a real band can still
-            # have 60+ entries; a classifier call doesn't need all of them,
-            # just enough real variety to make a genuine choice from.
-            shortlist = pool[:25]
-            candidates = [{'id': m['id'], 'provider': m.get('provider'),
-                           'description': f"{m['name']} -- ${m['price']:.3f}/M tokens"} for m in shortlist]
-            try:
-                data = await asyncio.to_thread(
-                    _call_openrouter_decision_sync, _jev_model(),
-                    {'messages': [], 'signals': {}},
-                    {'choice': {'type': 'choice', 'instructions': f'Picking the {band}-cost model tier for a small think tank simulation. {purpose}', 'criteria': {c['id']: c['description'] for c in candidates}}},
-                )
-                pick_id = _jev_choice(data)[0]
-            except Exception:
-                pick_id = None
-            ranked = [m for m in shortlist if m['id'] == pick_id] + [m for m in shortlist if m['id'] != pick_id]
-
-            # Verify the pick actually works before trusting it -- fall
-            # through to the next candidate (up to 3 real attempts) rather
-            # than caching something that 404s the first time an agent
-            # actually needs to talk.
-            for candidate in ranked[:3]:
-                if await asyncio.to_thread(_verify_model_works_sync,
-                                           candidate['id'],
-                                           candidate.get('provider') or pick_provider):
-                    picked = candidate
-                    break
+            # Fail-closed (2026-11-25): the old path handed the band to the
+            # Jev classifier here, whose pick carries NO evaluation score.
+            # Ungrounded picks are how one corrupt score row (a Time-per-Task
+            # 63.8 read as 638) hijacked the low/mid bands overnight: the
+            # corrupt row emptied the qualifier list, the classifier picked
+            # whatever looked plausible, and the tier row trusted it. A band
+            # whose whole policy is score-grounded has no basis to pick when
+            # no scored candidate qualifies -- keep the previous pick (its
+            # row still dials) and say why, exactly like the floor path.
+            print(f'[model-tiers] {band}: no qualified scored candidate '
+                  '(scores may be corrupt or below the quality bar); keeping '
+                  'the previous pick', flush=True)
+            continue
         if picked is None:
             print(f'[model-tiers] no working candidate found for {band} band after 3 attempts')
             continue

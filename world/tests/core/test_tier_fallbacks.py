@@ -15,16 +15,24 @@ def _cand(slug, price):
 
 
 class FallbackCandidateTest(unittest.TestCase):
-    def test_qualifiers_first_then_cheapest_remaining(self):
+    def test_qualifiers_only_and_chain_may_be_short(self):
+        # Below-gap pool members are never chain fill (2026-11-25 rewrite):
+        # an alternate should be a model that plausibly served the band, not
+        # the next-cheapest thing in the pool. Fewer qualifiers -> a shorter
+        # chain; live-call failure fall-through handles the rest.
         pool = [_cand('a', 1.0), _cand('b', 2.0), _cand('c', 3.0),
                 _cand('d', 4.0), _cand('e', 5.0)]
         scores = {'a': 90.0, 'b': 89.0, 'c': 88.0, 'd': 50.0}
         with mock.patch.object(serve, 'BAND_QUALITY_FLOOR_GAP', {'low': 5.0}):
             out = serve._tier_fallback_candidates('low', pool, scores,
                                                   _cand('a', 1.0))
-        self.assertEqual([m['id'] for m in out], ['b', 'c', 'd'])
+        self.assertEqual([m['id'] for m in out], ['b', 'c'])
 
-    def test_capability_bands_fill_by_score_not_price(self):
+    def test_below_gap_capability_pool_yields_empty_chain(self):
+        # Coding/high keep price order OUT of the chain too: an unscored or
+        # below-gap cheapest candidate must not become an alternate that a
+        # real availability failure would route work to (the 2026-11-24
+        # failure ran real work to an unscored toy model).
         pool = [_cand('pick', 1.0), _cand('cheap', 0.5), _cand('strong', 9.0)]
         scores = {'pick': 90.0, 'cheap': 10.0, 'strong': 80.0}
         with mock.patch.object(serve, 'BAND_QUALITY_FLOOR_GAP',
@@ -33,8 +41,8 @@ class FallbackCandidateTest(unittest.TestCase):
                 'coding', pool, scores, _cand('pick', 1.0))
             low = serve._tier_fallback_candidates(
                 'low', pool, scores, _cand('pick', 1.0))
-        self.assertEqual([m['id'] for m in coding], ['strong', 'cheap'])
-        self.assertEqual([m['id'] for m in low], ['cheap', 'strong'])
+        self.assertEqual(coding, [])
+        self.assertEqual(low, [])
 
     def test_no_pick_no_fallbacks(self):
         self.assertEqual(serve._tier_fallback_candidates(
