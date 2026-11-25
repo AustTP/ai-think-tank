@@ -789,17 +789,19 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
                  'rollback cost two-way vs one-way, error detection), mitigate what a cheap fix '
                  'can fix, and state each Verdict (low/medium/high) plus unmitigated gaps in your report.')
     # PR-first delivery (skill, 2026-11-25): main is protected -- a card that
-    # lands code in the tank's repo delivers it on an agent/<issueKey> branch
+    # lands code in the tank's repo delivers it on an agent/<cardId> branch
     # as a PR citing the GitHub issue + card id, merged squash on green gate.
     system_prompt += '\n' + __import__('agents.skill_prompts', fromlist=['*']).load_skill_prompt(
         'github',
         fallback='If this task lands code in the tank\'s own repo: work on a feature '
-                 'branch named agent/<issueKey> (never push main -- branch protection '
-                 'refuses it), open a pull request against main with "Closes #<issue '
-                 'number>" and the card id in the body, wait for the gate check to '
-                 'pass, merge the PR with the squash method, and delete the branch. '
-                 'No issue on file? Open one first (REST /repos/OWNER/REPO/issues) and '
-                 'cite the card id in the issue body.')
+                 'branch named agent/<cardId> (your task id; the card itself carries '
+                 '"Refs: issue #N" for the GitHub issue it came from -- never push '
+                 'main, branch protection refuses it), open a pull request against '
+                 'main with "Closes #<issue number>" and your card id in the body, '
+                 'wait for the gate check to pass, merge the PR with the squash '
+                 'method, and delete the branch. No issue on file? Open one first '
+                 '(REST /repos/OWNER/REPO/issues) and cite the card id in the issue '
+                 'body.')
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
     command = ''
     structured_paths = []
