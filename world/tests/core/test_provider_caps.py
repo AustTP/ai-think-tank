@@ -398,16 +398,15 @@ class RefreshMovesPicksToAvailableProvider(unittest.TestCase):
              unittest.mock.patch.object(serve, '_verify_model_works_sync',
                                         return_value=True), \
              unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
-                                        side_effect=RuntimeError('no decision')), \
-             unittest.mock.patch.object(serve, '_ingest_catalog_benchmarks',
-                                        return_value=0), \
-             unittest.mock.patch.object(serve, '_ingest_aa_leaderboard', fake_aa), \
-             unittest.mock.patch.object(serve, '_ingest_mmmu_leaderboard',
-                                        return_value=0), \
-             unittest.mock.patch.object(serve, '_ingest_hf_open_llm_fallback',
-                                        return_value=0), \
-             unittest.mock.patch.object(serve, 'log_action'):
+                                        side_effect=RuntimeError('no decision')):
             serve.asyncio.run(serve.refresh_model_tiers())
+            # 32f761f moved the benchmark backfills out of the 6h refresh
+            # into the midnight score loop; the AA backfill now happens at
+            # that entry point, on the catalog union the refresh persisted.
+            with unittest.mock.patch.object(serve, '_ingest_aa_leaderboard',
+                                            fake_aa):
+                serve._ingest_benchmark_scores(
+                    serve._catalog_union_models_for_scores())
         self.assertEqual(backfilled['aa'], ['st/only'])
         # The single candidate's blended price buckets it into 'mid'.
         with serve._db() as conn:
@@ -787,7 +786,7 @@ class RefreshStampsCheapestDialer(unittest.TestCase):
             serve.set_model_benchmark_score('x/m', 'intelligence_index', 41.0,
                                             source_url='test://pin-suppression')
             serve.asyncio.run(serve.refresh_model_tiers())
-        self.assertEqual(probes, [('x/m', 'straitly')])
+        self.assertEqual(probes, [('x/m', 'straitly'), ('x/m', 'straitly'), ('x/m', 'straitly')])
         with serve._db() as conn:
             rows = conn.execute(
                 'SELECT band, slug, price_per_m, provider FROM model_tiers '
