@@ -779,6 +779,15 @@ def _run_coding_content_inner(snapshot, agent_id, task, base_ctx=None, sandbox_o
     system_prompt += '\n' + __import__('agents.coding_library', fromlist=['*']).GUIDANCE
     if python_task:
         system_prompt += '\n' + python_delivery.GUIDANCE
+    # Merge-risk assessment (skill, 2026-11-25): run the five-category
+    # self-assessment BEFORE this task is marked ready for review, and fix
+    # what a cheap fix can fix before it reaches a reviewer.
+    system_prompt += '\n' + __import__('agents.skill_prompts', fromlist=['*']).load_skill_prompt(
+        'merge-risk',
+        fallback='Before this work is reviewed, self-assess merge risk on five categories '
+                 '(alignment with the request only, impact/blast radius, verification evidence, '
+                 'rollback cost two-way vs one-way, error detection), mitigate what a cheap fix '
+                 'can fix, and state each Verdict (low/medium/high) plus unmitigated gaps in your report.')
     messages = [{'role': 'system', 'content': system_prompt}, {'role': 'user', 'content': 'Go ahead.'}]
     command = ''
     structured_paths = []
