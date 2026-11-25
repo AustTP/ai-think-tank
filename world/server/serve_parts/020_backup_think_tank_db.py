@@ -532,7 +532,16 @@ async def _score_ingest_loop():
     with the scores ALREADY on file -- so a fresh score that would change a
     band's pick waits at most one sweep. A failed source contributes an empty
     slice (fail-open, same as every ingestion); rows already resolved are
-    never clobbered (INSERT OR IGNORE)."""
+    never clobbered (INSERT OR IGNORE).
+
+    A FAILED night must not sit silent until the next midnight
+    (operator, 2026-11-25): 2026-11-25 the score table drained to zero and
+    every band re-pick fell back to 'keeping the previous pick' for a whole
+    day because the 00:00 ingest predated the deploy that created this loop.
+    So after a failed cycle the loop SHORTENS its sleep to
+    SCORE_INGEST_RETRY_INTERVAL_S (hourly) and keeps retrying -- logging each
+    failure LOUDLY (traceback included) -- until an ingest adds rows, then
+    resumes the midnight cadence."""
     while True:
         # Sleep to the next midnight UTC (the cadence the sources actually
         # follow) rather than a fixed interval from boot, which drifted into
@@ -540,16 +549,46 @@ async def _score_ingest_loop():
         now = time.time()
         day = 24 * 3600
         await asyncio.sleep(day - (now % day))
-        added = 0
-        try:
-            added = await asyncio.to_thread(
-                lambda: _ingest_benchmark_scores(
-                    list(_catalog_union_models_for_scores())))
-        except Exception as e:
-            print(f'[model-tiers] score ingest failed (continuing): '
-                  f'{type(e).__name__}: {e}', flush=True)
-        if added:
-            print(f'[model-tiers] score ingest: {added} new benchmark rows', flush=True)
+        while True:
+            added = 0
+            try:
+                added = await asyncio.to_thread(
+                    lambda: _ingest_benchmark_scores(
+                        list(_catalog_union_models_for_scores())))
+            except Exception as e:
+                import traceback
+                print(f'[model-tiers] SCORE INGEST FAILED -- will retry in '
+                      f'{SCORE_INGEST_RETRY_INTERVAL_S // 60} min until it '
+                      f'succeeds: {type(e).__name__}: {e}\n'
+                      f'{traceback.format_exc()}', flush=True)
+            if added:
+                print(f'[model-tiers] score ingest: {added} new benchmark rows', flush=True)
+                break
+            # added == 0 with no exception can mean either a clean
+            # nothing-new day (normal -- sources update daily) or every
+            # source failing while returning empty slices (the fail-open
+            # shape _ingest_benchmark_scores keeps). Distinguish via the
+            # table: zero rows on file means bands are UNSUPPORTED, so treat
+            # it as failure and keep retrying; anything on file ends the
+            # retry cycle and returns to midnight cadence.
+            try:
+
+                def _score_row_count():
+                    with _db() as conn:
+                        return conn.execute(
+                            'SELECT COUNT(*) FROM model_benchmark_scores'
+                        ).fetchone()[0]
+
+                rows_on_file = await asyncio.to_thread(_score_row_count)
+            except Exception:
+                rows_on_file = 0  # DB error: conservative, keep retrying
+            if rows_on_file > 0:
+                break
+            print(f'[model-tiers] score ingest produced no rows and the '
+                  f'model_benchmark_scores table is EMPTY -- bands have no '
+                  f'scores on file; retrying in '
+                  f'{SCORE_INGEST_RETRY_INTERVAL_S // 60} min', flush=True)
+            await asyncio.sleep(SCORE_INGEST_RETRY_INTERVAL_S)
 
 
 def _catalog_union_models_for_scores():

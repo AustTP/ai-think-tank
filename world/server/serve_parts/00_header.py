@@ -958,6 +958,8 @@ _LAST_LOG_PRUNE = None
 # so readers see the old complete set or the new complete set, never a mix.
 MODEL_TIER_REFRESH_INTERVAL_S = 6 * 3600   # full re-pick: every 6h (catalog fetches + Jev picks + live-verify grew to 4 providers / 1,400 models; the 30-min price watch carries frequent moves, the sweep only adds value catching new models / delistings / promo repricing)
 TIER_PRICE_WATCH_INTERVAL_S = 30 * 60      # price watch: every 30 minutes
+SCORE_INGEST_INTERVAL_S = 24 * 3600        # benchmark-score ingest: midnight UTC (sourced daily); a FAILED midnight run is retried every SCORE_INGEST_RETRY_INTERVAL_S so one bad source fetch can't leave bands scoreless for 24h
+SCORE_INGEST_RETRY_INTERVAL_S = 1 * 3600   # retry cadence after a failed midnight ingest: hourly until it succeeds, then back to the midnight cadence
 _MAX_IDLE_MINUTES = 0.0  # 0 = disabled; set via --max-idle-minutes (float: allows <1m)
 _LAST_REQUEST_TIME = None  # touched by the no_store middleware below
 # Sleep-not-die. When --max-idle-minutes elapses, the server does
