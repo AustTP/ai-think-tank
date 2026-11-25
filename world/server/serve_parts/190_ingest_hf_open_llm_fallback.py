@@ -218,15 +218,15 @@ def _ingest_benchmark_scores(models):
     _ingest_frontiercode2_leaderboard(models)
     _ingest_hf_open_llm_fallback(models)
     with _db() as conn:
-        # Carry over each model's known benchmark scores into the catalog row.
+        # Carry over each model's known benchmark scores into the catalog row
+        # (batched -- same round-trip economics as the catalog sync above).
         known = {}
         for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
             known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
-        for mid, bench_scores in known.items():
-            conn.execute(
-                'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
-                (json.dumps(bench_scores), mid),
-            )
+        conn.execute_batch(
+            'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
+            [(json.dumps(bench_scores), mid) for mid, bench_scores in known.items()],
+        )
     return _count_benchmark_rows() - before
 
 
@@ -260,6 +260,17 @@ def _sync_model_catalog(models, keep_ids=None):
     seen_ids = set()
     _log_date = time.strftime('%Y-%m-%d', time.gmtime())
     with _db() as conn:
+        # Batch the per-model upserts (2026-11-25): the per-row .execute loop
+        # paid 3 network round trips per model per statement through the
+        # savepoint wrapper -- 911 models x 2 statements x 60ms RTT pushed a
+        # full sync past 6 minutes inside one transaction, past the 60s
+        # statement_timeout whenever any second writer was touching
+        # model_catalog (every full re-pick failed at 19:39 / 22:35 UTC).
+        # execute_batch pipelines the same statements page-wise: one round
+        # trip per page, identical semantics, 0.4s measured for the full
+        # table. Rows with unparsable prices are skipped exactly as before.
+        catalog_rows = []
+        price_rows = []
         for m in models:
             mid = m['id']
             seen_ids.add(mid)
@@ -272,33 +283,37 @@ def _sync_model_catalog(models, keep_ids=None):
             image_capable = 1 if 'image' in (arch.get('input_modalities') or []) else 0
             _blended = (prompt_price + completion_price) * 1_000_000
             _providers = ','.join(m['providers']) if m.get('providers') else None
-            conn.execute(
-                'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, providers, first_seen, last_seen) '
-                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
-                'ON CONFLICT(model_id) DO UPDATE SET name=excluded.name, prompt_price=excluded.prompt_price, '
-                'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
-                'image_capable=excluded.image_capable, '
-                'providers=COALESCE(excluded.providers, model_catalog.providers), last_seen=excluded.last_seen',
+            catalog_rows.append(
                 (mid, m.get('name', mid), prompt_price, completion_price,
                  _blended, image_capable, _providers, now, now),
             )
             # Daily price snapshot: append today's price for every model so
             # the market-wide history survives model_catalog's in-place
             # overwrite. Same-day re-runs overwrite (PK log_date+model_id).
-            conn.execute(
-                'INSERT INTO catalog_price_daily (log_date, model_id, price_per_m, logged_at) VALUES (?, ?, ?, ?) '
-                'ON CONFLICT(log_date, model_id) DO UPDATE SET price_per_m=excluded.price_per_m, logged_at=excluded.logged_at',
-                (_log_date, mid, _blended, now),
-            )
-        # Carry over each model's known benchmark scores into the catalog row.
+            price_rows.append((_log_date, mid, _blended, now))
+        conn.execute_batch(
+            'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, providers, first_seen, last_seen) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
+            'ON CONFLICT(model_id) DO UPDATE SET name=excluded.name, prompt_price=excluded.prompt_price, '
+            'completion_price=excluded.completion_price, price_per_m=excluded.price_per_m, '
+            'image_capable=excluded.image_capable, '
+            'providers=COALESCE(excluded.providers, model_catalog.providers), last_seen=excluded.last_seen',
+            catalog_rows,
+        )
+        conn.execute_batch(
+            'INSERT INTO catalog_price_daily (log_date, model_id, price_per_m, logged_at) VALUES (?, ?, ?, ?) '
+            'ON CONFLICT(log_date, model_id) DO UPDATE SET price_per_m=excluded.price_per_m, logged_at=excluded.logged_at',
+            price_rows,
+        )
+        # Carry over each model's known benchmark scores into the catalog row
+        # (batched -- same round-trip economics as the catalog sync above).
         known = {}
         for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
             known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
-        for mid, bench_scores in known.items():
-            conn.execute(
-                'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
-                (json.dumps(bench_scores), mid),
-            )
+        conn.execute_batch(
+            'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
+            [(json.dumps(bench_scores), mid) for mid, bench_scores in known.items()],
+        )
         # Purge models that are gone from EVERY provider -- both the catalog
         # row and any player-entered benchmark scores for that model.
         # Scanned from BOTH tables: a score row can exist for a model that

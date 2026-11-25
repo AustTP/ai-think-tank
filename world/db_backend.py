@@ -716,6 +716,38 @@ class CompatConnection:
         cur = self.cursor()
         return cur.execute(sql, params)
 
+    def execute_batch(self, sql, seq_of_params, page_size=1000):
+        """Pipelined multi-row write for Postgres: the 911-model catalog
+        sync issued ~1,800 sequential statements through .execute, each
+        paying 3 network round trips (SAVEPOINT + statement + RELEASE over
+        a 60ms-RTT Aiven link) -- 6+ minutes per refresh inside one
+        transaction, past the 60s statement_timeout whenever a second
+        writer touched model_catalog (every full re-pick failed 2026-11-25
+        19:39 / 22:35 UTC). psycopg2's execute_batch sends each page in
+        ONE round trip: the identical 911-row sync measured 0.4s instead
+        of 6 minutes. SQLite-shaped params; SQLite callers get the
+        sequential fallback. Statements still execute server-side in
+        order; the surrounding transaction's commit/rollback semantics
+        are unchanged."""
+        if not self.postgres:
+            cur = self.cursor()
+            for params in seq_of_params:
+                cur.execute(sql, params)
+            return
+        from psycopg2.extras import execute_batch as _eb
+        catalog = self._catalog
+        sql2 = catalog.translate(sql)
+        if '%' in sql2:
+            sql2 = _escape_literal_percent(sql2)
+        rows = []
+        for params in seq_of_params:
+            params = catalog.adapt_params(sql2, params)
+            if params:
+                rows.append(tuple(params))
+        if rows:
+            _eb(self._conn.cursor(), sql2, rows, page_size=max(1, page_size))
+        return self
+
     def executescript(self, script):
         """sqlite3's multi-statement runner. Each statement goes through the
         same translate + savepoint path as a plain execute."""
