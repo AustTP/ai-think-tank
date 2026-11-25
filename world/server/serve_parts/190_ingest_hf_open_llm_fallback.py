@@ -215,6 +215,7 @@ def _ingest_benchmark_scores(models):
     _ingest_catalog_benchmarks(models)
     _ingest_aa_leaderboard(models)
     _ingest_mmmu_leaderboard(models)
+    _ingest_frontiercode2_leaderboard(models)
     _ingest_hf_open_llm_fallback(models)
     with _db() as conn:
         # Carry over each model's known benchmark scores into the catalog row.

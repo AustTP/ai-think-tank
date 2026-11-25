@@ -17,14 +17,24 @@ def _backup_think_tank_db():
     stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000000) % 1000000:06d}'
     dest = os.path.join(DB_BACKUP_DIR, f'think_tank.db-{stamp}.bak')
     try:
-        if os.environ.get('THINK_TANK_DB_URL'):
+        if os.environ.get('THINK_TANK_DB_URL') or _is_postgres():
             # Postgres backend (2026-11-01): the .db file is no longer the
             # live store; pg_dump produces the consistent snapshot instead.
             # Custom format (-Fc) keeps the file compact and restorable with
             # pg_restore; the .bak name is kept so the prune logic below is
             # unchanged.
+            #
+            # 2026-11-25: the DSN check used to read os.environ directly,
+            # but the DSN moved into the repo .env (db_backend._dsn() reads
+            # it there). The env-only check silently demoted every backup to
+            # the sqlite snapshot path against a DB that was no longer the
+            # live store (backups stopped Nov 22). Use the shared _dsn()
+            # helper so the backup sees the same DSN resolution as every
+            # other _db() caller.
             import subprocess
-            dsn = os.environ['THINK_TANK_DB_URL']
+            dsn = os.environ.get('THINK_TANK_DB_URL') or _pg_dsn()
+            if not dsn:
+                raise RuntimeError('postgres backend active but DSN unresolved')
             proc = subprocess.run(
                 ['pg_dump', '--dbname=' + dsn, '-Fc', '-f', dest],
                 capture_output=True, text=True, timeout=300)
@@ -2076,3 +2086,25 @@ _SEED_PROFILE_DEFAULTS = {
         'notes': [],
     },
 }
+
+
+def _is_postgres():
+    # Same DSN resolution db_backend._dsn() gives every other caller: process
+    # env first, then the repo .env. Local lazy import like the other
+    # db_backend call sites in this part.
+    try:
+        import db_backend as _dbm
+        return _dbm.is_postgres()
+    except Exception:
+        return False
+
+
+def _pg_dsn():
+    """The resolved DSN (process env, then repo .env) -- the exact string
+    every _db() caller dials, from the same helper, so the pg_dump snapshot
+    can never diverge from the live store's location."""
+    try:
+        import db_backend as _dbm
+        return _dbm._dsn()
+    except Exception:
+        return None

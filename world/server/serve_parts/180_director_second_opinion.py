@@ -326,7 +326,7 @@ EVALUATOR_PLAYER = 'player'
 # config interface); the VALUES (the actual URLs) are operator data held in the
 # data_sources table, PUT via /api/data-sources with no restart -- these links
 # drift over time and the code must not hard-code them.
-DATA_SOURCE_KEYS = ('aa_leaderboard_url', 'hf_contents_parquet_url', 'hf_contents_source_url', 'mmmu_leaderboard_url')
+DATA_SOURCE_KEYS = ('aa_leaderboard_url', 'hf_contents_parquet_url', 'hf_contents_source_url', 'mmmu_leaderboard_url', 'mmmu_pro_eval_url', 'frontiercode2_leaderboard_url')
 
 
 def _get_data_source(key, default=None):
@@ -1176,11 +1176,36 @@ def _ingest_mmmu_leaderboard(models):
     pick. Mirrors the AA leaderboard backfill: INSERT OR IGNORE, so an
     already-resolved score (player-entered, or an earlier backfill) is never
     disputed. Matches by the same fuzzy display-name tokens as the AA
-    backfill. Returns the number of new rows."""
+    backfill. Returns the number of new rows.
+
+    2026-11-25: the registered source (pricepertoken.com) 403s behind
+    Cloudflare even with a browser UA. When the registered page yields
+    nothing (403 OR an empty parse -- the page moved its data into an
+    embedded payload), fall back to Artificial Analysis's own MMMU-Pro
+    evaluation page, whose embedded flight payload still publishes per-model
+    MMMU-Pro scores. MMMU-Pro is the stricter variant of the same benchmark
+    family; the vision band only consumes it as its primary metric, and a
+    consistent source beats a stale classifier placeholder."""
     url = _get_data_source('mmmu_leaderboard_url')
     if not url:
         print('[model-tiers] data source mmmu_leaderboard_url unset -- skipping MMMU backfill', flush=True)
         return 0
+    added = _ingest_mmmu_table_page(models, url)
+    if added:
+        return added
+    fallback_url = _get_data_source('mmmu_pro_eval_url')
+    if fallback_url and fallback_url != url:
+        added = _ingest_aa_eval_page(models, 'MMMU', 'mmmuPro', fallback_url)
+        if added:
+            print(f'[model-tiers] MMMU: registered page unusable, {added} rows from the AA MMMU-Pro page', flush=True)
+    return added
+
+
+def _ingest_mmmu_table_page(models, url):
+    """The ORIGINAL MMMU backfill: parse the registered leaderboard's HTML
+    table (provider, model, input $/M, output $/M, MMMU, actions). Returns
+    the number of new rows; an unreachable page or an empty parse returns 0
+    so the caller can fall back to the AA MMMU-Pro page."""
     import urllib.request as _ur
     try:
         # The leaderboard blocks plain urllib with a 403 -- send a browser
@@ -1217,6 +1242,136 @@ def _ingest_mmmu_leaderboard(models):
             if cur.rowcount:
                 added += 1
     return added
+
+
+def _aa_eval_scores(html, metric_key):
+    """Pull {slug: (display, value*100)} out of an Artificial Analysis
+    evaluation page's embedded flight payload (2026-11-25). AA moved the
+    per-model numbers into the Next.js flight payload as camelCase metric
+    keys (`mmmuPro`, `frontierCode20` -- 0-1 fractions); the public table
+    markup the earlier scrapers read is gone, which is exactly why the MMMU
+    backfill started returning zero rows. Attribution walks back to the
+    nearest model identity (`slug`/`name`/`shortName` triple) -- the flight
+    emits identity and metrics adjacently per model -- and the 0-1
+    fractions are scaled by 100 onto the platform's shared 0-100 scale
+    (values beyond BENCHMARK_SCALE_MAX, and NaN, are refused)."""
+    out = {}
+    for m in re.finditer(r'\\"' + re.escape(metric_key) + r'\\":([0-9.eE+]+)', html):
+        seg = html[max(0, m.start() - 60000):m.start()]
+        ident = re.findall(
+            r'\\"slug\\":\\"([a-z0-9./\-]+)\\",\\"name\\":\\"([^"\\]+)\\",\\"shortName\\":', seg)
+        if not ident:
+            continue
+        slug, display = ident[-1]
+        try:
+            value = float(m.group(1)) * 100.0
+        except ValueError:
+            continue
+        if value != value or value > BENCHMARK_SCALE_MAX:  # NaN or out of scale
+            continue
+        if slug not in out:  # nearest-identity wins; first read per slug stands
+            out[slug] = (display, value)
+    return out
+
+
+def _match_aa_eval_row(model_name, aa_scores):
+    """Match a catalog model against one AA evaluation page's rows. Same
+    token overlap as _match_aa_score (the rows are AA display names too),
+    with one extra bar: a catalog name carrying a VERSION token the AA name
+    lacks never matches -- a plain overlap match let 'GPT-6.1 Terra' inherit
+    'gpt-4.1''s score (2026-11-25), and a mismatch across a version line is
+    worse than no score at all. Version tokens are read as dotted/dashed
+    atoms ('6.1' == '6-1') so '6.1' does not collide with '6'+'1'."""
+    def version_sig(name):
+        return set(re.findall(r'\d+(?:[.-]\d+)*', (name or '').lower()))
+
+    nt = _benchmark_name_tokens(model_name)
+    if not nt:
+        return None
+    model_versions = version_sig(model_name)
+    candidates = []
+    for slug, (display, value) in aa_scores.items():
+        at = _benchmark_name_tokens(display)
+        inter = nt & at
+        if not inter:
+            continue
+        if version_sig(slug) and model_versions and not (version_sig(slug) & model_versions):
+            continue
+        overlap = len(inter) / min(len(nt), len(at))
+        if overlap < 0.6:
+            continue
+        candidates.append((round(overlap, 4), len(at), display, value))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (-c[0], -c[1], c[2]))
+    return candidates[0][3]
+
+
+def _ingest_aa_eval_page(models, benchmark_name, metric_key, url):
+    """Shared ingest for AA evaluation pages (`mmmu-pro`, `frontiercode-2-0`):
+    pull {slug: (display, score*100)} from the page's embedded flight
+    payload and backfill rows for not-yet-scored catalog models --
+    INSERT OR IGNORE, so an already-resolved score (player-entered, or an
+    earlier backfill) is never disputed. Matching goes through
+    _match_aa_eval_row (the AA display-name tokens plus a version-token
+    guard). Returns the number of new rows."""
+    import urllib.request as _ur
+    try:
+        _req = _ur.Request(url, headers={'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36'})
+        with _ur.urlopen(_req, timeout=20) as resp:  # nosec B310 -- URL comes from the operator registry, not user input
+            page = resp.read().decode('utf-8', 'ignore')
+    except Exception:
+        return 0
+    aa_scores = _aa_eval_scores(page, metric_key)
+    if not aa_scores:
+        return 0
+    now = time.time()
+    added = 0
+    with _db() as conn:
+        for m in models:
+            mid = m['id']
+            have = conn.execute(
+                'SELECT 1 FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                (mid, benchmark_name),
+            ).fetchone()
+            if have:
+                continue
+            value = _match_aa_eval_row(m.get('name') or mid, aa_scores)
+            if value is None:
+                continue
+            cur = conn.execute(
+                'INSERT OR IGNORE INTO model_benchmark_scores (model_id, benchmark, score, source_url, evaluator, checked_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                (mid, benchmark_name, value, url, EVALUATOR_ARTIFICIAL_ANALYSIS, now),
+            )
+            if cur.rowcount:
+                added += 1
+    return added
+
+
+def _ingest_frontiercode2_leaderboard(models):
+    """Coding-band supply (operator request, 2026-11-25): the catalog's AA
+    block carries coding_index only as `null` everywhere and NO registered
+    source fed `coding_index` at all -- the coding band could only ride its
+    intelligence_index fallback. Artificial Analysis's FrontierCode 2.0
+    evaluation page (their implementation of Cognition's FrontierCode 2.0,
+    an agentic coding benchmark graded on whether a maintainer would merge
+    the change) publishes per-model scores inside the same embedded flight
+    payload the MMMU numbers moved into, and it covers the CURRENT catalog
+    (28 models including the cheap tier the coding band picks from -- the
+    2025-era aider leaderboard covers none of them). Rows land under the
+    `coding_index` benchmark name: the band's OWN primary metric, so no
+    BAND_BENCHMARK or model_bands.json change is needed and existing
+    intelligence_index-backed picks keep working as the chain's fallback.
+    Values ride the shared 0-100 scale (the 0-1 fractions are scaled by
+    100). The operator registers the page URL under
+    `frontiercode2_leaderboard_url`; an unset key skips with a log line
+    like every other source."""
+    url = _get_data_source('frontiercode2_leaderboard_url')
+    if not url:
+        print('[model-tiers] data source frontiercode2_leaderboard_url unset -- skipping FrontierCode 2.0 backfill', flush=True)
+        return 0
+    return _ingest_aa_eval_page(models, 'coding_index', 'frontierCode20', url)
 
 
 def _parse_hf_contents(parquet_bytes):

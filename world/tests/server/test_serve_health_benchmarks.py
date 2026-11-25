@@ -762,6 +762,108 @@ class BenchmarkDataSources(unittest.TestCase):
                 ('xiaomi/mimo-v2.6-pro', 'intelligence_index')).fetchone()[0]
         self.assertEqual(score, 37.9)
 
+    @staticmethod
+    def _flight_page(entries):
+        """Build a fake AA evaluation page: one embedded-flight blob per
+        entry (slug, name, metric value). Mirrors the slug/name/shortName
+        triple plus camelCase metric key the real flight payload emits."""
+        return ''.join(
+            '\\"slug\\":\\"%s\\",\\"name\\":\\"%s\\",\\"shortName\\":\\"%s\\",\\"%s\\":%s'
+            % (slug, name, slug, metric, value)
+            for slug, name, metric, value in entries)
+
+    def _fake_page_response(self, body):
+        resp = unittest.mock.MagicMock()
+        resp.read.return_value = body.encode()
+        resp.__enter__.return_value = resp
+        return resp
+
+    def test_aa_eval_scores_parses_flight_and_scales(self):
+        page = self._flight_page([
+            ('zai/glm-5', 'GLM 5', 'mmmuPro', '0.782'),
+            ('openai/gpt-6.1', 'GPT-6.1', 'mmmuPro', '0.9'),
+            ('broken/entry', 'Broken', 'mmmuPro', '1.9'),  # out of scale
+            ('nan/entry', 'NaN', 'mmmuPro', 'NaN'),        # NaN refused
+        ])
+        self.assertEqual(serve._aa_eval_scores(page, 'mmmuPro'), {
+            'zai/glm-5': ('GLM 5', 78.2),
+            'openai/gpt-6.1': ('GPT-6.1', 90.0),
+        })
+
+    def test_mmmu_flight_fallback_when_registered_page_yields_nothing(self):
+        # Registered page 403s -> 0 rows from the table page -> the AA
+        # MMMU-Pro flight payload feeds the backfill instead (2026-11-25).
+        self._set(mmmu_leaderboard_url='https://ppt.test/mmmu',
+                  mmmu_pro_eval_url='https://aa.test/mmmu-pro')
+        page = self._flight_page([('xiaomi/mimo-v2.6-pro', 'MiMo-V2.6-Pro', 'mmmuPro', '0.642')])
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=[OSError('403'), self._fake_page_response(page)]):
+            added = serve._ingest_mmmu_leaderboard(
+                [self._model('xiaomi/mimo-v2.6-pro', 'MiMo-V2.6-Pro')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT benchmark, score, evaluator FROM model_benchmark_scores').fetchone()
+        self.assertEqual(row, ('MMMU', 64.2, 'artificial_analysis'))
+
+    def test_mmmu_no_fallback_when_table_page_still_works(self):
+        self._set(mmmu_leaderboard_url='https://ppt.test/mmmu',
+                  mmmu_pro_eval_url='https://aa.test/mmmu-pro')
+        table = ('<table><tr><td>p</td><td>MiMo-V2.6-Pro</td><td>$1</td><td>$2</td>'
+                 '<td>70</td></tr></table>')
+        with unittest.mock.patch('urllib.request.urlopen',
+                                 side_effect=[self._fake_page_response(table),
+                                              self._fake_page_response('')]):
+            added = serve._ingest_mmmu_leaderboard(
+                [self._model('xiaomi/mimo-v2.6-pro', 'MiMo-V2.6-Pro')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute('SELECT benchmark, score FROM model_benchmark_scores').fetchone()
+        self.assertEqual(row, ('MMMU', 70.0))
+
+    def test_version_guard_blocks_wrong_generation_match(self):
+        # 'GPT-6.1 Terra' must NOT inherit gpt-4.1's score (2026-11-25 fix).
+        page = self._flight_page([('openai/gpt-4.1', 'GPT-4.1', 'frontierCode20', '0.8')])
+        scores = serve._aa_eval_scores(page, 'frontierCode20')
+        self.assertIsNone(serve._match_aa_eval_row('OpenAI: GPT-6.1 Terra', scores))
+        # Same generation matches fine.
+        self.assertEqual(
+            serve._match_aa_eval_row('OpenAI: GPT-4.1 Terra', scores), 80.0)
+
+    def test_frontiercode2_skips_when_unconfigured(self):
+        with unittest.mock.patch('urllib.request.urlopen', side_effect=AssertionError('must not fetch')):
+            self.assertEqual(serve._ingest_frontiercode2_leaderboard([self._model('m/m')]), 0)
+
+    def test_frontiercode2_ingest_feeds_coding_index(self):
+        self._set(frontiercode2_leaderboard_url='https://aa.test/frontiercode-2-0')
+        page = self._flight_page([
+            ('zai/glm-5', 'GLM 5', 'frontierCode20', '0.551'),
+            ('unrelated/model', 'Unrelated Model', 'frontierCode20', '0.9'),
+        ])
+        with unittest.mock.patch('urllib.request.urlopen', return_value=self._fake_page_response(page)):
+            added = serve._ingest_frontiercode2_leaderboard(
+                [self._model('zai/glm-5', 'GLM 5')])
+        self.assertEqual(added, 1)
+        with serve._db() as conn:
+            row = conn.execute(
+                'SELECT benchmark, score, evaluator FROM model_benchmark_scores').fetchone()
+        # Lands under the coding band's OWN primary metric.
+        self.assertEqual(row, ('coding_index', 55.1, 'artificial_analysis'))
+
+    def test_frontiercode2_never_overwrites_existing_score(self):
+        self._set(frontiercode2_leaderboard_url='https://aa.test/frontiercode-2-0')
+        serve.set_model_benchmark_score('zai/glm-5', 'coding_index', 60.0,
+                                        'https:// elsewhere', 'player')
+        page = self._flight_page([('zai/glm-5', 'GLM 5', 'frontierCode20', '0.551')])
+        with unittest.mock.patch('urllib.request.urlopen', return_value=self._fake_page_response(page)):
+            added = serve._ingest_frontiercode2_leaderboard([self._model('zai/glm-5', 'GLM 5')])
+        self.assertEqual(added, 0)
+        with serve._db() as conn:
+            score = conn.execute(
+                'SELECT score FROM model_benchmark_scores WHERE model_id=? AND benchmark=?',
+                ('zai/glm-5', 'coding_index')).fetchone()[0]
+        self.assertEqual(score, 60.0)
+
     def test_hf_ingest_skips_when_unconfigured(self):
         with unittest.mock.patch('urllib.request.urlopen', side_effect=AssertionError('must not fetch')):
             self.assertEqual(serve._ingest_hf_open_llm_fallback([self._model('m/m')]), 0)
