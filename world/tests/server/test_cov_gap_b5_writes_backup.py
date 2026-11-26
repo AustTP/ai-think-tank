@@ -219,3 +219,61 @@ class CachedYoutubeTranscriptTest(_TempMixin, unittest.TestCase):
             fh.write('# YouTube transcript\n\n\n\n')
         self.assertIsNone(
             serve._cached_youtube_transcript('https://youtu.be/abcdefghijk'))
+
+
+class DbBackupSnapshotTest(_TempMixin, unittest.TestCase):
+    """_backup_think_tank_db, Postgres branch: the pg_dump binary comes from
+    PG_DUMP_BIN (the server-major-version rule the weekly script follows),
+    the dump streams to stdout into the .bak file (the Docker wrapper cannot
+    write -f into the host filesystem), and a failed dump leaves no bogus
+    snapshot behind."""
+
+    def _run(self, run_mock):
+        with mock.patch.object(serve, 'DB_BACKUP_DIR', self.tmp), \
+                mock.patch.object(serve, 'DB_BACKUP_KEEP', 2), \
+                mock.patch.object(serve, '_harden_db_perms') as harden, \
+                mock.patch.object(serve, '_pg_dsn', return_value=None), \
+                mock.patch.object(serve, '_is_postgres', return_value=True), \
+                mock.patch('subprocess.run', run_mock):
+            serve._backup_think_tank_db()
+        bak = [f for f in os.listdir(self.tmp) if f.endswith('.bak')]
+        return bak, harden
+
+    def test_pg_dump_bin_env_wins_and_streams_stdout(self):
+        captured = {}
+
+        def fake_run(argv, **kw):
+            captured['argv'] = argv
+            captured['kw'] = kw
+            return mock.Mock(returncode=0, stderr=b'')
+
+        with mock.patch.dict(os.environ, {'THINK_TANK_DB_URL': 'test-dsn',
+                                          'PG_DUMP_BIN': '/home/ubuntu/bin/pg_dump18'}):
+            bak, harden = self._run(fake_run)
+        self.assertEqual(captured['argv'][:2],
+                         ['/home/ubuntu/bin/pg_dump18', '--dbname=test-dsn'])
+        self.assertNotIn('-f', captured['argv'])
+        self.assertIn('stdout', captured['kw'])
+        self.assertEqual(len(bak), 1)
+        harden.assert_called_once()
+        # No .tmp leftover after success.
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith('.tmp')], [])
+
+    def test_distro_fallback_without_env(self):
+        def fake_run(argv, **kw):
+            return mock.Mock(returncode=0, stderr=b'')
+        with mock.patch.dict(os.environ, {'THINK_TANK_DB_URL': 'test-dsn'},
+                             clear=False):
+            os.environ.pop('PG_DUMP_BIN', None)
+            with mock.patch.dict(os.environ, {'THINK_TANK_DB_URL': 'test-dsn'}):
+                bak, _ = self._run(fake_run)
+        self.assertEqual(len(bak), 1)
+
+    def test_failed_dump_returns_and_no_bak(self):
+        def fake_run(argv, **kw):
+            return mock.Mock(returncode=1, stderr=b'mismatch')
+        with mock.patch.dict(os.environ, {'THINK_TANK_DB_URL': 'test-dsn'}):
+            bak, _ = self._run(fake_run)
+        # No .bak AND no empty .tmp: a failed dump leaves nothing behind.
+        self.assertEqual(bak, [])
+        self.assertEqual([f for f in os.listdir(self.tmp) if f.endswith('.tmp')], [])

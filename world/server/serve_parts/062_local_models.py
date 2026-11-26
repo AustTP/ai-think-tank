@@ -72,7 +72,7 @@ def _local_model_trip_cooldown(kind):
     _LOCAL_MODEL_STATE['ready'].pop(kind, None)
 
 
-def _local_ocr_text(image_bytes):
+def _local_ocr_text(image_bytes, tag='base'):
     """Run the registry's OCR engine over one PNG (bytes). Returns the text
     or None -- None ALWAYS means "cannot answer" (lane off, engine failed,
     empty output) and the caller falls back to the LLM band. Never raises."""
@@ -94,9 +94,10 @@ def _local_ocr_text(image_bytes):
         text = (run.stdout or '').strip()[:max_chars]
         if not text:
             return None
-        log_action(None, 'local_model_used',
-                   {'kind': 'ocr', 'engine': binary, 'chars': len(text)},
-                   authorized=True)
+        entry = {'kind': 'ocr', 'engine': binary, 'chars': len(text)}
+        if tag != 'base':
+            entry['pass'] = tag
+        log_action(None, 'local_model_used', entry, authorized=True)
         return text
     except Exception as exc:
         _local_model_trip_cooldown('ocr')
@@ -112,6 +113,60 @@ def _local_ocr_text(image_bytes):
 
 def _norm_ocr_text(text):
     return ' '.join(str(text or '').lower().split())
+
+
+_OCR_HEADER_CROP_FRAC = 0.2   # mastheads/toolbars live in the top strip
+_OCR_BINARIZE_AT = 128
+
+
+def _local_ocr_preprocess(image_bytes):
+    """Second-pass preprocessing for the OCR lane: crop the top strip
+    (the masthead/header region), grayscale, then normalize contrast --
+    the DOMINANT value (the background) is stretched to black and the
+    brightest value to white, inverted when the result still reads dark,
+    hard-thresholded to pure black/white and upscaled 2x (small header
+    fonts read badly at 1x). This is the chain real tesseract was probed
+    with: light-on-orange mastheads (the Hacker News class of miss) come
+    out as clean dark-on-light text, while a plain binarize at 128 erases
+    them (orange bg ~= gray 136 straddles the threshold). Returns PNG
+    bytes, or None when PIL is unavailable or the bytes are not a
+    decodable image -- never raises."""
+    if not image_bytes:
+        return None
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(image_bytes))
+        w, h = img.size
+        img = img.convert('L').crop((0, 0, w, max(1, int(h * _OCR_HEADER_CROP_FRAC))))
+        hist = img.histogram()
+        bg = max(range(256), key=lambda i: hist[i])
+        img = img.point(lambda p, m=bg: max(0, p - m) * 255 // max(1, 255 - m))
+        hist = img.histogram()
+        mean = sum(i * n for i, n in enumerate(hist)) / (sum(hist) or 1)
+        if mean < _OCR_BINARIZE_AT:
+            img = img.point(lambda p: 255 - p)
+        img = img.point(lambda p: 0 if p < _OCR_BINARIZE_AT else 255)
+        img = img.resize((img.width * 2, img.height * 2))
+        out = io.BytesIO()
+        img.save(out, format='PNG')
+        return out.getvalue() or None
+    except Exception:
+        return None
+
+
+def _ocr_phrase_found(expect, text):
+    """Positive-evidence phrase match. First the plain normalized compare;
+    then a whitespace-stripped compare, because tesseract glues adjacent
+    words ('TOTAL$12.50' for 'total $12.50') and the glued form never
+    appears as a normalized substring."""
+    norm = _norm_ocr_text(text)
+    if not norm:
+        return False
+    if expect in norm:
+        return True
+    glued = ''.join(norm.split())
+    return bool(glued) and ''.join(expect.split()) in glued
 
 
 def _local_ocr_visual_answer(image_b64, expect_visual):
@@ -132,13 +187,23 @@ def _local_ocr_visual_answer(image_b64, expect_visual):
         return None
     if not image_bytes:
         return None
-    text = _local_ocr_text(image_bytes)
-    if not text:
-        return None
     expect = ' '.join(str(expect_visual).lower().split())
-    if expect not in _norm_ocr_text(text):
+    matched = None
+    text = _local_ocr_text(image_bytes)
+    if text and _ocr_phrase_found(expect, text):
+        matched = text
+    if not matched:
+        # Second pass, only on a miss and only preprocessing ($0 local
+        # compute): the plain run reads the whole page, so a colored or
+        # inverted header it garbled is the remaining fixable miss.
+        prepped = _local_ocr_preprocess(image_bytes)
+        if prepped:
+            text2 = _local_ocr_text(prepped, tag='header')
+            if text2 and _ocr_phrase_found(expect, text2):
+                matched = text2
+    if not matched:
         return None
-    snippet = ' '.join(text.split())[:200]
+    snippet = ' '.join(matched.split())[:200]
     return {'ok': True,
             'reply': f'YES\nLocal OCR ({_local_model_cfg("ocr").get("engine", "tesseract")}) '
                      f'found "{expect_visual}" in the page text: "{snippet}"'}

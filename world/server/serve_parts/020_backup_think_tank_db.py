@@ -22,8 +22,7 @@ def _backup_think_tank_db():
             # live store; pg_dump produces the consistent snapshot instead.
             # Custom format (-Fc) keeps the file compact and restorable with
             # pg_restore; the .bak name is kept so the prune logic below is
-            # unchanged.
-            #
+            # unchanged.#
             # 2026-11-25: the DSN check used to read os.environ directly,
             # but the DSN moved into the repo .env (db_backend._dsn() reads
             # it there). The env-only check silently demoted every backup to
@@ -35,12 +34,37 @@ def _backup_think_tank_db():
             dsn = os.environ.get('THINK_TANK_DB_URL') or _pg_dsn()
             if not dsn:
                 raise RuntimeError('postgres backend active but DSN unresolved')
-            proc = subprocess.run(
-                ['pg_dump', '--dbname=' + dsn, '-Fc', '-f', dest],
-                capture_output=True, text=True, timeout=300)
-            if proc.returncode != 0:
-                raise RuntimeError(
-                    f'pg_dump failed: {(proc.stderr or "")[:200]}')
+            # pg_dump must match the SERVER major version or it aborts
+            # ("server version mismatch"). The distro client is 16 while
+            # Aiven runs Postgres 18; scripts/pg_backup_weekly.sh solves
+            # this with PG_DUMP_BIN -> a Dockerized 18 wrapper
+            # (~/bin/pg_dump18). The in-process backup used to hardcode
+            # 'pg_dump' and fail every hour on that mismatch -- same rule
+            # here: PG_DUMP_BIN first, falling back to the distro binary.
+            # The dump streams to stdout instead of -f: the Docker wrapper
+            # runs `docker run --rm -i postgres:18 pg_dump "$@"`, and a -f
+            # path would name a file inside the ephemeral container, not
+            # this host filesystem. The dump lands in a .tmp sibling and is
+            # renamed on success, so a failed dump never leaves an empty
+            # .bak for the prune logic to keep.
+            pg_dump_bin = (os.environ.get('PG_DUMP_BIN') or 'pg_dump')
+            tmp_dest = dest + '.tmp'
+            try:
+                with open(tmp_dest, 'wb') as dump_fh:
+                    proc = subprocess.run(
+                        [pg_dump_bin, '--dbname=' + dsn, '-Fc'],
+                        stdout=dump_fh, stderr=subprocess.PIPE, timeout=300)
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        'pg_dump failed: '
+                        f'{proc.stderr.decode(errors="replace")[:200]}')
+                os.replace(tmp_dest, dest)
+            finally:
+                if os.path.exists(tmp_dest):
+                    try:
+                        os.unlink(tmp_dest)
+                    except OSError:
+                        pass
         else:
             src = sqlite3.connect(DB_PATH)
             try:
