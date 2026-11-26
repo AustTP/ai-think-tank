@@ -1,6 +1,8 @@
-# Tests for the free-source search lane (362): adapter parsing, merged
-# fan-out, standalone-shim, and the 240 free-first wiring -- NO network
-# in tests; all source calls faked.
+# Tests for the free-source search lanes: the local SearXNG lane (361),
+# the 362 adapter parsing, merged fan-out, standalone-shim, and the 240
+# lane ordering (SearXNG -> 362 fan-out -> Tavily) -- NO network in tests;
+# all source calls faked.
+import json
 import os
 import sys
 import unittest
@@ -87,6 +89,75 @@ class MergedSearch(unittest.TestCase):
             self.assertIsNone(m._merged_search(None, 'q'))
 
 
+class SearxngLane(unittest.TestCase):
+    """The local SearXNG lane (361): JSON parse, disable/fall-through
+    behavior, and the Tavily-shaped output block."""
+
+    def test_parse_and_shape(self):
+        payload = json.dumps({'results': [
+            {'title': 'A', 'url': 'https://a.example/x', 'content': 'ca'},
+            {'title': 'B', 'url': '', 'content': 'dropped'},
+            {'title': 'C', 'url': 'https://c.example/', 'content': 'cc'},
+        ]})
+        with mock.patch.object(serve, '_fetch',
+                               return_value=(200, payload)), \
+             mock.patch.object(serve, 'log_action'):
+            out = serve._searxng_search('a1', 'q', max_results=5)
+        self.assertIn('- A (https://a.example/x): ca', out)
+        self.assertNotIn('dropped', out)
+        self.assertIn('https://c.example/', out)
+
+    def test_empty_results_return_none(self):
+        with mock.patch.object(serve, '_fetch',
+                               return_value=(200, json.dumps({'results': []}))), \
+             mock.patch.object(serve, 'log_action') as logged, \
+             mock.patch.object(serve, '_searxng_url',
+                               return_value='http://127.0.0.1:8888'):
+            self.assertIsNone(serve._searxng_search('a1', 'q'))
+        logged.assert_called_once()
+
+    def test_dead_instance_silent_fallthrough(self):
+        with mock.patch.object(serve, '_fetch', return_value=(0, 'boom')), \
+             mock.patch.object(serve, '_searxng_url',
+                               return_value='http://127.0.0.1:8888'):
+            self.assertIsNone(serve._searxng_search('a1', 'q'))
+
+    def test_disabled_by_empty_url(self):
+        with mock.patch.object(serve, '_searxng_url', return_value=''):
+            self.assertIsNone(serve._searxng_search('a1', 'q'))
+
+    def test_blank_query_skipped(self):
+        self.assertIsNone(serve._searxng_search('a1', '   '))
+
+
+class SearxngLaneWiring(unittest.TestCase):
+    """search_web tries the SearXNG lane FIRST; the 362 fan-out and Tavily
+    only run when it returns nothing."""
+
+    def _ex(self):
+        return serve._make_web_tools_executor('oliver', 'test')
+
+    def test_searxng_lane_wins_precedence(self):
+        with mock.patch.object(
+                serve, '_searxng_search',
+                return_value='- S hit (https://example.com/s): ss'), \
+             mock.patch.object(serve, '_merged_search') as fanout, \
+             mock.patch.object(serve, '_api_execute') as api:
+            out = self._ex()('search_web', {'query': 'q'})
+        self.assertIn('S hit', out)
+        fanout.assert_not_called()
+        api.assert_not_called()
+
+    def test_searxng_lane_silent_when_down(self):
+        # A dead SearXNG returns None and the fan-out answers instead.
+        with mock.patch.object(serve, '_searxng_search',
+                               return_value=None), \
+             mock.patch.object(serve, '_merged_search',
+                               return_value='- HN hit (https://example.com/h): s'):
+            out = self._ex()('search_web', {'query': 'q'})
+        self.assertIn('HN hit', out)
+
+
 class FreeFirstWiring(unittest.TestCase):
     """search_web in the shared web-tools executor must prefer the free
     lane and only fall through to Tavily when it returns nothing."""
@@ -95,7 +166,8 @@ class FreeFirstWiring(unittest.TestCase):
         return serve._make_web_tools_executor('oliver', 'test')
 
     def test_free_first_precedence(self):
-        with mock.patch.object(serve, '_merged_search',
+        with mock.patch.object(serve, '_searxng_search', return_value=None), \
+             mock.patch.object(serve, '_merged_search',
                                return_value='- HN hit (https://example.com/h): s'), \
              mock.patch.object(serve, '_api_execute') as api:
             out = self._ex()('search_web', {'query': 'q'})
@@ -103,7 +175,8 @@ class FreeFirstWiring(unittest.TestCase):
         api.assert_not_called()
 
     def test_tavily_fallback_when_free_empty(self):
-        with mock.patch.object(serve, '_merged_search', return_value=None), \
+        with mock.patch.object(serve, '_searxng_search', return_value=None), \
+             mock.patch.object(serve, '_merged_search', return_value=None), \
              mock.patch.object(serve, '_api_execute',
                                return_value={'ok': True,
                                              'modelInstruction': 'mi',

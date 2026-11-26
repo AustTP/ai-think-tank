@@ -229,11 +229,18 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
                                         args, agent_id, agent_key)
         if name == 'search_web':
             query = (args or {}).get('query') or default_query or ''
-            # Free-first search lane (operator, 2026-11-23): arXiv/HN/
-            # Wikipedia/GitHub are free, keyless APIs that answer most
-            # technical queries without touching the monthly page-request
-            # budget. Tavily (paid, metered) only fires when they return
-            # nothing -- the default path no longer spends the paid lane.
+            # Lane 0 (operator, 2026-11-26): the local SearXNG instance --
+            # free, keyless, unlimited, off the page-request ledger, and the
+            # only lane here that covers general pop-culture/TV queries the
+            # 362 technical fan-out can't. Dead instance -> None -> next lane.
+            searxng_text = _searxng_search(agent_id, query)
+            if searxng_text:
+                discovered.observe(searxng_text)
+                return searxng_text
+            # Lane 1: the 362 free-source fan-out (arXiv/HN/Wikipedia/
+            # GitHub). Free, keyless, off the page-request budget. Tavily
+            # (paid, metered) only fires when they return nothing -- the
+            # default path no longer spends the paid lane.
             free_text = _merged_search(agent_id, query)
             if free_text:
                 discovered.observe(free_text)
