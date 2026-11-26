@@ -223,7 +223,8 @@ def _ingest_benchmark_scores(models):
         known = {}
         for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
             known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
-        conn.execute_batch(
+        _batched_execute(
+            conn,
             'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
             [(json.dumps(bench_scores), mid) for mid, bench_scores in known.items()],
         )
@@ -233,6 +234,18 @@ def _ingest_benchmark_scores(models):
 def _count_benchmark_rows():
     with _db() as conn:
         return conn.execute('SELECT COUNT(*) FROM model_benchmark_scores').fetchone()[0]
+
+
+def _batched_execute(conn, sql, rows):
+    """Page-wise batched writes on the live Postgres backend (one round trip
+    per page instead of three per row). Raw sqlite3 connections -- used by the
+    isolated unit tests and local dev -- have no psycopg2 execute_batch, so
+    they take the equivalent executemany path."""
+    batch = getattr(conn, 'execute_batch', None)
+    if batch is not None:
+        batch(sql, rows, page_size=1000)
+    elif rows:
+        conn.executemany(sql, rows)
 
 
 def _sync_model_catalog(models, keep_ids=None):
@@ -291,7 +304,8 @@ def _sync_model_catalog(models, keep_ids=None):
             # the market-wide history survives model_catalog's in-place
             # overwrite. Same-day re-runs overwrite (PK log_date+model_id).
             price_rows.append((_log_date, mid, _blended, now))
-        conn.execute_batch(
+        _batched_execute(
+            conn,
             'INSERT INTO model_catalog (model_id, name, prompt_price, completion_price, price_per_m, image_capable, providers, first_seen, last_seen) '
             'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) '
             'ON CONFLICT(model_id) DO UPDATE SET name=excluded.name, prompt_price=excluded.prompt_price, '
@@ -300,7 +314,8 @@ def _sync_model_catalog(models, keep_ids=None):
             'providers=COALESCE(excluded.providers, model_catalog.providers), last_seen=excluded.last_seen',
             catalog_rows,
         )
-        conn.execute_batch(
+        _batched_execute(
+            conn,
             'INSERT INTO catalog_price_daily (log_date, model_id, price_per_m, logged_at) VALUES (?, ?, ?, ?) '
             'ON CONFLICT(log_date, model_id) DO UPDATE SET price_per_m=excluded.price_per_m, logged_at=excluded.logged_at',
             price_rows,
@@ -310,7 +325,8 @@ def _sync_model_catalog(models, keep_ids=None):
         known = {}
         for r in conn.execute('SELECT model_id, benchmark, score, evaluator FROM model_benchmark_scores').fetchall():
             known.setdefault(r[0], {})[r[1]] = {'score': r[2], 'evaluator': r[3]}
-        conn.execute_batch(
+        _batched_execute(
+            conn,
             'UPDATE model_catalog SET scores = ? WHERE model_id = ?',
             [(json.dumps(bench_scores), mid) for mid, bench_scores in known.items()],
         )

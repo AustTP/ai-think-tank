@@ -861,6 +861,62 @@ _REJECT_PATTERN_THRESHOLD = 3
 _REJECT_PATTERN_SWEEP_MS = 15 * 60 * 1000
 _PATTERN_FIX_COOLDOWN_MS = 14 * 24 * 3600 * 1000
 
+# Reciprocal-approval detection (2026-11-26, scaling-swarms lesson 7): two
+# agents approving each other's work repeatedly is a quid-pro-quo loop the
+# per-vote gates cannot see. Detection-only: flag into the governance log;
+# it does NOT change gate behavior (stranding work is worse than watching).
+_APPROVAL_RECIP_WINDOW_MS = 14 * 24 * 3600 * 1000
+_APPROVAL_RECIP_THRESHOLD = 2
+_APPROVAL_RECIP_SWEEP_MS = 15 * 60 * 1000
+_APPROVAL_RECIP_COOLDOWN_MS = 7 * 24 * 3600 * 1000
+
+
+def _reciprocal_approval_step(state, now_ms):
+    """Flag mutual approval loops from the approval ledger. A pair (a, b)
+    where each side approved the other's work >= _APPROVAL_RECIP_THRESHOLD
+    times inside the window is logged once per cooldown -- the same
+    cadence-gated, bounded, pure-state-mutation shape as _reject_pattern_step
+    (ledger pruning included). Governance log only: the operator decides what
+    to do with a flagged pair; no gate or assignment is touched."""
+    if now_ms - (state.get('lastRecipApprovalSweep') or 0) < _APPROVAL_RECIP_SWEEP_MS:
+        return
+    state['lastRecipApprovalSweep'] = now_ms
+    ledger = [e for e in (state.get('approvalLog') or [])
+              if isinstance(e, dict)
+              and now_ms - (e.get('atMs') or 0) <= _APPROVAL_RECIP_WINDOW_MS]
+    state['approvalLog'] = ledger
+    pairs = {}
+    for e in ledger:
+        a, b = e.get('reviewer'), e.get('author')
+        if not a or not b or a == b:
+            continue
+        pairs.setdefault((a, b), 0)
+        pairs[(a, b)] += 1
+    flagged = state.setdefault('_recipApprovalState', {})
+    for (a, b), count in sorted(pairs.items()):
+        if (count < _APPROVAL_RECIP_THRESHOLD
+                or pairs.get((b, a), 0) < _APPROVAL_RECIP_THRESHOLD):
+            continue
+        key = repr(tuple(sorted((a, b))))
+        st = flagged.get(key)
+        if isinstance(st, dict) and (st.get('cooldownUntil') or 0) > now_ms:
+            continue
+        flagged[key] = {'cooldownUntil': int(now_ms) + _APPROVAL_RECIP_COOLDOWN_MS}
+        over = len(flagged) - _APPROVAL_LOG_MAX
+        if over > 0:
+            for stale in sorted(flagged, key=lambda k: flagged[k].get('cooldownUntil') or 0)[:over]:
+                del flagged[stale]
+        try:
+            from serve import log_action
+            log_action(None, 'reciprocal_approval_flagged',
+                       {'a': a, 'b': b,
+                        'aApprovedB': pairs.get((a, b), 0),
+                        'bApprovedA': pairs.get((b, a), 0),
+                        'windowDays': _APPROVAL_RECIP_WINDOW_MS // 86400000},
+                       authorized=True)
+        except Exception as e:
+            print(f'[recip-approval] log failed: {e}', flush=True)
+
 
 def _reject_pattern_step(state, now_ms):
     """Supervisor pattern loop over the reject ledger (2026-11-10). The same
@@ -1103,6 +1159,7 @@ def _task_cycle(state, now=None, grid=None, doors=None, task_id_holder=None):
     # card is genuinely wedged).
     _stale_work_step(state, now, now_ms)
     _reject_pattern_step(state, now_ms)
+    _reciprocal_approval_step(state, now_ms)
 
     # W5: daily coaching catch-up sweep. Re-checks agents with an applied
     # coaching plan whose real trailing grade is still below the floor, and

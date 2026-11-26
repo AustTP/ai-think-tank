@@ -538,6 +538,7 @@ MAX_REVIEW_CYCLES = 8
 
 _REJECT_LEDGER_MAX = 200
 _REJECT_NOTE_CHARS = 400
+_APPROVAL_LOG_MAX = 500
 
 
 def _record_reject_event(state, parent, task, reviewer, kind, note, now_ms):
@@ -565,6 +566,32 @@ def _record_reject_event(state, parent, task, reviewer, kind, note, now_ms):
         'note': str(note or '')[:_REJECT_NOTE_CHARS],
     })
     over = len(ledger) - _REJECT_LEDGER_MAX
+    if over > 0:
+        del ledger[:over]
+
+
+def _note_approval_event(state, parent, task, reviewer, now_ms):
+    """One counted approval into the approval ledger (2026-11-26): the raw
+    material for the reciprocal-approval detector (_reciprocal_approval_step).
+    The scaling-swarms field report caught the subtle-misalignment mode where
+    agents trade approvals ("I approve yours in exchange; maybe she approves
+    ours faster") -- a quid-pro-quo our own review gates cannot see because
+    each individual vote looks legitimate. Every counted approval is logged
+    as (reviewer -> author) so the aggregator can flag mutual loops.
+    Bounded (oldest dropped), JSON-safe. Pure state mutation."""
+    if not isinstance(parent, dict):
+        return
+    author = task.get('reviewAuthorId') or parent.get('assignedTo')
+    if not author or not reviewer:
+        return
+    ledger = state.setdefault('approvalLog', [])
+    ledger.append({
+        'atMs': int(now_ms),
+        'taskId': parent.get('id'),
+        'reviewer': reviewer,
+        'author': author,
+    })
+    over = len(ledger) - _APPROVAL_LOG_MAX
     if over > 0:
         del ledger[:over]
 
@@ -1093,6 +1120,7 @@ def _apply_content_result(state, task, result, now_ms=None):
                 elif reviewer and reviewer not in gate['approvers']:
                     gate['approvers'].append(reviewer)
                     gate['approvals'] += 1
+                    _note_approval_event(state, parent, task, reviewer, now_ms)
                     if result.get('acceptanceAssessment') is not None:
                         gate['acceptanceVerified'] = bool(
                             (result.get('acceptanceAssessment') or {}).get('verified'))
