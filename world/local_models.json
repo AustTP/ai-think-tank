@@ -1,0 +1,18 @@
+{
+ "_notes": [
+  "Local model tiers (operator, 2026-11-26): repos and local ML runtimes that",
+  "serve jobs INSTEAD of an LLM band when the job fits. Operator-edited like",
+  "model_bands.json. Each entry: kind -> engine facts. A lane is live only",
+  "when enabled is true AND the binary is on PATH; any runtime failure cools",
+  "the lane down and the LLM band underneath answers instead. Local calls",
+  "log $0 spend. Nothing here fetches anything from the network."
+ ],
+ "ocr": {
+  "engine": "tesseract",
+  "binary": "tesseract",
+  "enabled": true,
+  "timeoutS": 15,
+  "maxTextChars": 20000,
+  "notes": "Local text extraction from screenshots. Answers a visual check only with POSITIVE evidence (expected text found verbatim in the OCR text); anything else falls back to the vision tier."
+ }
+}

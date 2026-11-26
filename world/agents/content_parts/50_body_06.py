@@ -209,9 +209,25 @@ def _vision_review_base64(agent_id, agent_key, task_id, image_b64, question):
     Mirrors _review_screenshot, but takes the base64 image the browser endpoint
     already captured instead of a sandbox file path. Degrades to a note, never a
     crash, when the vision tier or the model call is unavailable.
+
+    Local-model lane (operator, 2026-11-26): for the fixed expect_visual
+    question shape, a local OCR engine (world/local_models.json) answers
+    first when it can do so with POSITIVE evidence -- the expected text
+    found verbatim on the page -- at $0 ledger spend. Any other outcome
+    (lane off, OCR empty, phrase absent) falls through to the LLM vision
+    tier unchanged; absence of OCR evidence is never converted into a NO.
     """
     if not image_b64:
         return {'ok': False, 'note': 'no screenshot was captured'}
+    # The expect phrase is the segment between the fixed prefix and the
+    # fixed suffix of the expect_visual question; other questions (open
+    # reviews) never hit the local lane.
+    show_match = re.search(r'^Does this screenshot show: (.+)\? Answer exactly YES or NO\b',
+                           question or '', re.DOTALL)
+    if show_match:
+        local = _serve._local_ocr_visual_answer(image_b64, show_match.group(1).strip())
+        if local is not None:
+            return local
     slug = _serve._vision_tier_slug()
     if not slug:
         return {'ok': False, 'note': 'vision model tier not available'}
