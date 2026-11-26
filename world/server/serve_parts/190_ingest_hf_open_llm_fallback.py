@@ -489,6 +489,48 @@ def _annotate_cheapest_dialers(pick_models, per_provider, pick_provider):
     return out
 
 
+def _union_dialing_catalog(per_provider, only_provider=None):
+    """One candidate list across every dialing provider, deduped by model id
+    at the cheapest listing a transport can actually serve. Registry order
+    breaks exact price ties. A capped provider's listing is skipped; if every
+    provider is capped the registry-first slice still wins so bands keep
+    picks (the transports gate each call). Each returned candidate is stamped
+    with `provider`/`_dial_provider` so live verification and the tier row
+    use the listing the price came from, not the default provider."""
+    order = [only_provider] if only_provider else list(PROVIDER_CATALOGS)
+    providers = [p for p in order if per_provider.get(p)]
+    if not providers:
+        return []
+    cap_state = {}
+
+    def _capped(provider):
+        if provider not in cap_state:
+            try:
+                cap_state[provider] = bool(_provider_cap_exceeded(provider))
+            except Exception:
+                cap_state[provider] = False
+        return cap_state[provider]
+
+    source = [p for p in providers if not _capped(p)] or providers
+    best = {}
+    for provider in source:
+        for model in per_provider.get(provider) or []:
+            mid = model.get('id')
+            if not mid:
+                continue
+            try:
+                price = float(model['pricing']['prompt']) + float(model['pricing']['completion'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if mid in best and price >= best[mid][0] - 1e-15:
+                continue
+            fresh = dict(model)
+            fresh['provider'] = provider
+            fresh['_dial_provider'] = provider
+            best[mid] = (price, fresh)
+    return [model for _price, model in best.values()]
+
+
 # --- Cap-crossing watch -----------------------------------------------------
 # A provider's spend crossing its monthly cap is a re-pick EVENT, not
 # something the 30-min price watch or the 2h sweep should be first to notice
@@ -558,12 +600,12 @@ async def refresh_model_tiers():
     # persisted to model_provider_catalog, and the UNION drives the
     # canonical rows, the benchmark backfills (so a model only one provider
     # sells still gets scored), and the purge scope. The call-ability pools
-    # (price buckets, band pools, live-verify probes) draw from the registry
-    # pick provider's listing, then every candidate is re-priced to the
-    # cheapest other dialing provider's listing of the same model id and
-    # stamped with that provider -- the tier row dials the cheapest vendor
-    # (operator, 2026-11-20). A `tier_provider` pin keeps the pinned
-    # provider's own listings untouched.
+    # (price buckets, band pools, live-verify probes) draw from ONE union
+    # catalog across every dialing provider, deduped by model id at the
+    # cheapest servable listing and stamped with that provider -- the tier
+    # row prices and dials the cheapest vendor (operator, 2026-11-26,
+    # replacing the 2026-11-20 pick-slice-only scan). A `tier_provider` pin
+    # keeps the pinned provider's own listings only.
     per_provider = {}
     for provider, fetch_name in PROVIDER_CATALOGS.items():
         try:
@@ -610,16 +652,12 @@ async def refresh_model_tiers():
             print(f'[model-tiers] tier_provider pin {pin!r} has no listing this sweep; ignored', flush=True)
     else:
         pin_applied = False
-    pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
-    # Cross-provider price scan (operator, 2026-11-20): when no pin is in
-    # force, each candidate is re-priced and re-stamped to the cheapest other
-    # dialing provider's listing of the same model id, so buckets, floors and
-    # the tier rows all reflect the listing the transport will actually dial.
-    # An applied `tier_provider` pin keeps the pinned provider's own listings
-    # untouched -- that is the whole point of a pin.
-    if not pin_applied:
-        pick_models = _annotate_cheapest_dialers(pick_models, per_provider,
-                                                 pick_provider)
+    # One union catalog across every dialing provider (operator, 2026-11-26):
+    # a model is judged at its cheapest servable listing, even when the pick
+    # provider lists it higher or does not list it at all. An applied
+    # `tier_provider` pin keeps the pinned provider's own listings only.
+    pick_models = _union_dialing_catalog(
+        per_provider, only_provider=pick_provider if pin_applied else None)
     buckets = _bucket_models_by_price(pick_models)
     all_benchmark_rows = get_model_benchmark_scores()
     pools = _band_candidate_pools(pick_models)

@@ -689,6 +689,98 @@ class CheapestDialerAnnotation(unittest.TestCase):
         self.assertIs(out[0], pick[0])
 
 
+class UnionDialingCatalog(unittest.TestCase):
+    """One candidate list across every dialing provider, deduped by model id
+    at the cheapest servable listing (operator, 2026-11-26): a model listed
+    only on a non-default provider is a real candidate, and a shared model
+    is priced at its cheapest servable listing regardless of which provider
+    the registry picks first."""
+
+    def setUp(self):
+        # conftest trims PROVIDER_CATALOGS to openrouter; the union walks
+        # that registry order, so restore both providers for these tests.
+        reg = unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS',
+                                         {'openrouter': None, 'nous': None})
+        reg.start()
+        self.addCleanup(reg.stop)
+
+    def _m(self, mid, per_token='0.0000005'):
+        return {'id': mid, 'name': mid,
+                'pricing': {'prompt': per_token, 'completion': per_token},
+                'architecture': {'input_modalities': ['text'],
+                                 'output_modalities': ['text']}}
+
+    def test_model_only_on_nondefault_provider_is_a_candidate(self):
+        per = {'openrouter': [self._m('or/m')],
+               'nous': [self._m('nous/only', '0.0000004')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._union_dialing_catalog(per)
+        ids = sorted(m['id'] for m in out)
+        self.assertEqual(ids, ['nous/only', 'or/m'])
+        nous = next(m for m in out if m['id'] == 'nous/only')
+        self.assertEqual(nous['_dial_provider'], 'nous')
+        self.assertEqual(nous['provider'], 'nous')
+
+    def test_shared_model_priced_at_cheapest_listing(self):
+        per = {'openrouter': [self._m('x/m', '0.0000005')],
+               'nous': [self._m('x/m', '0.0000004')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['_dial_provider'], 'nous')
+        self.assertAlmostEqual(
+            float(out[0]['pricing']['prompt'])
+            + float(out[0]['pricing']['completion']), 8e-7)
+
+    def test_capped_provider_listings_skipped(self):
+        per = {'openrouter': [self._m('x/m', '0.0000005')],
+               'nous': [self._m('x/m', '0.0000004')]}
+
+        def capped(provider):
+            return provider == 'nous'
+
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        side_effect=capped):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['_dial_provider'], 'openrouter')
+
+    def test_every_provider_capped_still_returns_candidates(self):
+        # The transports gate each call; an empty catalog would blank the
+        # bands. Fail-open to the registry-first slice.
+        per = {'openrouter': [self._m('x/m')],
+               'nous': [self._m('y/m')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=True):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual({m['id'] for m in out}, {'x/m', 'y/m'})
+        self.assertEqual(out[0]['_dial_provider'], 'openrouter')
+
+    def test_price_tie_keeps_registry_order(self):
+        per = {'openrouter': [self._m('x/m')],
+               'nous': [self._m('x/m')]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual(out[0]['_dial_provider'], 'openrouter')
+
+    def test_only_provider_scopes_to_one_slice(self):
+        per = {'openrouter': [self._m('or/m')],
+               'nous': [self._m('nous/m')]}
+        out = serve._union_dialing_catalog(per, only_provider='nous')
+        self.assertEqual([m['id'] for m in out], ['nous/m'])
+
+    def test_unpriceable_rows_skipped(self):
+        per = {'openrouter': [self._m('or/m')],
+               'nous': [{'id': 'bad/m', 'pricing': {}}]}
+        with unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                        return_value=False):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual([m['id'] for m in out], ['or/m'])
+
+
 class RefreshStampsCheapestDialer(unittest.TestCase):
     """End to end: a model listed cheaper on CheaperInference lands in
     model_tiers stamped provider='cheaperinference' at CI's price, and the

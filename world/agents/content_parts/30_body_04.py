@@ -244,20 +244,26 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
         qp = _skipped_pipeline_result('non-code lane -- quality pipeline skipped')
 
     # A second opinion is worth having only when it can disagree. The peer
-    # gate mints TWO reviewers (2026-11-21); they now run DIFFERENT model
+    # gate mints TWO reviewers (2026-11-21); they run DIFFERENT model
     # families so both votes are independent of each other and of the JEV
-    # cross-check (typesafe/jev):
-    #   - CRITIC (reviewSlot=critic): the MID tier (deepseek family) -- the
-    #     adversarial judge gets the stronger reasoner.
+    # cross-check (typesafe/jev).
+    #   - CRITIC (reviewSlot=critic): the LOW tier for gate reviews of code
+    #     produced by the coding lane (operator, 2026-11-26): the mid tier's
+    #     price went up, and the mechanical pipeline is the objective anchor
+    #     here. Non-code/unmarked reviews keep the old mid-first order.
     #   - standard reviewer: the CODING tier (glm family) -- different
     #     family from the critic, cheap, and the pipeline anchor is
     #     mechanical anyway.
-    # Fallback chain mid -> coding -> low keeps single-band installs
-    # working; the author's coding lane is untouched. Unmarked review tasks
-    # (other mint sites) keep the mid-first order.
+    # The fallback ladders keep single-band installs working; the author's
+    # coding lane is untouched.
     if task.get('reviewSlot') == 'critic':
-        tier_slug = (_serve._mid_tier_slug() or _serve._coding_tier_slug()
-                     or _serve._low_tier_slug())
+        if (task.get('reviewOf') and pipeline_is_code_class
+                and not is_prose_review):
+            tier_slug = (_serve._low_tier_slug() or _serve._coding_tier_slug()
+                         or _serve._mid_tier_slug())
+        else:
+            tier_slug = (_serve._mid_tier_slug() or _serve._coding_tier_slug()
+                         or _serve._low_tier_slug())
     else:
         tier_slug = (_serve._coding_tier_slug() or _serve._mid_tier_slug()
                      or _serve._low_tier_slug())
@@ -284,6 +290,25 @@ def _run_review_content(snapshot, agent_id, task, base_ctx=None):
                 f'Be a genuine, skeptical reviewer, not a rubber stamp. Current code:\n{context}\n\nTask: {backlog_item}\n\n'
                 'List real, specific problems you actually see (bugs, broken logic, missing pieces), or say plainly if it genuinely '
                 'looks solid. Be honest either way.')
+    # Cheap-critic scaffold (2026-11-26): the code-lane critic runs on the LOW
+    # tier, and a cheap model approves most reliably when it is told exactly
+    # which narrow, checkable questions to answer rather than "be skeptical".
+    # Six binary items, each tied to evidence already in its context (the
+    # acceptance criteria, the changed files, the live pipeline output). The
+    # per-item evidence requirement blocks vague rubber-stamping; the checks
+    # list in the verdict JSON is where the answers land. Kept SHORT on
+    # purpose -- long rubrics degrade small models.
+    if task.get('reviewSlot') == 'critic' and not is_prose_review and not is_qa:
+        lead += ('\n\nBefore you decide, answer each of these six checks for yourself '
+                 '(state the answer inside your "checks" list, one line per item):\n'
+                 '1. Acceptance: does every acceptance criterion above have code that satisfies it? Name the file/function that does, or mark it missing.\n'
+                 '2. Files: does the changed file list actually contain the files the task claims to change?\n'
+                 '3. Pipeline: what does the quality pipeline output above literally say -- green or red? Quote the note.\n'
+                 '4. Errors: does the code handle empty inputs and failure paths, or only the happy path? One example either way.\n'
+                 '5. Tests: is there a test covering the changed behavior, or an explicit reason none is needed?\n'
+                 '6. Leftovers: any hardcoded value, disabled check, or copied stub left behind? Name it or say none.\n'
+                 'Every complaint you raise must cite a file (and line/function where possible) or a pipeline line. '
+                 'A complaint with no evidence is not a complaint.')
     criteria = _acceptance_criteria(review_parent or task)
     acceptance_clause = ''
     if criteria:

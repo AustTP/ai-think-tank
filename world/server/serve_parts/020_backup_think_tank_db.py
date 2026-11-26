@@ -688,17 +688,19 @@ def _tier_watch_moves_sync():
                 p, c = float(m['pricing']['prompt']), float(m['pricing']['completion'])
             except (KeyError, TypeError, ValueError):
                 continue
-            catalog[m['id']] = (p + c) * 1_000_000
+            price = (p + c) * 1_000_000
+            if m['id'] not in catalog or price < catalog[m['id']]:
+                catalog[m['id']] = price
     benchmark_rows = get_model_benchmark_scores()
-    # The pools a fresh pick would draw from: the serving provider's slice,
-    # re-priced and re-stamped through the SAME cross-provider dial
-    # annotation the refresh applies -- otherwise a cheaper listing on
-    # another provider is invisible to the watch and the value window waits
-    # for the next full refresh to be taken.
+    # The pools a fresh pick would draw from: ONE union catalog across every
+    # dialing provider, deduped by model id at the cheapest servable listing
+    # -- the same candidate list the refresh picks from, so a cheaper listing
+    # on another provider (or a model only that provider sells) moves the
+    # value window instead of waiting for the next full refresh.
     pick_provider = _pick_provider(per_provider)
-    pick_models = (per_provider.get(pick_provider) or []) if pick_provider else []
-    pools = _band_candidate_pools(_annotate_cheapest_dialers(
-        pick_models, per_provider, pick_provider))
+    if pick_provider is None:
+        pick_provider = ''
+    pools = _band_candidate_pools(_union_dialing_catalog(per_provider))
     moves = set()
     for band, meta in selected.items():
         if _provider_spec_for_band(band):

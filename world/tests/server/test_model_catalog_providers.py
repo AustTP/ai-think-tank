@@ -276,8 +276,9 @@ class StraitlyFetcher(unittest.TestCase):
 
 class RefreshIntegratesProviders(unittest.TestCase):
     """refresh_model_tiers: every registered provider is fetched, the union
-    drives the canonical sync and the score backfills, the pools stay on the
-    OpenRouter listing alone."""
+    drives the canonical sync and the score backfills, and the band pools
+    draw from the cross-provider union catalog at each model's cheapest
+    servable listing."""
 
     def setUp(self):
         _clear()

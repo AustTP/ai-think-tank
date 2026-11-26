@@ -626,6 +626,69 @@ class WorkroomAndProductBuildContent(_ExecutorTestCase):
         self.assertEqual(_run('rev4', 'critic', None, 'coding-slug'),
                          ['coding-slug'])
 
+    def test_code_review_critic_uses_low_tier(self):
+        # 2026-11-26: mid got expensive, so the critic on a gate review of
+        # coding-tier output dials LOW, while the standard reviewer keeps
+        # coding (different families). Prose/non-code parents keep mid-first.
+        seen = _store()
+        _base_mocks()
+        chat_models = []
+
+        def fake_http(method, base, path, body, key):
+            if path == '/api/chat':
+                chat_models.append(body.get('model'))
+                return {'reply': 'looks fine\n'
+                                 '{"verdict": "approve", "summary": "s", '
+                                 '"checks": [], "risks": []}'}
+            if path == '/api/library/file':
+                return {'ok': True}
+            return {}
+
+        def _run(task_id, slot, parent, low, mid, coding):
+            chat_models.clear()
+            tasks = {'story-1': parent} if parent else {}
+            snapshot = _snapshot(tasks=tasks)
+            with mock.patch.object(content, '_agent_name', return_value='Cora'), \
+                 mock.patch.object(content, '_review_sandbox_id', return_value='s'), \
+                 mock.patch.object(content, '_gather_unified_context', return_value=''), \
+                 mock.patch.object(content, '_run_quality_pipeline',
+                                   return_value={'ok': True, 'note': 'green',
+                                                 'skipped': False}), \
+                 mock.patch.object(content, '_review_screenshot',
+                                   return_value={'ok': True, 'review': 'page looks right'}), \
+                 mock.patch.object(serve, '_http_json', side_effect=fake_http), \
+                 mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                   return_value={'d': 1}), \
+                 mock.patch.object(serve, '_jev_choice', return_value=(None, 0.0, 0.0)), \
+                 mock.patch.object(serve, '_low_tier_slug', return_value=low), \
+                 mock.patch.object(serve, '_mid_tier_slug', return_value=mid), \
+                 mock.patch.object(serve, '_coding_tier_slug', return_value=coding):
+                content._run_review_content(
+                    snapshot, 'cora',
+                    {'id': task_id, 'taskType': 'review', 'reviewSlot': slot,
+                     'reviewOf': 'story-1'})
+            return list(chat_models)
+
+        code_parent = {'id': 'story-1', 'taskType': 'code',
+                       'deliverable': 'code', 'room': 'pressoffice'}
+        self.assertEqual(_run('rev-low', 'critic', code_parent,
+                              'low-slug', 'mid-slug', 'coding-slug'),
+                         ['low-slug'])
+        # Standard reviewer still rides coding: different family from critic.
+        self.assertEqual(_run('rev-code', 'standard', code_parent,
+                              'low-slug', 'mid-slug', 'coding-slug'),
+                         ['coding-slug'])
+        # Fallback when low is unconfigured.
+        self.assertEqual(_run('rev-fb', 'critic', code_parent,
+                              None, 'mid-slug', 'coding-slug'),
+                         ['coding-slug'])
+        # Prose parent stays on the old mid-first critic order.
+        prose_parent = {'id': 'story-1', 'taskType': 'report',
+                        'deliverable': 'report', 'room': 'observatory'}
+        self.assertEqual(_run('rev-prose', 'critic', prose_parent,
+                              'low-slug', 'mid-slug', 'coding-slug'),
+                         ['mid-slug'])
+
     def test_workroom_project_label_coding_with_ls_context(self):
         seen = _store()
         _base_mocks()
