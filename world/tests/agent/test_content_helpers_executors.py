@@ -414,6 +414,40 @@ class SpikeExecutorBranches(unittest.TestCase):
                 'textForModel': '', 'modelInstruction': ''}):
             out = ex('github_search_code', {'query': 'q', 'limit': 100})
             self.assertIn('o/r', out)
+        # github_get_ci_run (2026-11-26, task-35967 post-mortem): one
+        # authenticated call to verify a CI-failure premise before any deep
+        # investigation is paid for.
+        self.assertIn('owner and repo are required', ex('github_get_ci_run', {}))
+        with mock.patch.object(serve, '_api_execute', return_value={'ok': False, 'error': 'rate limited'}):
+            self.assertIn('Could not read CI runs',
+                          ex('github_get_ci_run', {'owner': 'o', 'repo': 'r'}))
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'workflow_runs': [
+                    {'id': 111, 'name': 'ci', 'status': 'completed',
+                     'conclusion': 'failure', 'head_branch': 'main',
+                     'head_sha': 'ab043a46f4ab0b102502e46d5ef8914e0539057b',
+                     'created_at': '2026-11-25T23:45:44Z'},
+                    {'id': 222, 'name': 'ci', 'status': 'completed',
+                     'conclusion': 'success', 'head_branch': 'main',
+                     'head_sha': '7a9660a27694953e907de91ce68e15bb55381306',
+                     'created_at': '2026-11-26T02:24:13Z'}]},
+                'textForModel': '', 'modelInstruction': ''}) as api:
+            out = ex('github_get_ci_run', {'owner': 'o', 'repo': 'r', 'branch': 'main'})
+            self.assertIn('"failure"', out)
+            self.assertIn('"success"', out)
+            self.assertIn('ab043a4', out)  # short sha surfaced
+            url = api.call_args[0][2]
+            self.assertIn('/actions/runs?', url)
+            self.assertIn('branch=main', url)
+        # A SHA query uses the check-runs endpoint for that commit.
+        with mock.patch.object(serve, '_api_execute', return_value={
+                'ok': True, 'data': {'check_runs': [
+                    {'id': 333, 'name': 'gate', 'status': 'completed',
+                     'conclusion': 'failure', 'head_sha': 'ab043a46f4'}]},
+                'textForModel': '', 'modelInstruction': ''}) as api:
+            out = ex('github_get_ci_run', {'owner': 'o', 'repo': 'r', 'sha': 'ab043a4'})
+            self.assertIn('"gate"', out)
+            self.assertIn('/commits/ab043a4/check-runs', api.call_args[0][2])
 
     def test_make_pixellab_tools_executor(self):
         ex = content._make_pixellab_tools_executor('ben', 'k')

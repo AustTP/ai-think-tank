@@ -896,3 +896,35 @@ _GITHUB_ISSUE_TOOL = {
         },
     },
 }
+
+# CI premise check (2026-11-26, task-35967 post-mortem): a spike investigating
+# a CI failure spent ~14 of its model calls re-deriving, through unauthenticated
+# sandbox curl retries, facts ONE authenticated call answers. Worse, the run it
+# chased was already stale -- a newer green run on the same branch existed.
+# This tool makes the premise check a single cheap call: is this SHA (or this
+# branch's latest run) actually red, and is there a newer green that voids the
+# premise before any deep investigation is paid for.
+_GITHUB_CI_RUN_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': 'github_get_ci_run',
+        'description': (
+            "Check REAL GitHub Actions CI results for a repo -- the runs for one commit SHA, or "
+            "the latest runs on a branch. Returns each run's id, status, conclusion, and head SHA. "
+            "Use this BEFORE investigating a CI failure: it also shows whether a NEWER green run "
+            "on the same branch already supersedes the red one (a stale premise). Authenticated "
+            "-- no rate-limit retries needed."
+        ),
+        'parameters': {
+            'type': 'object',
+            'properties': {
+                'owner': {'type': 'string', 'description': 'The repo owner (user or org).'},
+                'repo': {'type': 'string', 'description': 'The repository name.'},
+                'sha': {'type': 'string', 'description': 'Optional commit SHA to look up (short or full).'},
+                'branch': {'type': 'string', 'description': 'Optional branch name; omit to list the latest runs across branches.'},
+                'limit': {'type': 'integer', 'description': 'Max runs to return (default 10, max 20).'},
+            },
+            'required': ['owner', 'repo'],
+        },
+    },
+}

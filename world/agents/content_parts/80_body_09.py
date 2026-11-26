@@ -151,6 +151,14 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
                 'and follow a promising hit with read_library_file for the full content. If '
                 'search_library finds nothing relevant, say so explicitly in the plan rather than '
                 'assuming what the other team probably did.\n\n'
+                'CHEAP PREMISE PROBE FIRST -- if the question is about an infrastructure signal '
+                '(a CI run, a build failure, a deploy status), the FIRST item is a ONE-CALL probe '
+                'that verifies the premise before any deep work is planned: use github_get_ci_run '
+                'with the SHA or branch to confirm the failure is current AND not already superseded '
+                'by a newer green run. A stale or misread signal voids the whole investigation -- '
+                'finding that out costs one call, not the run\'s budget. Never route this through '
+                'unauthenticated execute_script curl retries: they burn calls on rate limits that '
+                'the authenticated tool does not pay.\n\n'
                 'DELIVERABLE DECISION -- make this call explicitly: does answering this question well '
                 'mean listing/comparing multiple items with attributes (sources, tools, options, prices, '
                 'anything enumerable), or computing/transforming something from what gets found? If yes, '
@@ -386,7 +394,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # same conditional-availability rule as search_web (unset = tool simply
     # absent, so the surface never advertises something that would fail).
     if _serve.GITHUB_TOKEN:
-        spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL]
+        spike_tools += [_GITHUB_REPO_TOOL, _GITHUB_ISSUES_TOOL, _GITHUB_ISSUE_TOOL, _GITHUB_SEARCH_TOOL, _GITHUB_CI_RUN_TOOL]
     # Apify scraping tools: offered only when APIFY_API_KEY is set --
     # same conditional-availability rule (unset = tool simply absent).
     if _serve.APIFY_API_KEY:
@@ -547,6 +555,7 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         # breaker propagated out of the tool loop and blew up the whole task.)
         _sim_module._store_content_result(task.get('id'), {
             'note': f'Spiked "{backlog}", but the investigation could not run (model call failed): {e}', 'ok': False,
+            'infra': True,
             'notifyPlayer': {'kind': 'spike_done',
                              'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
                              'body': f'{name} tried to spike "{backlog}" but the model call failed: {e}'},
@@ -555,6 +564,34 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
     # Ground truth from the transcript itself (not a side-channel counter) --
     # true whenever execute_tool actually ran at least once.
     investigated = any(m.get('role') == 'tool' for m in (transcript or []))
+    # Budget-stop detection (2026-11-26, task-35967): the tool loop's in-loop
+    # budget gate returns (None, transcript) once the task's ledger spend
+    # crosses the ceiling -- so execute_text=None + tool results present means
+    # "investigated until the money ran out", NOT "nothing usable". Reporting
+    # the empty path here threw away 40 already-paid-for tool results as a
+    # misleading "model call returned nothing usable" note. Synthesis is also
+    # gated by the same budget, so it will return '' -- the transcript itself
+    # is the deliverable now.
+    budget_stopped = (investigated and not (execute_text or '').strip()
+                      and _serve._task_budget_exhausted(task.get('id')))
+    if budget_stopped:
+        tool_n = sum(1 for m in (transcript or []) if m.get('role') == 'tool')
+        spent, attempts = _serve._task_budget_spent(task.get('id'))
+        _sim_module._store_content_result(task.get('id'), {
+            'ok': False,
+            'budgetExhausted': True,
+            'taskSpendUsd': spent,
+            'taskSpendAttempts': attempts,
+            'note': (f'Spike "{backlog}" gathered {tool_n} tool result(s) across the investigation, '
+                     f'then hit its model-spend budget (${spent:.4f}) before synthesis could run. '
+                     f'The plan and full transcript are preserved in the task checkpoint for resume.'),
+            'notifyPlayer': {'kind': 'spike_done',
+                             'subject': f'[AI Think Tank] Spike hit its budget: {backlog[:80]}',
+                             'body': (f'{name} investigated "{backlog}" ({tool_n} tool result(s) gathered) but the '
+                                      f'task\'s model-spend budget (${spent:.4f}) ran out before the report could be written. '
+                                     f'Grant more budget to resume -- the checkpoint carries the full evidence.')},
+        })
+        return
     if not investigated:
         # force_first_tool=True should make this unreachable in practice --
         # kept as an explicit, honest failure rather than synthesizing a
@@ -610,13 +647,26 @@ def _run_spike_content(snapshot, agent_id, task, base_ctx=None):
         task_id=task.get('id'))
     if not finding:
         finding = (execute_text or '').strip()
-    if not finding:
+    if not finding and investigated:
+        # Synthesis unavailable (model failure or the task budget exhausted
+        # between execute and synthesize) with REAL tool evidence in hand.
+        # This transcript was checkpointed by on_after_tools -- resume it with
+        # the budget decision left to the director, instead of discarding the
+        # run as "nothing usable". The next attempt resumes from the
+        # checkpoint (resume_transcript path) with the evidence intact, so no
+        # paid-for investigation is ever thrown away.
         _sim_module._store_content_result(task.get('id'), {
-            'note': f'Spiked "{backlog}", but the model call returned nothing usable.', 'ok': False,
+            'ok': False,
+            'infra': True,
+            'note': (f'Spiked "{backlog}": investigation evidence gathered ({sum(1 for m in (transcript or []) if m.get("role") == "tool")} '
+                     f'tool result(s)), but the synthesis model call returned nothing. The full transcript '
+                     f'is checkpointed; the retry resumes from the evidence instead of re-investigating.'),
+            'retryFromCheckpoint': True,
             'notifyPlayer': {'kind': 'spike_done',
-                             'subject': f'[AI Think Tank] Spike came up empty: {backlog[:80]}',
-                             'body': f'{name} looked into "{backlog}" but the model call returned nothing usable. You may want to ask again or rephrase it.'},
+                             'subject': f'[AI Think Tank] Spike synthesis empty: {backlog[:80]}',
+                             'body': f'{name} gathered real evidence for "{backlog}" but the report-writing call came back empty. The evidence is checkpointed for retry.'},
         })
+        return
         return
     # Deterministic safety net, not a prompt: confirmed
     # that the model doesn't reliably follow through on the VERIFICATION

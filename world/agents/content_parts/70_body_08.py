@@ -20,7 +20,7 @@ _GITHUB_SEARCH_TOOL = {
     },
 }
 
-_GITHUB_TOOL_NAMES = ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code')
+_GITHUB_TOOL_NAMES = ('github_get_repo', 'github_list_issues', 'github_get_issue', 'github_search_code', 'github_get_ci_run')
 
 
 def _make_github_tools_executor(agent_id, key):
@@ -118,6 +118,37 @@ def _make_github_tools_executor(agent_id, key):
             rows = [{'repo': ((it.get('repository') or {}).get('full_name')),
                      'path': it.get('path'), 'html_url': it.get('html_url')} for it in items]
             return json.dumps({'total_count': data.get('total_count'), 'matches': rows}, indent=1)[:4000]
+        if name == 'github_get_ci_run':
+            owner, repo = _owner_repo(args)
+            if not owner or not repo:
+                return 'owner and repo are required'
+            limit = min(int(args.get('limit') or 10), 20)
+            sha = (args.get('sha') or '').strip()
+            branch = (args.get('branch') or '').strip()
+            if sha:
+                url = f'{base}/repos/{q(owner, safe="")}/{q(repo, safe="")}/commits/{q(sha, safe="")}/check-runs'
+                purpose = 'check CI runs for one commit'
+            else:
+                url = f'{base}/repos/{q(owner, safe="")}/{q(repo, safe="")}/actions/runs?per_page={limit}'
+                if branch:
+                    url += f'&branch={q(branch, safe="")}'
+                purpose = 'check recent CI runs on a repo/branch'
+            data, error = _get(url, purpose)
+            if error:
+                return f'Could not read CI runs: {error}'
+            if sha and isinstance(data, dict):
+                runs = [{'id': r.get('id'), 'name': r.get('name'),
+                         'status': r.get('status'), 'conclusion': r.get('conclusion'),
+                         'sha': (r.get('head_sha') or '')[:12]}
+                        for r in ((data.get('check_runs') or [])[:limit])]
+            else:
+                raw = ((data or {}).get('workflow_runs') or [])[:limit]
+                runs = [{'id': r.get('id'), 'workflow': r.get('name'),
+                         'status': r.get('status'), 'conclusion': r.get('conclusion'),
+                         'branch': r.get('head_branch'),
+                         'sha': (r.get('head_sha') or '')[:12],
+                         'created': r.get('created_at')} for r in raw]
+            return json.dumps({'runs': runs}, indent=1)[:4000]
         raise ValueError(f'unknown tool: {name}')
     return execute_tool
 

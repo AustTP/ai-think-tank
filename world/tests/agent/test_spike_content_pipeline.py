@@ -367,6 +367,26 @@ class SpikeContent(unittest.TestCase):
         self.assertIn('execute_script to write', plan_system_text)
         self.assertIn('does NOT satisfy', plan_system_text)
 
+    def test_plan_prompt_requires_a_cheap_premise_probe_for_ci_questions(self):
+        """task-35967 post-mortem (2026-11-26): a spike investigating a CI
+        failure spent ~14 of its model calls on unauthenticated curl retries
+        against GitHub rate limits, and never noticed a newer green run had
+        already voided its premise. The PLAN instructions must make the
+        one-call authenticated CI premise check the FIRST item for
+        infrastructure-signal questions."""
+        self._common_mocks()
+        self._store()
+        task = {'id': 'spike-32', 'title': 'Investigate CI failure on main', 'budgetMs': 60000}
+        with self._mock_loop('summary'), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                         side_effect=[_completion('plan'), _completion('report')]) as oc:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        plan_system_text = oc.call_args_list[0].args[1][0]['content']
+        self.assertIn('CHEAP PREMISE PROBE FIRST', plan_system_text)
+        self.assertIn('github_get_ci_run', plan_system_text)
+        self.assertIn('newer green run', plan_system_text)
+        self.assertIn('unauthenticated execute_script curl', plan_system_text)
+
     def test_plan_prompt_requires_verification_honesty_for_judgment_columns(self):
         """Real refinement, caught reviewing an actual spike's
         output: a feasibility CSV looked equally authoritative whether each
@@ -597,18 +617,61 @@ class SpikeContent(unittest.TestCase):
     def test_both_synthesis_and_execute_empty_stores_nothing_usable(self):
         # Even with a real investigation (transcript has a tool result), when
         # BOTH the synthesis call AND the execute step's own closing text come
-        # back empty, the spike must fail honestly instead of filing an empty
-        # finding -- the exact same nothing-usable path as a non-investigation.
+        # back empty, the spike must fail honestly -- but with REAL evidence
+        # in hand, the failure is a synthesis failure, not "nothing usable":
+        # the transcript is checkpointed and the retry resumes from it.
         self._common_mocks()
         seen = self._store()
         task = {'id': 'spike-30', 'title': 'Review DreyX.com sources', 'budgetMs': 60000}
         with self._mock_loop(''), \
              unittest.mock.patch.object(serve, '_call_openrouter_sync',
-                                         side_effect=[_completion('plan'), _completion('')]):
+                                        side_effect=[_completion('plan'), _completion('')]):
             content._run_spike_content(_snapshot(), 'cora', task)
         self.assertFalse(seen['spike-30']['ok'])
-        self.assertIn('came up empty', seen['spike-30']['notifyPlayer']['subject'])
-        self.assertIn('nothing usable', seen['spike-30']['notifyPlayer']['body'])
+        self.assertTrue(seen['spike-30'].get('infra'))
+        self.assertTrue(seen['spike-30'].get('retryFromCheckpoint'))
+        self.assertIn('synthesis empty', seen['spike-30']['notifyPlayer']['subject'])
+        self.assertIn('evidence', seen['spike-30']['notifyPlayer']['body'])
+        self.assertNotIn('nothing usable', seen['spike-30']['notifyPlayer']['body'])
+
+    def test_budget_exhausted_mid_investigation_reports_honestly(self):
+        # task-35967 post-mortem (2026-11-26): the in-loop budget gate returns
+        # (None, transcript) once the task spend crosses its ceiling. The old
+        # code fell through to the "model call returned nothing usable" path
+        # and threw away 40 already-paid-for tool results. The budget-stopped
+        # path must report the honest cause and take the budgetExhausted
+        # branch (director notified, card fails closed) instead.
+        self._common_mocks()
+        seen = self._store()
+        task = {'id': 'spike-31', 'title': 'Investigate CI failure', 'budgetMs': 60000}
+        # Real call sequence of _task_budget_exhausted in one run: the
+        # executor's up-front gate, the PLAN _plain_completion's own gate,
+        # the reflection _plain_completion's gate, and finally the
+        # budget-stop detection after the loop. The real gate fires False on
+        # every check UNTIL the post-loop detection, which must see True to
+        # take the honest budget-stopped branch -- mirrored with a stateful
+        # stub returning True on the 4th call.
+        calls = []
+        def gate(_task_id):
+            calls.append(1)
+            return len(calls) >= 4
+        with unittest.mock.patch.object(serve, '_task_budget_exhausted', side_effect=gate), \
+             unittest.mock.patch.object(serve, '_task_budget_spent',
+                                        return_value=(0.65, 41)), \
+             self._mock_loop(None), \
+             unittest.mock.patch.object(serve, '_call_openrouter_sync',
+                                        side_effect=[_completion('plan'), _completion('')]) as oc:
+            content._run_spike_content(_snapshot(), 'cora', task)
+        result = seen['spike-31']
+        self.assertFalse(result['ok'])
+        self.assertTrue(result.get('budgetExhausted'))
+        self.assertEqual(result.get('taskSpendUsd'), 0.65)
+        self.assertEqual(result.get('taskSpendAttempts'), 41)
+        self.assertIn('tool result', result['note'])
+        self.assertIn('budget', result['notifyPlayer']['subject'].lower())
+        # Synthesis is never attempted: the budget gate would only return '',
+        # so the reflection call is the last _call_openrouter_sync of the run.
+        self.assertEqual(oc.call_count, 2)
 
     def test_run_on_colab_tool_absent_when_colab_cli_unavailable(self):
         # Same conditional-availability rule as search_web/GitHub/Apify: no
