@@ -1103,6 +1103,55 @@ def _task_attention_age_ms(task):
     return max(0, int(time.time() * 1000) - int(max(anchors)))
 
 
+# Archived-task compaction (2026-11-27): terminal tasks are history, not
+# working context, but they are materialized on EVERY state read and every
+# content snapshot base (the merged view is json.loads'd wholesale). The
+# 2026-11-08/10 review churn embedded whole review write-ups into each fix
+# card's 'instructions' (~541 KB apiece, 9,814 cards, 721 MB of the 793 MB
+# archive), so the merged state sat near 813 MB and every state op churned
+# GBs of RSS. The cap keeps the card's identity, lineage, verdicts and
+# Library pointers; prose above 4 KB becomes a 2 KB excerpt with a marker
+# saying where the full trail lives. Copy-on-write: an unchanged value comes
+# back as the SAME object, so the save path's compare-then-upsert still
+# skips untouched rows.
+ARCHIVE_STR_TRIGGER = 4000
+ARCHIVE_STR_KEEP = 2000
+_ARCHIVE_CUT_MARK = '…[truncated {} chars; full trail in action_log]'
+
+
+def _compact_archived_value(value):
+    if isinstance(value, str):
+        if len(value) <= ARCHIVE_STR_TRIGGER:
+            return value
+        return value[:ARCHIVE_STR_KEEP] + _ARCHIVE_CUT_MARK.format(
+            len(value) - ARCHIVE_STR_KEEP)
+    if isinstance(value, dict):
+        out = value
+        for key, val in value.items():
+            compact = _compact_archived_value(val)
+            if compact is not val:
+                if out is value:
+                    out = dict(value)
+                out[key] = compact
+        return out
+    if isinstance(value, list):
+        out = value
+        for i, val in enumerate(value):
+            compact = _compact_archived_value(val)
+            if compact is not val:
+                if out is value:
+                    out = list(value)
+                out[i] = compact
+        return out
+    return value
+
+
+def _compact_archived_task(task):
+    if not isinstance(task, dict):
+        return task
+    return _compact_archived_value(task)
+
+
 MANUAL_ATTENTION_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 
@@ -1691,7 +1740,12 @@ def _save_state_to_db_sync(data):
         # for minutes at a time (caught 2026-11-07).
         tasks = data.get('tasks') or {}
         task_items = list(tasks.items())
-        done = {tid: t for tid, t in task_items if _is_archived_task(t)}
+        # Compact BEFORE the compare-then-upsert: the archive cache holds the
+        # compacted form, so an unchanged terminal task compares equal and
+        # never rewrites its row (a post-upsert compaction would instead
+        # differ from its row every save and churn the archive table).
+        done = {tid: _compact_archived_task(t) for tid, t in task_items
+                if _is_archived_task(t)}
         # A surviving task may still point at a terminal one -- a repair child
         # mid-flight references its failed parent. Never archive a task a
         # surviving task references, or the child's completion lookup loses
