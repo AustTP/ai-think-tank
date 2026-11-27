@@ -906,6 +906,15 @@ def record_memory_provenance(state, actor, page_id, title, claim, source,
     }
     ledger = state.setdefault('memoryLedger', [])
     ledger.append(entry)
+    # Rower identity for this section is str(ts): two entries sharing a ts
+    # (same-millisecond writes, or an int and a string of the same digits)
+    # would make the rower fail the whole section closed forever -- the
+    # ledger reverts to blob storage with no path back. Bump the new ts
+    # past every identity collision; audit order stays monotonic and the
+    # drift is bounded by the collision count.
+    while any(str(e.get('ts')) == str(entry['ts'])
+              for e in ledger if e is not entry):
+        entry['ts'] += 1
     cap = _memory_ledger_cap()
     if len(ledger) > cap:
         del ledger[:len(ledger) - cap]

@@ -258,6 +258,39 @@ class WikiHelpers(unittest.TestCase):
                                              village_id='main')
         self.assertEqual(len(state['memoryLedger']), 3)
 
+    def test_memory_ledger_ts_collision_bumped_unique(self):
+        # Two writes inside the same millisecond must not share a ts: the
+        # list-ts rower keys row identity on it and duplicate identity
+        # would fail the whole section closed (ledger reverts to blob).
+        state = _make_product_state()
+        with unittest.mock.patch.object(sim, '_time_ms',
+                                        lambda: 1791862892393):
+            for _ in range(5):
+                sim.record_memory_provenance(state, 'maya', 'p', 'P', 'claim',
+                                             source=None, scope='team',
+                                             clock=sim.SLOW_CLOCK,
+                                             review_after_ms=None,
+                                             village_id='main')
+        ts_list = [e['ts'] for e in state['memoryLedger']]
+        self.assertEqual(ts_list, [1791862892393 + i for i in range(5)])
+
+    def test_memory_ledger_string_ts_collision_bumped(self):
+        # The rower identity is str(ts), so a legacy string-ts entry
+        # collides with a new int ts of the same digits. The writer must
+        # compare and bump by that same identity rule.
+        state = _make_product_state()
+        state['memoryLedger'] = [{'ts': '1791862892393', 'actor': 'old'}]
+        with unittest.mock.patch.object(sim, '_time_ms',
+                                        lambda: 1791862892393):
+            sim.record_memory_provenance(state, 'maya', 'p', 'P', 'claim',
+                                         source=None, scope='team',
+                                         clock=sim.SLOW_CLOCK,
+                                         review_after_ms=None,
+                                         village_id='main')
+        self.assertEqual(str(state['memoryLedger'][-1]['ts']),
+                         '1791862892394')
+        self.assertEqual(state['memoryLedger'][0]['ts'], '1791862892393')
+
     def test_resolve_memory_fields_defaults_and_overrides(self):
         state = _make_product_state()
         import time as _t
