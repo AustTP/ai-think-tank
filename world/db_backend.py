@@ -899,17 +899,22 @@ def is_postgres():
 def _test_sandboxed():
     """True when this process must NEVER open the production database: a
     pytest run (tests/conftest.py copies the DB and points THINK_TANK_DB at
-    the copy) or any process that sets THINK_TANK_FORCE_SQLITE explicitly.
-    This is the guard that keeps the repo-.env DSN -- a PRODUCTION pointer --
-    from silently redirecting test reads and writes into the live world:
-    when the DSN was added to .env, every unguarded test process started
-    hitting Postgres instead of its own isolated SQLite copy, and fixture
-    saves clobbered the live row tables."""
+    the copy), any plain-unittest run, or any process that sets
+    THINK_TANK_FORCE_SQLITE explicitly. This is the guard that keeps the
+    repo-.env DSN -- a PRODUCTION pointer -- from silently redirecting test
+    reads and writes into the live world: when the DSN was added to .env,
+    every unguarded test process started hitting Postgres instead of its
+    own isolated SQLite copy, and fixture saves clobbered the live row
+    tables. Incident 2026-11-27: state tests run under PLAIN unittest (no
+    pytest in sys.modules) were not sandboxed and their setUp DELETEs
+    (kv_state, state_checksum, task_archive) wiped the production tables;
+    'unittest' in sys.modules covers any test-module import, and serve.py
+    never imports unittest in production."""
     import os
     if os.environ.get('THINK_TANK_FORCE_SQLITE'):
         return True
     import sys
-    return 'pytest' in sys.modules
+    return 'pytest' in sys.modules or 'unittest' in sys.modules
 
 
 def _dsn():
