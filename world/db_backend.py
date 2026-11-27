@@ -984,7 +984,7 @@ def _PG_CONNECT_KWARGS():
         'keepalives_idle': 30,
         'keepalives_interval': 10,
         'keepalives_count': 3,
-        # 2026-11-20 wedge (95-minute tank freeze): a result-read stalled
+        # 2026-11-27 stall: a result-read stalled
         # mid-stream inside get_state_from_db()'s multi-MB blob transfer.
         # statement_timeout cannot fire (the statement finished server-side;
         # only the result stream stalled), and keepalives pass through the
@@ -996,6 +996,15 @@ def _PG_CONNECT_KWARGS():
         # a fast, retryable error instead of a hung socket. Requires libpq
         # >=12 (this host ships 17; verified 2026-11-20).
         'tcp_user_timeout': 45000,
+        # 2026-11-27: set the liveness GUCs at CONNECT time instead of
+        # relying on per-checkout priming. A session desynced mid-save held
+        # the mc_tasks projection transaction open for ~50 minutes because
+        # its per-checkout prime had been skipped (the _PRIMED_CONNS id()
+        # set below can miss recycled connections). Session-scoped GUCs
+        # need no round trips and cannot be skipped.
+        'options': ('-c statement_timeout=%d '
+                    '-c idle_in_transaction_session_timeout=300000'
+                    % _STATEMENT_TIMEOUT_MS),
     }
 
 
@@ -1009,6 +1018,13 @@ def _prime_session(raw):
     try:
         cur = raw.cursor()
         cur.execute('SET statement_timeout = %d' % _STATEMENT_TIMEOUT_MS)
+        # 2026-11-27 stall: a session left idle-in-transaction (aborted)
+        # inside the dormancy advisory-lock transaction held lock 20261114
+        # for ~25 minutes because Aiven's own idle_in_transaction_session_
+        # timeout is 1 day and nothing rolled it back sooner. 5 minutes
+        # bounds any wedged transaction far below that while staying well
+        # clear of legitimate multi-second statement gaps.
+        cur.execute('SET idle_in_transaction_session_timeout = 300000')
         raw.commit()
         cur.close()
     except Exception:
@@ -1057,17 +1073,23 @@ def _apply_socket_timeouts(raw):
 _SOCKET_TIMEOUT_S = 90
 
 
-_PRIMED_CONNS = set()
-
-
 def _checkout(dsn):
     try:
         pool = _get_pool(dsn)
         raw = pool.getconn()
         _apply_socket_timeouts(raw)
-        if id(raw) not in _PRIMED_CONNS:
+        # Key the once-only prime on the connection object itself: id() is
+        # a memory address Python reuses after GC, so a set of ids could
+        # (and did) miss priming a recycled pooled connection -- that
+        # unprimed session then ran with no liveness GUCs and held a
+        # projection transaction open ~50 minutes (2026-11-27). The GUCs
+        # also arrive via connect options now; this remains as fallback.
+        if not getattr(raw, '_tt_primed', False):
             _prime_session(raw)
-            _PRIMED_CONNS.add(id(raw))
+            try:
+                raw._tt_primed = True
+            except Exception:
+                pass
         return raw, pool
     except Exception:
         # Pool exhausted or unusable: fall back to an unpooled connection

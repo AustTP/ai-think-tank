@@ -372,6 +372,53 @@ _WINDOW_CRITERIA = [
 
 _DORMANCY_LOCK_SQL = 'SELECT pg_advisory_xact_lock(20261114)'
 
+_DORMANCY_WINDOW_COLUMNS = (
+    ('validator', 'TEXT'),
+    ('validator_status', 'TEXT'),
+    ('validator_note', 'TEXT'),
+    ('validated_at', 'REAL'),
+    ('remediation_used', 'INTEGER'),
+    ('gate_tail', 'TEXT'),
+    ('validator_attempt_at', 'REAL'),
+    ('validator_attempts', 'INTEGER'),
+    ('push_status', 'TEXT'),
+    ('push_category', 'TEXT'),
+    ('push_note', 'TEXT'),
+    ('push_sha', 'TEXT'),
+    ('pushed_at', 'REAL'),
+    ('admin_status', 'TEXT'),
+    ('admin_note', 'TEXT'),
+    ('admin_approved_at', 'REAL'),
+    ('admin_agent', 'TEXT'),
+    ('supervisor', 'TEXT'),
+    # Change-request detail (2026-10-22): enough context to review
+    # the change, not just the slot. High-risk modes require these.
+    ('title', 'TEXT'),
+    ('description', 'TEXT'),
+    ('change_type', 'TEXT'),
+    ('risk_level', 'TEXT'),
+    ('service_mode', 'TEXT'),
+    ('affected_services', 'TEXT'),
+    ('file_manifest', 'TEXT'),
+    ('rollback_plan', 'TEXT'),
+    ('rollback_owner', 'TEXT'),
+    ('success_criteria', 'TEXT'),
+    ('abort_criteria', 'TEXT'),
+    ('post_apply_checks', 'TEXT'),
+    ('safe_state_plan', 'TEXT'),
+    ('restore_plan', 'TEXT'),
+    ('on_call', 'TEXT'),
+    ('acknowledgements', 'TEXT'),
+    ('blackout_windows', 'TEXT'),
+    ('pre_apply_result', 'TEXT'),
+    ('pre_apply_tail', 'TEXT'),
+    ('fire_recheck', 'TEXT'),
+    ('deferred_reason', 'TEXT'),
+    ('vetoed_by', 'TEXT'),
+    ('vetoed_at', 'REAL'),
+    ('veto_reason', 'TEXT'),
+    ('veto_token', 'TEXT'))
+
 
 def _ensure_windows_table(conn):
     # Deadlock fix (2026-11-14): two tanks deadlocked on dormancy_windows --
@@ -383,7 +430,22 @@ def _ensure_windows_table(conn):
     # removes the lock-order inversion. pg_advisory_xact_lock is re-entrant
     # within one transaction and holds until commit/rollback; SQLite
     # (tests, THINK_TANK_DB) skips it entirely via the dialect flag.
-    if getattr(conn, 'postgres', False):
+    # Stall fix (2026-11-27): the migration used to take the advisory lock
+    # and run every ALTER on every tick, swallowing the ~40 "column exists"
+    # errors through statement savepoints INSIDE the locked transaction. A
+    # session wedged there then held the global lock while window_tick
+    # threads stacked up behind it until the executor pool starved (25
+    # minute tank stall, 2026-11-27 04:22-04:47 UTC). Now the advisory lock
+    # and ALTERs only run when a column is actually missing; the
+    # steady-state tick is two IF NOT EXISTS no-ops with no global lock.
+    have = set()
+    try:
+        have = {r[1] for r in conn.execute(
+            'PRAGMA table_info(dormancy_windows)').fetchall()}
+    except Exception:
+        have = set()
+    missing = [(c, d) for c, d in _DORMANCY_WINDOW_COLUMNS if c not in have]
+    if getattr(conn, 'postgres', False) and (not have or missing):
         conn.execute(_DORMANCY_LOCK_SQL)
     conn.execute(
         'CREATE TABLE IF NOT EXISTS dormancy_windows ('
@@ -400,56 +462,11 @@ def _ensure_windows_table(conn):
     # validated bytes be pushed to origin main. Every push outcome carries a
     # category (successful / successful_with_issues / unsuccessful); a
     # successful_with_issues push REQUIRES a non-empty note.
-    for col, decl in (
-            ('validator', 'TEXT'),
-            ('validator_status', 'TEXT'),
-            ('validator_note', 'TEXT'),
-            ('validated_at', 'REAL'),
-            ('remediation_used', 'INTEGER'),
-            ('gate_tail', 'TEXT'),
-            ('validator_attempt_at', 'REAL'),
-            ('validator_attempts', 'INTEGER'),
-            ('push_status', 'TEXT'),
-            ('push_category', 'TEXT'),
-            ('push_note', 'TEXT'),
-            ('push_sha', 'TEXT'),
-            ('pushed_at', 'REAL'),
-            ('admin_status', 'TEXT'),
-            ('admin_note', 'TEXT'),
-            ('admin_approved_at', 'REAL'),
-            ('admin_agent', 'TEXT'),
-            ('supervisor', 'TEXT'),
-            # Change-request detail (2026-10-22): enough context to review
-            # the change, not just the slot. High-risk modes require these.
-            ('title', 'TEXT'),
-            ('description', 'TEXT'),
-            ('change_type', 'TEXT'),
-            ('risk_level', 'TEXT'),
-            ('service_mode', 'TEXT'),
-            ('affected_services', 'TEXT'),
-            ('file_manifest', 'TEXT'),
-            ('rollback_plan', 'TEXT'),
-            ('rollback_owner', 'TEXT'),
-            ('success_criteria', 'TEXT'),
-            ('abort_criteria', 'TEXT'),
-            ('post_apply_checks', 'TEXT'),
-            ('safe_state_plan', 'TEXT'),
-            ('restore_plan', 'TEXT'),
-            ('on_call', 'TEXT'),
-            ('acknowledgements', 'TEXT'),
-            ('blackout_windows', 'TEXT'),
-            ('pre_apply_result', 'TEXT'),
-            ('pre_apply_tail', 'TEXT'),
-            ('fire_recheck', 'TEXT'),
-            ('deferred_reason', 'TEXT'),
-            ('vetoed_by', 'TEXT'),
-            ('vetoed_at', 'REAL'),
-            ('veto_reason', 'TEXT'),
-            ('veto_token', 'TEXT')):
+    for col, decl in missing:
         try:
             conn.execute(f'ALTER TABLE dormancy_windows ADD COLUMN {col} {decl}')
         except sqlite3.OperationalError:
-            pass  # column already exists
+            pass  # column already exists (another writer raced us to it)
 
 
 def _notify_agent(agent_id, text, about=''):
