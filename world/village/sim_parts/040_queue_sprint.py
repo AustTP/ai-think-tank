@@ -865,12 +865,31 @@ def _page_is_expired(rec, now_ms):
     return bool(review_after and int(review_after) < now_ms)
 
 
+_MEMORY_LEDGER_CAP = 60
+
+
+def _memory_ledger_cap():
+    """Keep the newest N provenance entries. The ledger is append-only and
+    read newest-first by /api/memory-ledger; unbounded it owned most of the
+    state blob (141 entries ~ 2.2KB each, 57% of the 546KB blob by
+    2026-11-27). MEMORY_LEDGER_CAP overrides for an operator who wants a
+    longer trail; tests get the deterministic default."""
+    import os
+    try:
+        return max(1, int(os.environ.get('MEMORY_LEDGER_CAP',
+                                         str(_MEMORY_LEDGER_CAP))))
+    except ValueError:
+        return _MEMORY_LEDGER_CAP
+
+
 def record_memory_provenance(state, actor, page_id, title, claim, source,
                              scope, clock, review_after_ms, village_id):
     """Pure: append a memory-write provenance entry to state['memoryLedger'].
     This is the audit trail (rari's external ledger) that answers "what did the
     team learn, where, who owns it, and when to recheck" -- independent of the
     wiki body so a stale or wrong memory can be found and corrected later.
+    Bounded: only the newest _memory_ledger_cap() entries survive (the reader
+    is newest-first, so the oldest provenance is what gets dropped).
     Best-effort; a ledger append never blocks the write."""
     entry = {
         'ts': _time_ms(),
@@ -885,7 +904,11 @@ def record_memory_provenance(state, actor, page_id, title, claim, source,
         'villageId': village_id,
         'reviewAfterMs': int(review_after_ms) if review_after_ms else None,
     }
-    state.setdefault('memoryLedger', []).append(entry)
+    ledger = state.setdefault('memoryLedger', [])
+    ledger.append(entry)
+    cap = _memory_ledger_cap()
+    if len(ledger) > cap:
+        del ledger[:len(ledger) - cap]
     return entry
 
 

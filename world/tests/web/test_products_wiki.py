@@ -228,6 +228,36 @@ class WikiHelpers(unittest.TestCase):
         self.assertEqual(entry['reviewAfterMs'], 123)
         self.assertEqual(len(state['memoryLedger']), 1)
 
+    def test_memory_provenance_ledger_is_bounded(self):
+        # Append-only audit trail read newest-first: only the newest
+        # _MEMORY_LEDGER_CAP entries survive the cap.
+        state = _make_product_state()
+        first = sim.record_memory_provenance(state, 'maya', 'p', 'P', 'oldest',
+                                             source=None, scope='team',
+                                             clock=sim.SLOW_CLOCK,
+                                             review_after_ms=None,
+                                             village_id='main')
+        for _ in range(sim._MEMORY_LEDGER_CAP + 5):
+            sim.record_memory_provenance(state, 'maya', 'p', 'P', 'newer',
+                                         source=None, scope='team',
+                                         clock=sim.SLOW_CLOCK,
+                                         review_after_ms=None,
+                                         village_id='main')
+        self.assertEqual(len(state['memoryLedger']), sim._MEMORY_LEDGER_CAP)
+        self.assertNotIn(first, state['memoryLedger'])
+        self.assertEqual(state['memoryLedger'][-1]['claim'], 'newer')
+
+    def test_memory_ledger_cap_env_override(self):
+        state = _make_product_state()
+        with unittest.mock.patch.dict(os.environ, {'MEMORY_LEDGER_CAP': '3'}):
+            for _ in range(5):
+                sim.record_memory_provenance(state, 'maya', 'p', 'P', 'claim',
+                                             source=None, scope='team',
+                                             clock=sim.SLOW_CLOCK,
+                                             review_after_ms=None,
+                                             village_id='main')
+        self.assertEqual(len(state['memoryLedger']), 3)
+
     def test_resolve_memory_fields_defaults_and_overrides(self):
         state = _make_product_state()
         import time as _t
