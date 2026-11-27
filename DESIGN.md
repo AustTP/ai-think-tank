@@ -746,8 +746,8 @@ grow the file without bound.
 ## 13. Video-Takeaway Mapping
 
 Three videos were reviewed and their takeaway lessons checked against the
-codebase. The mapping is already operationalized (the transcripts themselves
-are private and not published):
+codebase. The mapping is already operationalized — the lessons live in the
+code, not in published transcripts:
 
 | Video lesson | Where it lives |
 |--------------|----------------|
@@ -915,8 +915,9 @@ memory is Telegram-bridge-only.
   with a staleness decay — so an offhand false fact the player mentioned once
   does not outrank a stable, repeated one (poisoning defense).
 - Every write into persisted memory (LTM insert, STM summary merge) runs
-  through `_redact_secrets`: passwords, API keys, bearer tokens, JWT, git and
-  Databricks tokens, and connection-string passwords become
+  through `_redact_secrets`: passwords, API keys, bearer tokens, JWTs,
+  GitHub/GitLab tokens (`ghp_…`/`glpat-…`), Databricks access tokens
+  (`dapi…`), and connection-string passwords become
   `[REDACTED:TYPE]` — REDACT, not block, so the memory keeps its context while
   the secret value can never be re-injected into a later ask.
 - `ltm_memories` gained `confidence` / `source_type` / `fact_checked` columns;

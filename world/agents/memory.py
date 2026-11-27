@@ -87,7 +87,7 @@ _CREDENTIAL_PATTERNS = (
     ('CONN_STRING', re.compile(r"(password|pwd|passwd)\s*=\s*[^\s;]+", re.IGNORECASE)),
     ('JWT', re.compile(r"eyJ[a-zA-Z0-9_-]+\.eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+")),
     ('GIT_TOKEN', re.compile(r"\b(ghp_|gho_|ghu_|ghs_|ghr_|glpat-)[a-zA-Z0-9_]{20,}\b")),
-    ('DAPI_TOKEN', re.compile(r"\bdapi[a-f0-9]{32,}\b", re.IGNORECASE)),
+    ('DAPI_TOKEN', re.compile(r"\bdapi[a-f0-9]{32,}\b", re.IGNORECASE)),  # Databricks personal access token shape
     # 2026-11-01: sk- prefixed keys (OpenRouter sk-or-v1-, OpenAI sk-proj-,
     # Anthropic sk-ant-, Stripe sk-live/sk-test) were the one common shape
     # the filters above missed; agent work-notes quote them routinely.
