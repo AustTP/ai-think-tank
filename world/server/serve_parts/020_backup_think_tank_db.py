@@ -1436,6 +1436,12 @@ def _merge_live_tasks(data):
     ordering."""
     rows = _task_live_rows_snapshot()
     if not rows:
+        if 'tasks' not in data:
+            # Empty live set and no legacy blob copy: give readers the
+            # shape's default so direct indexing (state['tasks']) keeps
+            # working, exactly as the extracted sections do on an empty
+            # rowed section.
+            data['tasks'] = {}
         return
     data['tasks'] = {**(data.get('tasks') or {}), **copy.deepcopy(rows)}
 
@@ -1552,12 +1558,32 @@ EXTRACTED_SECTIONS = (
     # shape notes: 'dict' rows are keyed by entry id (values must be dicts);
     # 'dict-lists' rows are keyed by the dict key with the entry's LIST as
     # the row blob (growthPlans maps agent id -> [plan revisions]);
+    # 'dict-scalar' rows are keyed by the dict key with the entry's SCALAR
+    # value as the row blob (a notify timestamp, a replan counter);
     # 'list' rows keep order via seq and require every entry to carry an id.
     ('helpSignals', 'help_signal', 'list'),
     ('issues', 'tracked_issue', 'dict'),
     ('wakeQueue', 'wake_entry', 'list'),
     ('backlogRequests', 'backlog_request', 'list'),
     ('completedDeliverables', 'completed_deliverable', 'list'),
+    # Round 3 (2026-11-27): the bookkeeping dicts. These mutate one key at
+    # a time (a mail sent, a failure notified, a fire recorded) but were
+    # re-serialized into the blob on EVERY save -- together ~820KB of a
+    # 3.4MB blob at a 142-agent tank. firedAgents / storyCostTracking
+    # values are dicts (the existing 'dict' shape applies), _feedback
+    # values are per-agent text lists ('dict-lists'), and the five notify/
+    # counter dicts are scalar maps measured as int-only ('dict-scalar',
+    # new shape: the row blob is the scalar itself). memoryLedger stays in
+    # the blob: its entries carry no stable id, so the rower would fail
+    # closed on every save (harmless, but no win).
+    ('firedAgents', 'fired_agent', 'dict'),
+    ('storyCostTracking', 'story_cost_tracking', 'dict'),
+    ('_feedback', 'feedback_note', 'dict-lists'),
+    ('_cardFailureNotified', 'card_failure_notified', 'dict-scalar'),
+    ('_lastEmailAt', 'last_email_at', 'dict-scalar'),
+    ('_repairLoopNotified', 'repair_loop_notified', 'dict-scalar'),
+    ('_staleWorkReplans', 'stale_work_replan', 'dict-scalar'),
+    ('_patternSuppressedNotified', 'pattern_suppressed_notified', 'dict-scalar'),
 )
 _EXTRACTED_LOCK = threading.Lock()
 _EXTRACTED_CACHE = {key: {'db': None, 'loaded': False, 'rows': {}}
@@ -1629,7 +1655,8 @@ def _reconcile_extracted_sections(conn, data):
     transaction: upsert new/changed rows, delete removed ones. Returns the
     section keys that may be dropped from the blob (reconcile succeeded); a
     section that cannot be rowed (absent from the state, not a list/dict,
-    entries without ids) or whose table write fails keeps its blob copy --
+    entries without ids or, for dict-scalar, non-scalar values) or whose
+    table write fails keeps its blob copy --
     never lose data. An ABSENT key means the saved state has no such section:
     the blob write it accompanies is a full replace (every writer passes the
     whole state), so absent rows are DELETED exactly as the blob replace would
@@ -1652,7 +1679,7 @@ def _reconcile_extracted_sections(conn, data):
             unrowable = False
         elif not isinstance(entries, (list, dict)) or (
                 shape == 'list' and not isinstance(entries, list)) or (
-                shape in ('dict', 'dict-lists')
+                shape in ('dict', 'dict-lists', 'dict-scalar')
                 and not isinstance(entries, dict)):
             # Present but unrowable (fail-closed): the blob keeps its copy,
             # the rows stay -- no information is lost either way.
@@ -1662,11 +1689,15 @@ def _reconcile_extracted_sections(conn, data):
         else:
             desired = {}
             unrowable = False
-            if shape in ('dict', 'dict-lists'):
+            if shape in ('dict', 'dict-lists', 'dict-scalar'):
                 for rid, entry in entries.items():
                     if (not isinstance(rid, str) or not rid
                             or (shape == 'dict'
-                                and not isinstance(entry, dict))):
+                                and not isinstance(entry, dict))
+                            or (shape == 'dict-scalar'
+                                and not isinstance(
+                                    entry, (bool, int, float, str))
+                                and entry is not None)):
                         unrowable = True
                         break
                     desired[rid] = (0, entry)

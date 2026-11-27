@@ -73,6 +73,15 @@ ROUND2_TABLES = ('growth_plan', 'help_signal', 'tracked_issue',
 ROUND2_KEYS = ('growthPlans', 'helpSignals', 'issues', 'wakeQueue',
                'backlogRequests', 'completedDeliverables')
 
+# Round-3 sections (2026-11-27): the bookkeeping dicts.
+STAGE2_TABLES = ('fired_agent', 'story_cost_tracking', 'feedback_note',
+                 'card_failure_notified', 'last_email_at',
+                 'repair_loop_notified', 'stale_work_replan',
+                 'pattern_suppressed_notified')
+STAGE2_KEYS = ('firedAgents', 'storyCostTracking', '_feedback',
+               '_cardFailureNotified', '_lastEmailAt', '_repairLoopNotified',
+               '_staleWorkReplans', '_patternSuppressedNotified')
+
 
 def _with_round2(state):
     state['growthPlans'] = {
@@ -100,6 +109,29 @@ def _with_round2(state):
     return state
 
 
+def _with_stage2(state):
+    state['firedAgents'] = {
+        'liam': {'name': 'Liam', 'firedAt': 1792588474808,
+                 'reason': 'never reachable'},
+    }
+    state['storyCostTracking'] = {
+        'stories': {'task-6042': {'used': 1.5, 'calls': 3}},
+        'scrumMasters': {'ruth': {'used': 14.58, 'calls': 2}},
+    }
+    state['_feedback'] = {
+        'cora': [{'text': 'Your deliverable failed the rubric',
+                  'source': 'pipeline'}],
+    }
+    state['_cardFailureNotified'] = {
+        'observatory|Distill recent think tank k': 1793819623028}
+    state['_lastEmailAt'] = {'card_report:task-4': 1791683180424,
+                             'spike_done': 1795733599755}
+    state['_repairLoopNotified'] = {'repair_loop:[BUG] Re-open task-3': 1793004915876}
+    state['_staleWorkReplans'] = {'(Read and analyze all StealthX sites': 1}
+    state['_patternSuppressedNotified'] = {'issue:NORA-209': 1793804310553}
+    return state
+
+
 def _raw_blob():
     with serve._db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
@@ -122,7 +154,7 @@ class StateSplitTest(unittest.TestCase):
         serve.init_db()
         with serve._db() as conn:
             for table in ('roster_agent', 'live_agent', 'inbox_message',
-                          'sim_agent_snapshot') + ROUND2_TABLES:
+                          'sim_agent_snapshot') + ROUND2_TABLES + STAGE2_TABLES:
                 conn.execute(f'DELETE FROM {table}')
             conn.execute('DELETE FROM kv_state')
             conn.execute('DELETE FROM state_checksum')
@@ -342,3 +374,107 @@ class Round2StateSplitTest(StateSplitTest):
                 ('ada',)).fetchone()
         self.assertEqual(json.loads(row[0]),
                          [{'goal': 'build', 'route': 'staffed'}])
+
+
+class Stage2BookkeepingSplitTest(StateSplitTest):
+    """The 2026-11-27 sections: the bookkeeping dicts. firedAgents /
+    storyCostTracking row with the existing 'dict' shape, _feedback with
+    'dict-lists', and the five notify/counter dicts with the new
+    'dict-scalar' shape (the row blob is the scalar value itself)."""
+
+    def test_round_trip_preserves_exact_shapes(self):
+        state = _with_stage2(_base_state())
+        serve.save_state_to_db(copy.deepcopy(state))
+        back = serve.get_state_from_db()
+        for key in STAGE2_KEYS:
+            self.assertEqual(back[key], state[key], key)
+        # json round-trips 1 as int and could alias True == 1 in a dict
+        # comparison, so assert the type explicitly for a counter value.
+        self.assertIsInstance(
+            next(iter(back['_staleWorkReplans'].values())), int)
+
+    def test_blob_drops_stage2_keys_and_rows_carry_them(self):
+        serve.save_state_to_db(_with_stage2(_base_state()))
+        blob = _raw_blob()
+        for key in STAGE2_KEYS:
+            self.assertNotIn(key, blob, key)
+        with serve._db() as conn:
+            for table, count in (('fired_agent', 1),
+                                 ('story_cost_tracking', 2),
+                                 ('feedback_note', 1),
+                                 ('card_failure_notified', 1),
+                                 ('last_email_at', 2),
+                                 ('repair_loop_notified', 1),
+                                 ('stale_work_replan', 1),
+                                 ('pattern_suppressed_notified', 1)):
+                self.assertEqual(
+                    conn.execute(f'SELECT COUNT(*) FROM {table}')
+                    .fetchone()[0], count, table)
+
+    def test_scalar_row_blob_is_the_scalar_itself(self):
+        serve.save_state_to_db(_with_stage2(_base_state()))
+        with serve._db() as conn:
+            blob = conn.execute(
+                'SELECT blob FROM last_email_at WHERE id = ?',
+                ('spike_done',)).fetchone()
+        self.assertEqual(blob[0], '1795733599755')
+
+    def test_legacy_blob_migrates_on_first_save(self):
+        # The state this slice exists for: production's blob still carries
+        # all eight bookkeeping keys with empty row tables. Reads serve the
+        # blob copy; the first save moves the keys into rows atomically.
+        legacy = _with_stage2(_base_state())
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?)',
+                (json.dumps(legacy), time.time()))
+        back = serve.get_state_from_db()
+        self.assertEqual(back['_lastEmailAt'], legacy['_lastEmailAt'])
+        serve.save_state_to_db(serve.get_state_from_db())
+        blob = _raw_blob()
+        for key in STAGE2_KEYS:
+            self.assertNotIn(key, blob, key)
+        again = serve.get_state_from_db()
+        self.assertEqual(again['_lastEmailAt'], legacy['_lastEmailAt'])
+        self.assertEqual(again['_cardFailureNotified'],
+                         legacy['_cardFailureNotified'])
+        self.assertEqual(again['_feedback'], legacy['_feedback'])
+        self.assertEqual(again['firedAgents'], legacy['firedAgents'])
+
+    def test_diff_save_rewrites_only_changed_scalar_rows(self):
+        serve.save_state_to_db(_with_stage2(_base_state()))
+        with serve._db() as conn:
+            before = dict(conn.execute(
+                'SELECT id, updated_at FROM last_email_at').fetchall())
+        time.sleep(0.02)
+        state = serve.get_state_from_db()
+        state['_lastEmailAt']['spike_done'] += 1
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            after = dict(conn.execute(
+                'SELECT id, updated_at FROM last_email_at').fetchall())
+        self.assertEqual(after['card_report:task-4'], before['card_report:task-4'])
+        self.assertGreater(after['spike_done'], before['spike_done'])
+
+    def test_unrowable_scalar_value_stays_in_blob(self):
+        # A notify dict whose value is a dict (shape drift at write time)
+        # cannot be rowed fail-closed: the blob keeps its copy, the rows
+        # stay -- no information is lost either way.
+        state = _with_stage2(_base_state())
+        state['_lastEmailAt']['weird'] = {'used': 1.0}
+        serve.save_state_to_db(state)
+        blob = _raw_blob()
+        self.assertIn('_lastEmailAt', blob)
+        back = serve.get_state_from_db()
+        self.assertEqual(back['_lastEmailAt'], state['_lastEmailAt'])
+
+    def test_absent_key_clears_the_section(self):
+        serve.save_state_to_db(_with_stage2(_base_state()))
+        state = serve.get_state_from_db()
+        state.pop('_lastEmailAt')
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM last_email_at').fetchone()[0], 0)
+        back = serve.get_state_from_db()
+        self.assertFalse(back.get('_lastEmailAt'))

@@ -396,6 +396,59 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Scale slices round 3 (2026-11-27): the bookkeeping dicts that are
+        # re-serialized into the blob on EVERY save but change one key at a
+        # time (a mail sent, a card notified, a fire recorded). Same shape
+        # and authority rule as the round-1/2 tables; the dict-scalar
+        # sections store the scalar value itself as the row blob.
+        conn.execute('''CREATE TABLE IF NOT EXISTS fired_agent (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS story_cost_tracking (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS feedback_note (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS card_failure_notified (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS last_email_at (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS repair_loop_notified (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS stale_work_replan (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS pattern_suppressed_notified (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Durable cursor for a live feed collector. AISStream is live-only, so
         # this records the last ingested frame and the reconnect coverage gap;
         # it is a checkpoint, not a replay buffer.
