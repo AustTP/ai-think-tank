@@ -1383,7 +1383,7 @@ def _reconcile_task_archive(done):
                 # + RELEASE), so a first-time migration of the done set
                 # (~8,400 rows) spent ~25 minutes inside one transaction. A
                 # batched page is one round trip.
-                _batch(conn, 
+                _batch(conn,
                     'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?) '
                     'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
                     [(tid, json.dumps(t), now) for tid, t in changed.items()])
@@ -1491,7 +1491,7 @@ def _reconcile_task_live(conn, live):
         # a first-time migration of the live set (~320 rows) spent ~1
         # minute inside one transaction. A batched page is one round trip.
         if changed:
-            _batch(conn, 
+            _batch(conn,
                 'INSERT INTO task_live (id, blob, updated_at) '
                 'VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET '
                 'blob = excluded.blob, updated_at = excluded.updated_at',
@@ -1825,7 +1825,7 @@ def _reconcile_extracted_sections(conn, data):
             # locks until every other writer timed out (caught 2026-11-27,
             # minutes after deploy). A batched page is one round trip.
             if changed:
-                _batch(conn, 
+                _batch(conn,
                     f'INSERT INTO {table} (id, seq, blob, updated_at) '
                     f'VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET '
                     f'seq = excluded.seq, blob = excluded.blob, '
