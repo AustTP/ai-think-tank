@@ -271,6 +271,44 @@ class DistillExecutor(unittest.TestCase):
         self.assertEqual(wk.call_count, 0)
         self.assertTrue(captured.get('noop'))
 
+    def test_leaked_reasoning_reply_is_rejected_never_written(self):
+        # v140 of the state-of-knowledge page (2026-11-04) was a leaked model
+        # meta-monologue ("The request asks me to return the best candidate
+        # verbatim...") that the executor wrote to the wiki verbatim. The
+        # leak guard must treat that reply shape as unusable: no wiki write,
+        # noop task result, and the rejected body goes nowhere (archive/
+        # would feed it back into the NEXT distillation).
+        tmp = tempfile.mkdtemp()
+        archive_dir = os.path.join(tmp, 'archive')
+        os.makedirs(archive_dir, exist_ok=True)
+        p = os.path.join(archive_dir, 'new.md')
+        with open(p, 'w') as f:
+            f.write('NEW FINDING')
+        os.utime(p, (_NOW_MS / 1000 - 100, _NOW_MS / 1000 - 100))
+        import serve as serve_mod
+        leaked = (
+            'The request asks me to return the best candidate verbatim. However, I need '
+            'to consider the system prompt constraints. Candidate 1 appears cut off. '
+            'Candidate 2 appears more comprehensive. The honest approach is to note '
+            'that I cannot verify these claims.')
+        wk, captured = None, {}
+        with mock.patch.object(serve_mod, 'LIBRARY_DIR', tmp), \
+             mock.patch.object(serve_mod, 'LIBRARY_ARCHIVE_DIR', archive_dir), \
+             mock.patch.object(serve_mod, '_mid_tier_slug', return_value='mid-tier'), \
+             mock.patch.object(serve_mod, '_http_json',
+                               side_effect=lambda *a, **k: {'reply': leaked}), \
+             mock.patch.object(serve_mod, 'get_or_create_agent_key', return_value='k'), \
+             mock.patch.object(serve_mod, '_write_wiki_server',
+                               return_value={'id': 'state-of-knowledge', 'version': 141}) as write_mock, \
+             mock.patch.object(sim, '_store_content_result',
+                               side_effect=lambda _tid, res: captured.update(res)):
+            from content import _run_distill_content
+            _run_distill_content({'agents': {}}, 'ada', _distill_task(distillSince=0))
+        self.assertEqual(write_mock.call_count, 0,
+                         'a leaked meta-monologue must never reach the wiki')
+        self.assertEqual(captured.get('rejectedReason'), 'leaked-reasoning')
+        self.assertTrue(captured.get('noop'))
+
     def test_cap_at_max_archives(self):
         files = [(f'find-{100 + i}.md', f'F{i}', int(_NOW_MS / 1000) - i)
                  for i in range(40)]

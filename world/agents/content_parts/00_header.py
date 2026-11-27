@@ -392,6 +392,29 @@ _DISTILL_WIKI_EXCERPT_CHARS = 6000
 _DISTILL_THINK_TANK_PAGE_ID = 'state-of-knowledge'
 _DISTILL_CSV_MIN_LINES = 3
 
+# v140 of the state-of-knowledge page (2026-11-04) was a leaked model
+# meta-monologue ("the request asks me to return the best candidate verbatim...")
+# instead of a merged page -- the synthesis model narrated ITS OWN reasoning
+# about the input and the executor wrote it to the wiki verbatim. These are
+# the idiom markers from that incident. One strong marker in the reply's head
+# is enough to reject: none of them belong in a knowledge-page body, and a
+# real synthesis would have to quote the incident note itself to trip them.
+_DISTILL_LEAKED_REASONING_MARKERS = (
+    'the request asks me',
+    'return the best candidate verbatim',
+    'candidate 1 appears',
+    'candidate 2 appears',
+    'i need to consider the system prompt',
+    'the system prompt contains rules',
+)
+
+
+def _looks_like_leaked_reasoning(text):
+    """True when a synthesis reply is model meta-reasoning rather than a
+    merged knowledge page. Guards the state-of-knowledge write (v140 leak)."""
+    head = (text or '')[:4000].lower()
+    return any(marker in head for marker in _DISTILL_LEAKED_REASONING_MARKERS)
+
 
 def _extract_csv_like_blocks(text):
     """Best-effort detection of real CSV/tabular data inside an archive
@@ -687,6 +710,19 @@ def _run_distill_content(snapshot, agent_id, task, base_ctx=None):
                 reply += (f'\n\n---\n\nRaw source data preserved from {fn} (added automatically -- '
                          f'the merge above may have summarized rather than kept this verbatim):\n\n'
                          f'```\n{block[:4000]}\n```')
+
+    # 4b. Leak guard: never write model meta-reasoning to the wiki. The
+    # v140 incident (2026-11-04) persisted an entire "should I output one
+    # candidate verbatim" monologue as the think tank's knowledge. Rejected
+    # replies go nowhere (NOT to archive/ -- the next distill run would read
+    # them back) and the task completes as a noop so the budget trail stays
+    # honest.
+    if _looks_like_leaked_reasoning(reply):
+        _sim_module._store_content_result(
+            task.get('id'),
+            {'note': f'Distilled {len(archives)} finding(s), but the synthesis call returned model meta-reasoning instead of a merged page; rejected, wiki not modified.',
+             'noop': True, 'rejectedReason': 'leaked-reasoning'})
+        return
 
     # 5. Persist as server authority (chains the passport; survives autosave).
     record = _serve._write_wiki_server(
