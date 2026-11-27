@@ -341,6 +341,30 @@ async def delete_handle(handle: str, request: Request):
     return JSONResponse({'ok': True})
 
 
+# 2026-11-27: the experiment inference endpoints authenticate with a minted
+# grant token (not a session or agent key) and are publicly routed -- they
+# sit in AUTH_PUBLIC_PATHS. Nothing bounded their call rate: an operator
+# error in a notebook could flood the model-spend path, and a probing client
+# could hammer the token check unlogged. One IP-keyed limiter over both
+# inference endpoints, checked before any token parsing (cheapest gate
+# first), and the failed-token 401s are logged so probing noise is visible
+# in the action feed instead of silent.
+_EXPERIMENT_RATE_WINDOW_S = 60
+_EXPERIMENT_RATE_MAX_CALLS = 60
+_experiment_rate_calls: dict = {}
+
+
+def _experiment_rate_limit(request):
+    client_ip = (request.client.host if request.client else None) or 'unknown'
+    now = time.time()
+    calls = _experiment_rate_calls.setdefault(client_ip, [])
+    calls[:] = [t for t in calls if now - t < _EXPERIMENT_RATE_WINDOW_S]
+    if len(calls) >= _EXPERIMENT_RATE_MAX_CALLS:
+        return False
+    calls.append(now)
+    return True
+
+
 @app.get('/api/experiments/sublow/quote')
 async def sublow_quote(request: Request):
     """Cost-estimate worksheet for minting a grant: the model the proxy will
@@ -433,6 +457,8 @@ async def sublow_inference(request: Request):
     # self-guarding shape /api/chat uses.
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
+    if not _experiment_rate_limit(request):
+        return JSONResponse({'error': 'Rate limit exceeded.'}, status_code=429)
     raw_token = request.headers.get('X-Sublow-Grant') or ''
     if not raw_token:
         auth_header = request.headers.get('Authorization') or ''
@@ -440,6 +466,9 @@ async def sublow_inference(request: Request):
             raw_token = auth_header[7:].strip()
     grant = validate_sublow_grant(raw_token.strip())
     if not grant:
+        log_action('anonymous', 'sublow_grant_auth_failed',
+                   {'remote': (request.client.host if request.client else None) or 'unknown'},
+                   authorized=False)
         return JSONResponse({'error': 'a valid sublow grant token is required (X-Sublow-Grant header)'},
                             status_code=401)
     body = await request.json()
@@ -642,6 +671,8 @@ async def jev_inference(request: Request):
     # self-guarding shape /api/chat and the sublow inference endpoint use.
     if not OPENROUTER_API_KEY:
         return JSONResponse({'error': 'OPENROUTER_API_KEY not set in the repo-root .env'}, status_code=500)
+    if not _experiment_rate_limit(request):
+        return JSONResponse({'error': 'Rate limit exceeded.'}, status_code=429)
     raw_token = request.headers.get('X-Jev-Grant') or ''
     if not raw_token:
         auth_header = request.headers.get('Authorization') or ''
@@ -649,6 +680,9 @@ async def jev_inference(request: Request):
             raw_token = auth_header[7:].strip()
     grant = validate_jev_grant(raw_token.strip())
     if not grant:
+        log_action('anonymous', 'jev_grant_auth_failed',
+                   {'remote': (request.client.host if request.client else None) or 'unknown'},
+                   authorized=False)
         return JSONResponse({'error': 'a valid JEV grant token is required (X-Jev-Grant header)'},
                             status_code=401)
     body = await request.json()
