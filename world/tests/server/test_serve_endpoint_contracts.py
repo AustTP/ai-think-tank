@@ -583,14 +583,23 @@ class ApiAccrueDailyTest(unittest.TestCase):
 
 class OpenrouterOnceTest(unittest.TestCase):
     def test_paths(self):
-        with mock.patch.object(serve, '_think_tank_spend_cap_exceeded',
+        # Pin the budget-aware provider pivot off: the gate reads OpenRouter's
+        # LIVE balance against the pivot floor, so a near-empty account
+        # (real state, 2026-11-27) pivots the call to straitly, making
+        # is_custom=True and legitimately skipping the broken-key check.
+        # The broken-key contract under test requires a pivot-free call.
+        with mock.patch.object(serve, '_openrouter_budget_below_pivot_floor',
+                               return_value=False), \
+             mock.patch.object(serve, '_think_tank_spend_cap_exceeded',
                                return_value=False), \
              mock.patch.object(serve, '_api_key_is_broken',
                                return_value=True):
             with self.assertRaises(RuntimeError):
                 serve._call_openrouter_once_sync('m', [], 10)
         import urllib.error
-        with mock.patch.object(serve, '_think_tank_spend_cap_exceeded',
+        with mock.patch.object(serve, '_openrouter_budget_below_pivot_floor',
+                               return_value=False), \
+             mock.patch.object(serve, '_think_tank_spend_cap_exceeded',
                                return_value=False), \
              mock.patch.object(serve, '_api_key_is_broken',
                                return_value=False), \
