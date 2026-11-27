@@ -160,7 +160,8 @@ def propose(goal, route, payload, actor, constraints=None, ttl_s=DEFAULT_TTL_S) 
     with _connect() as conn:
         item = _insert(conn, plan_id, 1, goal, route, constraints, payload,
                        actor, ttl_s)
-    assert item is not None
+    if item is None:  # the row this same statement just inserted
+        raise PlanError('plan row vanished after insert')
     return item
 
 
@@ -222,7 +223,8 @@ def approve(plan_id: str, version: int, actor: str) -> dict:
                      (str(actor or 'player'), time.time(), row['id']))
         updated = _row(conn.execute('SELECT * FROM plan_revisions WHERE id = ?',
                                     (row['id'],)).fetchone())
-    assert updated is not None
+    if updated is None:  # the row this same statement just updated
+        raise PlanError('plan row vanished after write')
     return updated
 
 
@@ -241,7 +243,8 @@ def reject(plan_id: str, version: int, actor: str, reason: str) -> dict:
                       reason[:MAX_REASON], row['id']))
         updated = _row(conn.execute('SELECT * FROM plan_revisions WHERE id = ?',
                                     (row['id'],)).fetchone())
-    assert updated is not None
+    if updated is None:  # the row this same statement just updated
+        raise PlanError('plan row vanished after write')
     return updated
 
 
@@ -261,7 +264,8 @@ def revise(plan_id: str, goal, route, payload, actor,
                          "WHERE id=? AND status='pending'", (latest['id'],))
         item = _insert(conn, latest['plan_id'], latest['version'] + 1, goal,
                        route, constraints, payload, actor, ttl_s)
-    assert item is not None
+    if item is None:  # the row this same statement just inserted
+        raise PlanError('plan row vanished after insert')
     return item
 
 
@@ -279,7 +283,8 @@ def claim_apply(plan_id: str, version: int, actor='player') -> dict:
                      (str(actor or 'player'), row['id']))
         updated = _row(conn.execute('SELECT * FROM plan_revisions WHERE id = ?',
                                     (row['id'],)).fetchone())
-    assert updated is not None
+    if updated is None:  # the row this same statement just updated
+        raise PlanError('plan row vanished after write')
     return updated
 
 
@@ -296,7 +301,8 @@ def mark_failed(plan_id: str, version: int, reason: str) -> dict:
                      (str(reason or 'apply failed')[:MAX_REASON], row['id']))
         updated = _row(conn.execute('SELECT * FROM plan_revisions WHERE id = ?',
                                     (row['id'],)).fetchone())
-    assert updated is not None
+    if updated is None:  # the row this same statement just updated
+        raise PlanError('plan row vanished after write')
     return updated
 
 
@@ -314,7 +320,8 @@ def mark_applied(plan_id: str, version: int, actor='player') -> dict:
                      (time.time(), str(actor or 'player'), row['id']))
         updated = _row(conn.execute('SELECT * FROM plan_revisions WHERE id = ?',
                                     (row['id'],)).fetchone())
-    assert updated is not None
+    if updated is None:  # the row this same statement just updated
+        raise PlanError('plan row vanished after write')
     return updated
 
 

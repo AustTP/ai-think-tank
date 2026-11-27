@@ -134,7 +134,8 @@ def propose(action, target, args, actor, channel='web', ttl_s=DEFAULT_TTL_S) -> 
         row = conn.execute('SELECT * FROM confirmation_proposals WHERE id = ?',
                            (proposal_id,)).fetchone()
     item = _row(row)
-    assert item is not None
+    if item is None:  # the row this same statement just wrote
+        raise ConfirmationError('confirmation row vanished after write')
     return item
 
 
@@ -169,7 +170,8 @@ def confirm(proposal_id: str, phrase: str, actor='player') -> dict:
         row = conn.execute('SELECT * FROM confirmation_proposals WHERE id = ?',
                            (item['id'],)).fetchone()
     confirmed_item = _row(row)
-    assert confirmed_item is not None
+    if confirmed_item is None:  # the row this same statement just updated
+        raise ConfirmationError('confirmation row vanished after write')
     return confirmed_item
 
 
@@ -213,7 +215,8 @@ def cancel(proposal_id: str, actor: str) -> dict:
                      "WHERE id=? AND status IN ('pending', 'confirmed')",
                      (item['id'],))
     cancelled = get(item['id'])
-    assert cancelled is not None
+    if cancelled is None:  # the row this same statement just cancelled
+        raise ConfirmationError('confirmation row vanished after cancel')
     return cancelled
 
 

@@ -1441,7 +1441,8 @@ async def require_login(request: Request, call_next):
 async def save_collision(request: Request):
     try:
         data = await request.json()
-        assert 'grid' in data and 'cols' in data and 'rows' in data
+        if not ('grid' in data and 'cols' in data and 'rows' in data):
+            raise ValueError('collision grid needs grid, cols and rows')
     except Exception as e:
         return PlainTextResponse(str(e), status_code=400)
     with open(os.path.join(ROOT, 'collision_grid.json'), 'w') as f:
@@ -1455,7 +1456,8 @@ async def save_doors(request: Request):
     try:
         data = await request.json()
         for building, d in data.items():
-            assert {'x', 'y', 'w', 'h'} <= d.keys()
+            if not {'x', 'y', 'w', 'h'} <= d.keys():
+                raise ValueError(f'{building} needs x, y, w and h')
     except Exception as e:
         return PlainTextResponse(str(e), status_code=400)
     with open(os.path.join(ROOT, 'door_triggers.json'), 'w') as f:
