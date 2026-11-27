@@ -533,6 +533,83 @@ def _director_budget_gate(agent_id, model, service, authorized, lane):
     }, status_code=429)
 
 
+# MeterRouter (arXiv 2611.34327): meter each call against what the task has
+# LEFT, not just its all-time ceiling. Two levers, both best-effort and both
+# inactive for free/unpriced models: a hard output-token cap the remainder can
+# actually pay for, and a cheaper-tier fallback when the remainder drops below
+# a quarter of the task's ceiling. The existing hard `budgetUsd` gate still
+# refuses a call once spend crosses the ceiling; this only spends what is left
+# more carefully on the calls that are still allowed.
+METER_LOW_REMAINDER_FRACTION = 0.25
+METER_MIN_OUTPUT_TOKENS = 128
+
+
+def _model_price_per_m(model):
+    """Blended USD per million tokens from model_tiers, or None if the model
+    is unpriced/unknown (free pool included -- never meter a free call)."""
+    try:
+        with _db() as conn:
+            row = conn.execute('SELECT price_per_m FROM model_tiers WHERE slug = ?',
+                               (str(model or ''),)).fetchone()
+        if not row:
+            return None
+        price = float(row[0] or 0)
+        return price if price > 0 else None
+    except Exception:
+        return None
+
+
+def _metered_chat_call(task_id, model, max_tokens, messages, task_type=None):
+    """Return (model, max_tokens, info) after metering a task-bound call.
+    `info` is empty when nothing changed, so callers can log only real edits."""
+    info = {}
+    if not task_id or not model or str(model).startswith('@freepool:'):
+        return model, max_tokens, info
+    try:
+        state = get_state_from_db() or {}
+        task = (state.get('tasks') or {}).get(task_id) or {}
+        budget = float(task.get('budgetUsd') or 0)
+        if budget <= 0:
+            return model, max_tokens, info
+        spent, _calls = _task_budget_spent(task_id)
+        remaining = max(0.0, budget - float(spent or 0))
+        price = _model_price_per_m(model)
+        if not price or remaining <= 0:
+            return model, max_tokens, info
+        # A cheaper model is NOT a substitute for a reviewer's judgment: the
+        # coding/review lanes keep their model and only take the token cap.
+        if (remaining < METER_LOW_REMAINDER_FRACTION * budget
+                and str(task_type or task.get('taskType') or '').lower()
+                not in ('code', 'review', 'qa')):
+            cheaper = _slug_for_band('sublow') or _slug_for_band('low')
+            cheaper_price = _model_price_per_m(cheaper) if cheaper else None
+            if cheaper and cheaper_price and cheaper_price < price:
+                info['modelFrom'] = model
+                model, price = cheaper, cheaper_price
+        chars = 0
+        for message in messages or []:
+            raw = (message.get('content') if isinstance(message, dict) else '') or ''
+            if isinstance(raw, str):
+                chars += len(raw)
+            elif isinstance(raw, list):
+                chars += sum(len(str(p.get('text') or '')) for p in raw
+                             if isinstance(p, dict))
+        input_cost = (chars / 4.0) * price / 1e6
+        affordable = int(max(0.0, remaining - input_cost) * 1e6 / price)
+        if affordable < max_tokens:
+            capped = max(METER_MIN_OUTPUT_TOKENS, affordable)
+            if capped < max_tokens:
+                info['tokensFrom'] = max_tokens
+                max_tokens = capped
+        if info:
+            info.update({'model': model, 'maxTokens': max_tokens,
+                         'budgetUsd': round(budget, 4),
+                         'remainingUsd': round(remaining, 4)})
+    except Exception:
+        return model, max_tokens, {}
+    return model, max_tokens, info
+
+
 @app.post('/api/chat')
 async def chat(request: Request):
     # The only place OPENROUTER_API_KEY is ever used -- it never leaves
@@ -698,6 +775,14 @@ async def chat(request: Request):
                                          authorized, 'chat')
     if _dir_blocked:
         return _dir_blocked
+    # MeterRouter: cap the call against the task's *remaining* money and, on a
+    # nearly-spent non-code card, fall back to a cheaper tier. Runs after all
+    # hard gates so a blocked call is never re-priced into a permitted one.
+    model, max_tokens, meter_info = _metered_chat_call(
+        task_id, model, max_tokens, messages)
+    if meter_info:
+        log_action(agent_id, 'chat_budget_metered', meter_info,
+                   authorized=authorized)
     # Plain-writing directive (token saver): by default fold the anti-AI-slop
     # ban list into the first system message so prose replies come back
     # shorter -- less filler is fewer billed input AND output tokens, without

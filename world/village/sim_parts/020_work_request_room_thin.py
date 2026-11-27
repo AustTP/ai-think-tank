@@ -829,6 +829,45 @@ def _peer_coding_class(parent):
     return parent.get('room') == 'pressoffice' or bool(parent.get('productId'))
 
 
+# PROVE (arXiv 2611.34215): grade the verdict on the evidence behind it, not
+# on whether the peer happened to be right. For coding-class parents the
+# evidence is the quality-pipeline output. For non-code parents that DECLARE
+# an observable deliverable (a Library path or artifact) a clean vote also
+# needs a named artifact/digest the reviewer actually inspected. Pure
+# negative-result research (no declared deliverable) still rests on pipelineOk
+# alone: forcing an evidence field there creates false "no evidence" rejections
+# and the exact review-loop the stop-condition scope decision avoids.
+def _observable_review_deliverable(parent):
+    """True when a non-code parent pointed at a concrete artifact the reviewer
+    can inspect, rather than a prose/negative-result card with no deliverable."""
+    if not isinstance(parent, dict):
+        return False
+    for field in ('libraryPath', 'reportPath', 'artifactPath', 'artifactSha256'):
+        if str(parent.get(field) or '').strip():
+            return True
+    deliverable = str(parent.get('deliverable') or '').strip()
+    return '/' in deliverable or bool(re.search(r'\.[a-z0-9]{1,5}$', deliverable, re.I))
+
+
+def _review_evidence_ok(parent, result):
+    """A clean peer vote counts only when it cites objective evidence."""
+    if str((result or {}).get('evidence') or '').strip():
+        return True
+    if _peer_coding_class(parent):
+        return False
+    if not _observable_review_deliverable(parent):
+        return True
+    result = result or {}
+    artifact = ((result.get('reviewDiagnostics') or {}).get('artifactChecks') or {})
+    if artifact.get('checks') or any(str(result.get(field) or '').strip()
+                                     for field in ('artifactPath', 'artifactSha256')):
+        return True
+    assessment = result.get('acceptanceAssessment') or {}
+    return bool(assessment.get('verified')) and any(
+        isinstance(check, dict) and check.get('evidenceIds')
+        for check in assessment.get('checks') or [])
+
+
 def _apply_content_result(state, task, result, now_ms=None):
     """Merge a completed content-executor result into the durable state, inside
     the task_cycle's single read-modify-write. Writes the research topic's
@@ -1108,19 +1147,16 @@ def _apply_content_result(state, task, result, now_ms=None):
                 if not result.get('pipelineOk'):
                     verdict = 'actionable'
                     reject_kind = 'red_pipeline'
-                # Item 7 evidence-based done gate: for a CODING-CLASS parent (a
-                # pressoffice story or any product-backed card), a clean vote also
-                # needs OBJECTIVE evidence that the quality pipeline actually ran
-                # and exercised the code -- the executor files the real per-step
-                # output (coverage line, flake8/mypy/bandit tails) in
-                # result['evidence']. A 'looks solid' with no evidence cannot
-                # approve code any more than a red pipeline can; without this a
-                # hollow clean vote would close a card that was never really
-                # tested. Non-coding lanes (observatory etc.) stay on the
-                # pipelineOk check alone -- deliberately: they can
-                # legitimately conclude with no deliverable (see
+                # Evidence-based done gate (PROVE, arXiv 2611.34215): a clean
+                # vote is not a verdict on whether the peer was right -- it
+                # needs the evidence behind it. Coding-class parents need the
+                # quality-pipeline output; non-code parents that declared an
+                # observable deliverable need a named artifact/digest the
+                # reviewer actually checked. A "looks solid" with no evidence
+                # cannot close either card. Pure negative-result research with
+                # no declared deliverable stays on pipelineOk alone (see
                 # library/design-references/stop-condition.md).
-                elif _peer_coding_class(parent) and not (result.get('evidence') or '').strip():
+                elif not _review_evidence_ok(parent, result):
                     verdict = 'actionable'
                     reject_kind = 'no_evidence'
                 if verdict == 'actionable':

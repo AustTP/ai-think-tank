@@ -142,6 +142,61 @@ class ChatEndpointTest(unittest.TestCase):
         self.assertEqual(json.loads(resp.body)['reply'], '')
 
 
+    def test_budget_meter_caps_tokens_and_demotes_nearly_spent_task(self):
+        state = {'tasks': {'t': {'id': 't', 'budgetUsd': 0.10,
+                                 'taskType': 'research'}}}
+        patches = [
+            mock.patch.object(serve, 'get_state_from_db', return_value=state),
+            mock.patch.object(serve, '_task_budget_spent', return_value=(0.08, 3)),
+            mock.patch.object(serve, '_model_price_per_m',
+                              side_effect=lambda m: {'high': 3.0, 'low': 0.20}.get(m)),
+            mock.patch.object(serve, '_slug_for_band',
+                              side_effect=lambda band: 'low' if band == 'low' else None),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        model, tokens, info = serve._metered_chat_call(
+            't', 'high', 4000, [{'role': 'user', 'content': 'x'}])
+        self.assertEqual(model, 'low')
+        self.assertEqual(info['modelFrom'], 'high')
+        self.assertEqual(tokens, 4000)
+        # A coding/review card keeps its model; only the cap applies.
+        state['tasks']['t']['taskType'] = 'code'
+        model, tokens, info = serve._metered_chat_call(
+            't', 'high', 4000, [{'role': 'user', 'content': 'x'}])
+        self.assertEqual(model, 'high')
+        self.assertNotIn('modelFrom', info)
+
+    def test_budget_meter_caps_output_to_what_remains(self):
+        state = {'tasks': {'t': {'id': 't', 'budgetUsd': 0.10,
+                                 'taskType': 'review'}}}
+        patches = [
+            mock.patch.object(serve, 'get_state_from_db', return_value=state),
+            mock.patch.object(serve, '_task_budget_spent', return_value=(0.09, 3)),
+            mock.patch.object(serve, '_model_price_per_m', return_value=3.0),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        model, tokens, info = serve._metered_chat_call(
+            't', 'high', 4000, [{'role': 'user', 'content': 'x'}])
+        self.assertEqual(model, 'high')
+        self.assertEqual(tokens, 3333)
+        self.assertIn('tokensFrom', info)
+
+    def test_budget_meter_leaves_free_and_unbudgeted_calls_alone(self):
+        state = {'tasks': {'t': {'id': 't', 'budgetUsd': 0.10}}}
+        with mock.patch.object(serve, 'get_state_from_db', return_value=state):
+            self.assertEqual(
+                serve._metered_chat_call('t', '@freepool:x', 4000, []),
+                ('@freepool:x', 4000, {}))
+        state['tasks']['t']['budgetUsd'] = 0
+        self.assertEqual(
+            serve._metered_chat_call('t', 'high', 4000, []),
+            ('high', 4000, {}))
+
+
 class InitDbTest(unittest.TestCase):
     def test_migration_branches(self):
         conn = mock.Mock()

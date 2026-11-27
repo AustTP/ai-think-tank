@@ -63,6 +63,44 @@ class ApprovalLedger(unittest.TestCase):
         self.assertEqual(state['approvalLog'][0]['reviewer'], 'felix')
         self.assertEqual(state['approvalLog'][0]['author'], 'ada')
 
+    def test_noncode_deliverable_needs_named_artifact_for_clean_vote(self):
+        parent = {'id': 'p2', 'assignedTo': 'ada', 'deliverable': 'library/projects/x.md',
+                  'libraryPath': 'library/projects/x.md', 'room': 'observatory',
+                  'title': 'parent',
+                  '_peerGate': {'enteredMs': 1, 'approvals': 0,
+                                'approvers': [], 'reviewedTaskIds': []}}
+        state = {'tasks': {'p2': parent}}
+        task = {'id': 'r2', 'reviewOf': 'p2', 'assignedTo': 'felix',
+                'taskType': 'review', 'createdAt': 200}
+        with mock.patch.object(sim, '_resolve_review_parent', return_value=parent):
+            sim._apply_content_result(
+                state, task,
+                {'peerVerdict': 'clean', 'pipelineOk': True, 'note': 'looks solid'},
+                now_ms=NOW)
+        self.assertEqual(parent['_peerGate']['approvals'], 0)
+        self.assertEqual(state.get('approvalLog', []), [])
+
+        with mock.patch.object(sim, '_resolve_review_parent', return_value=parent):
+            sim._apply_content_result(
+                state, task,
+                {'peerVerdict': 'clean', 'pipelineOk': True,
+                 'reviewDiagnostics': {'artifactChecks': {
+                     'checks': [{'path': 'library/projects/x.md'}]}}},
+                now_ms=NOW)
+        self.assertEqual(parent['_peerGate']['approvals'], 1)
+
+    def test_noncode_acceptance_evidence_counts_as_evidence(self):
+        parent = {'id': 'p3', 'reportPath': 'archive/report.md', 'deliverable': 'report',
+                  'room': 'observatory', 'title': 'parent',
+                  '_peerGate': {'enteredMs': 1, 'approvals': 0,
+                                'approvers': [], 'reviewedTaskIds': []}}
+        self.assertTrue(sim._review_evidence_ok(parent, {
+            'acceptanceAssessment': {
+                'verified': True,
+                'checks': [{'status': 'met', 'evidenceIds': ['f-1']}]}}))
+        self.assertFalse(sim._review_evidence_ok(parent, {
+            'acceptanceAssessment': {'verified': False, 'checks': []}}))
+
 
 class ReciprocalApprovalSweep(unittest.TestCase):
     def _state(self, approvals):
