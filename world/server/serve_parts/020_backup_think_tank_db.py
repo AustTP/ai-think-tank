@@ -106,6 +106,103 @@ async def _backup_loop():
         await asyncio.to_thread(_backup_think_tank_db)
 
 
+ARCHIVE_RETENTION_DAYS_DEFAULT = 30
+# Terminal-but-not-done: 'done' rows are deliverable history the tank reads
+# back; the churn problem was cancelled/quarantined cards accumulating.
+_ARCHIVE_PRUNE_TERMINAL_STATUSES = frozenset({
+    'cancelled', 'failed', 'quarantined', 'deferred_conflict', 'rolled_back',
+})
+# Same guard list the operator-approved churn deletions ran (2026-11-27):
+# a card still referenced by a live task or a kept row survives, so no
+# surviving card's ref dangles.
+_ARCHIVE_PRUNE_REF_FIELDS = (
+    'reviewOf', 'rootStoryId', 'investigationOf', 'recoveryOf',
+    'dependsOn', 'adversarialTaskId', 'parentTaskId', 'storyId',
+    'blockerTaskId',
+)
+
+
+def _collect_ref_values(task, into):
+    for field in _ARCHIVE_PRUNE_REF_FIELDS:
+        value = task.get(field)
+        if isinstance(value, str) and value:
+            into.add(value)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item:
+                    into.add(item)
+
+
+def _prune_terminal_archive_cards(conn, cap=None):
+    """Delete terminal, non-done task_archive rows older than
+    ARCHIVE_RETENTION_DAYS (default 30, 0 disables). Age is the CARD's own
+    createdAt inside the blob -- task_archive.updated_at is the reconcile
+    upsert stamp and refreshes on every save, so it must never be the age
+    signal (the 2026-11-27 operator deletion round keyed 'fresh' on it and
+    wrongly kept 7,845 storm cards). Every victim must be unreferenced by
+    a live task and by every kept row. Returns the deleted count."""
+    try:
+        days = float(_load_env().get(
+            'ARCHIVE_RETENTION_DAYS', ARCHIVE_RETENTION_DAYS_DEFAULT)
+            or ARCHIVE_RETENTION_DAYS_DEFAULT)
+    except Exception:
+        days = ARCHIVE_RETENTION_DAYS_DEFAULT
+    if days <= 0:
+        return 0
+    cutoff_ms = (time.time() - days * 86400) * 1000
+    protected = set()
+    try:
+        live_state = get_state_from_db(archive_merge='none') or {}
+        for task in (live_state.get('tasks') or {}).values():
+            if isinstance(task, dict):
+                _collect_ref_values(task, protected)
+    except Exception:
+        pass  # guard data unavailable: kept-row refs still guard below
+    try:
+        rows = conn.execute('SELECT id, blob FROM task_archive').fetchall()
+    except Exception:
+        return 0
+    victims = []
+    kept_refs = set()
+    for row_id, blob in rows:
+        try:
+            task = json.loads(blob) if isinstance(blob, str) else (blob or {})
+        except Exception:
+            continue
+        if not isinstance(task, dict):
+            continue
+        tid = task.get('id') or row_id
+        status = task.get('status')
+        try:
+            created = float(task.get('createdAt')
+                            or task.get('created_ms') or 0)
+        except (TypeError, ValueError):
+            created = 0.0
+        if (status in _ARCHIVE_PRUNE_TERMINAL_STATUSES
+                and created > 0 and created < cutoff_ms
+                and tid not in protected):
+            # A victim's own refs also land in kept_refs: if it points at
+            # another old card, that target survives this run and goes the
+            # next one, so no surviving row's ref dangles mid-run.
+            _collect_ref_values(task, kept_refs)
+            victims.append(tid)
+        else:
+            _collect_ref_values(task, kept_refs)
+    victims = [tid for tid in victims if tid not in kept_refs]
+    if cap is None:
+        cap = LOG_PRUNE_MAX_ROWS
+    victims = victims[:max(0, int(cap))]
+    deleted = 0
+    chunk = 500
+    for start in range(0, len(victims), chunk):
+        part = victims[start:start + chunk]
+        placeholders = ','.join('?' * len(part))
+        cur = conn.execute(
+            'DELETE FROM task_archive WHERE id IN (%s)' % placeholders, part)
+        deleted += cur.rowcount or 0
+    return deleted
+
+
 def _prune_logs():
     """Rolling retention prune for the two heavy append-only tables
     (decision_tape, action_log). Deletes rows older than the
@@ -122,6 +219,7 @@ def _prune_logs():
         days = LOG_RETENTION_DAYS_DEFAULT
     cutoff = time.time() - max(0.0, days) * 86400
     deleted = 0
+    archive_pruned = 0
     try:
         with _db() as conn:
             # action_log keeps the noisy per-agent feed; pruned as before.
@@ -149,6 +247,15 @@ def _prune_logs():
                 (cutoff, LOG_PRUNE_MAX_ROWS),
             )
             deleted += cur.rowcount
+            # 2026-11-27: terminal churn cards (cancelled/quarantined/...) used
+            # to pile up in task_archive forever -- 10k+ from the Nov 5-22
+            # churn wave needed an operator-supervised deletion. Rolling
+            # retention keeps them bounded without supervision. Same conn/txn
+            # as the other prunes; a failure here must not take the run down.
+            try:
+                archive_pruned = _prune_terminal_archive_cards(conn)
+            except Exception as e:
+                print(f'[prune] archive prune failed: {e}', flush=True)
     except Exception as e:
         print(f'[prune] failed: {e}', flush=True)
         return 0
@@ -170,8 +277,9 @@ def _prune_logs():
     except Exception as e:
         memory_pruned = 0
         print(f'[prune] memory cleanup failed: {e}', flush=True)
-    if deleted or pruned_escalations or memory_pruned:
+    if deleted or pruned_escalations or memory_pruned or archive_pruned:
         print(f'[prune] removed {deleted} rows older than {days}d from decision_tape/action_log '
+              f'and {archive_pruned} terminal archive cards '
               f'and {pruned_escalations} resolved escalations '
               f'and {memory_pruned} expired conversation-memory sessions', flush=True)
     return deleted
