@@ -545,6 +545,8 @@ def _import_driver_fork():
     stock playwright at the baked /opt/ms-playwright path; when THAT is
     missing too, the caller's error contract applies (a None entry for
     'playwright.sync_api' in sys.modules means deliberately unavailable)."""
+    if sys.modules.get('playwright.sync_api') is None and 'playwright.sync_api' in sys.modules:
+        raise RuntimeError('deliberately unavailable (caller preloaded None)')
     try:
         os.environ['PLAYWRIGHT_BROWSERS_PATH'] = '/opt/ms-playwright-patchright'
         from patchright.sync_api import sync_playwright as sync_playwright_fn
