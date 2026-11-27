@@ -1350,6 +1350,19 @@ def _archived_snapshot_json():
         return _TASK_ARCHIVE_SNAPSHOT['json']
 
 
+def _batch(conn, sql, rows):
+    """One round trip per page on Postgres (execute_batch); the raw
+    sqlite3.Connection gets the sequential fallback -- local disk, no
+    round trips to save, and the semantics (all rows into the caller's
+    transaction) are identical."""
+    batch = getattr(conn, 'execute_batch', None)
+    if batch is not None:
+        batch(sql, rows)
+        return
+    for row in rows:
+        conn.execute(sql, row)
+
+
 def _reconcile_task_archive(done):
     # Make the archive table hold exactly the currently-done tasks: upsert any
     # that are new or changed. No deletes -- done tasks are never removed, and
@@ -1365,11 +1378,15 @@ def _reconcile_task_archive(done):
         now = time.time()
         try:
             with _db() as conn:
-                for tid, t in changed.items():
-                    conn.execute(
-                        'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?) '
-                        'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
-                        (tid, json.dumps(t), now))
+                # execute_batch, not per-row execute: on Postgres every
+                # .execute pays 3 network round trips (SAVEPOINT + statement
+                # + RELEASE), so a first-time migration of the done set
+                # (~8,400 rows) spent ~25 minutes inside one transaction. A
+                # batched page is one round trip.
+                _batch(conn, 
+                    'INSERT INTO task_archive (id, blob, updated_at) VALUES (?, ?, ?) '
+                    'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, updated_at = excluded.updated_at',
+                    [(tid, json.dumps(t), now) for tid, t in changed.items()])
                 # Retention is handled by _prune_terminal_archive_cards (the
                 # save-path pruner, cap-bounded and reference-guarded); it
                 # used to ALSO run here and the duplicate never pulled its
@@ -1469,14 +1486,19 @@ def _reconcile_task_live(conn, live):
         return True
     now = time.time()
     try:
-        for tid, t in changed.items():
-            conn.execute(
-                'INSERT INTO task_live (id, blob, updated_at) VALUES (?, ?, ?) '
-                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, '
-                'updated_at = excluded.updated_at',
-                (tid, json.dumps(t), now))
-        for tid in deleted:
-            conn.execute('DELETE FROM task_live WHERE id = ?', (tid,))
+        # execute_batch, not per-row execute: on Postgres every .execute
+        # pays 3 network round trips (SAVEPOINT + statement + RELEASE), so
+        # a first-time migration of the live set (~320 rows) spent ~1
+        # minute inside one transaction. A batched page is one round trip.
+        if changed:
+            _batch(conn, 
+                'INSERT INTO task_live (id, blob, updated_at) '
+                'VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET '
+                'blob = excluded.blob, updated_at = excluded.updated_at',
+                [(tid, json.dumps(t), now) for tid, t in changed.items()])
+        if deleted:
+            _batch(conn, 'DELETE FROM task_live WHERE id = ?',
+                               [(tid,) for tid in deleted])
     except sqlite3.OperationalError:
         return False
     with _TASK_LIVE_LOCK:
@@ -1713,15 +1735,23 @@ def _reconcile_extracted_sections(conn, data):
                    if rows.get(rid) != (seq, obj)}
         deleted = [rid for rid in rows if rid not in desired]
         try:
-            for rid, (seq, obj) in changed.items():
-                conn.execute(
+            # execute_batch, not per-row execute: on Postgres every .execute
+            # pays 3 network round trips (SAVEPOINT + statement + RELEASE),
+            # so the FIRST migration of a big section (~4,400 bookkeeping
+            # rows) took ~15 minutes inside one transaction, holding row
+            # locks until every other writer timed out (caught 2026-11-27,
+            # minutes after deploy). A batched page is one round trip.
+            if changed:
+                _batch(conn, 
                     f'INSERT INTO {table} (id, seq, blob, updated_at) '
                     f'VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET '
                     f'seq = excluded.seq, blob = excluded.blob, '
                     f'updated_at = excluded.updated_at',
-                    (rid, seq, json.dumps(obj), now))
-            for rid in deleted:
-                conn.execute(f'DELETE FROM {table} WHERE id = ?', (rid,))
+                    [(rid, seq, json.dumps(obj), now)
+                     for rid, (seq, obj) in changed.items()])
+            if deleted:
+                _batch(conn, f'DELETE FROM {table} WHERE id = ?',
+                                   [(rid,) for rid in deleted])
         except sqlite3.OperationalError:
             continue
         with _EXTRACTED_LOCK:
