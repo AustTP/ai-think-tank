@@ -747,6 +747,7 @@ class AskEndpoint(unittest.TestCase):
         with unittest.mock.patch.object(serve, '_coding_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_mid_tier_slug', return_value='fake-model'), \
              unittest.mock.patch.object(serve, '_post_openrouter_raw', side_effect=fake_post), \
+             unittest.mock.patch.object(serve, '_searxng_search', return_value=None), \
              unittest.mock.patch.object(serve, '_merged_search', return_value=None), \
              unittest.mock.patch.object(serve, '_api_execute',
                                         return_value={'ok': True, 'allowed': True,

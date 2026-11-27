@@ -236,7 +236,12 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             searxng_text = _searxng_search(agent_id, query)
             if searxng_text:
                 discovered.observe(searxng_text)
-                return searxng_text
+                # Raw search output is EXTERNAL DATA: wrap before it can
+                # reach a model (same boundary the Tavily lane below
+                # already returns through _api_execute's modelInstruction).
+                wrapped, _nonce, _tag, instruction = wrap_external_content(
+                    searxng_text, 'web search results from the local SearXNG engine')
+                return f'{instruction}\n\n{wrapped}'
             # Lane 1: the 362 free-source fan-out (arXiv/HN/Wikipedia/
             # GitHub). Free, keyless, off the page-request budget. Tavily
             # (paid, metered) only fires when they return nothing -- the
@@ -244,7 +249,9 @@ def _make_web_tools_executor(agent_id, agent_key, default_location=None, default
             free_text = _merged_search(agent_id, query)
             if free_text:
                 discovered.observe(free_text)
-                return free_text
+                wrapped, _nonce, _tag, instruction = wrap_external_content(
+                    free_text, 'web search results from free public sources')
+                return f'{instruction}\n\n{wrapped}'
             # Runs through the generic chokepoint -- Tavily auth (body_field
             # api_key) injected server-side from the registry, page-request
             # spend accrued.

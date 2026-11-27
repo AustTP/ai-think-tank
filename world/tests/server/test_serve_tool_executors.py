@@ -512,6 +512,29 @@ class WebToolsExecutorTest(unittest.TestCase):
                                return_value={'ok': False, 'reason': 'r'}):
             self.assertIn('Could not search the web: r',
                           ex('search_web', {'query': 'q'}))
+        # The free lanes return raw external text, so the executor must wrap
+        # it with the EXTERNAL_DATA boundary before it reaches a model --
+        # exactly what the Tavily lane above gets from _api_execute.
+        with mock.patch.object(serve, '_searxng_search',
+                               return_value='- T (http://u): s'), \
+             mock.patch.object(serve, '_merged_search',
+                               return_value=None), \
+             mock.patch.object(serve, 'wrap_external_content',
+                               return_value=('w', 'n', 't', 'i')) as wrap, \
+             mock.patch.object(serve, '_api_execute') as api:
+            self.assertEqual(ex('search_web', {'query': 'q'}), 'i\n\nw')
+            api.assert_not_called()
+        self.assertIn('- T (http://u): s', wrap.call_args[0][0])
+        with mock.patch.object(serve, '_searxng_search',
+                               return_value=None), \
+             mock.patch.object(serve, '_merged_search',
+                               return_value='- T (http://u): s'), \
+             mock.patch.object(serve, 'wrap_external_content',
+                               return_value=('w', 'n', 't', 'i')) as wrap, \
+             mock.patch.object(serve, '_api_execute') as api:
+            self.assertEqual(ex('search_web', {'query': 'q'}), 'i\n\nw')
+            api.assert_not_called()
+        self.assertIn('- T (http://u): s', wrap.call_args[0][0])
 
     def test_ais_feed(self):
         ex = self._ex()
