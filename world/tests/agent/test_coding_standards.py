@@ -363,6 +363,33 @@ class RunQualityPipeline(unittest.TestCase):
         self.assertIn('--isolated', flake8_cmd)
         self.assertTrue(flake8_cmd.endswith('--exclude=tests,.selfedit_staging,.selfedit_failed .'))
 
+    def test_docs_only_scope_skips_the_python_gate(self):
+        # A story that wrote only a markdown transcript cannot be parsed as
+        # Python: flake8 failed it on E999 SyntaxError (the em dash in
+        # library/projects/pilot-transcript.md, task-36104). A scope with
+        # no .py runs no Python step; every step reports a skip.
+        steps = content._quality_pipeline_steps(
+            ['library/projects/pilot-transcript.md'])
+        self.assertEqual(
+            [(s['name'], s['command']) for s in steps],
+            [(n, f"echo 'no .py in scope -- skipping {n}'")
+             for n in ('flake8', 'mypy', 'bandit', 'pytest-cov')]
+            + [(s['name'], s['command']) for s in
+               content._quality_pipeline_steps(None)
+               if s['name'] in ('node-syntax', 'node-tests')])
+
+    def test_mixed_scope_lints_only_the_py_files(self):
+        steps = content._quality_pipeline_steps(
+            ['app.py', 'README.md', 'tests/test_app.py'])
+        flake8_cmd = next(s['command'] for s in steps if s['name'] == 'flake8')
+        self.assertIn('app.py', flake8_cmd)
+        self.assertNotIn('README.md', flake8_cmd)
+        mypy_cmd = next(s['command'] for s in steps if s['name'] == 'mypy')
+        self.assertIn('app.py', mypy_cmd)
+        self.assertNotIn('README.md', mypy_cmd)
+        pytest_cmd = next(s['command'] for s in steps if s['name'] == 'pytest-cov')
+        self.assertIn('tests/test_app.py', pytest_cmd)
+
     def test_red_pipeline_reports_failing_step_and_snippet(self):
         resp = {'sandboxId': 'workroom-shared', 'failedStep': 'flake8',
                 'results': [{'name': 'flake8', 'exitCode': 1,

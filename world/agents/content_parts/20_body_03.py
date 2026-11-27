@@ -100,7 +100,9 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
     README-only or single-file change no longer fails on pre-existing findings
     in unrelated files, and --cov-fail-under=90 measures just the touched
     files (a one-file story in a worktree that also holds the base tree's
-    files must not be failed by the OTHER files' coverage). The unscoped path
+    files must not be failed by the OTHER files' coverage). Non-.py scope
+    files (docs, transcripts) are skipped: the Python tools cannot parse
+    them, so a docs-only scope runs no Python step at all. The unscoped path
     skips mypy/bandit/pytest-cov entirely: the staged workspace holds the
     whole base tree, whose scripts/ and world/tests/ are not valid targets
     inside a network-disabled sandbox (missing stubs, conftest that imports
@@ -144,7 +146,35 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # assignment), E9xx, and every F code stay enforced.
         _flake8_flags += ',E1,E2,E3,E4,E5,W1,W2,W3,W4,W5,W6'
     if scope_files:
-        _scoped = ' '.join(scope_files)
+        # Non-Python scope files (docs, transcripts, data) cannot be parsed
+        # as Python: flake8 died with E999 SyntaxError on an em dash inside
+        # library/projects/pilot-transcript.md (task-36104, 2026-11-27), and
+        # the same class looped several review-fix chains into "stopped
+        # minting cards" retries. A scope with no .py wrote no Python, so
+        # the Python steps skip exactly like the unscoped no-Python path
+        # below; a mixed scope lints/tests only the .py files.
+        _py_scope = [f for f in scope_files if f.endswith('.py')]
+        if not _py_scope:
+            return [
+                {'name': 'flake8',
+                 'command': "echo 'no .py in scope -- skipping flake8'"},
+                {'name': 'mypy',
+                 'command': "echo 'no .py in scope -- skipping mypy'"},
+                {'name': 'bandit',
+                 'command': "echo 'no .py in scope -- skipping bandit'"},
+                {'name': 'pytest-cov',
+                 'command': "echo 'no .py in scope -- skipping pytest-cov'"},
+                {'name': 'node-syntax', 'command': (
+                    'sh -c \'files=$(ls *.js *.mjs 2>/dev/null); '
+                    'if [ -z "$files" ]; then echo "no JS files -- skipping"; exit 0; fi; '
+                    'fail=0; for f in $files; do node --check "$f" || fail=1; done; '
+                    'exit $fail\'')},
+                {'name': 'node-tests', 'command': (
+                    'sh -c \'ls *.test.mjs *.test.js 2>/dev/null | head -1 | grep -q . || '
+                    '{ echo "no JS test files -- skipping"; exit 0; }; '
+                    'node --test\'')},
+            ]
+        _scoped = ' '.join(_py_scope)
         # Coverage is scoped to the same files as lint when scope_files is
         # given, so a one-file story in a worktree that also holds the base
         # tree's files is not failed by --cov-fail-under=90 on the OTHER
@@ -165,7 +195,7 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # how pytest.ini's pythonpath=world imports resolve); an unimportable
         # candidate is harmless (verified: both styles coexist at 100%).
         _cov_names = set()
-        for _f in scope_files:
+        for _f in _py_scope:
             if _f.endswith('.py'):
                 _cov_names.add(_f[:-3].replace('/', '.'))
                 _cov_names.add(_f.split('/')[-1][:-3])
@@ -180,7 +210,7 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # resolves their imports. A task that wrote implementation without
         # tests has nothing to measure -- skip the step (python_delivery.check
         # already forces tests/test_*.py for python_task work upstream).
-        _test_files = [f for f in scope_files
+        _test_files = [f for f in _py_scope
                        if f.split('/')[-1].startswith('test_')]
         if _test_files:
             _pytest_step = {'name': 'pytest-cov',
@@ -197,7 +227,7 @@ def _quality_pipeline_steps(scope_files=None, style_lenient=False):
         # missing stubs (websockets, PIL) a network-disabled sandbox can never
         # install (live: scripts/browser_record.py:710). Real type errors in
         # the author's own implementation still fail the step.
-        _mypy_files = [f for f in scope_files
+        _mypy_files = [f for f in _py_scope
                        if not f.split('/')[-1].startswith('test_')]
         if _mypy_files:
             _mypy_step = {'name': 'mypy',
