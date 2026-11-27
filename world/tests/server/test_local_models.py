@@ -311,6 +311,7 @@ class LocalOcrPreprocess(unittest.TestCase):
         mean = sum(i * n for i, n in enumerate(hist)) / (hist and sum(hist))
         self.assertGreater(mean, serve._OCR_BINARIZE_AT)
 
+    @unittest.skipUnless(shutil.which('tesseract'), 'tesseract not installed')
     def test_preprocess_orange_masthead_survives(self):
         # The real-miss shape: white text on an orange band. Gray value 136
         # straddles the 128 threshold, so a naive binarize erases it; the
