@@ -226,6 +226,18 @@ def compute_health_snapshot():
         # not just how many cards failed. Roots that fail twice in a day are
         # repair loops, not independent incidents.
         tasks = data.get('tasks') or {}
+        # task_live (2026-11-27): the blob carries no tasks once the live
+        # rows are authoritative -- the same blind spot the agents count
+        # hit above (a healthy digest would read zero failures forever).
+        # Fall back to the live table; archived failures are historical and
+        # not this digest's job.
+        if not tasks:
+            try:
+                with _db() as conn2:
+                    tasks = {tid: json.loads(b) for tid, b in conn2.execute(
+                        'SELECT id, blob FROM task_live').fetchall()}
+            except Exception:
+                tasks = {}
         now_ms = now * 1000
         failed_cards = [t for t in tasks.values()
                         if t.get('status') in ('failed', 'abandoned', 'blocked')]

@@ -5,6 +5,11 @@ every tick; only a handful of tasks were ever active. Completed tasks now live
 in the task_archive table and are merged back on read, so state['tasks'] keeps
 its exact shape. These tests pin that round-trip, the blob shrinking, and the
 agent-directory sync throttle.
+
+Stage 2 of the split (2026-11-27, task_live): the LIVE working set left the
+blob too. After a reconciling save the blob carries no 'tasks' key at all;
+live tasks live in task_live rows (merged first, live wins) under the archive
+merge. "Stays in the blob" assertions became "stays live (in task_live rows)".
 """
 import json
 import os
@@ -33,6 +38,7 @@ class _StateCase(unittest.TestCase):
         self._db_patch.start()
         serve.init_db()
         serve._TASK_ARCHIVE_CACHE.update({'db': None, 'loaded': False, 'tasks': {}})
+        serve._TASK_LIVE_CACHE.update({'db': None, 'loaded': False, 'rows': {}})
         serve._LAST_AGENT_DIR_SYNC_AT = 0.0
         serve._LAST_AGENT_DIR_FINGERPRINT = None
         self._ttl_patch = None
@@ -66,7 +72,11 @@ class _StateCase(unittest.TestCase):
     def _blob_tasks(self):
         with serve._db() as conn:
             row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
-        return json.loads(row[0])['tasks']
+        return json.loads(row[0]).get('tasks') or {}
+
+    def _live_ids(self):
+        with serve._db() as conn:
+            return {r[0] for r in conn.execute('SELECT id FROM task_live').fetchall()}
 
 
 class TaskArchive(_StateCase):
@@ -80,8 +90,10 @@ class TaskArchive(_StateCase):
 
     def test_done_tasks_are_not_written_to_the_blob(self):
         serve.save_state_to_db(self._state())
-        blob_tasks = self._blob_tasks()
-        self.assertEqual(set(blob_tasks), {'t-active'})
+        # Stage 2: the blob drops 'tasks' entirely; the live working set is
+        # in task_live rows, done tasks in task_archive.
+        self.assertEqual(set(self._blob_tasks()), set())
+        self.assertEqual(self._live_ids(), {'t-active'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
         self.assertEqual(set(archived), {'t-done'})
@@ -148,29 +160,32 @@ class TaskArchive(_StateCase):
         state['tasks']['t-quar'] = {'id': 't-quar', 'status': 'quarantined'}
         state['tasks']['t-aband'] = {'id': 't-aband', 'status': 'abandoned'}
         serve.save_state_to_db(state)
-        self.assertEqual(set(self._blob_tasks()), {'t-active'})
+        self.assertEqual(self._live_ids(), {'t-active'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
         self.assertEqual(set(archived),
                          {'t-done', 't-fail', 't-quar', 't-aband'})
 
-    def test_recovering_failed_task_stays_in_the_blob(self):
+    def test_recovering_failed_task_stays_live(self):
         # A failed task mid-recovery must stay live: the watchdog flips it
-        # back to 'repairing' and the retry child looks its parent up in the
-        # blob. Archiving it would orphan the repair chain.
+        # back to 'repairing' and the retry child looks its parent up.
+        # Archiving it would orphan the repair chain. Stage 2: "live" means
+        # task_live rows, not the blob.
         state = self._state()
         state['tasks']['t-recover'] = {'id': 't-recover', 'status': 'failed',
                                        '_peerRepairPending': True}
         state['tasks']['t-manual'] = {'id': 't-manual', 'status': 'failed',
                                       'manualAttention': True}
         serve.save_state_to_db(state)
-        self.assertEqual(set(self._blob_tasks()),
+        self.assertEqual(self._live_ids(),
                          {'t-active', 't-recover', 't-manual'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
         self.assertEqual(set(archived), {'t-done'})
+        self.assertEqual(set(serve.get_state_from_db()['tasks']),
+                         {'t-active', 't-recover', 't-manual', 't-done'})
 
-    def test_fresh_manual_attention_task_stays_in_the_blob(self):
+    def test_fresh_manual_attention_task_stays_live(self):
         # The operator flag holds a fresh task out of the archive; lastProgressAt
         # is unusable as an age anchor because the observe pass re-stamps it.
         state = self._state()
@@ -181,7 +196,7 @@ class TaskArchive(_StateCase):
                                       'manualAttention': True,
                                       'blockedAt': int(time.time() * 1000) - 1000}
         serve.save_state_to_db(state)
-        self.assertEqual(set(self._blob_tasks()),
+        self.assertEqual(self._live_ids(),
                          {'t-active', 't-manual', 't-recent'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
@@ -199,12 +214,12 @@ class TaskArchive(_StateCase):
                                     'manualAttention': True,
                                     'blockedAt': int(time.time() * 1000) - week_plus}
         serve.save_state_to_db(state)
-        self.assertEqual(set(self._blob_tasks()), {'t-active'})
+        self.assertEqual(self._live_ids(), {'t-active'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
         self.assertEqual(set(archived), {'t-done', 't-old', 't-old2'})
 
-    def test_terminal_task_referenced_by_a_live_task_stays_in_the_blob(self):
+    def test_terminal_task_referenced_by_a_live_task_stays_live(self):
         # A repair child mid-flight references its failed parent; archiving
         # the parent would break the child's completion lookup.
         state = self._state()
@@ -213,7 +228,7 @@ class TaskArchive(_StateCase):
         state['tasks']['t-child'] = {'id': 't-child', 'status': 'working',
                                      'reviewOf': 't-parent'}
         serve.save_state_to_db(state)
-        self.assertEqual(set(self._blob_tasks()),
+        self.assertEqual(self._live_ids(),
                          {'t-active', 't-parent', 't-child'})
         with serve._db() as conn:
             archived = dict(conn.execute('SELECT id, blob FROM task_archive').fetchall())
@@ -437,6 +452,9 @@ class NoneMergeReadCache(unittest.TestCase):
                                             return_value=_FakeConn()), \
                  unittest.mock.patch.object(serve,
                                             '_merge_extracted_sections',
+                                            lambda data: None), \
+                 unittest.mock.patch.object(serve,
+                                            '_merge_live_tasks',
                                             lambda data: None):
                 first = serve.get_state_from_db(archive_merge='none')
                 second = serve.get_state_from_db(archive_merge='none')

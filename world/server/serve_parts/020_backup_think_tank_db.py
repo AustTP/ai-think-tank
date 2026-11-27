@@ -1107,8 +1107,9 @@ def get_state_from_db(archive_merge='copy'):
               (serialize-and-return handlers, single-key readers). Cuts the
               merge to a dict spread; a mutating caller would silently
               corrupt the archive cache and lose changes on restart.
-      'none'  -- the archive is NOT merged at all: state['tasks'] holds only
-              the live blob's tasks. For callers that never read tasks
+      'none'  -- the ARCHIVE is not merged; state['tasks'] still carries the
+              live working set (task_live rows since 2026-11-27, before that
+              the blob's tasks). For callers that never read tasks
               (roster/village lookups, sandbox id remaps). Observed
               2026-11-04: the execute pipeline's _village_sandbox_id paid a
               ~1.9s whole-archive deepcopy ON THE EVENT LOOP per run while
@@ -1155,6 +1156,11 @@ def get_state_from_db(archive_merge='copy'):
             return None
         data = json.loads(row[0])
     _merge_extracted_sections(data)
+    # Live tasks (task_live rows) merge in every mode: after the 2026-11-27
+    # slice the blob carries no tasks, so even a 'none' reader that resolves
+    # task ids needs the live working set. 'none' still means "the archive
+    # is not merged".
+    _merge_live_tasks(data)
     if archive_merge != 'none':
         _merge_archived_tasks(data, mode=archive_merge)
     if archive_merge == 'copy' and not _state_io_test_mode():
@@ -1398,6 +1404,135 @@ def _prune_task_archive(conn):
     for tid in stale:
         _TASK_ARCHIVE_CACHE['tasks'].pop(tid, None)
     _bump_task_archive_rev()
+
+
+# task_live (2026-11-27): the live working set is the last heavyweight the
+# blob still re-serialized on every save (320 cards, 2.1 MB of a 3.45 MB
+# blob -- 61% of every save's serialize). The archive pattern applied to the
+# live set: per-task rows, diff upserts, merge back on read. With this, the
+# blob carries NO tasks; state['tasks'] on read is task_live rows (live
+# wins) over task_archive rows (the same union the old blob+archive merge
+# produced).
+_TASK_LIVE_LOCK = threading.Lock()
+_TASK_LIVE_CACHE: dict = {'db': None, 'loaded': False, 'rows': {},
+                          'broken': False}
+
+
+def _task_live_load_locked():
+    # Same per-DB cache discipline as _TASK_ARCHIVE_CACHE: a test that
+    # repoints DB_PATH never reads another database's rows, and an absent
+    # table (test schema predating the split) is an empty row set, never an
+    # error -- the legacy blob copy keeps standing. A failed load sets
+    # 'broken': the empty row set must never read as "reconcile is
+    # authoritative", or an empty diff would let a save drop 'tasks' from
+    # the blob while the table holds nothing (silent task loss).
+    cache = _TASK_LIVE_CACHE
+    if cache['loaded'] and cache['db'] == DB_PATH:
+        return cache['rows']
+    rows = {}
+    broken = False
+    try:
+        with _db() as conn:
+            rows = {rid: json.loads(blob) for rid, blob in
+                    conn.execute('SELECT id, blob FROM task_live').fetchall()}
+    except sqlite3.OperationalError:
+        rows = {}
+        broken = True
+    cache['rows'] = rows
+    cache['db'] = DB_PATH
+    cache['loaded'] = True
+    cache['broken'] = broken
+    return rows
+
+
+def _task_live_rows_snapshot():
+    with _TASK_LIVE_LOCK:
+        return dict(_task_live_load_locked())
+
+
+def _merge_live_tasks(data):
+    """Merge task_live rows into data['tasks']. Runs in EVERY read mode,
+    including 'none': after this slice the blob carries no tasks at all, so
+    a 'none' reader that resolves task ids still needs the live working set
+    ('none' means the ARCHIVE is not merged, not that tasks vanish). Rows
+    win over a legacy blob copy (the scale-slice authority rule); the
+    archive merge that runs after this one updates over these, so live
+    beats archived on any id overlap, exactly like the old blob-wins
+    ordering."""
+    rows = _task_live_rows_snapshot()
+    if not rows:
+        return
+    data['tasks'] = {**(data.get('tasks') or {}), **copy.deepcopy(rows)}
+
+
+def _reconcile_task_live(conn, live):
+    """Diff the live (non-terminal) task set into task_live rows inside the
+    caller's transaction: upsert new/changed tasks, delete tasks that left
+    the live set (they moved to the archive in the same save). Returns True
+    when the table is authoritative -- the caller may drop 'tasks' from the
+    blob view; False when the table write failed, so the blob keeps carrying
+    the section (never lose data, same contract as the other slices)."""
+    with _TASK_LIVE_LOCK:
+        cached = _task_live_load_locked()
+        broken = _TASK_LIVE_CACHE['broken']
+    if broken:
+        # The load failed (table missing in a legacy schema, or the DB was
+        # briefly busy): never claim authority, and never treat the empty
+        # diff below as a healthy no-op -- force the next save to re-probe
+        # the table instead.
+        _TASK_LIVE_CACHE['loaded'] = False
+        return False
+    changed = {tid: t for tid, t in live.items() if cached.get(tid) != t}
+    deleted = [tid for tid in cached if tid not in live]
+    if not changed and not deleted:
+        return True
+    now = time.time()
+    try:
+        for tid, t in changed.items():
+            conn.execute(
+                'INSERT INTO task_live (id, blob, updated_at) VALUES (?, ?, ?) '
+                'ON CONFLICT(id) DO UPDATE SET blob = excluded.blob, '
+                'updated_at = excluded.updated_at',
+                (tid, json.dumps(t), now))
+        for tid in deleted:
+            conn.execute('DELETE FROM task_live WHERE id = ?', (tid,))
+    except sqlite3.OperationalError:
+        return False
+    with _TASK_LIVE_LOCK:
+        cache = _task_live_load_locked()
+        for tid in deleted:
+            cache.pop(tid, None)
+        cache.update(changed)
+    return True
+
+
+def _invalidate_row_caches():
+    # The row reconciles update their in-process caches INSIDE the caller's
+    # transaction (same pattern as _reconcile_extracted_sections since
+    # 2026-11-01), so a rollback after the reconcile phase leaves a cache
+    # claiming rows the DB never committed. The retry loop then re-diffs
+    # against that cache, sees "no changes needed", and the blob drop in the
+    # same retry commits -- the section would silently regress to stale rows
+    # on the next restart. Invalidate instead: the next load re-reads the
+    # committed rows, so every later diff compares against the truth.
+    _TASK_LIVE_CACHE['loaded'] = False
+    _TASK_ARCHIVE_CACHE['loaded'] = False
+    for cache in _EXTRACTED_CACHE.values():
+        cache['loaded'] = False
+
+
+@contextlib.contextmanager
+def _save_txn():
+    # _db() with a rollback-on-failure guarantee for the row caches: the
+    # inner _db() rolls the transaction back FIRST (its own with-block), and
+    # only then does the except invalidate the caches -- so the invalidation
+    # can never claim rows over a still-open transaction.
+    try:
+        with _db() as conn:
+            yield conn
+    except Exception:
+        _invalidate_row_caches()
+        raise
 
 
 # --- Scale slices: high-cardinality sections leave the whole blob ---------
@@ -1828,7 +1963,16 @@ def _save_state_to_db_sync(data):
                 # EVERY save and was the largest GIL hog in the tick
                 # thread -- the merged archived dicts alias the archive
                 # cache, but this path only reads them.
-                current['tasks'] = {**archived, **(current.get('tasks') or {})}
+                # task_live (2026-11-27): the persisted blob no longer
+                # carries the live working set, so the "current" view
+                # preserve_guidance compares against must merge the
+                # task_live rows too -- otherwise a stale whole-state save
+                # could erase a newer recovery decision on a LIVE task,
+                # which is the exact case this guard exists for. Legacy
+                # blob copy last (it wins while the migration is
+                # incomplete, same authority ordering as the reads).
+                current['tasks'] = {**archived, **_task_live_rows_snapshot(),
+                                    **(current.get('tasks') or {})}
             data = state_updates.preserve_guidance(current, data)
     # Training capture (opt-in): link task outcomes to recorded
     # interactions whenever the sim state is committed.
@@ -1874,15 +2018,25 @@ def _save_state_to_db_sync(data):
             done = {tid: t for tid, t in done.items() if tid not in referenced}
         _save_phase(data, 'save_archive_reconcile')
         archived_ok = _reconcile_task_archive(done) if done else True
+        # The live set: everything not handed to the archive, INCLUDING
+        # reference-guarded terminal cards (a repair child mid-flight
+        # references its failed parent; the child's completion lookup must
+        # find it). With task_live authoritative, the guarded card lives in
+        # task_live rows until the chain clears, then graduates to the
+        # archive -- same visibility on read, smaller blob either way.
+        live = {tid: t for tid, t in task_items if tid not in done}
         if done and archived_ok:
-            blob = {**data, 'tasks': {tid: t for tid, t in task_items
-                                      if tid not in done}}
+            blob = {**data, 'tasks': dict(live)}
         else:
             # Nothing to archive, or the archive table is unavailable -- keep
             # every task in the blob so nothing is ever lost.
             blob = data
         _save_phase(data, 'save_blob_write')
-        with _db() as conn:
+        # A failure inside this transaction (kv_state insert, checksum write,
+        # a raise between phases) rolls the whole transaction back -- but the
+        # row reconciles already updated their caches. _save_txn invalidates
+        # them on the way out so the retry diffs against committed rows.
+        with _save_txn() as conn:
             # Scale slices: reconcile the extracted sections (roster, live
             # agents, player inbox) in the SAME transaction as the blob write,
             # then drop the reconciled keys from the blob. A crash before this
@@ -1891,6 +2045,13 @@ def _save_state_to_db_sync(data):
             # no blob copy. Either state reads correctly.
             _save_phase(data, 'save_extracted_sections')
             extracted_ok = _reconcile_extracted_sections(conn, data)
+            _save_phase(data, 'save_live_tasks')
+            # Same transaction, same authority rule: on success the blob view
+            # drops 'tasks' entirely; on failure the blob keeps carrying the
+            # tasks so nothing is lost.
+            live_ok = _reconcile_task_live(conn, live)
+            if live_ok:
+                blob = {k: v for k, v in blob.items() if k != 'tasks'}
             _save_phase(data, 'save_blob_serialize')
             if extracted_ok:
                 blob = {k: v for k, v in blob.items() if k not in extracted_ok}

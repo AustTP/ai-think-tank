@@ -298,6 +298,18 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # task_live (2026-11-27): the live working set leaves the blob the
+        # same way the archive did. The blob no longer carries state['tasks']
+        # at all: every save upserts only the task rows that changed, and
+        # get_state_from_db merges task_live (live wins) under task_archive
+        # so every reader keeps its exact shape. Authority rule mirrors the
+        # other scale slices: rows win over a legacy blob copy once they
+        # exist; a failed reconcile keeps the blob copy.
+        conn.execute('''CREATE TABLE IF NOT EXISTS task_live (
+            id TEXT PRIMARY KEY,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Idempotency ledger for external writes. A retry with the same
         # requestId returns the original result instead of starting a second
         # Apify run or creating a second calendar event.

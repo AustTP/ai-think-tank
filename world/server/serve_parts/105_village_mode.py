@@ -91,8 +91,18 @@ def _village_heartbeat_payload():
                 'SELECT count(*) FROM health_alerts WHERE ts > ?',
                 (time.time() - 24 * 3600,)).fetchone()
         state = json.loads(row[0]) if row else {}
+        tasks = dict(state.get('tasks') or {})
+        # task_live (2026-11-27): the blob carries no tasks once the live
+        # rows are authoritative -- a raw-blob count would read 0 forever
+        # (the agents-count blind spot). Rows win over the legacy blob
+        # copy, same authority as the reads.
+        try:
+            for tid, b in conn.execute('SELECT id, blob FROM task_live'):
+                tasks[tid] = json.loads(b)
+        except Exception:
+            pass
         open_tasks = sum(
-            1 for t in (state.get('tasks') or {}).values()
+            1 for t in tasks.values()
             if isinstance(t, dict)
             and t.get('status') not in ('done', 'cancelled', 'abandoned'))
         return {

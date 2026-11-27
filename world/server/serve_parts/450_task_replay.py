@@ -79,8 +79,10 @@ def _load_task_and_children(task_id):
 
     get_state_from_db('copy') costs a ~1.9s whole-archive deepcopy for ONE
     task's summary (observed 2026-11-04: replay took ~6s, ~5s of it the
-    merge). The live blob and the archive table are queried directly
-    instead; JSON path filters do the child scan in the DB."""
+    merge). The live blob and the row tables are queried directly instead;
+    JSON path filters do the child scan in the DB. task_live (2026-11-27)
+    joined the split: the live working set left the blob, so both the task
+    lookup and the child scan must cover it."""
     children = []
     task = None
     with _db() as conn:
@@ -88,19 +90,29 @@ def _load_task_and_children(task_id):
             "SELECT blob FROM kv_state WHERE id = 1").fetchone()
         if row:
             data = json.loads(row[0])
-            task = (data.get('tasks') or {}).get(task_id)
+            tasks = (data.get('tasks') or {})
+            task = tasks.get(task_id)
             children = _child_cards_from_rows(
-                ((cid, t) for cid, t in (data.get('tasks') or {}).items()
+                ((cid, t) for cid, t in tasks.items()
                  if isinstance(t, dict)), task_id)
         if task is None:
-            arow = conn.execute(
-                'SELECT blob FROM task_archive WHERE id = ?',
+            lrow = conn.execute(
+                'SELECT blob FROM task_live WHERE id = ?',
                 (task_id,)).fetchone()
-            if arow:
-                task = json.loads(arow[0])
-        # Child scan over the archive. Postgres does it in the DB with a
-        # JSON path filter; sqlite has no jsonb cast, so scan the (test-
-        # sized) archive in Python.
+            if lrow:
+                task = json.loads(lrow[0])
+        # Child scan over the live rows and the archive. Postgres does it in
+        # the DB with a JSON path filter; sqlite has no jsonb cast, so scan
+        # the (test-sized) tables in Python. The live table holds the
+        # non-terminal cards (repair children mid-flight); the archive holds
+        # the completed ones.
+        try:
+            lrows = [(cid, json.loads(b) if isinstance(b, str) else b)
+                     for cid, b in conn.execute(
+                         'SELECT id, blob FROM task_live').fetchall()]
+        except Exception:
+            lrows = []
+        children.extend(_child_cards_from_rows(lrows, task_id))
         import db_backend as _dbm
         if _dbm.is_postgres():
             arows = conn.execute(

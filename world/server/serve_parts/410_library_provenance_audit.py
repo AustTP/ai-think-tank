@@ -932,6 +932,14 @@ def _unfinished_task_causes(task_ids):
                 live = (json.loads(row[0]).get('tasks') or {})
             except Exception:
                 live = {}
+        # task_live (2026-11-27): the blob carries no tasks once the live
+        # rows are authoritative; rows win over the legacy blob copy, same
+        # authority as the reads.
+        try:
+            for tid, b in conn.execute('SELECT id, blob FROM task_live'):
+                live[tid] = json.loads(b)
+        except Exception:
+            pass
         try:
             rows = conn.execute('SELECT id, blob FROM task_archive').fetchall()
         except Exception:
