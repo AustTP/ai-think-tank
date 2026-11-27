@@ -338,19 +338,44 @@ def test_dormancy_tools_surface_and_executor_forwarding(monkeypatch):
 def test_ensure_windows_table_takes_cross_tank_advisory_lock_on_postgres():
     # Deadlock fix (2026-11-14): the migration ALTER and window writes must
     # serialize across tanks via a session-scoped advisory lock, taken
-    # BEFORE any dormancy_windows statement in the transaction.
+    # BEFORE any dormancy_windows migration statement. Stall fix
+    # (2026-11-27): the lock only runs when a column is actually missing,
+    # behind the PRAGMA probe that detects it -- so on a mocked connection
+    # (probe returns nothing, every column counts as missing) the probe is
+    # first and the lock still precedes every migration statement.
     from unittest import mock
     conn = mock.MagicMock()
     conn.postgres = True
     selfedit._ensure_windows_table(conn)
-    first_sql = conn.execute.call_args_list[0][0][0]
-    assert 'pg_advisory_xact_lock' in first_sql
-    create_sqls = [c[0][0] for c in conn.execute.call_args_list
-                   if 'CREATE TABLE' in c[0][0] or 'ALTER TABLE' in c[0][0]]
-    assert create_sqls, 'migration statements must still run'
-    assert conn.execute.call_args_list.index(
-        mock.call(first_sql)) < conn.execute.call_args_list.index(
-        mock.call(create_sqls[0]))
+    calls = [c[0][0] for c in conn.execute.call_args_list]
+    assert calls[0] == 'PRAGMA table_info(dormancy_windows)'
+    lock_calls = [i for i, sql in enumerate(calls)
+                  if 'pg_advisory_xact_lock' in sql]
+    assert lock_calls, 'postgres + missing columns must take the advisory lock'
+    migrate_calls = [i for i, sql in enumerate(calls)
+                     if 'CREATE TABLE' in sql or 'ALTER TABLE' in sql]
+    assert migrate_calls, 'migration statements must still run'
+    assert lock_calls[0] < migrate_calls[0]
+
+
+def test_ensure_windows_table_skips_lock_on_healthy_table():
+    # Stall fix (2026-11-27): with every column present the steady-state
+    # tick is the probe plus two IF NOT EXISTS no-ops -- the global
+    # advisory lock must NOT be taken, or window_tick threads stack up
+    # behind the holder and starve the executor pool (25 minute tank
+    # stall, 2026-11-27 04:22-04:47 UTC).
+    from unittest import mock
+    conn = mock.MagicMock()
+    conn.postgres = True
+    probe = mock.MagicMock()
+    probe.fetchall.return_value = [
+        (i, name, 'TEXT', 0, None, 0)
+        for i, (name, _decl) in enumerate(selfedit._DORMANCY_WINDOW_COLUMNS)]
+    conn.execute.return_value = probe
+    selfedit._ensure_windows_table(conn)
+    for c in conn.execute.call_args_list:
+        assert 'pg_advisory_xact_lock' not in c[0][0]
+    assert any('CREATE TABLE' in c[0][0] for c in conn.execute.call_args_list)
 
 
 def test_ensure_windows_table_skips_advisory_lock_on_sqlite():
