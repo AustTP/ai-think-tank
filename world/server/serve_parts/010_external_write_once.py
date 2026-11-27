@@ -449,6 +449,127 @@ def init_db():
             blob TEXT NOT NULL,
             updated_at REAL NOT NULL
         )''')
+        # Scale slices round 4 (2026-11-27): what remained of the blob after
+        # stage 2. 'list' sections keep the id-carrying shape; 'list-seq'
+        # sections row by POSITION (entries carry no stable id -- workQueue
+        # cards shift on assignment, so a mid-list removal rewrites the tail;
+        # appends, the common case, write one row); 'list-ts' sections row by
+        # the entry's own ts field (memoryLedger entries are append-only
+        # with unique ms timestamps).
+        conn.execute('''CREATE TABLE IF NOT EXISTS memory_ledger (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS work_queue (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS reject_ledger (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS repair_failure_log (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS abandoned_card (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS quarantine_log (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS used_name (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS sim_pause_window (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS wiki_section (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS replan_capped_logged_at (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS agent_failure_memory (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS team_lesson (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS scheduled_item (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS workflow_template (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS agent_template (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS team (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS work_program (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS pattern_fix_state (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS avatar_task_at (
+            id TEXT PRIMARY KEY,
+            seq INTEGER NOT NULL DEFAULT 0,
+            blob TEXT NOT NULL,
+            updated_at REAL NOT NULL
+        )''')
         # Durable cursor for a live feed collector. AISStream is live-only, so
         # this records the last ingested frame and the reconnect coverage gap;
         # it is a checkpoint, not a replay buffer.

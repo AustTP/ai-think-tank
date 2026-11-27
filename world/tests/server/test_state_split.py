@@ -82,6 +82,21 @@ STAGE2_KEYS = ('firedAgents', 'storyCostTracking', '_feedback',
                '_cardFailureNotified', '_lastEmailAt', '_repairLoopNotified',
                '_staleWorkReplans', '_patternSuppressedNotified')
 
+# Round-4 sections (2026-11-27): what remained of the blob after stage 2.
+STAGE3_TABLES = ('memory_ledger', 'work_queue', 'reject_ledger',
+                 'repair_failure_log', 'abandoned_card', 'quarantine_log',
+                 'used_name', 'sim_pause_window', 'wiki_section',
+                 'replan_capped_logged_at', 'agent_failure_memory',
+                 'team_lesson', 'scheduled_item', 'workflow_template',
+                 'agent_template', 'team', 'work_program',
+                 'pattern_fix_state', 'avatar_task_at')
+STAGE3_KEYS = ('memoryLedger', 'workQueue', 'rejectLedger',
+               '_repairFailureLog', '_abandonedCards', '_quarantineLog',
+               '_usedNames', '_simPauseWindows', 'wiki',
+               '_replanCappedLoggedAt', 'agentFailureMemory', 'teamLessons',
+               'scheduledItems', 'workflowTemplates', 'templates', 'teams',
+               'programs', '_patternFixState', '_avatarTaskAt')
+
 
 def _with_round2(state):
     state['growthPlans'] = {
@@ -132,6 +147,72 @@ def _with_stage2(state):
     return state
 
 
+def _with_stage3(state):
+    state['memoryLedger'] = [
+        {'ts': 1791862892393, 'actor': 'distill',
+         'pageId': 'state-of-knowledge',
+         'title': 'Think tank knowledge state', 'claim': 'x'},
+        {'ts': 1791862892500, 'actor': 'distill',
+         'pageId': 'state-of-knowledge',
+         'title': 'Think tank knowledge state', 'claim': 'y'},
+    ]
+    state['workQueue'] = [
+        {'title': 'card-a', 'requestId': 'wrq-1', 'taskType': 'code'},
+        {'title': 'card-b', 'taskType': 'code'},
+        {'title': 'card-c', 'taskType': 'write'},
+    ]
+    state['rejectLedger'] = [
+        {'atMs': 1795194531026, 'taskId': 'task-35448',
+         'title': '[GOVERN] review', 'kind': 'review', 'note': 'no',
+         'reviewer': 'ben', 'room': 'dev', 'teamId': 'nora',
+         'workType': 'code'},
+    ]
+    state['_repairFailureLog'] = [
+        {'key': 'title:Implement fix', 'root': 'Implement fix',
+         'taskId': 'task-1', 'ts': 1795194531026},
+    ]
+    state['_abandonedCards'] = [
+        {'at': 1793054650525, 'attempts': 3, 'room': 'pressoffice',
+         'taskType': 'code', 'teamId': 'nora', 'title': 'Add door map data'},
+    ]
+    state['_quarantineLog'] = [
+        {'at': 1793054650525, 'by': 'operator', 'cards': ['task-421'],
+         'reason': 'spam', 'workQueue': []},
+    ]
+    state['_usedNames'] = ['ada', 'ben', 'cora']
+    state['_simPauseWindows'] = [[1795704958469, 1795705161013]]
+    state['wiki'] = {
+        'pages': {'state-of-knowledge': {'title': 'Think', 'body': '...'}}}
+    state['_replanCappedLoggedAt'] = {'task-24842': 1794937323647}
+    state['agentFailureMemory'] = {
+        'eli': {'count': 44, 'lastFailedAt': 1795205420188}}
+    state['teamLessons'] = {
+        "(nora, code)": {'lesson': 'do not re-file the review'}}
+    state['scheduledItems'] = [
+        {'id': 'sch-rvp-telegram-digest', 'title': 'digest',
+         'cadence': 'daily', 'enabled': True, 'instructions': 'x',
+         'ownerRole': 'chief', 'lastRunAtMs': 0},
+    ]
+    state['workflowTemplates'] = {
+        'wft-1b66470b996ae6b3': {'id': 'wft-1b66470b996ae6b3',
+                                 'name': 'Research and write'}}
+    state['templates'] = {
+        'Research': {'mission': 'Investigate assigned topics'}}
+    state['teams'] = [
+        {'id': 'ben', 'name': "The Writers' Room", 'directorId': 'ben',
+         'purpose': 'Modernize'},
+    ]
+    state['programs'] = [
+        {'id': 'prog-1', 'title': 'Integrate the dankornas corpus',
+         'status': 'active'},
+    ]
+    state['_patternFixState'] = {
+        "(None, 'code', 'rejected')": {'team': None, 'workType': 'code',
+                                       'kind': 'rejected'}}
+    state['_avatarTaskAt'] = {'marta': 1795552041826}
+    return state
+
+
 def _raw_blob():
     with serve._db() as conn:
         row = conn.execute('SELECT blob FROM kv_state WHERE id = 1').fetchone()
@@ -154,7 +235,8 @@ class StateSplitTest(unittest.TestCase):
         serve.init_db()
         with serve._db() as conn:
             for table in ('roster_agent', 'live_agent', 'inbox_message',
-                          'sim_agent_snapshot') + ROUND2_TABLES + STAGE2_TABLES:
+                          'sim_agent_snapshot') + ROUND2_TABLES \
+                    + STAGE2_TABLES + STAGE3_TABLES:
                 conn.execute(f'DELETE FROM {table}')
             conn.execute('DELETE FROM kv_state')
             conn.execute('DELETE FROM state_checksum')
@@ -478,3 +560,159 @@ class Stage2BookkeepingSplitTest(StateSplitTest):
                 'SELECT COUNT(*) FROM last_email_at').fetchone()[0], 0)
         back = serve.get_state_from_db()
         self.assertFalse(back.get('_lastEmailAt'))
+
+
+class Stage3TailSplitTest(StateSplitTest):
+    """The 2026-11-27 round 4: what remained of the blob after stage 2.
+    memoryLedger rows by its unique per-entry ts ('list-ts'); the no-id
+    lists (workQueue, rejectLedger, _repairFailureLog, _abandonedCards,
+    _quarantineLog, _usedNames, _simPauseWindows) row by POSITION
+    ('list-seq'); the id-carrying lists and dict sections use the
+    existing shapes."""
+
+    def test_round_trip_preserves_exact_shapes(self):
+        state = _with_stage3(_base_state())
+        serve.save_state_to_db(copy.deepcopy(state))
+        back = serve.get_state_from_db()
+        for key in STAGE3_KEYS:
+            self.assertEqual(back[key], state[key], key)
+        # list-seq entries are not limited to dicts: strings and lists row.
+        self.assertIsInstance(back['_usedNames'][0], str)
+        self.assertIsInstance(back['_simPauseWindows'][0], list)
+
+    def test_blob_drops_stage3_keys_and_rows_carry_them(self):
+        serve.save_state_to_db(_with_stage3(_base_state()))
+        blob = _raw_blob()
+        for key in STAGE3_KEYS:
+            self.assertNotIn(key, blob, key)
+        with serve._db() as conn:
+            for table, count in (('memory_ledger', 2), ('work_queue', 3),
+                                 ('reject_ledger', 1),
+                                 ('repair_failure_log', 1),
+                                 ('abandoned_card', 1),
+                                 ('quarantine_log', 1), ('used_name', 3),
+                                 ('sim_pause_window', 1),
+                                 ('wiki_section', 1),
+                                 ('replan_capped_logged_at', 1),
+                                 ('agent_failure_memory', 1),
+                                 ('team_lesson', 1), ('scheduled_item', 1),
+                                 ('workflow_template', 1),
+                                 ('agent_template', 1), ('team', 1),
+                                 ('work_program', 1),
+                                 ('pattern_fix_state', 1),
+                                 ('avatar_task_at', 1)):
+                self.assertEqual(
+                    conn.execute(f'SELECT COUNT(*) FROM {table}')
+                    .fetchone()[0], count, table)
+
+    def test_legacy_blob_migrates_on_first_save(self):
+        legacy = _with_stage3(_base_state())
+        with serve._db() as conn:
+            conn.execute(
+                'INSERT INTO kv_state (id, blob, updated_at) VALUES (1, ?, ?)',
+                (json.dumps(legacy), time.time()))
+        back = serve.get_state_from_db()
+        self.assertEqual(back['workQueue'], legacy['workQueue'])
+        serve.save_state_to_db(serve.get_state_from_db())
+        blob = _raw_blob()
+        for key in STAGE3_KEYS:
+            self.assertNotIn(key, blob, key)
+        again = serve.get_state_from_db()
+        self.assertEqual(again['memoryLedger'], legacy['memoryLedger'])
+        self.assertEqual(again['workQueue'], legacy['workQueue'])
+        self.assertEqual(again['_usedNames'], legacy['_usedNames'])
+
+    def test_append_writes_only_the_new_position(self):
+        serve.save_state_to_db(_with_stage3(_base_state()))
+        with serve._db() as conn:
+            before = dict(conn.execute(
+                'SELECT id, updated_at FROM reject_ledger').fetchall())
+        time.sleep(0.02)
+        state = serve.get_state_from_db()
+        state['rejectLedger'].append(
+            {'atMs': 1795194531999, 'taskId': 'task-99', 'title': 'late',
+             'kind': 'review', 'note': '', 'reviewer': 'ben', 'room': 'dev',
+             'teamId': 'nora', 'workType': 'code'})
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            after = dict(conn.execute(
+                'SELECT id, updated_at FROM reject_ledger').fetchall())
+        self.assertEqual(after['0'], before['0'])
+        self.assertNotIn('1', before)
+        self.assertIn('1', after)
+
+    def test_mid_list_removal_rewrites_the_shifted_tail(self):
+        serve.save_state_to_db(_with_stage3(_base_state()))
+        with serve._db() as conn:
+            before = dict(conn.execute(
+                'SELECT id, updated_at FROM work_queue').fetchall())
+        time.sleep(0.02)
+        state = serve.get_state_from_db()
+        state['workQueue'].pop(0)
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            after = dict(conn.execute(
+                'SELECT id, updated_at FROM work_queue').fetchall())
+        # Every surviving position now holds different content, so both
+        # rows rewrite and the tail row is deleted.
+        self.assertNotIn('2', after)
+        self.assertGreater(after['0'], before['0'])
+        self.assertGreater(after['1'], before['1'])
+        back = serve.get_state_from_db()
+        self.assertEqual([c['title'] for c in back['workQueue']],
+                         ['card-b', 'card-c'])
+
+    def test_memory_ledger_rows_by_ts_and_diffs_by_content(self):
+        serve.save_state_to_db(_with_stage3(_base_state()))
+        with serve._db() as conn:
+            before = dict(conn.execute(
+                'SELECT id, updated_at FROM memory_ledger').fetchall())
+        time.sleep(0.02)
+        state = serve.get_state_from_db()
+        # Same ts, new content: the row identity is ts, so this REWRITES
+        # that one row.
+        state['memoryLedger'][0]['claim'] = 'x2'
+        # New ts: appends one row.
+        state['memoryLedger'].append(
+            {'ts': 1791862899999, 'actor': 'distill',
+             'pageId': 'state-of-knowledge', 'title': 'Think tank',
+             'claim': 'z'})
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            after = dict(conn.execute(
+                'SELECT id, updated_at FROM memory_ledger').fetchall())
+        self.assertGreater(after['1791862892393'], before['1791862892393'])
+        self.assertEqual(after['1791862892500'], before['1791862892500'])
+        self.assertIn('1791862899999', after)
+        back = serve.get_state_from_db()
+        self.assertEqual(back['memoryLedger'][0]['claim'], 'x2')
+        self.assertEqual(len(back['memoryLedger']), 3)
+
+    def test_duplicate_ts_fails_closed(self):
+        # Two entries sharing a ts would collapse into one row and silently
+        # lose an entry; the rower must refuse the section instead.
+        state = _with_stage3(_base_state())
+        state['memoryLedger'].append(dict(state['memoryLedger'][0]))
+        serve.save_state_to_db(state)
+        blob = _raw_blob()
+        self.assertIn('memoryLedger', blob)
+
+    def test_unrowable_list_ts_entry_stays_in_blob(self):
+        state = _with_stage3(_base_state())
+        state['memoryLedger'][0].pop('ts')
+        serve.save_state_to_db(state)
+        blob = _raw_blob()
+        self.assertIn('memoryLedger', blob)
+        back = serve.get_state_from_db()
+        self.assertEqual(back['memoryLedger'], state['memoryLedger'])
+
+    def test_absent_key_clears_the_section(self):
+        serve.save_state_to_db(_with_stage3(_base_state()))
+        state = serve.get_state_from_db()
+        state.pop('workQueue')
+        serve.save_state_to_db(state)
+        with serve._db() as conn:
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM work_queue').fetchone()[0], 0)
+        back = serve.get_state_from_db()
+        self.assertFalse(back.get('workQueue'))

@@ -1582,7 +1582,11 @@ EXTRACTED_SECTIONS = (
     # the row blob (growthPlans maps agent id -> [plan revisions]);
     # 'dict-scalar' rows are keyed by the dict key with the entry's SCALAR
     # value as the row blob (a notify timestamp, a replan counter);
-    # 'list' rows keep order via seq and require every entry to carry an id.
+    # 'list' rows keep order via seq and require every entry to carry an id;
+    # 'list-seq' rows keep order via seq and use the POSITION as the row
+    # identity (any JSON entry; a mid-list removal shifts and rewrites the
+    # tail); 'list-ts' rows use str(entry['ts']) as the row identity
+    # (append-only entries with unique timestamps, e.g. memoryLedger).
     ('helpSignals', 'help_signal', 'list'),
     ('issues', 'tracked_issue', 'dict'),
     ('wakeQueue', 'wake_entry', 'list'),
@@ -1606,6 +1610,33 @@ EXTRACTED_SECTIONS = (
     ('_repairLoopNotified', 'repair_loop_notified', 'dict-scalar'),
     ('_staleWorkReplans', 'stale_work_replan', 'dict-scalar'),
     ('_patternSuppressedNotified', 'pattern_suppressed_notified', 'dict-scalar'),
+    # Round 4 (2026-11-27): what remained of the blob after stage 2
+    # (~527KB of a 544KB blob; the blob drops to a tail of small
+    # bookkeeping keys). memoryLedger rows by its unique per-entry ts
+    # ('list-ts'); the no-id lists row by POSITION ('list-seq': identity
+    # is the entry's index, so a mid-list removal rewrites the tail --
+    # workQueue shifts constantly but only ~28 cards, while appends, the
+    # common case, write one row); the id-carrying lists keep 'list';
+    # everything else uses the existing dict shapes.
+    ('memoryLedger', 'memory_ledger', 'list-ts'),
+    ('workQueue', 'work_queue', 'list-seq'),
+    ('rejectLedger', 'reject_ledger', 'list-seq'),
+    ('_repairFailureLog', 'repair_failure_log', 'list-seq'),
+    ('_abandonedCards', 'abandoned_card', 'list-seq'),
+    ('_quarantineLog', 'quarantine_log', 'list-seq'),
+    ('_usedNames', 'used_name', 'list-seq'),
+    ('_simPauseWindows', 'sim_pause_window', 'list-seq'),
+    ('wiki', 'wiki_section', 'dict'),
+    ('_replanCappedLoggedAt', 'replan_capped_logged_at', 'dict-scalar'),
+    ('agentFailureMemory', 'agent_failure_memory', 'dict'),
+    ('teamLessons', 'team_lesson', 'dict'),
+    ('scheduledItems', 'scheduled_item', 'list'),
+    ('workflowTemplates', 'workflow_template', 'dict'),
+    ('templates', 'agent_template', 'dict'),
+    ('teams', 'team', 'list'),
+    ('programs', 'work_program', 'list'),
+    ('_patternFixState', 'pattern_fix_state', 'dict'),
+    ('_avatarTaskAt', 'avatar_task_at', 'dict-scalar'),
 )
 _EXTRACTED_LOCK = threading.Lock()
 _EXTRACTED_CACHE = {key: {'db': None, 'loaded': False, 'rows': {}}
@@ -1653,11 +1684,12 @@ def _merge_extracted_sections(data):
             if key.startswith('sim:'):
                 if isinstance(data.get('sim'), dict) \
                         and key[4:] not in data['sim']:
-                    data['sim'][key[4:]] = [] if shape == 'list' else {}
+                    data['sim'][key[4:]] = \
+                        [] if shape.startswith('list') else {}
             elif key not in data:
-                data[key] = [] if shape == 'list' else {}
+                data[key] = [] if shape.startswith('list') else {}
             continue
-        if shape == 'list':
+        if shape.startswith('list'):
             merged = [obj for _rid, (_seq, obj)
                       in sorted(rows.items(), key=lambda kv: (kv[1][0], kv[0]))]
         else:
@@ -1677,7 +1709,8 @@ def _reconcile_extracted_sections(conn, data):
     transaction: upsert new/changed rows, delete removed ones. Returns the
     section keys that may be dropped from the blob (reconcile succeeded); a
     section that cannot be rowed (absent from the state, not a list/dict,
-    entries without ids or, for dict-scalar, non-scalar values) or whose
+    entries without ids or, for dict-scalar, non-scalar values or, for
+    list-ts, entries without ts, or duplicate row identities) or whose
     table write fails keeps its blob copy --
     never lose data. An ABSENT key means the saved state has no such section:
     the blob write it accompanies is a full replace (every writer passes the
@@ -1700,7 +1733,8 @@ def _reconcile_extracted_sections(conn, data):
             desired = {}
             unrowable = False
         elif not isinstance(entries, (list, dict)) or (
-                shape == 'list' and not isinstance(entries, list)) or (
+                shape.startswith('list')
+                and not isinstance(entries, list)) or (
                 shape in ('dict', 'dict-lists', 'dict-scalar')
                 and not isinstance(entries, dict)):
             # Present but unrowable (fail-closed): the blob keeps its copy,
@@ -1725,10 +1759,25 @@ def _reconcile_extracted_sections(conn, data):
                     desired[rid] = (0, entry)
             else:
                 for seq, entry in enumerate(entries):
-                    if not isinstance(entry, dict) or not entry.get('id'):
+                    if shape == 'list-seq':
+                        # Position IS the identity: any JSON entry rows.
+                        rid = str(seq)
+                    elif shape == 'list-ts':
+                        if not isinstance(entry, dict) or not entry.get('ts'):
+                            unrowable = True
+                            break
+                        rid = str(entry['ts'])
+                    elif not isinstance(entry, dict) or not entry.get('id'):
                         unrowable = True
                         break
-                    desired[str(entry['id'])] = (seq, entry)
+                    else:
+                        rid = str(entry['id'])
+                    desired[rid] = (seq, entry)
+            if not unrowable and len(desired) != len(entries):
+                # Duplicate row identities (two entries carrying the same id
+                # or ts) would silently collapse into one row -- fail closed
+                # instead of losing entries.
+                unrowable = True
         if unrowable:
             continue
         changed = {rid: (seq, obj) for rid, (seq, obj) in desired.items()
