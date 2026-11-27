@@ -841,6 +841,22 @@ def _apply_content_result(state, task, result, now_ms=None):
     note = result.get('note')
     if note:
         task['note'] = note
+    # Shared findings buffer (2026-11-27, arXiv 2610.31355 "Muffin"): a
+    # real completion drops ONE finding into the request's append-only
+    # buffer (agents/findings_buffer, library/findings/<root>.jsonl), so a
+    # later dispatch on the same request reads peers' findings instead of
+    # re-deriving them. Noop placeholders, budget-exhaustion stubs,
+    # infra-failure notes and ok:False model-failure stubs (30_body_04
+    # review/QA failures) are not findings. Best-effort: a buffer failure
+    # never blocks the merge.
+    if note and result.get('ok') is not False and not result.get('noop') \
+            and not result.get('budgetExhausted') and not result.get('infra'):
+        try:
+            import agents.findings_buffer as findings_buffer
+            findings_buffer.append(state, task.get('assignedTo'), task, note,
+                                   library_path=result.get('libraryPath'))
+        except Exception:
+            pass
     # Review diagnostics and workspace handoff survive the result channel.
     for field in ('reviewDiagnostics', 'reviewFailureKind', 'reviewContract',
                   'stagedWorkspace', 'previousWorkspace', 'resumedFromWorkspace',

@@ -373,6 +373,23 @@ def _server_content_dispatcher(snapshot, agent_id, task, base_ctx=None):
                                 'do not quote it)]\n' + _hy_digest)
             except Exception as _hybrid_err:
                 print(f'[hybrid] prepare failed: {_hybrid_err}', flush=True)
+            # Shared findings buffer (16_body_02_findings, from arXiv
+            # 2610.31355 "Muffin"): fold the k most recent findings from
+            # OTHER agents on this request into the perception string, so
+            # the executor builds on what peers already learned instead of
+            # re-deriving it. Read-only here; the write happens when a run
+            # completes (sim._apply_content_result). Best-effort -- never
+            # breaks the dispatch.
+            try:
+                _fb_digest = _findings_prepare(snapshot, agent_id, task, base_ctx)
+                if _fb_digest and isinstance(_fb_digest, str):
+                    base_ctx = ((base_ctx or '') +
+                                '\n\n[Shared findings from other agents on '
+                                'this request (recent runs left these; build '
+                                'on them, do not repeat their work)]\n'
+                                + _fb_digest)
+            except Exception as _fb_err:
+                print(f'[findings] prepare failed: {_fb_err}', flush=True)
             executor(snapshot, agent_id, task, base_ctx)
         finally:
             if _capture_token is not None:
