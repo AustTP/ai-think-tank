@@ -716,3 +716,21 @@ class Stage3TailSplitTest(StateSplitTest):
                 'SELECT COUNT(*) FROM work_queue').fetchone()[0], 0)
         back = serve.get_state_from_db()
         self.assertFalse(back.get('workQueue'))
+
+    def test_one_stale_section_bulk_loads_every_section(self):
+        # The cold-read fix: a single stale section cache triggers one
+        # UNION ALL round trip that fills ALL section caches, not just the
+        # one asked for. Spot-check every shape family afterwards.
+        expected = _with_stage3(_base_state())
+        serve.save_state_to_db(expected)
+        _reset_extracted_caches()
+        with serve._EXTRACTED_LOCK:
+            serve._extracted_rows_load_locked(
+                'memory_ledger', serve._EXTRACTED_CACHE['memoryLedger'])
+        for key, cache in serve._EXTRACTED_CACHE.items():
+            self.assertTrue(cache['loaded'], key)
+            self.assertEqual(cache['db'], serve.DB_PATH, key)
+        back = serve.get_state_from_db()
+        for key in ('memoryLedger', 'workQueue', '_usedNames',
+                    '_avatarTaskAt', '_patternFixState', 'templates'):
+            self.assertEqual(back[key], expected[key], key)

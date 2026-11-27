@@ -1083,18 +1083,16 @@ def _checkout(dsn):
         pool = _get_pool(dsn)
         raw = pool.getconn()
         _apply_socket_timeouts(raw)
-        # Key the once-only prime on the connection object itself: id() is
-        # a memory address Python reuses after GC, so a set of ids could
-        # (and did) miss priming a recycled pooled connection -- that
-        # unprimed session then ran with no liveness GUCs and held a
-        # projection transaction open ~50 minutes (2026-11-27). The GUCs
-        # also arrive via connect options now; this remains as fallback.
-        if not getattr(raw, '_tt_primed', False):
-            _prime_session(raw)
-            try:
-                raw._tt_primed = True
-            except Exception:
-                pass
+        # No per-checkout priming: the liveness GUCs arrive at CONNECT time
+        # via the options in _PG_CONNECT_KWARGS() (2026-11-27), so every
+        # session starts with them already set. A per-checkout prime here
+        # was pure overhead -- 3 round trips (2 SETs + commit) per checkout,
+        # ~245ms each on the 60ms link, because the once-only marker could
+        # never stick (psycopg2 C connections carry no __dict__, so the
+        # attribute assignment raised and was swallowed) and every pooled
+        # checkout re-primed. _prime_session remains only for the unpooled
+        # fallback below, where the connect kwargs are applied but a
+        # belt-and-braces SET is free.
         return raw, pool
     except Exception:
         # Pool exhausted or unusable: fall back to an unpooled connection

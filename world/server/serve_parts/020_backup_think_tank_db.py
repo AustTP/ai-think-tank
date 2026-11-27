@@ -1650,18 +1650,52 @@ def _extracted_rows_load_locked(table, cache):
     # blob copy keeps standing and the first save recreates the table.
     if cache['loaded'] and cache['db'] == DB_PATH:
         return cache['rows']
-    rows = {}
-    try:
-        with _db() as conn:
-            for rid, seq, blob in conn.execute(
-                    f'SELECT id, seq, blob FROM {table}'):
-                rows[rid] = (int(seq), json.loads(blob))
-    except sqlite3.OperationalError:
-        rows = {}
+    _extracted_sections_bulk_load_locked()
+    return cache['rows']
+
+
+def _extracted_cache_fill(key, rows):
+    cache = _EXTRACTED_CACHE[key]
     cache['rows'] = rows
     cache['db'] = DB_PATH
     cache['loaded'] = True
-    return rows
+
+
+def _extracted_sections_bulk_load_locked():
+    # ONE _db() + one UNION ALL for every section table. A cold read used
+    # to open one connection per section: ~0.55s each on the 60ms link
+    # (a 3-round-trip prime that never stuck + the savepointed SELECT +
+    # the commit), ~15s just to cold-load 28 sections. Every table shares
+    # the same (id, seq, blob) shape, so a single statement carries them
+    # all in one round trip.
+    try:
+        with _db() as conn:
+            sql = ' UNION ALL '.join(
+                f"SELECT {key!r} AS sk, id, seq, blob FROM {table}"
+                for key, table, _shape in EXTRACTED_SECTIONS)
+            found = {}
+            for sk, rid, seq, blob in conn.execute(sql):
+                found.setdefault(sk, {})[rid] = (int(seq), json.loads(blob))
+        for key, _table, _shape in EXTRACTED_SECTIONS:
+            _extracted_cache_fill(key, found.get(key, {}))
+        return
+    except sqlite3.OperationalError:
+        pass
+    # A schema missing one table (test fixtures predating a split, or a
+    # mid-restart schema) fails the UNION wholesale. The historical
+    # per-table loads tolerate absence individually, so fall back to
+    # exactly those; empty results still fill the cache so the bulk path
+    # never re-runs.
+    for key, table, _shape in EXTRACTED_SECTIONS:
+        rows = {}
+        try:
+            with _db() as conn:
+                for rid, seq, blob in conn.execute(
+                        f'SELECT id, seq, blob FROM {table}'):
+                    rows[rid] = (int(seq), json.loads(blob))
+        except sqlite3.OperationalError:
+            rows = {}
+        _extracted_cache_fill(key, rows)
 
 
 def _merge_extracted_sections(data):
