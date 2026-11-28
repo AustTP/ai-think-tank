@@ -82,6 +82,7 @@ _SCHEDULED_VILLAGE_SCAN_ITEM = {
               'route real problems to the owning director'),
     'ownerRole': 'regional-vp',
     'cadence': 'hourly',
+    'priority': 'high',
     'deliverable': 'report',
     'taskType': 'report',
     'instructions': (

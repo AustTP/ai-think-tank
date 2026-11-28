@@ -307,10 +307,14 @@ def _validate_scheduled_item(body):
     deliverable = str(body.get('deliverable') or 'report').strip()
     if deliverable not in ('code', 'report', 'note', 'meeting', 'supervision', 'review'):
         return None, 'deliverable must be a valid deliverable'
+    priority = str(body.get('priority') or 'normal').strip().lower()
+    if priority not in ('low', 'normal', 'high', 'urgent'):
+        return None, 'priority must be a valid priority'
     item = {
         'title': title,
         'ownerRole': owner_role,
         'cadence': cadence,
+        'priority': priority,
         'deliverable': deliverable,
         'instructions': str(body.get('instructions') or '').strip() or None,
         'villageId': (str(body.get('villageId') or '').strip() or None),
@@ -383,11 +387,12 @@ async def patch_scheduled_item(item_id: str, request: Request):
     if 'enabled' in body:
         item['enabled'] = bool(body['enabled'])
     merged = {k: item.get(k) for k in ('title', 'ownerRole', 'cadence',
-                                       'deliverable', 'instructions',
+                                       'priority', 'deliverable', 'instructions',
                                        'villageId', 'teamId', 'agentId',
                                        'approvedTools')}
-    for k in ('title', 'ownerRole', 'cadence', 'deliverable', 'instructions',
-              'villageId', 'teamId', 'agentId', 'approvedTools'):
+    for k in ('title', 'ownerRole', 'cadence', 'priority', 'deliverable',
+              'instructions', 'villageId', 'teamId', 'agentId',
+              'approvedTools'):
         if k in body:
             merged[k] = body[k]
     validated, err = _validate_scheduled_item(merged)

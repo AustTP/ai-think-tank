@@ -333,6 +333,17 @@ class CadenceWindowTests(unittest.TestCase):
             self.assertIsNone(err, cadence)
             self.assertEqual(item['cadence'], cadence)
 
+    def test_scheduled_items_accept_an_explicit_priority(self):
+        item, err = serve._validate_scheduled_item({
+            'title': 'x', 'ownerRole': 'regional-vp', 'cadence': 'hourly',
+            'priority': 'high'})
+        self.assertIsNone(err)
+        self.assertEqual(item['priority'], 'high')
+        _, err = serve._validate_scheduled_item({
+            'title': 'x', 'ownerRole': 'regional-vp', 'cadence': 'hourly',
+            'priority': 'whenever'})
+        self.assertIsNotNone(err)
+
     def test_engine_knows_the_fine_cadences(self):
         self.assertIn('30min', sim.SCHEDULED_CADENCE_MS)
         self.assertEqual(sim.SCHEDULED_CADENCE_MS['30min'], 30 * 60 * 1000)

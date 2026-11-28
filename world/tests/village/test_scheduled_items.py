@@ -231,6 +231,7 @@ class VillageScanSeedTests(unittest.TestCase):
         item = sim._SCHEDULED_VILLAGE_SCAN_ITEM
         self.assertEqual(item['cadence'], 'hourly')
         self.assertEqual(item['ownerRole'], 'regional-vp')
+        self.assertEqual(item['priority'], 'high')
         self.assertEqual(sim._resolve_scheduled_owners(
             _state(), item), ['nora'])
 
