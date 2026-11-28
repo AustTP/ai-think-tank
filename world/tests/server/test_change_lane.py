@@ -108,6 +108,19 @@ class ChangeLaneEnqueue(unittest.TestCase):
         self.assertEqual(serve._CHANGE_LANE_QUEUE[-1]['taskId'], 'task-12345')
         self.assertEqual(serve._CHANGE_LANE_QUEUE[-1]['agent'], 'ruth')
 
+    def test_code_published_without_explicit_deliverable_enqueues(self):
+        serve._CHANGE_LANE_ENABLED = True
+        job = serve._change_lane_on_task_completed(
+            _fake_task(deliverable=None), 'ruth')
+        self.assertIsNotNone(job)
+        self.assertEqual(serve._CHANGE_LANE_QUEUE[-1]['taskId'], 'task-12345')
+
+    def test_explicit_report_deliverable_does_not_enqueue(self):
+        serve._CHANGE_LANE_ENABLED = True
+        self.assertIsNone(serve._change_lane_on_task_completed(
+            _fake_task(deliverable='report'), 'ruth'))
+        self.assertFalse(serve._CHANGE_LANE_QUEUE)
+
     def test_non_code_or_unpublished_is_ignored(self):
         serve._CHANGE_LANE_ENABLED = True
         self.assertIsNone(serve._change_lane_on_task_completed(

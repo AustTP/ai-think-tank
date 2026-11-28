@@ -114,6 +114,14 @@ def _reclaim_orphaned_walking_tasks(state):
             # silently downgrade a player-vetted task to agent-authored.
             'playerAuthored': bool(task.get('playerAuthored')),
             'attempts': attempts,
+            'directedTo': bool(task.get('directedTo')),
+            'issueKey': task.get('issueKey') or None,
+            'deliverable': task.get('deliverable') or None,
+            'approvedTools': list(task.get('approvedTools') or []),
+            'sourcePaths': task.get('sourcePaths') or None,
+            'reportPath': task.get('reportPath') or None,
+            '_reassignedTo': task.get('_reassignedTo') or None,
+            'facilitatorId': task.get('facilitatorId') or None,
         })
         # Fault-aware routing memory: this agent's work attempt just failed
         # to complete -- steer the next round-robin pick away from it for a

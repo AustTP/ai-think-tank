@@ -151,7 +151,8 @@ def _change_lane_on_task_completed(task, agent_id):
     if not _CHANGE_LANE_ENABLED:
         return None
     task = task or {}
-    if task.get('deliverable') != 'code' or not task.get('codePublished'):
+    deliverable = str(task.get('deliverable') or '').strip().lower()
+    if not task.get('codePublished') or deliverable not in ('', 'code'):
         return None
     if not _CHANGE_LANE_REPO or not _CHANGE_LANE_TOKEN:
         log_action(agent_id or 'system', 'change_lane_skipped',

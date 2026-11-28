@@ -169,6 +169,39 @@ _SPIKE_ISSUE_PROBLEM_SIGNALS = (
 )
 
 
+def _finding_triage_digest(finding, signals, limit=1500):
+    text = (finding or '').strip()
+    if len(text) <= limit:
+        return text, None
+    lines = text.splitlines()
+    start = 0
+    for i, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped.startswith('##'):
+            continue
+        label = stripped.lstrip('#').strip().lower()
+        if any(k in label for k in ('problem', 'finding', 'issue')):
+            start = i
+            break
+    picked = []
+    headline = None
+    for raw in lines[start:]:
+        line = raw.strip()
+        if not line:
+            continue
+        low = line.lower()
+        heading = line.startswith('###')
+        if heading and headline is None and any(sig in low for sig in signals):
+            headline = line.lstrip('#').strip()[:140]
+        if heading or line.startswith('**') or any(sig in low for sig in signals):
+            picked.append(line[:300])
+        if len(picked) >= 12:
+            break
+    if not picked:
+        picked = [line.strip()[:300] for line in lines if line.strip()][:8]
+    return '\n'.join(picked)[:limit], headline
+
+
 def _spike_file_issue_wish(finding, task, name, backlog):
     """W3: does this spike's finding identify a real, actionable gap worth
     filing as an issue, and if so, what should the wish look like?
@@ -200,12 +233,14 @@ def _spike_file_issue_wish(finding, task, name, backlog):
     haystack = ' '.join((finding or '').split()).lower()
     if not any(sig in haystack for sig in signals):
         return None
-    headline = next((line.strip() for line in (finding or '').splitlines() if line.strip()), None)
+    digest, digest_headline = _finding_triage_digest(finding, signals)
+    headline = digest_headline or next(
+        (line.strip() for line in (finding or '').splitlines() if line.strip()), None)
     if not headline:
         headline = (backlog or '').strip() or 'gap found during spike'  # pragma: no cover -- the empty-finding pre-filter above guarantees a non-blank first line
     prompt = (
         f'{name} just finished a time-boxed spike on "{backlog}" and reported this '
-        f'finding:\n\n"{finding[:1500]}"\n\n'
+        f'finding:\n\n"{digest[:1500]}"\n\n'
         f'Does this finding identify at least one concrete, real, actionable gap '
         f'-- a bug, a missing capability, a broken integration, or a real '
         f'limitation worth filing as a backlog issue? Or is it just an '

@@ -141,6 +141,21 @@ class ReclaimOrphaned(unittest.TestCase):
         self.assertEqual(re['assignedTo'], 'ada', 'keeps the review-fix pin')
         self.assertEqual(re['room'], 'pressoffice')
 
+    def test_directed_scheduled_card_keeps_its_pin_and_deliverable(self):
+        state = _state()
+        state['agents']['ada']['task'] = None
+        state['tasks']['task-1'] = _orphan_task(
+            directedTo=True, deliverable='report',
+            approvedTools=['github_get_ci_run'],
+            sourcePaths=['analysis/digest.md'], reportPath='archive/scan.md')
+        self.assertEqual(sim._reclaim_orphaned_walking_tasks(state), 1)
+        re = state['workQueue'][0]
+        self.assertTrue(re['directedTo'])
+        self.assertEqual(re['deliverable'], 'report')
+        self.assertEqual(re['approvedTools'], ['github_get_ci_run'])
+        self.assertEqual(re['sourcePaths'], ['analysis/digest.md'])
+        self.assertEqual(re['reportPath'], 'archive/scan.md')
+
     def test_leaves_a_held_walking_task_alone(self):
         # ben genuinely walking a task he holds must NOT be reclaimed.
         state = _state()

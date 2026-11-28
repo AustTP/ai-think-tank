@@ -857,6 +857,25 @@ class SpikeFileIssueWish(unittest.TestCase):
                 wish = self._call_wish('Found a broken integration.', task=task)
             self.assertEqual(wish['feature'], expected)
 
+    def test_long_report_digest_leads_with_the_actionable_problem(self):
+        preamble = ('# Hourly Village Scan\n\n**Sources read:** ' + 'digest-x, ' * 200 + '\n\n')
+        finding = preamble + (
+            '## Genuine village-level problems\n\n'
+            '### 1. api_key_auth_failure is broken and recurring every few hours\n'
+            '**Evidence:** 21 CRITICAL events across four days on task-36122.\n'
+            '**Owning director:** dev director.\n'
+            'No open issue covers this family, so it needs a fix.\n')
+        self.assertGreater(len(finding), 1500)
+        with unittest.mock.patch.object(serve, '_call_openrouter_decision_sync',
+                                        return_value=self._decision('file_bug')) as decider:
+            wish = self._call_wish(finding)
+        self.assertIsNotNone(wish)
+        self.assertIn('api_key_auth_failure', wish['summary'])
+        prompt = decider.call_args.args[2]['choice']['instructions']
+        self.assertIn('api_key_auth_failure', prompt)
+        self.assertNotIn('digest-x', prompt)
+        self.assertEqual(wish['description'], finding[:3000])
+
     def test_wish_never_mutates_shared_state(self):
         # The executor thread runs against a snapshot -- the wish is a pure
         # return value, never a file_issue call on the live state.
