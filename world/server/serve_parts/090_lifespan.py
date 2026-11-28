@@ -88,6 +88,7 @@ async def _lifespan(app):
     health_task = asyncio.create_task(_health_check_loop())
     credits_probe_task = asyncio.create_task(_openrouter_credits_probe_loop())
     director_task = asyncio.create_task(_director_approval_loop())
+    supervisor_budget_task = asyncio.create_task(_supervisor_budget_autopilot_loop())
     backup_task = asyncio.create_task(_backup_loop())
     prune_task = asyncio.create_task(_log_prune_loop())
     disk_task = asyncio.create_task(_disk_hygiene_loop())
@@ -231,6 +232,7 @@ async def _lifespan(app):
     health_task.cancel()
     credits_probe_task.cancel()
     director_task.cancel()
+    supervisor_budget_task.cancel()
     backup_task.cancel()
     if calibration_task is not None:
         calibration_task.cancel()

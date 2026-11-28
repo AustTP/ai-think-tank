@@ -835,6 +835,8 @@ def _notify_task_budget_exhausted(state, task, spent=None, attempts=None,
     # ceiling and reopens the failed card.
     if not task.get('_budgetReviewQueued') and director_id:
         task['_budgetReviewQueued'] = True
+        task['budgetExhaustedAtMs'] = int(time.time() * 1000)
+        task['supervisorBudgetReviewQueuedAtMs'] = task['budgetExhaustedAtMs']
         spent_num = float(spent or 0.0)
         ceiling_num = float(budget or 0.0)
         suggested = max(spent_num * 2.0, ceiling_num * 1.5, 0.05)
@@ -916,8 +918,34 @@ def _director_grant_budget_reopen(state, task_id, new_budget_usd, director_id=No
     _log_governance(state, director_id or task.get('assignedTo'), 'task_budget_granted',
                     {'taskId': task_id, 'title': (task.get('title') or '')[:120],
                      'newBudgetUsd': budget, 'spentUsd': spent, 'attempts': attempts})
+    _notify_budget_granted(state, task, budget, director_id or 'the director', '')
     return {'ok': True, 'taskId': task_id, 'budgetUsd': budget,
             'spentUsd': spent, 'attempts': attempts}
+
+
+def _notify_budget_granted(state, task, new_budget, by, reason):
+    """Tell the original author their card was refunded with more budget, so
+    they know the work is coming back to them (the re-queued card is pinned to
+    them and arrives through the normal assignment loop -- they pick it up
+    when free). Non-disruptive mailbox note, best-effort: a missing or
+    unknown author never blocks the grant itself. Pure state mutation."""
+    author_id = (task or {}).get('assignedTo')
+    author = (state.get('agents') or {}).get(author_id) if author_id else None
+    if not author or author_id == by:
+        return
+    try:
+        _append_mailbox(author, {
+            'kind': 'budget_granted',
+            'taskId': task.get('id'),
+            'title': task.get('title'),
+            'budgetUsd': new_budget,
+            'text': (f'Your card "{task.get("title")}" ran out of model-spend budget. '
+                     f'{by} raised the ceiling to ${float(new_budget):.2f} and re-queued '
+                     f'the work; it will reach you through the normal queue when you '
+                     f'are free.' + (f' Supervisor note: {str(reason)[:300]}' if reason else '')),
+        })
+    except Exception:
+        pass
 
 
 def _revoke_agent_credentials(agent_id):

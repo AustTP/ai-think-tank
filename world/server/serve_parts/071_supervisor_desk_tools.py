@@ -708,6 +708,7 @@ def supervisor_grant_budget(agent_id, task_id, budget_usd, reason=''):
     task.setdefault('budgetGrants', []).append(grant)
     task['budgetUsd'] = new_budget
     task.pop('_budgetExhaustedNotified', None)
+    _sim._notify_budget_granted(state, task, new_budget, actor, note)
     save_state_to_db(state)
     log_action(actor, 'supervisor_budget_grant',
                {'taskId': task.get('id'), 'from': current, 'to': new_budget,
