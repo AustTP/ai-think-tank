@@ -367,7 +367,10 @@ class RefreshLatencyAudit(unittest.TestCase):
 
     def test_speed_pick_row_records_latency_grounds(self):
         models = [self._model('low/cheap', '0.00000005', '0.00000005'),
-                  self._model('low/fast', '0.000000055', '0.000000055')]
+                  self._model('low/fast', '0.000000055', '0.000000055'),
+                  # Coding picks first; give it an anchor outside low's pool.
+                  self._model('coding/anchor', '0.000001', '0.000001')]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('low/cheap', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('low/fast', 'intelligence_index', 69.0, 'u')
         _seed('low/cheap', 900.0)
@@ -377,7 +380,9 @@ class RefreshLatencyAudit(unittest.TestCase):
         self.assertEqual(self._row(), ('low/fast', 100.0, 5, 1))
 
     def test_cheapest_pick_row_stays_null(self):
-        models = [self._model('low/cheap', '0.00000005', '0.00000005')]
+        models = [self._model('low/cheap', '0.00000005', '0.00000005'),
+                  self._model('coding/anchor', '0.000001', '0.000001')]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('low/cheap', 'intelligence_index', 70.0, 'u')
         chosen = self._run_refresh(models)
         self.assertEqual(chosen['low']['id'], 'low/cheap')

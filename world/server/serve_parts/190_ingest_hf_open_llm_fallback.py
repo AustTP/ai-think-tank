@@ -92,8 +92,9 @@ PROVIDER_CATALOGS = {
 # deep-work calls; the sweep may still pick them differently) but must NEVER
 # equal sublow/low/mid -- mid peer-reviews the coding band's output, and one
 # model grading its own work is the failure mode. Bounty and vision sit
-# outside the ladder. Keys list the bands a band must differ from; the loop
-# only needs each pair listed on one side (the later band's check fires).
+# outside the ladder. Keys list the bands a band must differ from; a band
+# only checks bands already picked, so the coding-first order below relies
+# on sublow/low/mid listing coding to enforce their half of each pair.
 BAND_MUST_DIFFER = {
     'sublow': ('low', 'mid', 'coding', 'high'),
     'low': ('sublow', 'coding', 'high'),
@@ -101,6 +102,20 @@ BAND_MUST_DIFFER = {
     'coding': ('sublow', 'low', 'mid'),
     'high': ('sublow', 'low', 'mid'),
 }
+
+
+# Pick order (operator, 2026-11-28): coding resolves FIRST so its score
+# floor is set by the whole catalog before a cheaper rung claims a model.
+# Other bands keep their configured order. Computed per refresh so a live
+# config reload that adds or drops a band is honored.
+TIER_PICK_FIRST_BAND = 'coding'
+
+
+def _tier_pick_order():
+    if TIER_PICK_FIRST_BAND not in MODEL_BAND_PURPOSE:
+        return list(MODEL_BAND_PURPOSE)
+    return [TIER_PICK_FIRST_BAND] + [
+        band for band in MODEL_BAND_PURPOSE if band != TIER_PICK_FIRST_BAND]
 
 
 def _band_pick_conflict(band, slug, chosen):
@@ -746,7 +761,7 @@ async def refresh_model_tiers():
     pools = _band_candidate_pools(pick_models)
     chosen = {}
     fallbacks = {}
-    for band, purpose in MODEL_BAND_PURPOSE.items():
+    for band in _tier_pick_order():
         # Aliased bands have no model of their own, and an operator's custom
         # endpoint is a PIN: re-picking it would overwrite the row the board
         # shows, spend a verify probe, and still never be used at call time

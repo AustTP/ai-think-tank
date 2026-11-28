@@ -351,7 +351,12 @@ class TierProviderPin(unittest.TestCase):
         # $2.4/M lands both fixtures in the SAME 'mid' bucket (0.5-3 $/M
         # since the 2026-11-25 retune), so the ONLY thing deciding the pick
         # is the provider pin.
+        # Coding picks FIRST and these fixtures only carry intelligence
+        # scores; drop its intelligence fallback so it cannot claim the one
+        # model this provider-pin scenario is asserting mid picks.
+        coding_only = {**serve.BAND_BENCHMARK, 'coding': ('coding_index',)}
         with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
+             unittest.mock.patch.object(serve, 'BAND_BENCHMARK', coding_only), \
              unittest.mock.patch.object(
                  serve, '_fetch_openrouter_catalog_sync',
                  return_value=[_model('or/cheap', 0.0000012, 0.0000012)]), \

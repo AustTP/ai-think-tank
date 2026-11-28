@@ -388,7 +388,12 @@ class RefreshMovesPicksToAvailableProvider(unittest.TestCase):
         def capped(provider):
             return provider == 'openrouter'
 
+        # Coding picks FIRST. This fixture scores only intelligence_index,
+        # so remove coding's live intelligence fallback: otherwise coding
+        # claims st/only and mid has no alternative left to pick.
+        coding_only = {**serve.BAND_BENCHMARK, 'coding': ('coding_index',)}
         with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', catalogs), \
+             unittest.mock.patch.object(serve, 'BAND_BENCHMARK', coding_only), \
              unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=[]), \
              unittest.mock.patch.object(serve, '_fetch_straitly_catalog_sync',

@@ -219,7 +219,11 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('sub/cheap', '0.00000002', '0.00000003'),   # $0.05/M blended
             self._model('sub/mid', '0.00000003', '0.00000005'),     # $0.08/M blended
             self._model('sub/star', '0.0000001', '0.0000002'),      # $0.30/M blended (over ceiling)
+            # Coding picks FIRST now; give it its own anchor so it does not
+            # consume the model this low/sublow scenario is asserting on.
+            self._model('coding/anchor', '0.000001', '0.000001'),
         ]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('sub/cheap', 'intelligence_index', 24.0, 'u')
         serve.set_model_benchmark_score('sub/mid', 'intelligence_index', 20.0, 'u')
         serve.set_model_benchmark_score('sub/star', 'intelligence_index', 50.0, 'u')
@@ -306,7 +310,9 @@ class RefreshModelTiers(unittest.TestCase):
         models = [
             self._model('low/primary', '0.0000001', '0.0000001'),
             self._model('low/fallback', '0.0000001', '0.0000001'),
+            self._model('coding/anchor', '0.000001', '0.000001'),
         ]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('low/primary', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('low/fallback', 'MMLU-Pro', 0.95, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
@@ -367,7 +373,9 @@ class RefreshModelTiers(unittest.TestCase):
         models = [
             self._model('low/unscored', '0.00000005', '0.00000005'),
             self._model('mid/holder', '0.0000005', '0.0000005'),
+            self._model('coding/anchor', '0.000001', '0.000001'),
         ]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('mid/holder', 'intelligence_index', 70.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
                                         return_value=models), \
@@ -474,7 +482,9 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('low/plain', '0.00000005', '0.00000005'),
             dict(self._model('low/reason', '0.00000001', '0.00000001'),
                  reasoning={'default_enabled': True}),
+            self._model('coding/anchor', '0.000001', '0.000001'),
         ]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('low/plain', 'intelligence_index', 40.0, 'u')
         serve.set_model_benchmark_score('low/reason', 'intelligence_index', 70.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
@@ -497,7 +507,9 @@ class RefreshModelTiers(unittest.TestCase):
             self._model('low/plain', '0.00000005', '0.00000005'),
             dict(self._model('low/mand', '0.00000004', '0.00000004'),
                  reasoning={'mandatory': True}),
+            self._model('coding/anchor', '0.000001', '0.000001'),
         ]
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
         serve.set_model_benchmark_score('low/plain', 'intelligence_index', 40.0, 'u')
         serve.set_model_benchmark_score('low/mand', 'intelligence_index', 70.0, 'u')
         with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
@@ -582,11 +594,13 @@ class RefreshModelTiers(unittest.TestCase):
     def test_slug_change_resets_logged_at(self):
         serve.set_model_benchmark_score('low/m1', 'intelligence_index', 70.0, 'u')
         serve.set_model_benchmark_score('low/m2', 'intelligence_index', 69.0, 'u')
-        self._refresh([self._model('low/m1', '0.0000001', '0.0000001')])
+        serve.set_model_benchmark_score('coding/anchor', 'coding_index', 90.0, 'u')
+        anchor = self._model('coding/anchor', '0.000001', '0.000001')
+        self._refresh([self._model('low/m1', '0.0000001', '0.0000001'), anchor])
         first = self._logged_at('low')
         time.sleep(0.01)
         # m1 delisted; m2 (in floor) takes over -> new pick, new window start.
-        self._refresh([self._model('low/m2', '0.0000002', '0.0000002')])
+        self._refresh([self._model('low/m2', '0.0000002', '0.0000002'), anchor])
         self.assertNotEqual(self._logged_at('low'), first)
 
 
@@ -902,12 +916,35 @@ class TierDistinctRule(unittest.TestCase):
                              'output_modalities': ['text']},
         }
 
+    def test_coding_is_picked_before_every_other_band(self):
+        # Operator directive 2026-11-28: coding resolves first so its score
+        # floor is set by the whole catalog before a cheaper rung can claim
+        # the model it needs.
+        seen = []
+
+        async def record(pool, scores, gap=None, band=None, **kwargs):
+            seen.append(band)
+            return None
+
+        with unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=[]), \
+             unittest.mock.patch.object(serve, '_best_value_pick', new=record), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            asyncio.run(serve.refresh_model_tiers())
+        self.assertEqual(seen[0], 'coding')
+        self.assertLess(seen.index('coding'), seen.index('low'))
+        self.assertLess(seen.index('coding'), seen.index('sublow'))
+        self.assertLess(seen.index('coding'), seen.index('mid'))
+        self.assertLess(seen.index('coding'), seen.index('high'))
+        self.assertLess(seen.index('coding'), seen.index('vision'))
+
     def test_coding_never_collapses_onto_mid(self):
-        # One model is the best coding value AND mid's pick: the loop reaches
-        # coding after mid, sees the collision, and must move coding to the
-        # next value-ranked qualifier INSTEAD of letting mid peer-review its
-        # own work. m2's coding score must sit within the 6-point quality
-        # floor gap of m1's, or it is not an eligible alternative.
+        # Coding picks FIRST now, so it takes its own best value model and
+        # mid must move off it: one model grading its own work is the failure
+        # mode the tier-distinct rule exists to prevent. m2 still sits inside
+        # mid's 6-point quality floor gap, so it is an eligible alternative.
         models = [
             # Mid band is [0.5, 3) $/M blended since the 2026-11-25
             # retune; $2.4/M keeps m1 in mid's bucket and $2.5/M keeps
@@ -938,9 +975,9 @@ class TierDistinctRule(unittest.TestCase):
         # prices sit under the coding/high ceilings pinned to $5/M in the
         # patch below, sublow's $0.09 cap excludes both, and low has no
         # landing bucket.
-        self.assertEqual(chosen['mid']['id'], 'mid/m1')
-        self.assertNotEqual(chosen['coding']['id'], chosen['mid']['id'])
-        self.assertEqual(chosen['coding']['id'], 'mid/m2')
+        self.assertEqual(chosen['coding']['id'], 'mid/m1')
+        self.assertNotEqual(chosen['mid']['id'], chosen['coding']['id'])
+        self.assertEqual(chosen['mid']['id'], 'mid/m2')
 
     def test_coding_may_equal_high(self):
         # The waiver: both capability bands resolving onto the SAME strong
@@ -999,13 +1036,11 @@ class TierDistinctRule(unittest.TestCase):
                                       {'low': {'id': 'vendor/same'}}), 'low')
 
     def test_same_family_second_id_is_not_the_conflict_escape_hatch(self):
-        # The 2026-11-28 morning state: low resolved onto cheaperinference's
-        # 'hy4-flash' ($0.079/M); coding's best value pick was the same
-        # weights under OpenRouter's 'tencent/hy4-flash' id ($0.176/M) and
-        # the exact-id conflict check let it through. With family-aware
-        # identity, BOTH ids are off the table for coding, which must walk
-        # to the next cheapest different-family qualifier (deepseek) --
-        # same scores, $0.15/M, genuinely distinct weights.
+        # The 2026-11-28 morning state inverted by the coding-first order:
+        # coding now claims cheaperinference's 'hy4-flash' ($0.079/M) first,
+        # and low must avoid BOTH ids of that family (family-aware identity)
+        # and walk to the next cheapest different-family qualifier
+        # (deepseek) -- genuinely distinct weights at $0.15/M.
         cheaperinference = [self._model('hy4-flash', '0.0000000395', '0.0000000395')]
         openrouter = [
             self._model('tencent/hy4-flash', '0.000000088', '0.000000088'),
@@ -1034,21 +1069,23 @@ class TierDistinctRule(unittest.TestCase):
                                         return_value=0), \
              unittest.mock.patch.object(serve, 'log_action'):
             chosen = asyncio.run(serve.refresh_model_tiers())
-        # Low keeps the cheapest listing of the family; coding is FORCED off
+        # Coding keeps the cheapest listing of the family; low is FORCED off
         # both ids of it onto the next qualifier.
-        self.assertEqual(chosen['low']['id'], 'hy4-flash')
-        self.assertEqual(chosen['low'].get('provider'), 'cheaperinference')
-        self.assertEqual(chosen['coding']['id'],
+        self.assertEqual(chosen['coding']['id'], 'hy4-flash')
+        self.assertEqual(chosen['coding'].get('provider'), 'cheaperinference')
+        self.assertEqual(chosen['low']['id'],
                          'deepseek/deepseek-v4.1-flash-1017')
-        self.assertEqual(chosen['coding'].get('provider'), 'openrouter')
+        self.assertEqual(chosen['low'].get('provider'), 'openrouter')
         # Both hy4 ids cost more than deepseek's 31.22-2.98 gap under the
         # 6-point floor, and every other band has no landing bucket here.
         self.assertNotIn('sublow', chosen)
         self.assertNotIn('mid', chosen)
-        self.assertNotIn('high', chosen)
+        # high may share coding's model: the waiver says both deep-work
+        # bands can resolve onto the same weights.
+        self.assertEqual(chosen['high']['id'], chosen['coding']['id'])
         with serve._db() as conn:
             row = conn.execute(
                 "SELECT slug, provider FROM model_tiers WHERE band = 'coding'"
             ).fetchone()
-        self.assertEqual(row[0], 'deepseek/deepseek-v4.1-flash-1017')
-        self.assertEqual(row[1], 'openrouter')
+        self.assertEqual(row[0], 'hy4-flash')
+        self.assertEqual(row[1], 'cheaperinference')
