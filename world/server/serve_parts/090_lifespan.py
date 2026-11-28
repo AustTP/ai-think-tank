@@ -55,6 +55,13 @@ async def _lifespan(app):
         _backfill_agent_identity_in_db()
     except Exception as e:
         print(f'[identity] backfill failed: {e}', flush=True)
+    # Stale hire-era "Assistant to X" badges -> function titles derived from
+    # recent real work (operator directive 2026-11-28). Idempotent; reruns are
+    # no-ops once every assistant carries a function title.
+    try:
+        _backfill_assistant_titles_in_db()
+    except Exception as e:
+        print(f'[titles] backfill failed: {e}', flush=True)
     # The Research Desk's standing watchlist (world/watchlist.json) seeds
     # researchTopics on boot. This is the REAL boot path, so it also authorizes
     # write-back of villager-added topics into that file -- tests never run

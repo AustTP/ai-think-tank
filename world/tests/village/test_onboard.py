@@ -406,8 +406,9 @@ class WorkAgreementEmpowered(unittest.TestCase):
         self.assertEqual(agreement['empoweredBy'], 'faye',
                          'the admin (faye) empowers the draft')
         # The text is built from the hire's own self-description, not a director
-        # template -- the role phrase "Assistant to" comes from the hire itself.
-        self.assertIn('Assistant to', agreement['text'])
+        # template -- the role phrase "I am the <title>" comes from the hire
+        # itself (function title, operator directive 2026-11-28).
+        self.assertIn('I am the', agreement['text'])
         self.assertIn('My mission', agreement['text'])
 
     def test_drafting_logs_agent_and_admin_actions(self):

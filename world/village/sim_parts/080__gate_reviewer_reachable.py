@@ -718,7 +718,26 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     # Subdirector layer: with 3+ subdirectors the director directs the layer,
     # not workers -- a new hire lands under the least-loaded subdirector.
     supervisor_id = governance.supervisor_for_new_hire(state, director_id)
-    role = f"Assistant to {pending['helpForName']}"
+    # A hire gets a FUNCTION title ("Staff Writer"), not a relationship title
+    # ("Assistant to X"): the reporting line belongs in the mission, the job
+    # description belongs on the badge. The hiring director picks the title
+    # with one small model call; a model outage falls back to the team's
+    # dominant work type so a hire is never titled "Assistant to ..." again.
+    team_row = next((t for t in (state.get('teams') or [])
+                     if (t.get('id') or t.get('directorId')) == director_id), None)
+    recent_hints = _recent_work_hints(state, director_id)
+    role = _hire_title_chooser(
+        state, pending.get('adminName') or pending.get('adminId'),
+        team_label=team_row.get('name') if team_row else director_id,
+        team_focus=(team_row or {}).get('focus') or '',
+        help_for_name=pending.get('helpForName') or '',
+        help_for_role=help_for.get('role') or '',
+        recent_hints=recent_hints)
+    if not role:
+        role = _title_from_recent_work(
+            state, None, room=(team_row or {}).get('room'),
+            team_focus=(team_row or {}).get('focus') or '',
+            recent_hints=recent_hints) or 'Associate'
     # The hiring DIRECTOR (pending['adminName']) names the new employee via a
     # real generative call -- no predetermined names. All-time uniqueness is
     # enforced against _all_used_names (roster + every name ever reserved), and
@@ -740,7 +759,9 @@ def _complete_auto_hire(state, pending, grid, now_ms):
     color = color_pool[random.randrange(len(color_pool))]
     access_grant = f"Read/write access to {pending['helpForName']}'s {help_for.get('role', '')} files and tooling."
     profile = {
-        'mission': f"Support the {director_id} team by picking up overflow work for {pending['helpForName']} ({help_for.get('role', '')}).",
+        'mission': f"{role} on the {director_id} team. Reports to "
+                   f"{pending['helpForName']}; picks up the overflow work they "
+                   "flag.",
         'instructions': [
             f"Report to {pending['helpForName']} -- pick up whatever they flag as overloaded.",
             f"Your director is {pending['adminName']}; your work lands in the {director_id} team's shared space.",
@@ -945,3 +966,153 @@ def _name_chooser_default(state, chooser_name, used_names, for_role):
 # the default (the hiring director names the hire via a real model call).
 # Mirrors how _governance_decider is injected.
 _hire_name_chooser = _name_chooser_default
+
+
+# Function titles (operator directive 2026-11-28): a hire's `role` is what the
+# agent DOES, never a reporting line. "Assistant to X" minted a stale
+# relationship label that org moves never refreshed (ruth: titled after nora,
+# directed by maya, mission still citing a dead team). These helpers derive a
+# real function title from recent real work, with a deterministic fallback so
+# a model outage never produces an "Assistant to ..." badge again.
+
+_TITLE_NOUN_BY_TYPE = {
+    'code': 'Software Engineer', 'bug': 'Software Engineer',
+    'review': 'Review Analyst', 'qa': 'QA Analyst',
+    'spike': 'Research Analyst', 'research': 'Research Analyst',
+    'story': 'Staff Writer', 'report': 'Analyst',
+    'media': 'Media Producer', 'distill': 'Knowledge Curator',
+    'skillReview': 'Skills Reviewer', '3d': '3D Artist',
+}
+# taskType values that say nothing about a function (bookkeeping lanes).
+_TITLE_NEUTRAL_TYPES = {'task', 'meeting', 'supervise'}
+_TITLE_ROOM_FALLBACK = {'pressoffice': 'Staff Writer',
+                        'observatory': 'Research Analyst'}
+
+
+def _recent_work_hints(state, agent_or_team_id, limit=80):
+    """Done-task taskTypes for one agent (or, for a hire, the team the hire
+    is joining, keyed by director id). Newest first, bounded -- the signal a
+    title is derived from. Pure read, no state mutation."""
+    done = []
+    for task in (state.get('tasks') or {}).values():
+        if not isinstance(task, dict) or task.get('status') != 'done':
+            continue
+        if task.get('assignedTo') != agent_or_team_id \
+                and task.get('teamId') != agent_or_team_id:
+            continue
+        done.append((int(task.get('doneAt') or task.get('updatedAt') or 0),
+                     task.get('taskType') or ''))
+    done.sort(reverse=True)
+    return [t for _, t in done[:limit]]
+
+
+def _title_from_recent_work(state, agent_id, room=None, team_focus='',
+                            recent_hints=None):
+    """Dominant function title from recent real work. Neutral bookkeeping
+    types are skipped; no signal falls back to the room, then 'Associate'.
+    Pure function of the inputs -- the backfill and the hire fallback share
+    it so an agent is never retitled into something unverifiable."""
+    hints = recent_hints
+    if hints is None and agent_id:
+        hints = _recent_work_hints(state, agent_id)
+    counts = {}
+    for t in (hints or []):
+        if not t or t in _TITLE_NEUTRAL_TYPES:
+            continue
+        noun = _TITLE_NOUN_BY_TYPE.get(t)
+        if noun:
+            counts[noun] = counts.get(noun, 0) + 1
+    if counts:
+        return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+    return _TITLE_ROOM_FALLBACK.get(room or '') \
+        or _TITLE_ROOM_FALLBACK.get(team_focus or '') or 'Associate'
+
+
+def _title_chooser_default(state, chooser_name, team_label='', team_focus='',
+                           help_for_name='', help_for_role='',
+                           recent_hints=None):
+    """The hiring DIRECTOR picks the new hire's function title with one cheap
+    small-tier call, given the team's name/focus and who the hire relieves.
+    Only a short plain-ASCII title without a reporting line is trusted;
+    anything else (or any outage) returns None so the caller falls back to
+    the deterministic work-derived title. Late-imports serve.py so sim.py
+    stays unit-testable offline. Cost accrues to its own service bucket."""
+    import serve
+    try:
+        model = serve._low_tier_slug()
+        if not model:
+            return None
+        prompt = (
+            f"You are {chooser_name}, a director at a think tank. You just "
+            f"hired someone for the {team_label} team to pick up overflow "
+            f"work for {help_for_name or 'a teammate'}"
+            + (f" (whose role is {help_for_role})" if help_for_role else '')
+            + (f". The team focuses on: {team_focus}" if team_focus else '')
+            + (f". Recent team work: {', '.join(recent_hints[:8])}"
+               if recent_hints else '')
+            + ". Pick their JOB TITLE: 2-3 words describing the function "
+              "(for example: Staff Writer, Research Analyst, Software "
+              "Engineer). It must NOT contain 'Assistant to' or name a "
+              "person. Respond with ONLY the title.")
+        data = serve._call_openrouter_sync(
+            model,
+            [{'role': 'system', 'content': prompt},
+             {'role': 'user', 'content': 'Pick the title.'}],
+            max_tokens=12)
+        cost = (data.get('usage') or {}).get('cost', 0.0)
+        if isinstance(cost, (int, float)) and cost:
+            serve._accrue_spend('__hire_titles__', cost)
+        reply = ((data.get('choices') or [{}])[0].get('message') or {}).get('content') or ''
+        title = ' '.join(reply.strip().strip('"').split())
+        if 3 <= len(title) <= 40 and 1 <= len(title.split()) <= 5 \
+                and title.isascii() and 'assistant to' not in title.lower():
+            return title
+        return None
+    except Exception:
+        return None
+
+
+_hire_title_chooser = _title_chooser_default
+
+
+def _backfill_assistant_titles(state, now_ms=None):
+    """One-time housekeeping sweep (operator directive 2026-11-28): retitle
+    every roster agent still wearing a hire-era "Assistant to X" badge with
+    the function title their recent real work supports, and rewrite the
+    equally stale mission so the reporting line reflects the CURRENT
+    director. The original hire context is kept as provenance. Idempotent:
+    retitled agents no longer match the "Assistant to " prefix, so a rerun
+    is a no-op. Returns the number of agents retitled. Pure state mutation."""
+    changed = 0
+    agents = state.get('agents') or {}
+    for entry in (state.get('agentRoster') or []):
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get('role') or '')
+        if not role.startswith('Assistant to '):
+            continue
+        agent_id = entry.get('id')
+        title = _title_from_recent_work(state, agent_id,
+                                        room=entry.get('room'))
+        entry['role'] = title
+        agent = agents.get(agent_id)
+        if isinstance(agent, dict):
+            agent['role'] = title
+            profile = agent.setdefault('profile', {})
+        else:
+            profile = entry.setdefault('profile', {})
+        director_id = entry.get('director') or ''
+        director_row = agents.get(director_id) or {}
+        director_name = director_row.get('name') or director_id or 'the tank'
+        hired_relief = role[len('Assistant to '):].strip() or 'a teammate'
+        profile['mission'] = (
+            f"{title}. Reports to {director_name}. Originally hired to "
+            f"relieve {hired_relief}.")
+        changed += 1
+    if changed:
+        try:
+            _log_governance(state, None, 'assistant_titles_backfill',
+                            {'retitled': changed})
+        except Exception:
+            pass
+    return changed

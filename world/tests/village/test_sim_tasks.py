@@ -757,6 +757,7 @@ class HiringCluster(SimIsolation):
             'helpForId': 'm1', 'helpForName': 'Mia', 'at': 1_000_000,
         }
         with unittest.mock.patch.object(sim, '_hire_name_chooser', return_value='maya'), \
+             unittest.mock.patch.object(sim, '_hire_title_chooser', return_value='Staff Writer'), \
              unittest.mock.patch.object(sim, '_free_outdoor_spot',
                                         return_value={'x': 10, 'y': 10}):
             new_id = sim._complete_auto_hire(state, pending, grid=self._free_grid(),
@@ -785,6 +786,7 @@ class HiringCluster(SimIsolation):
             'helpForId': 'x1', 'helpForName': 'Xia', 'at': 1_000_000,
         }
         with unittest.mock.patch.object(sim, '_hire_name_chooser', return_value='maya'), \
+             unittest.mock.patch.object(sim, '_hire_title_chooser', return_value='Staff Writer'), \
              unittest.mock.patch.object(sim, '_free_outdoor_spot',
                                         return_value={'x': 10, 'y': 10}):
             new_id = sim._complete_auto_hire(state, pending, grid=self._free_grid(),
@@ -802,7 +804,8 @@ class HiringCluster(SimIsolation):
             'adminId': 'd1', 'adminName': 'Dana', 'directorId': 'd1',
             'helpForId': 'm1', 'helpForName': 'Mia', 'at': 1_000_000,
         }
-        with unittest.mock.patch.object(sim, '_hire_name_chooser', return_value=None):
+        with unittest.mock.patch.object(sim, '_hire_name_chooser', return_value=None), \
+             unittest.mock.patch.object(sim, '_hire_title_chooser', return_value=None):
             new_id = sim._complete_auto_hire(state, pending, grid=self._free_grid(),
                                              now_ms=1_000_000)
         self.assertIsNone(new_id)
@@ -821,6 +824,7 @@ class HiringCluster(SimIsolation):
             'helpForId': 'm0', 'helpForName': 'M0', 'at': 1_000_000,
         }
         with unittest.mock.patch.object(sim, '_hire_name_chooser', return_value='maya'), \
+             unittest.mock.patch.object(sim, '_hire_title_chooser', return_value='Staff Writer'), \
              unittest.mock.patch.object(sim, '_free_outdoor_spot',
                                         return_value={'x': 10, 'y': 10}):
             new_id = sim._complete_auto_hire(state, pending, grid=self._free_grid(),
