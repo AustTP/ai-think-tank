@@ -365,6 +365,26 @@ class DecisionCache(_StateCase):
         self.assertEqual(rep['ttl_s'], 3600)
 
 
+class ManualAttentionTtlBinding(unittest.TestCase):
+    def test_ttl_is_bound_before_the_archive_predicate(self):
+        # 2026-11-27: a misplaced TTL assignment made every coalesced save
+        # fail with NameError for 12 minutes until the service was restarted.
+        import json as _json
+        import os as _os
+        import threading as _threading
+        import time as _time
+        source_path = serve._is_archived_task.__code__.co_filename
+        with open(source_path, encoding='utf-8') as fh:
+            source = fh.read()
+        prefix = source[:source.index('\n# Archived-task compaction')]
+        ns = {'os': _os, 'json': _json, 'threading': _threading,
+              'time': _time}
+        exec(compile(prefix, source_path, 'exec'), ns)
+        fresh = {'status': 'failed', 'manualAttention': True,
+                 'createdAt': int(_time.time() * 1000)}
+        self.assertFalse(ns['_is_archived_task'](fresh))
+
+
 class StaleReplanKeyIsJsonSafe(unittest.TestCase):
     """The stale-work sweep keys its replan counter map by (title, room). That
     map lives in kv_state, so a tuple key made every subsequent save fail with

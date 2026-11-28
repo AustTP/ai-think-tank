@@ -1183,6 +1183,9 @@ _TASK_ARCHIVE_LOCK = threading.Lock()
 _TASK_ARCHIVE_CACHE: dict[str, object] = {'db': None, 'loaded': False, 'tasks': {}}
 
 
+MANUAL_ATTENTION_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
+
+
 def _is_archived_task(task):
     if not task or task.get('status') not in TASK_ARCHIVE_STATUSES:
         return False
@@ -1265,8 +1268,6 @@ def _compact_archived_task(task):
         return task
     return _compact_archived_value(task)
 
-
-MANUAL_ATTENTION_ARCHIVE_TTL_MS = 7 * 24 * 60 * 60 * 1000
 
 
 def _task_archive_load_locked():
