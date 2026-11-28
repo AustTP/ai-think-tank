@@ -228,10 +228,18 @@ def _provider_catalogs_offline():
     saved = serve.PROVIDER_CATALOGS
     serve.PROVIDER_CATALOGS = {
         name: fetch for name, fetch in saved.items() if name == 'openrouter'}
+    # The balance-aware pick layer reads live prepaid balances (openrouter /
+    # straitly credit endpoints) at refresh and watch time; stub that read
+    # to None (fail-open: an unreadable balance never blocks) so no test
+    # session dials a balance endpoint. Per-test mocks that need a real
+    # number patch the same name and win.
+    saved_remaining = serve._provider_remaining_usd
+    serve._provider_remaining_usd = lambda name: None
     try:
         yield
     finally:
         serve.PROVIDER_CATALOGS = saved
+        serve._provider_remaining_usd = saved_remaining
 
 
 @pytest.fixture(autouse=True)

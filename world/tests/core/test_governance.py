@@ -182,7 +182,10 @@ class AutoHire(unittest.TestCase):
         # A hire that completes names its employee via the default
         # _hire_name_chooser -- a REAL model call. Stub it deterministic (like
         # the injected `decider`) so these tests stay offline and hermetic.
+        # The function-title chooser is the same shape: stub it so the badge
+        # is deterministic and no test dials the low tier.
         with unittest.mock.patch('sim._hire_name_chooser', return_value='Rowan'), \
+                unittest.mock.patch('sim._hire_title_chooser', return_value='Associate'), \
                 unittest.mock.patch.object(sim, 'SIM_TICK_S', 1.0):
             for _ in range(ticks):
                 now += sim.SIM_TICK_S
@@ -222,7 +225,11 @@ class AutoHire(unittest.TestCase):
         self.assertEqual(len(roster), 5, 'a hire added one roster entry')
         new_def = next((d for d in roster if d.get('id') not in ('faye', 'nora', 'ada', 'ben')), None)
         self.assertIsNotNone(new_def, 'a brand-new agent exists')
-        self.assertEqual(new_def['role'], 'Assistant to Ben')
+        # Function title, not a relationship title (operator, 2026-11-26):
+        # "Assistant to Ben" is gone; the reporting line lives in the mission.
+        self.assertEqual(new_def['role'], 'Associate')
+        self.assertNotIn('Assistant to', new_def['role'])
+        self.assertIn('Reports to Ben', (new_def.get('profile') or {}).get('mission', ''))
         self.assertEqual(new_def['model'], 'small')
         self.assertTrue(new_def.get('elevatedAccess'), 'command-center hires get elevated access')
         self.assertIn(new_def['id'], state['agents'], 'hired agent exists in the live map')

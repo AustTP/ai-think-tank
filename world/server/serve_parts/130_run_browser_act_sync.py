@@ -845,6 +845,22 @@ def _openrouter_budget_below_pivot_floor():
     return credits_pause_active()
 
 
+def _provider_balance_exhausted(provider):
+    """True when a dialing provider's live prepaid balance is at/below the
+    pivot floor -- the same budget-critical threshold the call-time pivot
+    uses (operator, 2026-11-28: the PICK layer must know this too, not just
+    the dial sites; tiers kept naming openrouter all day while the account
+    sat at $0 and every call remapped at dial time). Only OpenRouter and
+    Straitly expose a credit endpoint today; every other provider, and any
+    unreadable balance, stays eligible -- an unreadable balance never
+    blocks (same fail-open rule as the cap gate and the pivot itself).
+    The monthly spend cap stays the disaster brake behind this check."""
+    remaining = _provider_remaining_usd(provider)
+    if remaining is None:
+        return False
+    return remaining <= OPENROUTER_PIVOT_FLOOR_USD
+
+
 def _straitly_has_budget():
     """Straitly may take the pivoted call: neither local disaster cap has
     tripped, and its live balance -- when readable -- is above zero."""

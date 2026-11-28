@@ -421,12 +421,16 @@ def _tier_fallback_candidates(band, pool, scores, picked, limit=3):
 def _pick_provider(per_provider):
     """The provider tier picks are selected from: the first DIALING provider
     (registry order) that lists models and has spend left under its own
-    monthly cap. A capped provider is skipped, so the picks -- and every
-    call the bands then dial -- move to a provider with budget, under the
-    SAME evaluation-score and cost policy per band (operator, 2026-11-13).
-    When every provider is capped or empty, the first listing provider
-    still wins: the transports gate per call, and the bands keep their
-    previous picks rather than going blank."""
+    monthly cap AND whose live prepaid balance is above the pivot floor
+    (balance-aware pick, operator 2026-11-28: tiers kept naming openrouter
+    all day while the account sat at $0 and every band call remapped at
+    dial time). A capped or balance-drained provider is skipped, so the
+    picks -- and every call the bands then dial -- move to a provider with
+    budget, under the SAME evaluation-score and cost policy per band
+    (operator, 2026-11-13). When every provider is capped, drained or
+    empty, the first listing provider still wins: the transports gate per
+    call, and the bands keep their previous picks rather than going
+    blank."""
     fallback = None
     for provider in PROVIDER_CATALOGS:
         models = per_provider.get(provider) or []
@@ -438,8 +442,15 @@ def _pick_provider(per_provider):
             capped = _provider_cap_exceeded(provider)
         except Exception:
             capped = False
-        if not capped:
-            return provider
+        if capped:
+            continue
+        try:
+            broke = _provider_balance_exhausted(provider)
+        except Exception:
+            broke = False
+        if broke:
+            continue
+        return provider
     return fallback
 
 
@@ -504,11 +515,14 @@ def _annotate_cheapest_dialers(pick_models, per_provider, pick_provider):
 def _union_dialing_catalog(per_provider, only_provider=None):
     """One candidate list across every dialing provider, deduped by model id
     at the cheapest listing a transport can actually serve. Registry order
-    breaks exact price ties. A capped provider's listing is skipped; if every
-    provider is capped the registry-first slice still wins so bands keep
-    picks (the transports gate each call). Each returned candidate is stamped
-    with `provider`/`_dial_provider` so live verification and the tier row
-    use the listing the price came from, not the default provider."""
+    breaks exact price ties. A capped or balance-drained provider's listing
+    is skipped (operator, 2026-11-28: an openrouter account at $0 cannot
+    pay for its cheaper listing, so the pick must not ride it); if every
+    provider is capped or drained the registry-first slice still wins so
+    bands keep picks (the transports gate each call). Each returned
+    candidate is stamped with `provider`/`_dial_provider` so live
+    verification and the tier row use the listing the price came from, not
+    the default provider."""
     order = [only_provider] if only_provider else list(PROVIDER_CATALOGS)
     providers = [p for p in order if per_provider.get(p)]
     if not providers:
@@ -518,7 +532,8 @@ def _union_dialing_catalog(per_provider, only_provider=None):
     def _capped(provider):
         if provider not in cap_state:
             try:
-                cap_state[provider] = bool(_provider_cap_exceeded(provider))
+                cap_state[provider] = bool(_provider_cap_exceeded(provider)) \
+                    or bool(_provider_balance_exhausted(provider))
             except Exception:
                 cap_state[provider] = False
         return cap_state[provider]
@@ -582,22 +597,78 @@ def _provider_cap_transitions_sync():
     return flipped
 
 
+_PROVIDER_BALANCE_STATE: dict = {}    # provider -> last observed balance-exhausted bool
+
+
+def _provider_balance_transitions_sync():
+    """(provider, now_exhausted) pairs whose prepaid-balance state FLIPPED
+    across the pivot floor since the last poll, either direction. Same shape
+    and seeding rule as _provider_cap_transitions_sync: the first poll only
+    seeds the cache -- a process boot into an already-drained account must
+    not fire a spurious re-pick (the dial-time pivot already guards every
+    call in the meantime). A provider whose balance read FAILS contributes
+    nothing: an unreadable balance never fabricates a crossing, and only
+    providers with a readable prepaid balance (openrouter, straitly) are
+    polled at all."""
+    current = {}
+    for provider in PROVIDER_CATALOGS:
+        try:
+            if _provider_remaining_usd(provider) is None:
+                continue
+            current[provider] = _provider_balance_exhausted(provider)
+        except Exception:
+            continue
+    flipped = []
+    if _PROVIDER_BALANCE_STATE:
+        for provider, now_exhausted in current.items():
+            was = _PROVIDER_BALANCE_STATE.get(provider)
+            if was is not None and was != now_exhausted:
+                flipped.append((provider, now_exhausted))
+    for provider, now_exhausted in current.items():
+        _PROVIDER_BALANCE_STATE[provider] = now_exhausted
+    return flipped
+
+
 async def _provider_cap_watch_loop():
+    """The 60s watch owns BOTH provider re-pick events: a monthly spend cap
+    crossing, and a prepaid-balance crossing of the pivot floor (operator,
+    2026-11-28: the pick layer is balance-aware, so a drained OpenRouter
+    account must re-pick the tiers onto a provider that can actually pay
+    instead of waiting for the next scheduled sweep; crossing back up
+    migrates the picks home the same way). One source failing never blocks
+    the other: each poll contributes what it read, and a poll with no
+    events refreshes nothing."""
     while True:
         await asyncio.sleep(PROVIDER_CAP_WATCH_INTERVAL_S)
+        cap_events = []
+        balance_events = []
         try:
-            flipped = await asyncio.to_thread(_provider_cap_transitions_sync)
+            cap_events = await asyncio.to_thread(_provider_cap_transitions_sync)
         except Exception as e:
             print(f'[model-tiers] provider cap watch failed: {e}', flush=True)
             import traceback
             print(traceback.format_exc(), flush=True)
-            continue
-        if not flipped:
-            continue
-        named = ', '.join(f'{p} {"hit" if capped else "fell under"} its cap'
-                          for p, capped in flipped)
         try:
-            await _tier_refresh_logged(f'cap watch: {named}')
+            balance_events = await asyncio.to_thread(
+                _provider_balance_transitions_sync)
+        except Exception as e:
+            print(f'[model-tiers] provider balance watch failed: {e}', flush=True)
+            import traceback
+            print(traceback.format_exc(), flush=True)
+        if not cap_events and not balance_events:
+            continue
+        parts = []
+        if cap_events:
+            parts.append('cap watch: ' + ', '.join(
+                f'{p} {"hit" if capped else "fell under"} its cap'
+                for p, capped in cap_events))
+        if balance_events:
+            parts.append('balance watch: ' + ', '.join(
+                f'{p} fell to the pivot floor' if broke
+                else f'{p} is above the pivot floor again'
+                for p, broke in balance_events))
+        try:
+            await _tier_refresh_logged('; '.join(parts))
         except Exception as e:
             # Same fail-open rule as every other tier loop: keep current
             # tiers and let the next crossing poll or sweep retry.

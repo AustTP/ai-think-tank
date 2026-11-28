@@ -251,7 +251,10 @@ class CallSitePivotTests(unittest.TestCase):
     def test_call_pivots_to_straitly_below_floor(self):
         capture = {}
         with unittest.mock.patch.object(serve, '_urlopen_with_resilience',
-                                        side_effect=self._fake_post(capture)):
+                                        side_effect=self._fake_post(capture)), \
+                unittest.mock.patch.object(
+                    serve, '_provider_remaining_usd',
+                    side_effect=lambda n: 0.0 if n == 'openrouter' else 88.0):
             result = serve._call_openrouter_once_sync(
                 'inclusionai/ling-3.1-flash',
                 [{'role': 'user', 'content': 'hi'}], 10)
@@ -318,3 +321,123 @@ class SublowFreeOnlyTests(unittest.TestCase):
                                         return_value='@freepool:sublow:or-free'):
             self.assertEqual(serve._sublow_tier_slug(),
                              '@freepool:sublow:or-free')
+
+
+class BalanceAwarePickTests(unittest.TestCase):
+    """The pick layer reads live prepaid balances (operator, 2026-11-28):
+    a provider at/below the pivot floor must not win the registry-order
+    provider pick or donate listings to the union catalog -- the exact
+    2026-11-17 morning state was tiers naming openrouter all day while the
+    account sat at $0 and every band call remapped to straitly at dial
+    time. An unreadable balance never blocks (fail-open), and the monthly
+    spend cap stays the disaster brake."""
+
+    def setUp(self):
+        serve._PROVIDER_BALANCE_STATE.clear()
+
+    def tearDown(self):
+        serve._PROVIDER_BALANCE_STATE.clear()
+
+    def test_exhausted_follows_readable_balance(self):
+        with unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                        return_value=0.0):
+            self.assertTrue(serve._provider_balance_exhausted('openrouter'))
+        with unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                        return_value=5.01):
+            self.assertFalse(serve._provider_balance_exhausted('straitly'))
+        # Unreadable balance and unknown provider: never blocked.
+        with unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                        return_value=None):
+            self.assertFalse(serve._provider_balance_exhausted('openrouter'))
+            self.assertFalse(serve._provider_balance_exhausted('nous'))
+
+    def test_pick_provider_skips_drained_provider(self):
+        # conftest trims the registry to openrouter by default; both
+        # providers must be dialing for the skip to be observable.
+        registry = {'openrouter': 'a', 'cheaperinference': 'b'}
+        models = [{'id': 'x', 'pricing': {'prompt': '1e-7', 'completion': '1e-7'}}]
+        per = {'openrouter': models, 'cheaperinference': list(models)}
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', registry), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           side_effect=lambda n: 0.0
+                                           if n == 'openrouter' else 100.0):
+            self.assertEqual(serve._pick_provider(per), 'cheaperinference')
+        # Fail-open: when EVERY provider is drained the registry-first one
+        # still wins so the bands keep picks (the transports gate per call).
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', registry), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           return_value=0.0):
+            self.assertEqual(serve._pick_provider(per), 'openrouter')
+
+    def test_cap_beats_balance_and_skips_first(self):
+        # A capped provider is skipped before the balance check is even
+        # consulted: the disaster brake outranks the balance read.
+        registry = {'openrouter': 'a', 'cheaperinference': 'b'}
+        models = [{'id': 'x', 'pricing': {'prompt': '1e-7', 'completion': '1e-7'}}]
+        per = {'openrouter': models, 'cheaperinference': list(models)}
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', registry), \
+                unittest.mock.patch.object(serve, '_provider_cap_exceeded',
+                                           side_effect=lambda n: n == 'openrouter'), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           side_effect=lambda n: 100.0):
+            self.assertEqual(serve._pick_provider(per), 'cheaperinference')
+
+    def test_union_catalog_skips_drained_listings(self):
+        or_models = [{'id': 'x', 'name': 'x',
+                      'pricing': {'prompt': '5e-8', 'completion': '5e-8'},
+                      'architecture': {'input_modalities': ['text'],
+                                       'output_modalities': ['text']}}]
+        ci_models = [dict(or_models[0])]
+        ci_models[0] = dict(ci_models[0])
+        ci_models[0]['pricing'] = {'prompt': '1e-7', 'completion': '1e-7'}
+        per = {'openrouter': or_models, 'cheaperinference': ci_models}
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS',
+                                        {'openrouter': 'a',
+                                         'cheaperinference': 'b'}), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           side_effect=lambda n: 0.0
+                                           if n == 'openrouter' else 100.0):
+            out = serve._union_dialing_catalog(per)
+        # OpenRouter's cheaper listing is unusable ($0 account): the union
+        # stamps the model with the provider that can actually pay.
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['id'], 'x')
+        self.assertEqual(out[0]['provider'], 'cheaperinference')
+        self.assertEqual(out[0]['_dial_provider'], 'cheaperinference')
+
+    def test_union_catalog_fail_open_when_all_drained(self):
+        models = [{'id': 'x', 'name': 'x',
+                   'pricing': {'prompt': '5e-8', 'completion': '5e-8'},
+                   'architecture': {'input_modalities': ['text'],
+                                    'output_modalities': ['text']}}]
+        per = {'openrouter': [dict(models[0])],
+               'cheaperinference': [dict(models[0])]}
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS',
+                                        {'openrouter': 'a',
+                                         'cheaperinference': 'b'}), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           return_value=0.0):
+            out = serve._union_dialing_catalog(per)
+        self.assertEqual([m['provider'] for m in out], ['openrouter'])
+
+    def test_balance_transition_seeds_then_fires(self):
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS',
+                                        {'openrouter': 'a'}), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           return_value=0.0):
+            # First poll only seeds: a boot into an already-drained account
+            # must not fire a spurious re-pick.
+            self.assertEqual(serve._provider_balance_transitions_sync(), [])
+            # Crossing back above the floor is a flip, either direction.
+            with unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                            return_value=100.0):
+                self.assertEqual(
+                    serve._provider_balance_transitions_sync(),
+                    [('openrouter', False)])
+        # An unreadable balance contributes nothing and cannot fabricate a
+        # crossing.
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS',
+                                        {'openrouter': 'a'}), \
+                unittest.mock.patch.object(serve, '_provider_remaining_usd',
+                                           return_value=None):
+            self.assertEqual(serve._provider_balance_transitions_sync(), [])
