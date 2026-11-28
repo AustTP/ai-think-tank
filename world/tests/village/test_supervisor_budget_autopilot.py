@@ -36,9 +36,31 @@ class SupervisorBudgetStep(unittest.TestCase):
         self.decided.append(task['id'])
         return self.decision
 
+    def _consult(self, state, task, spent, attempts, question=None):
+        self.consulted.append(question)
+        report = dict(self.worker_report)
+        if question:
+            report['reason'] = 'reply to the follow-up'
+        return report
+
     def setUp(self):
         self.decided = []
+        self.consulted = []
         self.decision = None
+        self.worker_report = {'completed': 'outline and two scenes',
+                              'whyOver': 'the transcript ran longer than planned',
+                              'moreBudgetUsd': 0.30,
+                              'reason': 'three scenes remain'}
+
+    def _step(self, state, **kw):
+        params = {'decide': self._decide, 'consult': self._consult}
+        params.update(kw)
+        with mock.patch.object(serve, 'log_action'):
+            return serve._supervisor_budget_step(state, **params)
+
+    def _apply(self, state, **kw):
+        with mock.patch.object(serve, 'log_action'):
+            return serve._supervisor_budget_apply(state, **kw)
 
     def test_grant_is_clamped_to_the_supervisor_cap(self):
         task = _exhausted_task()
@@ -51,9 +73,8 @@ class SupervisorBudgetStep(unittest.TestCase):
             grants.append((agent_id, task_id, amount, reason))
             return True, {'ok': True}
 
-        with mock.patch.object(serve, 'log_action'):
-            made = serve._supervisor_budget_step(state, decide=self._decide)
-            applied = serve._supervisor_budget_apply(state, grant=grant)
+        made = self._step(state)
+        applied = self._apply(state, grant=grant)
         self.assertEqual((made, applied), (1, 1))
         self.assertEqual(grants[0][0], 'ruth')
         self.assertEqual(grants[0][2], 5.00)  # the $50 ask clamps to the cap
@@ -73,11 +94,10 @@ class SupervisorBudgetStep(unittest.TestCase):
             grants.append((agent_id, task_id, amount, reason))
             return True, {'ok': True}
 
-        with mock.patch.object(serve, 'log_action'), \
-                mock.patch.object(serve, '_task_budget_spent',
-                                  return_value=(0.14, 3)):
-            serve._supervisor_budget_step(state, decide=self._decide)
-            serve._supervisor_budget_apply(state, grant=grant)
+        with mock.patch.object(serve, '_task_budget_spent',
+                               return_value=(0.14, 3)):
+            self._step(state)
+            self._apply(state, grant=grant)
         self.assertEqual(grants[0][2], 0.19)  # spent 0.14 + the 0.05 floor
 
     def test_close_decision_records_the_reason(self):
@@ -91,9 +111,8 @@ class SupervisorBudgetStep(unittest.TestCase):
             grants.append(1)
             return False, {'error': 'should not be called'}
 
-        with mock.patch.object(serve, 'log_action'):
-            made = serve._supervisor_budget_step(state, decide=self._decide)
-            applied = serve._supervisor_budget_apply(state, grant=grant)
+        made = self._step(state)
+        applied = self._apply(state, grant=grant)
         self.assertEqual((made, applied), (1, 1))
         self.assertEqual(grants, [])
         self.assertEqual(task['_supervisorBudgetDecision']['decision'], 'close')
@@ -103,9 +122,8 @@ class SupervisorBudgetStep(unittest.TestCase):
         task = _exhausted_task(
             _supervisorBudgetDecision={'decision': 'close', 'applied': True})
         state = _state(task)
-        with mock.patch.object(serve, 'log_action'):
-            made = serve._supervisor_budget_step(state, decide=self._decide)
-            applied = serve._supervisor_budget_apply(state, grant=lambda *a: (True, {}))
+        made = self._step(state)
+        applied = self._apply(state, grant=lambda *a: (True, {}))
         self.assertEqual((made, applied, self.decided), (0, 0, []))
 
     def test_a_human_grant_racing_in_is_observed_not_clobbered(self):
@@ -114,8 +132,7 @@ class SupervisorBudgetStep(unittest.TestCase):
             _supervisorBudgetDecision={'decision': 'grant', 'budgetUsd': 0.3,
                                        'applied': False})
         state = _state(task)
-        with mock.patch.object(serve, 'log_action'):
-            applied = serve._supervisor_budget_apply(state, grant=lambda *a: (True, {}))
+        applied = self._apply(state, grant=lambda *a: (True, {}))
         self.assertEqual(applied, 1)
         self.assertTrue(task['_supervisorBudgetDecision']['humanGrantObserved'])
         self.assertEqual(task['budgetGrants'][0]['by'], 'ruth')
@@ -132,10 +149,112 @@ class SupervisorBudgetStep(unittest.TestCase):
         with mock.patch.object(serve, 'log_action'), \
                 mock.patch.object(serve, 'SUPERVISOR_BUDGET_RETRY_COOLDOWN_MS', 0):
             for _ in range(serve.SUPERVISOR_BUDGET_MAX_LLM_ATTEMPTS):
-                serve._supervisor_budget_step(state, decide=decide)
-            serve._supervisor_budget_step(state, decide=decide)
+                serve._supervisor_budget_step(state, decide=decide,
+                                              consult=self._consult)
+            serve._supervisor_budget_step(state, decide=decide,
+                                          consult=self._consult)
         self.assertEqual(len(calls), serve.SUPERVISOR_BUDGET_MAX_LLM_ATTEMPTS)
         self.assertEqual(task['_supervisorBudgetDecision']['decision'], 'deferred')
+
+
+    def test_worker_report_reaches_the_director_before_judgment(self):
+        task = _exhausted_task()
+        state = _state(task)
+        seen = []
+
+        def decide(state, t):
+            seen.append((t.get('_supervisorBudgetNegotiationDraft') or {}).get('worker'))
+            return self.decision
+
+        self.decision = {'decision': 'close', 'budgetUsd': None,
+                         'reason': 'duplicated work'}
+        self._step(state, decide=decide)
+        self.assertEqual(seen[0]['completed'], 'outline and two scenes')
+        self.assertEqual(seen[0]['moreBudgetUsd'], 0.30)
+        self.assertTrue(self.consulted[0] is None)
+
+    def test_director_may_ask_one_follow_up_before_deciding(self):
+        task = _exhausted_task()
+        state = _state(task)
+        answers = [{'decision': 'grant', 'budgetUsd': 0.4,
+                    'reason': 'progress is real'},
+                   {'decision': 'grant', 'budgetUsd': 0.4,
+                    'reason': 'concluded after the reply'}]
+        questions = []
+
+        def decide(state, t):
+            draft = t.get('_supervisorBudgetNegotiationDraft') or {}
+            if draft.get('round_no') == 1 and len(questions) == 0:
+                questions.append(1)
+                return {'action': 'ask', 'question': 'what did the spend buy?'}
+            return answers[1]
+
+        consults = []
+
+        def consult(state, t, spent, attempts, question=None):
+            consults.append(question)
+            if question:
+                return {'completed': 'the scenes', 'whyOver': 'length',
+                        'moreBudgetUsd': 0.3, 'reason': 'reply to follow-up'}
+            return dict(self.worker_report)
+
+        with mock.patch.object(serve, 'log_action'):
+            made = serve._supervisor_budget_step(state, decide=decide,
+                                                 consult=consult)
+        self.assertEqual(made, 1)
+        self.assertEqual(consults, [None, 'what did the spend buy?'])
+        sides = [r['side'] for r in task['_supervisorBudgetDecision']['negotiation']]
+        self.assertEqual(sides, ['worker', 'director', 'worker'])
+        decision = task['_supervisorBudgetDecision']
+        self.assertEqual(decision['workerEstimateUsd'], 0.30)
+        self.assertTrue(decision['applied'] is False)
+
+    def test_worker_consult_failure_does_not_block_the_decision(self):
+        task = _exhausted_task()
+        state = _state(task)
+        self.decision = {'decision': 'close', 'budgetUsd': None,
+                         'reason': 'decide from the record'}
+
+        def consult(state, t, spent, attempts, question=None):
+            raise RuntimeError('model down')
+
+        with mock.patch.object(serve, 'log_action'):
+            made = serve._supervisor_budget_step(state, decide=self._decide,
+                                                 consult=consult)
+        self.assertEqual(made, 1)
+        self.assertEqual(task['_supervisorBudgetDecision']['decision'], 'close')
+        self.assertIsNone(task['_supervisorBudgetDecision']['workerEstimateUsd'])
+
+    def test_worker_ask_feeds_the_default_grant_amount(self):
+        task = _exhausted_task()
+        state = _state(task)
+        self.decision = {'decision': 'grant', 'budgetUsd': None,
+                         'reason': 'fund the remainder the author sized'}
+        grants = []
+
+        def grant(agent_id, task_id, amount, reason):
+            grants.append((agent_id, task_id, amount, reason))
+            return True, {'ok': True}
+
+        with mock.patch.object(serve, '_task_budget_spent',
+                               return_value=(0.14, 3)):
+            self._step(state)
+            self._apply(state, grant=grant)
+        # the author asked for 0.30 more on top of 0.14 spent: 0.44 beats the
+        # old default (max(2x spent, 1.5x ceiling) = 0.28)
+        self.assertEqual(grants[0][2], 0.44)
+        self.assertIn('estimated $0.30 more', grants[0][3])
+
+    def test_decided_card_stamps_the_negotiation(self):
+        task = _exhausted_task()
+        state = _state(task)
+        self.decision = {'decision': 'close', 'budgetUsd': None,
+                         'reason': 'not worth continuing'}
+        self._step(state)
+        decision = task['_supervisorBudgetDecision']
+        self.assertEqual(decision['negotiation'][0]['side'], 'worker')
+        self.assertIn('three scenes remain', decision['negotiation'][0]['text'])
+        self.assertNotIn('_supervisorBudgetNegotiationDraft', task)
 
 
 class WorkerNotification(unittest.TestCase):
