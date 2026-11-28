@@ -1102,9 +1102,12 @@ def _backfill_assistant_titles(state, now_ms=None):
         agent = agents.get(entry.get('id'))
         agent_profile = agent.get('profile') if isinstance(agent, dict) else None
         entry_profile = entry.get('profile') if isinstance(entry.get('profile'), dict) else None
-        mission_text = ((agent_profile or {}).get('mission')
-                        or (entry_profile or {}).get('mission') or '')
-        stale_text = bool(stale_mission.match(mission_text or ''))
+        # Each surface is checked independently: the first sweep may already
+        # have rewritten the agent-side record while the roster entry's
+        # embedded copy (what the DB mirror persists) still carries the old
+        # template. Either copy being stale triggers the rewrite of both.
+        stale_text = bool(stale_mission.match((agent_profile or {}).get('mission') or '')
+                          or stale_mission.match((entry_profile or {}).get('mission') or ''))
         if not stale_role and not stale_text:
             continue
         if stale_role:
