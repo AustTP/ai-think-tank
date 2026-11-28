@@ -1080,39 +1080,60 @@ def _backfill_assistant_titles(state, now_ms=None):
     every roster agent still wearing a hire-era "Assistant to X" badge with
     the function title their recent real work supports, and rewrite the
     equally stale mission so the reporting line reflects the CURRENT
-    director. The original hire context is kept as provenance. Idempotent:
-    retitled agents no longer match the "Assistant to " prefix, so a rerun
-    is a no-op. Returns the number of agents retitled. Pure state mutation."""
+    director. The original hire context is kept as provenance. Both profile
+    copies are rewritten -- the agents-dict record the agent reads AND the
+    roster entry's embedded copy the roster_agent DB mirror persists -- so a
+    partially applied first run cannot leave the two surfaces disagreeing.
+    Idempotent: retitled agents no longer match the "Assistant to " prefix
+    and rewritten missions no longer match the old hire template, so a rerun
+    is a no-op. Returns the number of agents changed. Pure state mutation."""
+    import re as _re
+    stale_mission = _re.compile(
+        r'^Support the .+ team by picking up overflow work for ')
     changed = 0
     agents = state.get('agents') or {}
-    for entry in (state.get('agentRoster') or []):
+    roster = state.get('agentRoster') or []
+    by_id = {str(e.get('id') or ''): e for e in roster if isinstance(e, dict)}
+    for entry in roster:
         if not isinstance(entry, dict):
             continue
         role = str(entry.get('role') or '')
-        if not role.startswith('Assistant to '):
+        stale_role = role.startswith('Assistant to ')
+        agent = agents.get(entry.get('id'))
+        agent_profile = agent.get('profile') if isinstance(agent, dict) else None
+        entry_profile = entry.get('profile') if isinstance(entry.get('profile'), dict) else None
+        mission_text = ((agent_profile or {}).get('mission')
+                        or (entry_profile or {}).get('mission') or '')
+        stale_text = bool(stale_mission.match(mission_text or ''))
+        if not stale_role and not stale_text:
             continue
-        agent_id = entry.get('id')
-        title = _title_from_recent_work(state, agent_id,
-                                        room=entry.get('room'))
-        entry['role'] = title
-        agent = agents.get(agent_id)
-        if isinstance(agent, dict):
-            agent['role'] = title
-            profile = agent.setdefault('profile', {})
+        if stale_role:
+            title = _title_from_recent_work(state, entry.get('id'),
+                                            room=entry.get('room'))
+            entry['role'] = title
+            if isinstance(agent, dict):
+                agent['role'] = title
         else:
-            profile = entry.setdefault('profile', {})
+            title = role
         director_id = entry.get('director') or ''
-        director_row = agents.get(director_id) or {}
-        director_name = director_row.get('name') or director_id or 'the tank'
-        hired_relief = role[len('Assistant to '):].strip() or 'a teammate'
-        profile['mission'] = (
-            f"{title}. Reports to {director_name}. Originally hired to "
-            f"relieve {hired_relief}.")
+        director_entry = by_id.get(str(director_id)) or {}
+        director_name = (director_entry.get('name')
+                         or (agents.get(director_id) or {}).get('name')
+                         or director_id or 'the tank')
+        hired_relief = role[len('Assistant to '):].strip() if stale_role \
+            else 'a teammate'
+        mission = (f"{title}. Reports to {director_name}. Originally hired "
+                   f"to relieve {hired_relief}.")
+        if isinstance(agent, dict):
+            agent.setdefault('profile', {})['mission'] = mission
+        # The roster entry's embedded copy is what the roster_agent DB mirror
+        # persists; keep both surfaces in agreement.
+        entry.setdefault('profile', {})['mission'] = mission
         changed += 1
     if changed:
         try:
             _log_governance(state, None, 'assistant_titles_backfill',
-                            {'retitled': changed})
+                            {'changed': changed})
         except Exception:
             pass
     return changed

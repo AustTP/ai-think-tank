@@ -6,6 +6,7 @@ real work."""
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 import sim  # noqa: E402
@@ -83,7 +84,27 @@ class Backfill(unittest.TestCase):
         mission = state['agents']['ruth']['profile']['mission']
         self.assertIn('Reports to Maya', mission)
         self.assertIn('relieve Nora', mission)
+        # Both surfaces agree: the roster entry's embedded profile copy (what
+        # the roster_agent DB mirror persists) carries the same rewrite.
+        self.assertEqual(entry['profile']['mission'], mission)
         # Idempotent: a retitled agent no longer matches the stale prefix.
+        self.assertEqual(sim._backfill_assistant_titles(state), 0)
+
+    def test_partially_applied_first_run_still_fixes_the_mirror_mission(self):
+        # A first run that retitled the role but left the roster entry's
+        # embedded profile copy on the old hire template is repaired by a
+        # rerun: the stale mission alone triggers the rewrite.
+        entry = {'id': 'ruth', 'name': 'Ruth', 'role': 'Review Analyst',
+                 'director': 'maya',
+                 'profile': {'mission':
+                             'Support the nora team by picking up overflow '
+                             'work for Ben (Banking).'}}
+        state = _state()
+        state['agentRoster'] = [entry]
+        state['agents'] = {'maya': {'id': 'maya', 'name': 'Maya'}}
+        self.assertEqual(sim._backfill_assistant_titles(state), 1)
+        self.assertEqual(entry['role'], 'Review Analyst')
+        self.assertIn('Reports to Maya', entry['profile']['mission'])
         self.assertEqual(sim._backfill_assistant_titles(state), 0)
 
     def test_directors_and_current_roles_are_untouched(self):
