@@ -972,3 +972,83 @@ class TierDistinctRule(unittest.TestCase):
         self.assertEqual(chosen['mid']['id'], 'mid/m_mid')
         self.assertEqual(chosen['coding']['id'], 'high/h1')
         self.assertEqual(chosen['high']['id'], 'high/h1')
+
+    def test_band_pick_conflict_matches_family_not_raw_id(self):
+        # One model sold under two catalog ids (cheaperinference's
+        # 'hy4-flash' vs OpenRouter's vendor-prefixed 'tencent/hy4-flash')
+        # is the SAME weights: the tier-distinct rule must see through the
+        # vendor prefix, or a band dodges it by hopping provider under a
+        # second id (coding paid 2.2x doing exactly that, 2026-11-28).
+        self.assertEqual(
+            serve._band_pick_conflict('coding', 'tencent/hy4-flash',
+                                      {'low': {'id': 'hy4-flash'}}), 'low')
+        self.assertEqual(
+            serve._band_pick_conflict('low', 'hy4-flash',
+                                      {'coding': {'id': 'tencent/hy4-flash'}}),
+            'coding')
+        # Unrelated families stay allowed.
+        self.assertIsNone(
+            serve._band_pick_conflict('coding', 'ling-3.0-flash',
+                                      {'low': {'id': 'hy4-flash'}}))
+        # An unnormalizable slug (empty family) keeps the exact-id rule.
+        self.assertIsNone(
+            serve._band_pick_conflict('coding', 'vendor/one',
+                                      {'low': {'id': 'vendor/two'}}))
+        self.assertEqual(
+            serve._band_pick_conflict('coding', 'vendor/same',
+                                      {'low': {'id': 'vendor/same'}}), 'low')
+
+    def test_same_family_second_id_is_not_the_conflict_escape_hatch(self):
+        # The 2026-11-28 morning state: low resolved onto cheaperinference's
+        # 'hy4-flash' ($0.079/M); coding's best value pick was the same
+        # weights under OpenRouter's 'tencent/hy4-flash' id ($0.176/M) and
+        # the exact-id conflict check let it through. With family-aware
+        # identity, BOTH ids are off the table for coding, which must walk
+        # to the next cheapest different-family qualifier (deepseek) --
+        # same scores, $0.15/M, genuinely distinct weights.
+        cheaperinference = [self._model('hy4-flash', '0.0000000395', '0.0000000395')]
+        openrouter = [
+            self._model('tencent/hy4-flash', '0.000000088', '0.000000088'),
+            self._model('deepseek/deepseek-v4.1-flash-1017',
+                        '0.000000075', '0.000000075'),
+        ]
+        serve.set_model_benchmark_score('hy4-flash', 'intelligence_index', 35.0, 'u')
+        serve.set_model_benchmark_score('hy4-flash', 'coding_index', 31.22, 'u')
+        serve.set_model_benchmark_score('tencent/hy4-flash', 'coding_index', 31.22, 'u')
+        serve.set_model_benchmark_score('deepseek/deepseek-v4.1-flash-1017',
+                                        'intelligence_index', 30.0, 'u')
+        serve.set_model_benchmark_score('deepseek/deepseek-v4.1-flash-1017',
+                                        'coding_index', 28.24, 'u')
+        # conftest trims PROVIDER_CATALOGS to OpenRouter by default; this
+        # scenario NEEDS the second provider's listing in the union.
+        registry = {'openrouter': '_fetch_openrouter_catalog_sync',
+                    'cheaperinference': '_fetch_cheaperinference_catalog_sync'}
+        with unittest.mock.patch.object(serve, 'PROVIDER_CATALOGS', registry), \
+             unittest.mock.patch.object(serve, '_fetch_openrouter_catalog_sync',
+                                        return_value=openrouter), \
+             unittest.mock.patch.object(serve, '_fetch_cheaperinference_catalog_sync',
+                                        return_value=cheaperinference), \
+             unittest.mock.patch.object(serve, '_verify_model_works_sync',
+                                        return_value=True), \
+             unittest.mock.patch.object(serve, '_sync_model_catalog',
+                                        return_value=0), \
+             unittest.mock.patch.object(serve, 'log_action'):
+            chosen = asyncio.run(serve.refresh_model_tiers())
+        # Low keeps the cheapest listing of the family; coding is FORCED off
+        # both ids of it onto the next qualifier.
+        self.assertEqual(chosen['low']['id'], 'hy4-flash')
+        self.assertEqual(chosen['low'].get('provider'), 'cheaperinference')
+        self.assertEqual(chosen['coding']['id'],
+                         'deepseek/deepseek-v4.1-flash-1017')
+        self.assertEqual(chosen['coding'].get('provider'), 'openrouter')
+        # Both hy4 ids cost more than deepseek's 31.22-2.98 gap under the
+        # 6-point floor, and every other band has no landing bucket here.
+        self.assertNotIn('sublow', chosen)
+        self.assertNotIn('mid', chosen)
+        self.assertNotIn('high', chosen)
+        with serve._db() as conn:
+            row = conn.execute(
+                "SELECT slug, provider FROM model_tiers WHERE band = 'coding'"
+            ).fetchone()
+        self.assertEqual(row[0], 'deepseek/deepseek-v4.1-flash-1017')
+        self.assertEqual(row[1], 'openrouter')

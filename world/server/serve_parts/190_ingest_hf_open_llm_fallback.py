@@ -105,9 +105,21 @@ BAND_MUST_DIFFER = {
 
 def _band_pick_conflict(band, slug, chosen):
     """The already-picked band this band's candidate collides with under the
-    tier-distinct rule, or None when the pick is allowed."""
+    tier-distinct rule, or None when the pick is allowed. Identity is the
+    normalized model FAMILY (`_freepool_model_family`), not the raw slug:
+    one model sold under two ids (cheaperinference 'hy4-flash' vs
+    OpenRouter's vendor-prefixed 'tencent/hy4-flash') is the same weights,
+    and a band must not dodge the rule by hopping provider under a second
+    id (operator, 2026-11-28: coding paid 2.2x doing exactly that).
+    Unnormalizable slugs (family '') compare by exact id as before."""
+    family = _freepool_model_family(slug)
     for other in BAND_MUST_DIFFER.get(band, ()):
-        if (chosen.get(other) or {}).get('id') == slug:
+        other_id = (chosen.get(other) or {}).get('id')
+        if not other_id:
+            continue
+        if other_id == slug:
+            return other
+        if family and _freepool_model_family(other_id) == family:
             return other
     return None
 
